@@ -277,9 +277,9 @@ export function MessageRail({ turns, contentRef, onReveal }) {
 				const tickH = on || aimed ? Math.min(geo.tickH + 1, 4) : geo.tickH;
 				return html`<i key=${entries[i].key} class=${`msg-tick ${on ? "on" : ""} ${aimed ? "aimed" : ""}`} style=${{ top: `${y}px`, width: `${width}px`, height: `${tickH}px`, marginTop: `${-tickH / 2}px` }} />`;
 			})}
-			${shown ? html`<div class="msg-tip" style=${{ top: `${tipY}px` }} role="presentation">
-				<span class="msg-tip-n">${shown.index + 1}<span class="dim"> / ${entries.length}</span></span>
-				<span class="msg-tip-text">${entries[shown.index].preview || t("Message")}</span>
+			${shown ? html`<div class="msg-rail-tip" style=${{ top: `${tipY}px` }} role="presentation">
+				<span class="msg-rail-tip-n">${shown.index + 1}<span class="dim"> / ${entries.length}</span></span>
+				<span class="msg-rail-tip-text">${entries[shown.index].preview || t("Message")}</span>
 			</div>` : null}
 		</div>
 	</nav>${origin ? html`<${BackPill} origin=${origin} onDone=${() => setOrigin(null)} />` : null}`;

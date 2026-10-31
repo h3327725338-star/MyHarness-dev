@@ -59,8 +59,14 @@ try {
  const rail=document.querySelector('.msg-rail');
  const ticks=[...document.querySelectorAll('.msg-tick')];
  const y0=ticks[0].getBoundingClientRect().top;
- ptr(rail,'pointermove',y0); await wait(80);
- if(!document.querySelector('.msg-tip')) throw Error('no tip while aiming');
+ ptr(rail,'pointermove',y0); await wait(300);
+ const tip=rail.querySelector('[role="presentation"]');
+ if(!tip) throw Error('no tip while aiming');
+ // In the page and readable beside the tick: a tip that only exists can still be fully transparent or out of place.
+ const tipBox=tip.getBoundingClientRect();
+ if(getComputedStyle(tip).opacity!=='1') throw Error('tip is not visible: opacity '+getComputedStyle(tip).opacity);
+ if(!tip.textContent.includes('1 / ')||!tip.textContent.includes('seed line 0')) throw Error('tip text: '+tip.textContent);
+ if(tipBox.right>rail.getBoundingClientRect().left+rail.offsetWidth/2||tipBox.height<30||tipBox.height>90||Math.abs(tipBox.top+tipBox.height/2-y0)>6) throw Error('tip misplaced: '+JSON.stringify(tipBox)+' tick at '+y0);
  ptr(rail,'pointerdown',y0); ptr(rail,'pointerup',y0);
  if(!await waitFor(()=>el().scrollTop<4,3000)) throw Error('did not reach the first message: '+el().scrollTop);
  if(!await waitFor(()=>document.querySelectorAll('.msg-tick')[0].classList.contains('on'),2000)) throw Error('first tick not lit at top: top='+el().scrollTop+' on='+[...document.querySelectorAll('.msg-tick')].findIndex(x=>x.classList.contains('on')));
