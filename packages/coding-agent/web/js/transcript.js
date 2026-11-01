@@ -7,7 +7,7 @@ import { shortcutFor } from "./shortcuts.js";
 import { GitRecord } from "./git-record.js";
 import { Markdown } from "./markdown.js";
 import { DiffView, languageFor, parsePatch } from "./diff.js";
-import { buildTurns, buildTurnsAsync, buildTurnsWork, cachedTurns, tailPreviewSlice, changeTotals, groupSteps, groupLabel, runForTurn, interruptedByNext, turnDuration, turnOutcome, turnSegments, historySourcesOf } from "./turns.js";
+import { buildTurns, buildTurnsAsync, buildTurnsWork, cachedTurns, tailPreviewSlice, changeTotals, groupSteps, groupLabel, nextRound, runForTurn, interruptedByNext, turnDuration, turnOutcome, turnSegments, historySourcesOf } from "./turns.js";
 import { actions, openCommand } from "./actions.js";
 import { KIND_ICON, StatusGlyph, WebSteps } from "./tool-rows.js";
 import { StepCounts } from "./step-counts.js";
@@ -574,12 +574,15 @@ function OutcomeBanner({ turn, outcome, run, changeCount, isLast }) {
 		return html`<div class="banner o-waiting" role="status"><div class="banner-head"><${Icon} name="clock" size=${15} /><strong>${t("Waiting for you")}</strong><span class="dim">${t("The agent is paused until you answer the question above the input box.")}</span></div></div>`;
 	}
 	const error = run?.error || turn.error?.message;
-	const commands = run?.bashRuns ?? turn.stats.commands;
+	const commands = turn.stats.commands;
 	const facts = [];
-	if (run) facts.push(changeCount ? t("{files} changed", { files: plural(changeCount, "file") }) : t("No files were changed"));
-	else facts.push(changeCount ? t("{files} edited", { files: plural(changeCount, "file") }) : t("No file edits were recorded"));
+	// What the run detected is at hand with its record or its saved card of changes. Without either, a turn that called
+	// no tool changed nothing, and any other is known only by the edits it recorded.
+	const detected = run || turn.changes;
+	if (detected) facts.push(changeCount ? t("{files} changed", { files: plural(changeCount, "file") }) : t("No files were changed"));
+	else facts.push(changeCount ? t("{files} edited", { files: plural(changeCount, "file") }) : turn.stats.actions ? t("No file edits were recorded") : t("No files were changed"));
 	if (run?.externalCommitCount) facts.push(t("{files} committed outside this run (not counted)", { files: plural(run.externalCommitCount, "file") }));
-	if (commands) facts.push(run ? t("{commands} ran (side effects outside the workspace cannot be ruled out)", { commands: plural(commands, "command") }) : t("{commands} ran and may have changed files — check the Changes panel", { commands: plural(commands, "command") }));
+	if (commands) facts.push(detected ? t("{commands} ran (side effects outside the workspace cannot be ruled out)", { commands: plural(commands, "command") }) : t("{commands} ran and may have changed files — check the Changes panel", { commands: plural(commands, "command") }));
 	if (turn.stats.failedActions) facts.push(t("{actions} failed", { actions: plural(turn.stats.failedActions, "action") }));
 	const titles = { partial: N_("Partially completed"), failed: N_("Failed"), cancelled: N_("Cancelled"), waiting: N_("Waiting for you"), unanswered: N_("No response") };
 	const blurbs = { cancelled: N_("You stopped this run before it finished."), unanswered: N_("The message was sent but the agent did not respond.") };
@@ -945,7 +948,8 @@ const TurnView = memo(function TurnView({ turn, isLast, live, waiting, run, cwd,
 	const ended = turnOutcome(turn, { run, live, waiting });
 	// Stopped by a message sent with "interrupt": no "cancelled" banner, the answer to that message follows.
 	const outcome = ended === "cancelled" && interrupted ? "redirected" : ended;
-	const changeCount = run ? run.changeCount : turn.stats.files;
+	// The run's card of changes is saved, so a reopened chat counts the same files as the run record did.
+	const changeCount = run ? run.changeCount : turn.changes?.files?.length ?? turn.stats.files;
 	const duration = turnDuration(turn, run);
 	const working = live || waiting;
 	const expanded = processDefault === "expanded";
@@ -2018,7 +2022,7 @@ export function Transcript() {
 					// Nothing else is faked: the row ends when the real run takes over (or the message is rejected).
 					const awaiting = !live && isLast && !turn.final && !turn.steps?.length && !!turn.user?.pending;
 					const working = live || awaiting;
-					const run = working ? undefined : runForTurn(turn, runs, turns[index + 1]);
+					const run = working ? undefined : runForTurn(turn, runs, nextRound(turns, index));
 					return html`<${TurnView} key=${turn.key} turn=${turn} isLast=${isLast} live=${working} waiting=${live && waiting} run=${run} cwd=${cwd} processDefault=${processDefault} snapRun=${live ? snap?.run : undefined} compacting=${live && compacting} interrupted=${interruptedByNext(turn, turns[index + 1])} />`;
 				})}
 				${(switching ? [] : liveBash).map((entry) => html`<${BashCard} key=${entry.id} item=${entry} />`)}

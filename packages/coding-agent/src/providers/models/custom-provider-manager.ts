@@ -2,8 +2,9 @@ import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/pr
 import { dirname } from "node:path";
 import type { ThinkingLevelMap } from "@myharness/ai";
 import { stripJsonComments } from "../../utils/json.ts";
-import type { ModelsJsonModel, ModelsJsonProvider } from "./config.ts";
+import type { ModelsJsonModel, ModelsJsonProvider, ModelsJsonProviderGroup } from "./config.ts";
 import { ModelConfig } from "./config.ts";
+import { newGroupId, resolveProviderLayers, withGroupValues } from "./layers.ts";
 import { resolveThinkingCapability, type ThinkingSource } from "./thinking-capability.ts";
 
 export const CUSTOM_PROVIDER_API_TYPES = [
@@ -18,12 +19,22 @@ export type CustomProviderApiType = (typeof CUSTOM_PROVIDER_API_TYPES)[number];
 
 interface ModelsJsonDocument {
 	providers: Record<string, ModelsJsonProvider>;
+	providerGroups?: Record<string, ModelsJsonProviderGroup>;
 	[key: string]: unknown;
 }
 
 export interface CustomProviderEntry {
 	id: string;
 	config: ModelsJsonProvider;
+}
+
+/** What a merge or a departure changed besides the entries themselves: the keys of these groups are the caller's to move. */
+export interface ProviderGroupChange {
+	groupId: string;
+	/** Entries that left another group, which may hold a key they were using. */
+	moved: Array<{ id: string; fromGroup: string }>;
+	/** Groups left without any entry; their records are gone. */
+	emptied: string[];
 }
 
 export interface ModelsJsonSnapshot {
@@ -125,6 +136,19 @@ function parseDocument(content: string, path: string): ModelsJsonDocument {
 		throw new Error(`models.json 必须包含 providers 对象。\n文件：${path}`);
 	}
 	return parsed as ModelsJsonDocument;
+}
+
+function groupOf(document: ModelsJsonDocument, entry: ModelsJsonProvider): ModelsJsonProviderGroup | undefined {
+	const groups = document.providerGroups;
+	return entry.group && groups && Object.hasOwn(groups, entry.group) ? groups[entry.group] : undefined;
+}
+
+function dropEmptyGroups(document: ModelsJsonDocument): string[] {
+	const groups = document.providerGroups ?? {};
+	const used = new Set(Object.values(document.providers).map((entry) => entry.group));
+	const emptied = Object.keys(groups).filter((groupId) => !used.has(groupId));
+	for (const groupId of emptied) delete groups[groupId];
+	return emptied;
 }
 
 function modelListUrl(baseUrl: string, api: string): URL {
@@ -655,6 +679,114 @@ export class CustomProviderManager {
 		return provider ? structuredClone(provider) : undefined;
 	}
 
+	/** `list` with each entry's layers applied: the values that really apply (see layers.ts). */
+	async listResolved(): Promise<CustomProviderEntry[]> {
+		const document = await this.readDocument();
+		return Object.entries(document.providers).map(([id, config]) => ({
+			id,
+			config: resolveProviderLayers(id, structuredClone(config), groupOf(document, config)),
+		}));
+	}
+
+	/** `get` with the entry's layers applied. */
+	async getResolved(providerId: string): Promise<ModelsJsonProvider | undefined> {
+		const document = await this.readDocument();
+		const provider = document.providers[providerId];
+		return provider
+			? resolveProviderLayers(providerId, structuredClone(provider), groupOf(document, provider))
+			: undefined;
+	}
+
+	async listGroups(): Promise<Record<string, ModelsJsonProviderGroup>> {
+		return structuredClone((await this.readDocument()).providerGroups ?? {});
+	}
+
+	/**
+	 * The group this entry belongs to. An entry that stands alone gets one now, named after it, and from then on lives
+	 * under the layered rule; nothing its models use changes.
+	 */
+	async ensureGroupFor(providerId: string): Promise<string> {
+		const document = await this.readDocument();
+		const entry = document.providers[providerId];
+		if (!entry) throw new Error(`Provider“${providerId}”不存在。`);
+		if (entry.group && groupOf(document, entry)) return entry.group;
+		document.providerGroups ??= {};
+		const groups = document.providerGroups;
+		const name = entry.name ?? providerId;
+		const groupId = newGroupId(name, new Set(Object.keys(groups)));
+		groups[groupId] = { name };
+		document.providers[providerId] = { ...withGroupValues(entry, undefined), group: groupId };
+		await this.writeDocument(document);
+		return groupId;
+	}
+
+	/** Replaces what the group itself sets. An empty field means the layers below decide. */
+	async updateGroup(groupId: string, group: ModelsJsonProviderGroup): Promise<void> {
+		const document = await this.readDocument();
+		const groups = document.providerGroups ?? {};
+		if (!Object.hasOwn(groups, groupId)) throw new Error(`Provider“${groupId}”不存在。`);
+		groups[groupId] = structuredClone(group);
+		await this.writeDocument(document);
+	}
+
+	/**
+	 * Makes these entries keys of one group, an existing one or a new one with this name. An entry coming out of another
+	 * group takes that group's values along, so that only the target group's own values can change what it uses. The file
+	 * as it was before is kept next to it as models.json.before-merge.bak.
+	 */
+	async mergeProviders(options: {
+		ids: readonly string[];
+		groupId?: string;
+		name?: string;
+	}): Promise<ProviderGroupChange> {
+		const document = await this.readDocument();
+		document.providerGroups ??= {};
+		const groups = document.providerGroups;
+		let groupId = options.groupId;
+		if (groupId && !Object.hasOwn(groups, groupId)) throw new Error(`Provider“${groupId}”不存在。`);
+		if (!groupId) {
+			const first = options.ids[0] ?? "";
+			const name = options.name?.trim() || document.providers[first]?.name || first;
+			groupId = newGroupId(name, new Set(Object.keys(groups)));
+			groups[groupId] = { name };
+		}
+		const moved: ProviderGroupChange["moved"] = [];
+		for (const id of options.ids) {
+			const entry = document.providers[id];
+			if (!entry) throw new Error(`Provider“${id}”不存在。`);
+			if (entry.group === groupId) continue;
+			const from = groupOf(document, entry);
+			if (from && entry.group) moved.push({ id, fromGroup: entry.group });
+			document.providers[id] = { ...withGroupValues(entry, from), group: groupId };
+		}
+		const emptied = dropEmptyGroups(document);
+		await this.keepBeforeMerge();
+		await this.writeDocument(document);
+		return { groupId, moved, emptied };
+	}
+
+	/** Takes an entry out of its group: it stands alone again, using what it used inside the group. */
+	async leaveGroup(providerId: string): Promise<ProviderGroupChange> {
+		const document = await this.readDocument();
+		const entry = document.providers[providerId];
+		if (!entry) throw new Error(`Provider“${providerId}”不存在。`);
+		const groupId = entry.group;
+		if (!groupId) return { groupId: "", moved: [], emptied: [] };
+		const { group: _group, ...next } = withGroupValues(entry, groupOf(document, entry));
+		document.providers[providerId] = next;
+		const emptied = dropEmptyGroups(document);
+		await this.writeDocument(document);
+		return { groupId, moved: [{ id: providerId, fromGroup: groupId }], emptied };
+	}
+
+	/** Removes the records of groups no entry belongs to any more; returns their IDs. */
+	async removeEmptyGroups(): Promise<string[]> {
+		const document = await this.readDocument();
+		const emptied = dropEmptyGroups(document);
+		if (emptied.length > 0) await this.writeDocument(document);
+		return emptied;
+	}
+
 	/**
 	 * Append newly discovered models to one provider without replacing any
 	 * existing definitions. There is no removal path because models.json does not
@@ -814,18 +946,32 @@ export class CustomProviderManager {
 	 * literal API key or header). Let `scrub` drop it there too so a deletion leaves no secrets behind.
 	 */
 	private async scrubBackup(scrub: (backup: ModelsJsonDocument) => boolean): Promise<void> {
-		const backupPath = `${this.requirePath()}.bak`;
-		try {
-			const backup = parseDocument(await readFile(backupPath, "utf8"), backupPath);
-			if (!scrub(backup)) return;
-			await writeFile(
-				backupPath,
-				`${JSON.stringify(backup, null, 2)}
+		for (const backupPath of [`${this.requirePath()}.bak`, this.beforeMergePath()]) {
+			try {
+				const backup = parseDocument(await readFile(backupPath, "utf8"), backupPath);
+				if (!scrub(backup)) continue;
+				await writeFile(
+					backupPath,
+					`${JSON.stringify(backup, null, 2)}
 `,
-				{ encoding: "utf8", mode: 0o600 },
-			);
-		} catch {
-			// The backup is a convenience copy; a missing or unreadable one is not a reason to fail the deletion.
+					{ encoding: "utf8", mode: 0o600 },
+				);
+			} catch {
+				// The backup is a convenience copy; a missing or unreadable one is not a reason to fail the deletion.
+			}
+		}
+	}
+
+	private beforeMergePath(): string {
+		return `${this.requirePath()}.before-merge.bak`;
+	}
+
+	/** A copy that later saves do not overwrite the way they do models.json.bak, so that a merge can be looked up. */
+	private async keepBeforeMerge(): Promise<void> {
+		try {
+			await copyFile(this.requirePath(), this.beforeMergePath());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
 

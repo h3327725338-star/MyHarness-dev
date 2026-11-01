@@ -7,6 +7,7 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { MAX_KEEP_ALIVE_SECONDS, MIN_KEEP_ALIVE_SECONDS } from "../../platform/process/http-dispatcher.ts";
 import { stripJsonComments } from "../../utils/json.ts";
 import { normalizePath } from "../../utils/paths.ts";
+import { resolveProviderLayers } from "./layers.ts";
 import { upgradeNebiusPresetModels } from "./nebius-preset.ts";
 
 const PercentileCutoffsSchema = Type.Object({
@@ -234,16 +235,32 @@ const ProviderConfigSchema = Type.Object({
 	ipFamily: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("ipv4"), Type.Literal("ipv6")])),
 	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
 	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
+	/** The entry of `providerGroups` this entry is a key of. An unknown ID is the same as no group. */
+	group: Type.Optional(Type.String({ minLength: 1 })),
+	/**
+	 * This entry's Base URL and API format win over its models' (see layers.ts). Omitted keeps the older rule, where a
+	 * model's own value wins.
+	 */
+	layered: Type.Optional(Type.Boolean()),
+});
+
+/** The top layer: what applies to every entry of the group when it is set. Its API key is in the credential store. */
+const ProviderGroupSchema = Type.Object({
+	name: Type.Optional(Type.String({ minLength: 1 })),
+	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+	api: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const ModelsConfigSchema = Type.Object({
 	providers: Type.Record(Type.String(), ProviderConfigSchema),
+	providerGroups: Type.Optional(Type.Record(Type.String(), ProviderGroupSchema)),
 });
 const validateModelsConfig = Compile(ModelsConfigSchema);
 
 export type ModelsJsonModel = Static<typeof ModelDefinitionSchema>;
 export type ModelsJsonModelOverride = Static<typeof ModelOverrideSchema>;
 export type ModelsJsonProvider = Static<typeof ProviderConfigSchema>;
+export type ModelsJsonProviderGroup = Static<typeof ProviderGroupSchema>;
 type ModelsJson = Static<typeof ModelsConfigSchema>;
 
 function formatValidationPath(error: TLocalizedValidationError): string {
@@ -310,12 +327,16 @@ export class ModelConfig {
 
 		const config = parsed as ModelsJson;
 		const providers = new Map<string, ModelsJsonProvider>();
+		const groups = config.providerGroups ?? {};
 		for (const [providerId, provider] of Object.entries(config.providers)) {
-			providers.set(providerId, deepFreeze(upgradeNebiusPresetModels(providerId, structuredClone(provider))));
+			const entry = upgradeNebiusPresetModels(providerId, structuredClone(provider));
+			const group = entry.group && Object.hasOwn(groups, entry.group) ? groups[entry.group] : undefined;
+			providers.set(providerId, deepFreeze(resolveProviderLayers(providerId, entry, group)));
 		}
 		return new ModelConfig(providers);
 	}
 
+	/** One entry with its layers already applied: its fields and models hold the values that really apply (layers.ts). */
 	getProvider(providerId: string): ModelsJsonProvider | undefined {
 		return this.providers.get(providerId);
 	}

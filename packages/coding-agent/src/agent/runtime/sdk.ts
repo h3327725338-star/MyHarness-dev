@@ -3,6 +3,8 @@ import { Agent, type AgentMessage, type ThinkingLevel } from "@myharness/agent-c
 import { clampThinkingLevel, type Message, type Model } from "@myharness/ai/compat";
 import type { ResourceLoader } from "../../application/resource-loader.ts";
 import { DefaultResourceLoader } from "../../application/resource-loader.ts";
+import { withAbsoluteAttachmentPaths } from "../../config/paths/attachments.ts";
+import { getDataDir } from "../../config/paths/index.ts";
 import { SettingsManager } from "../../config/settings/index.ts";
 import { getAgentDir } from "../../config.ts";
 import type { LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "../../extensions/compat/types.ts";
@@ -320,7 +322,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
+		const dataRoot = sessionManager.getDataRoot() ?? getDataDir();
+		const converted = convertToLlm(messages).map((msg) => {
+			if (msg.role !== "user") return msg;
+			if (typeof msg.content === "string")
+				return { ...msg, content: withAbsoluteAttachmentPaths(msg.content, dataRoot) };
+			return {
+				...msg,
+				content: msg.content.map((part) =>
+					part.type === "text" ? { ...part, text: withAbsoluteAttachmentPaths(part.text, dataRoot) } : part,
+				),
+			};
+		});
 		// Check setting dynamically so mid-session changes take effect
 		const blockImages = settingsManager.getBlockImages();
 		const useVisionAssistant = settingsManager.isVisionAssistantActive();

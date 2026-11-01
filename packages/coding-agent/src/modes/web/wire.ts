@@ -10,9 +10,10 @@ import type { AgentMessage } from "@myharness/agent-core";
 import { stripModelGuidance } from "@myharness/ai";
 import { getSupportedThinkingLevels, type Model } from "@myharness/ai/compat";
 import { parseSkillBlock } from "../../agent/runtime/agent-session.ts";
+import { ATTACHED_FILES_HEADER } from "../../config/paths/attachments.ts";
 import { explainProviderError } from "../../providers/recovery/error-explanation.ts";
 import { imageBase64Length, imageForDisplay, imageHasData } from "../../session/storage/jsonl/image-files.ts";
-import type { SessionEntry, SessionMessageTiming } from "../../session/types.ts";
+import { SCHEDULED_RUN_ENTRY, type SessionEntry, type SessionMessageTiming } from "../../session/types.ts";
 import { parseExpandedBuiltinPromptCommand } from "../../startup/slash-commands.ts";
 
 /** Tool result details larger than this are replaced by a marker to keep payloads bounded. */
@@ -34,7 +35,7 @@ export const RUN_CHANGES_ENTRY = "web-run-changes";
  * Written just before the message a scheduled Agent task sends (routes-schedules.ts): which task it is, so the chat
  * shows that message as the task's card instead of as something the user typed. Never sent to the model.
  */
-export const SCHEDULED_RUN_ENTRY = "scheduled-run";
+export { SCHEDULED_RUN_ENTRY };
 
 /**
  * Custom entry written when a message sent with "interrupt" ended the run before it: it sits between the stopped
@@ -124,11 +125,19 @@ export interface WireAttachment {
 }
 
 /** Header POST /api/prompt prepends to the message text for the composer's non-image uploads (`attachments`). */
-export const ATTACH_HEADER = "Attached files (use read to inspect):";
+export const ATTACH_HEADER = ATTACHED_FILES_HEADER;
 
-/** Display name of an uploaded file: the basename without the server's `attachment-` prefix. */
+/**
+ * Display name of an uploaded file: the basename without the server's `attachment-` prefix. A file of an uploaded
+ * folder keeps its place in the folder: `uploads/<id>/attachment-top/sub/a.txt` is `top/sub/a.txt`.
+ */
 export function attachmentName(path: string): string {
 	const base = path.replace(/\\/g, "/").replace(/\/+$/, "");
+	const parts = base.split("/");
+	const uploads = parts.indexOf("uploads");
+	const top = uploads < 0 ? -1 : parts.findIndex((part, index) => index > uploads && part.startsWith("attachment-"));
+	if (top >= 0 && top < parts.length - 1)
+		return [parts[top]!.slice("attachment-".length) || parts[top], ...parts.slice(top + 1)].join("/");
 	const leaf = base.slice(base.lastIndexOf("/") + 1) || path;
 	return leaf.startsWith("attachment-") ? leaf.slice("attachment-".length) || leaf : leaf;
 }

@@ -21,7 +21,6 @@ import { SearchableMultiSelect } from "./settings-multiselect.js";
 import { Select } from "./select.js";
 import { SyncPage } from "./sync-page.js";
 import { ConnectPage } from "./connect-page.js";
-import { SchedulesPage } from "./schedules.js";
 import { AppZoomControl } from "./app-zoom.js";
 
 export { ProviderEditorHost, deleteCustomProvider } from "./providers-page.js";
@@ -34,7 +33,6 @@ export const NAV = [
 	{ id: "git", label: N_("Git"), icon: "gitBranch" },
 	{ id: "providers", label: N_("Providers"), icon: "key" },
 	{ id: "connect", label: N_("Connections"), icon: "plug" },
-	{ id: "schedules", label: N_("Scheduled tasks"), icon: "bell" },
 	{ id: "sync", label: N_("Google Drive"), icon: "drive" },
 	{ id: "search", label: N_("Web search"), icon: "globe" },
 	{ id: "code", label: N_("Code Intelligence"), icon: "wrench" },
@@ -311,7 +309,7 @@ function SettingControl({ item, models, onApply }) {
 				? html`<span title=${t("Sub-agent mode")}><${Select} class="mref-mode" ariaLabel=${t("Sub-agent mode")} value=${v.mode === "read-write" ? "read-write" : "read-only"} onChange=${(next) => onApply(item.id, { ...rest, mode: next })} options=${item.modeSelect.options.map((o) => ({ value: o.value, label: serverText(o.label) }))} /></span>`
 				: null;
 			return html`<div class="mref">
-				<div class="mref-main"><${ModelRefPicker} models=${models} value=${v} jobId=${item.id} label=${t("Model for {name}", { name: serverText(item.label) })} onChange=${(ref) => onApply(item.id, { ...rest, ...ref })} />
+				<div class="mref-main"><${ModelRefPicker} models=${models} value=${v} jobId=${item.id} noModelLabel=${item.noModelLabel ? serverText(item.noModelLabel) : undefined} label=${t("Model for {name}", { name: serverText(item.label) })} onChange=${(ref) => onApply(item.id, { ...rest, ...ref })} />
 				${modeSelect}${item.inlineNumber ? html`<${InlineNumberField} item=${item} onApply=${onApply} />` : null}${hasEnable ? html`<${Toggle} checked=${!!v.enabled} label=${serverText(item.label)} onChange=${(on) => onApply(item.id, { ...rest, enabled: on })} />` : null}</div>
 			</div>`;
 		}
@@ -355,6 +353,7 @@ const SHORT_DESCRIPTION = {
 	fallbackModel: N_("Takes over when the main model keeps failing."),
 	conversationNaming: N_("Name automatically; check new replies every 10 minutes."),
 	autoMemory: N_("Save memory after each task."),
+	memoryPicker: N_("Before each message, this model picks the memories that help (about 2 seconds, 5 at most). It sees every memory's name and description plus your message. Off or no model: keyword match only."),
 	"sessionContinuity.autoSearch": N_("Find and read your earlier chats when you continue a topic. Independent of Auto Memory."),
 	visionAssistant: N_("Use a model for image analysis."),
 	"webSearch.enabled": N_("Enable search and page reads."),
@@ -1363,7 +1362,7 @@ export function SettingsModal() {
 			</nav>
 			<div class=${`settings-body ${section === "providers" && !searching ? "wide" : ""}`}>
 				${searching ? html`<${SearchResults} results=${results} query=${query.trim()} onPick=${pick} />` : html`<div class="settings-title"><h2>${t(current.label)}</h2>${PAGE_NOTE[current.id] ? html`<span class="set-desc">${t(PAGE_NOTE[current.id])}</span>` : null}</div>
-				${section === "appearance" ? html`<${Appearance} />` : section === "conversation" ? html`<${Appearance} conversation=${true} /><${SettingsList} items=${items} models=${models} />` : section === "providers" ? html`<${ProvidersPage} />` : section === "sync" ? html`<${SyncPage} />` : section === "connect" ? html`<${ConnectPage} />` : section === "schedules" ? html`<${SchedulesPage} />` : section === "code" ? html`<${CodeIntelligence} items=${items} />` : section === "shortcuts" ? html`<${Shortcuts} />` : section === "personal" ? html`<${Personalization} />` : section === "git" ? html`<${GitPreferences} />` : section === "about" ? html`<${About} />` : !settings ? html`<${Spinner} />` : section === "safety" ? html`<${Safety} items=${items} models=${models} />` : html`<${SettingsList} items=${items} models=${models} />`}`}
+				${section === "appearance" ? html`<${Appearance} />` : section === "conversation" ? html`<${Appearance} conversation=${true} /><${SettingsList} items=${items} models=${models} />` : section === "providers" ? html`<${ProvidersPage} />` : section === "sync" ? html`<${SyncPage} />` : section === "connect" ? html`<${ConnectPage} />` : section === "code" ? html`<${CodeIntelligence} items=${items} />` : section === "shortcuts" ? html`<${Shortcuts} />` : section === "personal" ? html`<${Personalization} />` : section === "git" ? html`<${GitPreferences} />` : section === "about" ? html`<${About} />` : !settings ? html`<${Spinner} />` : section === "safety" ? html`<${Safety} items=${items} models=${models} />` : html`<${SettingsList} items=${items} models=${models} />`}`}
 				${settings?.errors?.length ? html`<div class="notice danger">${settings.errors.map((e) => `${e.scope}: ${e.message}`).join("\n")}</div>` : null}
 			</div>
 		</div>

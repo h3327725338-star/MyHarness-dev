@@ -5,8 +5,8 @@ import { t } from "./i18n.js";
 
 export const SHORTCUTS = [
 	{ id: "newChat", label: "New chat", key: "Ctrl+O" },
-	{ id: "uploadFile", label: "Add files", key: "Ctrl+I" },
-	{ id: "uploadFolder", label: "Add folder", key: "Ctrl+U" },
+	{ id: "uploadFile", label: "Add files", key: "Ctrl+U" },
+	{ id: "uploadFolder", label: "Add folder", key: "Ctrl+I" },
 	{ id: "sidebar", label: "Show or hide the sidebar", key: "Ctrl+B" },
 	{ id: "panel", label: "Show or hide the right panel", key: "Ctrl+J" },
 	{ id: "browser", label: "Open the built-in browser", key: "Ctrl+E", desktop: true },

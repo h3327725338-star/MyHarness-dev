@@ -83,6 +83,8 @@ interface SettingDef {
 	inlineNumber?: { min: number; max: number };
 	/** `modelRef` only: a small selector shown before the enable toggle (sub-agent capability mode). */
 	modeSelect?: { options: Array<{ value: string; label: string }> };
+	/** What a modelRef row calls the empty choice when no model does not mean "use the main model". */
+	noModelLabel?: string;
 	/** `numberUnit` only: the units the typed number can be read in; the first matching one is how the value is shown. */
 	units?: NumberUnitOption[];
 	/** `numberUnit` only: what to tell the user when the typed number is out of range. */
@@ -164,6 +166,7 @@ export const SETTINGS_MENU_SETTING: Readonly<Record<string, string>> = {
 	"terminal-progress": "showTerminalProgress",
 	"popup-notifications": "popupNotifications",
 	"auto-memory": "autoMemory",
+	"memory-picker": "memoryPicker",
 	"sub-agent": "subAgent",
 	"code-intelligence": "codeIntelligence.symbolsEnabled",
 	"vision-assistant": "visionAssistant",
@@ -307,6 +310,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		const session = host.session;
 		const autoMemory = s.getAutoMemorySettings();
 		const conversationNaming = s.getConversationNamingSettings();
+		const memoryPicker = s.getMemoryPickerSettings();
 		const continuity = s.getSessionContinuitySettings();
 		/** Which model hand-off notes really use, since "unset" falls back to the compaction model first. */
 		const handoffUsing = (): string => {
@@ -474,6 +478,17 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				note: "enabled",
 			},
 			{
+				id: "memoryPicker",
+				section: "Assistants",
+				label: "Memory picker",
+				description:
+					"Before each message, this model reads your memory list and picks what helps. It waits up to 5 seconds and sees every memory's name and description plus your message. Off or no model: keyword match only.",
+				type: "modelRef",
+				value: { ...modelRef(memoryPicker), enabled: memoryPicker.enabled },
+				note: "enabled",
+				noModelLabel: "No model (keywords only)",
+			},
+			{
 				id: "sessionContinuity.autoSearch",
 				section: "Session continuity",
 				label: "Search earlier chats",
@@ -559,7 +574,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				section: "Assistants",
 				label: "Scheduled tasks",
 				description:
-					"Model and thinking effort that run scheduled Agent tasks (Settings → Scheduled tasks), in the chat each run starts. Unset uses the main model.",
+					"Model and thinking effort that run scheduled Agent tasks (Scheduled tasks in the sidebar), in the chat each run starts. Unset uses the main model.",
 				using: scheduledTasksUsing(),
 				type: "modelRef",
 				value: { ...modelRef(scheduledTasks) },
@@ -1117,6 +1132,16 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 					thinkingLevel: ref.thinkingLevel as ThinkingLevel | undefined,
 				});
 				host.refreshConversationNaming();
+				return;
+			}
+			case "memoryPicker": {
+				const ref = modelRefValue(value);
+				s.setMemoryPickerSettings({
+					enabled: (value as { enabled?: unknown } | undefined)?.enabled === true,
+					provider: ref.provider,
+					model: ref.model,
+					thinkingLevel: ref.thinkingLevel as ThinkingLevel | undefined,
+				});
 				return;
 			}
 			case "sessionContinuity.autoSearch": {

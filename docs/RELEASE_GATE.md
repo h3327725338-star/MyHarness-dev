@@ -21,12 +21,12 @@ Code Intelligence 归档和 Linux/macOS 行为仍需单独记录，不能由这�
 
 ## GitHub CI baseline 与用户平台
 
-正式 `.github/workflows/ci.yml` 固定在 `windows-2022` 和 `windows-2025` 两个
-GitHub-hosted Windows x64 runner 上运行相同的完整流程；两边都必须通过，且不使用
-`windows-latest`。本地 Release Gate 不能替代两个远端 job 的实际结果。
+正式 `.github/workflows/ci.yml` 固定在 `windows-2025` 这一个 GitHub-hosted
+Windows x64 runner 上运行完整流程，不使用 `windows-latest`。本地 Release Gate
+不能替代远端 job 的实际结果。
 
 这只是 GitHub CI baseline。MyHarness 的用户平台是 Windows 桌面 x64；不能把 CI
-Windows Server runner 写成“只支持 Windows Server”，也不能声称仅凭这两个 runner
+Windows Server runner 写成“只支持 Windows Server”，也不能声称仅凭这个 runner
 已经逐一验证 Windows 10/11 的每个桌面版本。发布 binary、npm、audit 和协作
 workflow 的其他 runner 仍按各自 workflow 单独记录。
 

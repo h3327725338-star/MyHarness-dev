@@ -256,6 +256,8 @@ export interface SlotStatus {
 	atDefaultDir: boolean;
 	/** The session runs inside a worktree copy (the sidebar shows one space at a time: main or copies). */
 	copy: boolean;
+	/** A scheduled task started this chat while it was open here; once it is saved, its list row says so (SessionInfo). */
+	scheduled: boolean;
 	/**
 	 * Last time something happened in this session while it was open here (a task started or ended, a command ran, a
 	 * Git operation): the sidebar orders chats by it. Null until something happens; merely showing the chat is not activity.
@@ -391,6 +393,16 @@ export class WebHost {
 		{ refused: number; claimed: boolean; timer: ReturnType<typeof setTimeout>; popup: () => void; focus: string }
 	>();
 	private lastTaskNoticeKey: string | undefined;
+	/**
+	 * This chat is running a scheduled task (routes-schedules.ts). The task's corner card is already on screen, so while
+	 * the app is in front the end of the run is only a sound, whichever chat is showing.
+	 */
+	scheduledRun = false;
+	/**
+	 * The chat a scheduled task started in this slot: unlike `scheduledRun` this stays once the run has ended. It names the
+	 * chat, because a slot can go on to another one (a fork in place starts a new chat here, and that one is the user's).
+	 */
+	scheduledSessionId: string | undefined;
 	/** A message sent with "interrupt" is ending the run: that is the user moving on, not a task to be told about. */
 	private interruptingForMessage = false;
 	/** True while an automatic (threshold / overflow) compaction runs: its run-state settle is not a task end. */
@@ -545,6 +557,7 @@ export class WebHost {
 				unbound &&
 				pathIdentityKey(this.cwd) === pathIdentityKey(getDefaultWorkingDir(this.runtimeHost.services.agentDir)),
 			copy: isWorktreeCopyPath(this.runtimeHost.services.agentDir, this.cwd),
+			scheduled: this.scheduledSessionId === this.session.sessionId,
 			lastActivityAt: this.lastActivityAt,
 			conversationNaming: this.conversationNaming?.status ?? null,
 			sessionHandoff: this.sessionHandoff?.status ?? null,
@@ -895,9 +908,10 @@ export class WebHost {
 			return;
 		}
 		const id = `${this.slotId}:${key}`;
+		const focus = this.scheduledRun ? "unfocused" : settings.turnComplete;
 		const timer = setTimeout(() => this.answerTaskNotice(id, false, true), TASK_NOTICE_ANSWER_MS);
 		timer.unref?.();
-		this.taskNotices.set(id, { refused: 0, claimed: false, timer, popup, focus: settings.turnComplete });
+		this.taskNotices.set(id, { refused: 0, claimed: false, timer, popup, focus });
 		this.broadcast("task_notification", {
 			id,
 			kind,
@@ -905,7 +919,7 @@ export class WebHost {
 			error: state.error,
 			startedAt: state.startedAt,
 			endedAt: state.lastActivityAt,
-			focus: settings.turnComplete,
+			focus,
 			sound: settings.sound,
 			project: folder,
 			taskName,
@@ -1012,7 +1026,8 @@ export class WebHost {
 					this.cacheChanged = false;
 					this.broadcast("cache_hit", { cache: this.cache.current });
 					const item = messageToWire(message);
-					this.broadcast("message_end", { liveId: this.liveAssistantId, item });
+					// The item keeps the time the reply started; a turn that ends inside a longer run needs when it ended.
+					this.broadcast("message_end", { liveId: this.liveAssistantId, item, endedAt: Date.now() });
 					this.liveAssistantId = undefined;
 				} else if (message.role === "toolResult") {
 					// Tool results are delivered through tool_end with the same data.
@@ -1161,7 +1176,16 @@ export class WebHost {
 				this.broadcast("memory_status", event.status);
 				return;
 			case "auto_memory_error":
-				// Background failures are shown by the quiet maintenance status, not transcript notices.
+				// Background failures are shown by the quiet maintenance status, not transcript notices. The Memory picker
+				// has no such status and the chat carries on without it, so it says once that it is not working.
+				if (event.operation === "pick") {
+					this.broadcast("notice", {
+						id: `memory-picker-${Date.now()}`,
+						message: `Memory picker failed, so this message used the keyword match: ${event.errorMessage}`,
+						type: "warning",
+						ts: Date.now(),
+					});
+				}
 				return;
 			case "vision_assistant_start":
 			case "vision_assistant_end":

@@ -230,6 +230,27 @@ describe("computeContextBudgetSnapshot", () => {
 		expect(snapshot.autoCompactEnabled).toBe(false);
 		expect(snapshot.overBudget).toBe(false);
 	});
+
+	it("measures a model that manages its own context without gating or compacting it", () => {
+		const own = resolveContextRuntimePolicy({
+			role: "main",
+			modelWindow: 100_000,
+			modelMaxOutput: 16_384,
+			compactionSettings: DEFAULT_COMPACTION_SETTINGS,
+			autoCompactEnabled: true,
+			configuredViaCli: false,
+			managesOwnContext: true,
+		});
+		const snapshot = computeContextBudgetSnapshot(own, {
+			tokens: 131_000,
+			usageSource: "provider-anchor",
+			anchorIndex: 1,
+		});
+		expect(snapshot.effectiveWindow).toBe(100_000);
+		expect(snapshot.percent).toBe(131);
+		expect(snapshot.overBudget).toBe(false);
+		expect(snapshot.shouldAutoCompact).toBe(false);
+	});
 });
 
 describe("normal auto-compact threshold (90% of the raw effective window)", () => {

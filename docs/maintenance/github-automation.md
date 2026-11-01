@@ -6,7 +6,7 @@
 
 | Workflow | Runner | 作用 |
 | --- | --- | --- |
-| `ci.yml` | `windows-2022` + `windows-2025` matrix | 正式 CI baseline：完整安装、audit、build、check 和 test |
+| `ci.yml` | `windows-2025` | 正式 CI baseline：完整安装、audit、build、check 和 test |
 | `pr-gate.yml` | `ubuntu-latest` | Pull Request contributor gate；不是正式 CI baseline |
 | `build-binaries.yml` | `ubuntu-latest` | 多平台 Bun binary 构建和发布；只能在 GitHub 上手动运行（`workflow_dispatch`），推送标签不会触发；不是正式 CI baseline |
 | `npm-audit.yml` | `ubuntu-latest` | 独立 npm 依赖审计；不是正式 CI baseline |
@@ -20,26 +20,26 @@
 `electron`（桌面宿主和内置浏览器的 Chromium 内核），其他依赖仍按精确版本人工升级。
 
 表中的辅助 workflow 是现有发布、审计和协作自动化，不是本轮新增的 Linux/macOS
-产品 CI。正式 CI 只由 `ci.yml` 的两个固定 Windows x64 runner 构成；如果修改
+产品 CI。正式 CI 只由 `ci.yml` 的一个固定 Windows x64 runner 构成；如果修改
 runner 或命令，必须同时更新 YAML、相关脚本和本说明。
 
 ## CI baseline 与用户平台
 
-`ci.yml` 每次正常 push / pull request 触发都会在 `windows-2022` 和 `windows-2025`
-分别执行相同流程：`npm ci --ignore-scripts`、release/privacy audit、
-`npm rebuild ffmpeg-static`、build、check、安装 fd/ripgrep 和 test。两个 job 都
-必须通过；不得使用 `windows-latest`，也不应把其中一个 job 失败解释为可以跳过
-另一边。
+`ci.yml` 每次正常 push / pull request 触发都会在 `windows-2025` 上执行：
+`npm ci --ignore-scripts`、release/privacy audit、`npm rebuild ffmpeg-static`、
+build、check、安装 fd/ripgrep 和 test。不得使用 `windows-latest`。
 
-这两个 runner 是 GitHub Windows Server 的自动化验证环境，不是 MyHarness 的最终
-用户支持矩阵。MyHarness 面向 Windows 桌面 x64；通过这两个 job 不能声称“只支持
+2026-11-01 起去掉了 `windows-2022`：开发仓库转为私有后，Actions 要占用账号的月度额度。
+
+这个 runner 是 GitHub Windows Server 的自动化验证环境，不是 MyHarness 的最终
+用户支持矩阵。MyHarness 面向 Windows 桌面 x64；通过这个 job 不能声称“只支持
 Windows Server”，也不能声称已逐一验证 Windows 10/11 的每个桌面版本。桌面版本、
 终端、真实 Provider、OAuth、LSP 和外部网络仍需分别标记实际验证状态。
 
 ## 维护边界
 
 - workflow 使用的命令必须与根 `package.json`、`scripts/README.md` 和各 package 的 scripts 一致；命令改名时同步检查 YAML。
-- 正式 CI 的 runner 只能是 `windows-2022` 和 `windows-2025`；禁止把 `windows-latest` 当作稳定基线。
+- 正式 CI 的 runner 只能是 `windows-2025`；禁止把 `windows-latest` 当作稳定基线。
 - binary workflow 与 [`scripts/build-binaries.sh`](../../scripts/build-binaries.sh) 的平台、资源和产物名称必须保持一致。
 - 没有任何 workflow 由标签触发。`build-binaries.yml` 曾在推送 `v*` 标签时自动发布多平台 Bun binary；MyHarness 以 Windows 桌面应用发布，桌面版的 `v*` 标签会因此多出一个带 Linux/macOS 产物的 Release，所以只保留手动运行。`scripts/release.mjs` 推送的标签同样不会自动发布任何东西。
 - CI 通过只表示对应 workflow 在其实际 runner、凭据和网络条件下通过；不自动证明本机 Windows、真实 Provider、OAuth、终端或 LSP 行为。

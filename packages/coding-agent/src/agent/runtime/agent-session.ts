@@ -197,7 +197,7 @@ export type AgentSessionEvent =
 	| { type: "auto_memory_status"; status: MemoryMaintenanceStatus }
 	| {
 			type: "auto_memory_error";
-			operation: "recall" | "extract" | "consolidate";
+			operation: "recall" | "pick" | "extract" | "consolidate";
 			errorMessage: string;
 	  }
 	| { type: "vision_assistant_start"; progress: VisionAssistantProgress }
@@ -427,6 +427,18 @@ function retryAttemptsShown(maxRetries: number): number | string {
 	return Number.isFinite(maxRetries) ? maxRetries : "∞";
 }
 
+/** What the memories are looked up with: for an expanded built-in command, the user's own task inside it. */
+function memoryQueryOf(text: string): string {
+	return parseExpandedBuiltinPromptCommand(text)?.task || text;
+}
+
+/** The recalls already in context: the next recall adds only what they lack. */
+function recallDetailsIn(messages: readonly AgentMessage[]): unknown[] {
+	return messages
+		.filter((message) => message.role === "custom" && message.customType === "auto-memory-recall")
+		.map((message) => (message as CustomMessage).details);
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -522,6 +534,10 @@ export class AgentSession {
 	/** The run holding prompt admission has published agent_settled and is only finishing (trace) before releasing it. */
 	private _runSettling = false;
 	private _abortRequested = false;
+	/** Ends what a starting run is still waiting on before it reaches the Agent (the Memory picker's request). */
+	private _runPreparation: AbortController | undefined;
+	/** Queued messages now in the conversation whose memories have not been looked up yet. */
+	private _queuedMessagesToRecall: string[] = [];
 	/** Wakes the final answer's wait for background Explore batches (see _holdForBackgroundExplore). */
 	private _wakeBackgroundWait: (() => void) | undefined;
 	private _holdingForBackground = false;
@@ -865,6 +881,7 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		this._installQueuedMessageRecall();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -1067,6 +1084,44 @@ export class AgentSession {
 				continueAfterTurn: previousSnapshot?.continueAfterTurn === true || (compacted && resumeAfterCompaction),
 			};
 		};
+	}
+
+	/**
+	 * A message sent while a task runs reaches the model through the queues, not through prompt(), so its memories are
+	 * looked up here: it is already in the conversation by then and never waits in the queue for them, and the next
+	 * request has them. The wait is the same one every message has, and Stop ends it.
+	 */
+	private _installQueuedMessageRecall(): void {
+		const previousBeforeProviderRequest = this.agent.beforeProviderRequest;
+		this.agent.beforeProviderRequest = async (context, signal) => {
+			const previousUpdate = await previousBeforeProviderRequest?.(context, signal);
+			const current = previousUpdate?.context ?? context;
+			const recalled = await this._recallForQueuedMessages(current.messages, signal);
+			if (!recalled) return previousUpdate;
+			return { ...previousUpdate, context: { ...current, messages: [...current.messages, recalled] } };
+		};
+	}
+
+	private async _recallForQueuedMessages(
+		contextMessages: readonly AgentMessage[],
+		signal: AbortSignal | undefined,
+	): Promise<CustomMessage | undefined> {
+		if (this._queuedMessagesToRecall.length === 0) return undefined;
+		const texts = this._queuedMessagesToRecall.splice(0);
+		if (signal?.aborted) return undefined;
+		try {
+			const query = texts.map(memoryQueryOf).join("\n");
+			const recalled = await this._autoMemory.recall(query, recallDetailsIn(contextMessages), signal);
+			if (!recalled || signal?.aborted) return undefined;
+			this.agent.state.messages.push(recalled);
+			this._persistMessageEnd({ type: "message_end", message: recalled });
+			this._emit({ type: "message_start", message: recalled });
+			this._emit({ type: "message_end", message: recalled });
+			return recalled;
+		} catch {
+			// Memory lookup is optional context and must never block a user request.
+			return undefined;
+		}
 	}
 
 	// =========================================================================
@@ -1326,6 +1381,7 @@ export class AgentSession {
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
+					this._queuedMessagesToRecall.push(messageText);
 					this._emitQueueUpdate();
 					// Mid-run steering continues the current task: keep the timer baseline.
 					// Steering consumed after the final answer is a new user round: restart it.
@@ -1337,6 +1393,7 @@ export class AgentSession {
 					const followUpIndex = this._followUpMessages.indexOf(messageText);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
+						this._queuedMessagesToRecall.push(messageText);
 						this._emitQueueUpdate();
 						// A follow-up runs after the previous work: it always starts a new user round.
 						this._runStateTracker.setTurnBaseline();
@@ -2031,6 +2088,7 @@ export class AgentSession {
 		messages: AgentMessage | AgentMessage[],
 		onAgentRunStarted?: () => void,
 		onContextPreflightPersisted?: () => void,
+		prepareRun?: (signal: AbortSignal) => Promise<void>,
 	): Promise<void> {
 		if (this._promptAdmissionPromise) {
 			throw new Error("Agent is already preparing or processing a prompt.");
@@ -2040,7 +2098,7 @@ export class AgentSession {
 		});
 		this._promptAdmissionPromise = admissionPromise;
 		try {
-			await this._runAgentPromptOwned(messages, onAgentRunStarted, onContextPreflightPersisted);
+			await this._runAgentPromptOwned(messages, onAgentRunStarted, onContextPreflightPersisted, prepareRun);
 		} finally {
 			if (this._promptAdmissionPromise === admissionPromise) {
 				this._promptAdmissionPromise = undefined;
@@ -2057,8 +2115,10 @@ export class AgentSession {
 		messages: AgentMessage | AgentMessage[],
 		onAgentRunStarted?: () => void,
 		onContextPreflightPersisted?: () => void,
+		prepareRun?: (signal: AbortSignal) => Promise<void>,
 	): Promise<void> {
 		this._gitCheckpointCoordinator.resetForRun();
+		this._queuedMessagesToRecall = [];
 		if (this._beforeAgentRun) {
 			await this._beforeAgentRun();
 		}
@@ -2078,6 +2138,14 @@ export class AgentSession {
 		let runFailed = false;
 		let finalizationError: unknown;
 		try {
+			if (prepareRun) {
+				this._runPreparation = new AbortController();
+				try {
+					await prepareRun(this._runPreparation.signal);
+				} finally {
+					this._runPreparation = undefined;
+				}
+			}
 			try {
 				await this._ensureContextBudget(inputMessages);
 			} catch (error) {
@@ -2102,6 +2170,8 @@ export class AgentSession {
 			}
 			this._pendingRunStartCallback = onAgentRunStarted;
 			const agentPrompt = this.agent.prompt(messages);
+			// Stop pressed while the run was still being prepared: the message is kept and the run ends right away.
+			if (this._abortRequested) this.agent.abort();
 			await agentPrompt;
 			while (await this._handlePostAgentRun()) {
 				const continuation = this.agent.continue();
@@ -2369,6 +2439,7 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		const onAgentRunStarted = (options as InternalPromptOptions | undefined)?.onAgentRunStarted;
 		let messages: AgentMessage[] | undefined;
+		let prepareRun: ((signal: AbortSignal) => Promise<void>) | undefined;
 		let pendingNextTurnMessages: CustomMessage[] = [];
 		const builtinPrompt = expandPromptTemplates ? expandBuiltinPromptCommand(text) : text;
 
@@ -2510,20 +2581,20 @@ export class AgentSession {
 					});
 				}
 			}
-			try {
-				const builtinPrompt = parseExpandedBuiltinPromptCommand(expandedText);
-				const memoryQuery = builtinPrompt?.task || expandedText;
-				// The recalls already in context: this turn's recall adds only what they lack.
-				const earlierRecalls = this.agent.state.messages
-					.filter((message) => message.role === "custom" && message.customType === "auto-memory-recall")
-					.map((message) => (message as CustomMessage).details);
-				const recalledMemory = await this._autoMemory.recall(memoryQuery, earlierRecalls);
-				if (recalledMemory) {
-					messages.push(recalledMemory);
+			// The memories go here in the message order, but are looked up once the run has started: choosing them can wait
+			// for a model, and by then the page shows the run, Stop works and another message is queued as usual.
+			const turnMessages = messages;
+			const recallAt = messages.length;
+			const memoryQuery = memoryQueryOf(expandedText);
+			const earlierRecalls = recallDetailsIn(this.agent.state.messages);
+			prepareRun = async (signal) => {
+				try {
+					const recalledMemory = await this._autoMemory.recall(memoryQuery, earlierRecalls, signal);
+					if (recalledMemory) turnMessages.splice(recallAt, 0, recalledMemory);
+				} catch {
+					// Memory lookup is optional context and must never block a user request.
 				}
-			} catch {
-				// Memory lookup is optional context and must never block a user request.
-			}
+			};
 			// The user's bookmarks with what each one is for, in a chat that can use the built-in browser: added again only
 			// when the list changed since the copy this conversation already has.
 			if (this.getActiveToolNames().includes("workspace")) {
@@ -2588,6 +2659,7 @@ export class AgentSession {
 				onAgentRunStarted?.();
 			},
 			commitPendingNextTurnMessages,
+			prepareRun,
 		);
 	}
 
@@ -2971,6 +3043,7 @@ export class AgentSession {
 	 */
 	async abort(options?: { keepBackground?: boolean }): Promise<void> {
 		if (this._isAgentRunActive) this._abortRequested = true;
+		this._runPreparation?.abort();
 		// An interruption (a new message) keeps the sub-agents: dispatches running inside a tool call move to the
 		// background and the tool call returns at once. The stop button ends everything.
 		if (options?.keepBackground) this._backgroundWork.detachForeground();
@@ -3023,6 +3096,7 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeModelDownshift(nextModel: Model<any>): Promise<void> {
+		if (nextModel.managesOwnContext) return;
 		const nextWindow = Math.min(
 			this.configuredContextWindow ?? Number.POSITIVE_INFINITY,
 			getModelContextWindow(nextModel),

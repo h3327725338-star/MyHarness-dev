@@ -21,7 +21,7 @@ Web UI 的每个对话都有自己的 `SettingsManager`，共用同一份 settin
 
 ## Web 专属快捷键与代码智能状态
 
-Web 设置的“键盘快捷键”页只列常用动作：新对话 Ctrl+O（在当前对话的工作区里新建，没有工作区时在默认区）、添加文件 Ctrl+I、添加文件夹 Ctrl+U、侧栏 Ctrl+B、右侧面板 Ctrl+J、内置浏览器 Ctrl+E（仅桌面端）、命令面板 Ctrl+K、设置 Ctrl+,。点一下键位再按下任意组合即可改；按 Backspace/Delete 或点 × 删掉（删掉的动作没有快捷键）；与另一个动作、应用或系统已用的键（复制粘贴、撤销、查找、网页标签、缩放、Enter/Esc 等）冲突，或字母数字没带 Ctrl/Alt 时标红写明冲突对象且不保存；“恢复默认”在卡片右上角。配置保存在当前浏览器，不改旧终端 `keybindings.json`。侧栏、命令面板和实际监听共用键位注册表（`web/js/shortcuts.js`）。网络页对 Provider 传输方式提供说明；**自动重试次数**改用紧凑下拉选择（0（不重试）、1–20、无限，超出标准范围的已保存整数仍作为额外选项保留）。原来的单个“HTTP 空闲超时”已拆成“超时与重试”卡片里互相独立的三个时限（建连超时（秒）、首包超时（秒）、静默超时（秒），存储仍是毫秒）加“同一模型最多尝试次数（次，含第一次）”，单位并入标题且使用统一的 96px 窄数字框，去掉了分离的单位方块，详见 [Retry](#retry) 下的“网络超时与网络失败重试”。
+Web 设置的“键盘快捷键”页只列常用动作：新对话 Ctrl+O（在当前对话的工作区里新建，没有工作区时在默认区）、添加文件 Ctrl+U、添加文件夹 Ctrl+I、侧栏 Ctrl+B、右侧面板 Ctrl+J、内置浏览器 Ctrl+E（仅桌面端）、命令面板 Ctrl+K、设置 Ctrl+,。点一下键位再按下任意组合即可改；按 Backspace/Delete 或点 × 删掉（删掉的动作没有快捷键）；与另一个动作、应用或系统已用的键（复制粘贴、撤销、查找、网页标签、缩放、Enter/Esc 等）冲突，或字母数字没带 Ctrl/Alt 时标红写明冲突对象且不保存；“恢复默认”在卡片右上角。配置保存在当前浏览器，不改旧终端 `keybindings.json`。侧栏、命令面板和实际监听共用键位注册表（`web/js/shortcuts.js`）。网络页对 Provider 传输方式提供说明；**自动重试次数**改用紧凑下拉选择（0（不重试）、1–20、无限，超出标准范围的已保存整数仍作为额外选项保留）。原来的单个“HTTP 空闲超时”已拆成“超时与重试”卡片里互相独立的三个时限（建连超时（秒）、首包超时（秒）、静默超时（秒），存储仍是毫秒）加“同一模型最多尝试次数（次，含第一次）”，单位并入标题且使用统一的 96px 窄数字框，去掉了分离的单位方块，详见 [Retry](#retry) 下的“网络超时与网络失败重试”。
 
 代码智能页通过 `codeIntelligence.symbolsEnabled` 控制 Symbols 工具（以及配套的 `apply_rename`），默认关闭；关闭时这两个工具都不会注册，也不会出现在模型可用工具、活动工具或提示词中。开关修改后需重启运行时生效。旧 `codeIntelligence.enabled` 字段仅作为 deprecated 类型兼容保留，读取时忽略、不迁移且不再写出；`disabledLanguages` 和 `servers` 仍用于语言模块配置。工具输入、workspace 路由、诊断/空结果语义、默认超时与分页契约见 [Symbols](symbols.md)。页面把保存的配置与运行时实际状态分开显示，每秒比对；需要重启时提供一键重启本地 Web 服务，运行中的任务必须先停止。详见 [Web UI](web-ui.md)。
 
@@ -125,7 +125,7 @@ Google 云端硬盘同步、Gmail 和 Outlook 的 API 访问都要经过一个�
 
 - **Providers** 会把 services 分为**已启用**和**已保存但未启用**。两组可以包含 `models.json`、extension/native registration 和 custom Providers。
 - 打开某个 Provider 可以管理它的 enabled state、models 和 Provider-level API keys。禁用 Provider 会保留其 configuration 和 credentials，但会将它的 models 从普通选择列表中移除。
-- 当前选中的 API Key 会被该 Provider 下的所有 models 使用，包括 main model、Auto Memory、Sub Agent、Workflow 和 Vision Assistant。
+- 当前选中的 API Key 会被它所在层下面的所有 models 使用，包括 main model、Auto Memory、Sub Agent、Workflow 和 Vision Assistant（层的规则见下面的“三层结构”）。
 - **添加 Provider** 可以输入已知 Provider ID 配置密钥，也可以为兼容的 third-party service **创建自定义 Provider**。当前 MyHarness 没有由 `packages/ai/src/providers/all.ts` 提供的默认 Provider 列表，也没有内置 Provider。
 - **Default Model** 用于选择 main model，然后只列出该 model 实际支持的 thinking levels。选择结果会成为当前 model，并保存为后续 sessions 使用的 global default。
 - **Vision Assistant** 只会选择来自 enabled Provider 且已确认支持 image input 的 model。
@@ -134,13 +134,31 @@ Google 云端硬盘同步、Gmail 和 Outlook 的 API 访问都要经过一个�
 
 Provider credentials 保存在 `~/.myharness/agent/auth.json` 中。文件以 plain text 保存 key values，依赖本地 filesystem permissions 保护，并不是 encrypted vault。输入 key 时会隐藏内容，Settings UI 只显示用户定义的 label，以及可用时的末四位字符。
 
-每个 Provider 有一个由其 models 共享的 current credential。MyHarness 不会在已保存的 keys 之间自动 rotate 或 fail over。命令行提供的 runtime key 会覆盖该进程的 Provider credential。
+每个 `models.json` 条目有一个由其 models 共享的 current credential。MyHarness 不会在已保存的 keys 之间自动 rotate 或 fail over。命令行提供的 runtime key 会覆盖该进程的 Provider credential。
 
 已保存的 OAuth credentials 和 API keys 可以共存。OAuth 为 current 时添加 API key 不会丢弃或替换 OAuth；你可以手动在两者之间切换。删除 key 需要确认，确认后只会从本地删除，不会修改 environment variables 或远程 Provider accounts。已有的单 key `auth.json` entries 仍兼容，并显示为**默认密钥**。启动时，MyHarness 会把 legacy `vision-auth.json` collection 中保存的 API keys 导入 `auth.json`，同时保留 legacy file 作为 rollback copy。
 
 MyHarness 可以确认 credential 已保存、Provider 的 model catalog 已加载，但许多 Providers 没有无副作用的 key-validation endpoint。对于这些 Providers，key 是否真正有效只能通过第一次 model request 确认。因此，MyHarness 不会把新输入的 key 标记为 remotely verified。
 
 Vision Assistant 接受声明支持 image input 的 models，以及通过 MyHarness manual image-capability test 的 custom models。如果 Provider 有已保存的 API key，unknown custom models 会直接出现在 vision-model picker 中；选择后会先运行 image-capability test，测试通过才启用，不会再次询问 key。明确声明为 text-only 的 models 会被排除。如果没有 enabled Provider 提供符合条件的 model，Settings screen 会链接回 **Providers**。
+
+### 三层结构（Provider → 密钥 → 模型）
+
+一个中转站可以放多把密钥，每把密钥下面有自己的模型，每个模型可以有自己的格式。层数固定三层：
+
+- **Provider**：页面上的“全局设置”，可以填名称、API 格式、Base URL 和 API Key。
+- **密钥**：一个 `models.json` 条目，名称、API 格式、Base URL 和 API Key 都可以单独设置。
+- **模型**：可以单独设置名称、API 格式、Base URL 和 API Key。
+
+规则只有一条：Base URL、API 格式、API Key 各自从上往下看，**第一个填了的生效**；上层留空就由下层自己决定；哪一层都没填就标红，这个模型不可用，MyHarness 不会替你猜。被上层盖住的值不会删除：输入框变灰并写明被什么盖住，清空上层后它重新生效。
+
+- 名字都由你自己设置，MyHarness 不加后缀；模型没有名字时显示 Model ID。
+- 如果中转站不同格式要用不同地址（带 `/v1` 和不带），不要在上层填 Base URL，分别填在下面。
+- 旧配置原样可用：每个旧条目显示成一个 Provider 下的一把密钥，全局设置为空。打开页面不写文件，保存或合并时才写，每个模型实际用的地址、格式和密钥不变，旧对话也继续能用。
+- 页面按 Base URL 的域名（不看名字）在顶部给出合并建议：主机名相同的默认勾上；主机名不同但主域名相同或 Key 相同的标“可能是同一家”，由你决定。不点不影响使用；确认合并前会先把 `models.json` 备份成 `models.json.before-merge.bak`。
+- 登录型 Provider、覆盖已注册 Provider 的条目和 Nebius 不进入三层，保持原来的页面。
+
+文件格式和 Key 的保存位置见 [models.md](models.md#provider-layers)。
 
 ### Custom Providers（自定义 Provider）
 
@@ -193,6 +211,7 @@ Package 资源和 project-local settings 走同一套 Project Trust flow：启�
 | `showCacheMissNotices` | boolean | `false` | 在发生明显 prompt-cache miss 时显示 Transcript notice |
 | `thinkingBudgets` | object | - | 为每个 thinking level 自定义 token budgets |
 | `autoMemory` | object | `{ "enabled": true }` | Global long-term memory configuration。通过 `/settings` 设置。 |
+| `memoryPicker` | object | `{ "enabled": false }` | Global 记忆挑选模型：每条消息发出前由它从记忆目录里挑几条；关闭或没选模型时只用本地关键词排序。见 [memoryPicker](#memorypicker)。 |
 | `conversationNaming` | object | `{ "enabled": false }` | Global 对话自动命名；设置 → 智能体 → 助手选择模型、思考级别和开关。 |
 | `sessionContinuity` | object | `{ "autoSearch": true, "autoHandoff": true }` | Global 跨会话衔接：查找之前的聊天、后台交接摘要及其模型；见 [sessionContinuity](#sessioncontinuity)。 |
 | `subAgent` | object | `{ "enabled": false, "mode": "read-only" }` | Global built-in exploration-agent 和 workflow configuration，含只读/读写模式。通过 `/settings` 设置。 |
@@ -273,16 +292,16 @@ Global，设置 → 智能体 → “跨对话衔接”分组。三个部分共�
 
 `Auto Memory` 是 global 的，默认开启（`settings.json` 里没有 `autoMemory.enabled` 时按开启处理；关掉后保存为 `false`）。没有单独选 model 时用 main model；也可以在 `/settings` 中选择一个可用 model，以及该 model 支持的 thinking level。开启时 MyHarness 会：
 
-1. 在 main model 收到新的 user request 前（包括新 session 的第一次 request），通过本地文本匹配选择相关的已保存 memories（查询全文匹配）。Recall 不会发起 blocking model request；
+1. 在 main model 收到新的 user request 前（包括新 session 的第一次 request），选择相关的已保存 memories。默认用本地文本排序（查询全文匹配），不发模型请求；打开 [memoryPicker](#memorypicker) 后先问它选的模型，失败或超时再回到本地排序。任务运行中排队或引导的消息同样按自己的文字选一次：消息先进对话，下一次请求模型前再选，一起送达的几条消息合并选一次；
 2. 将这些 memories 作为 hidden、low-priority context 添加。它们不能覆盖 system、global、project 或当前 user instructions，也不会授予 tool permissions；长期规则归属二分：人维护的、长期有效的规则放项目指令（`AGENTS.md` / `CLAUDE.md` / `.myharness/SYSTEM.md`），AI 从纠正和偏好里学到的放记忆。两者冲突时项目指令优先，记忆只当背景；觉得某条记忆已经是长期铁律时，把它写进项目指令而不是只留在记忆里；
 3. Task 完成后，只等待待处理任务安全写入当前 Conversation 的 `memory/maintenance.json`，不等待记忆模型。后台合并短时间内的任务快照，逐批处理尚未提取的 conversation delta，提取持久的 preferences、corrections、project facts 和 references；
 4. 每个 Workspace 的新增或实质更新累计达到 5 条时立即后台整理；不足 5 条但大于零时，从第一条待整理变化起满 3 小时整理，后续变化不重置计时。重复且无变化的写入不计数，整理自身的修改不计入下一轮。计数与起始时间保存在 `state.json`（关闭期间也保留，下次打开按原时间算），成功整理后清零，失败保留；旧 session-count 状态按当前 active memories 的更新时间恢复。软件开着时，任一存活的 persisted Chat runtime 每 30 秒检查到期任务，无需新消息：先整本 Workspace，再顺带清扫其他到期 Workspace（含 `unbound`）的 Global＋Workspace 共享部分，不为此新建 runtime；关闭服务期间不运行，打开任意 Chat 后恢复检查（含逾期的顺带清扫）。本 Workspace 整理读取该 runtime 可见的 Global、Workspace 和当前 Conversation，顺带清扫只读 Global＋对应 Workspace（其会话私密笔记仍等本人点开），超出输入保护的记忆分批全部检查，不跨 Conversation 提升归属。被替代条目和更新前的版本保存到所属层的 `archive/`，不永久删除。同一 Workspace 的整理（含顺带清扫）同时只运行一个：后来者本轮直接跳过，由 30 秒后的下一轮自然排队；写回前的乐观快照校验保留为安全网。模型调用不写死输出上限，与主聊天一致走 Provider 默认（思考与正文共用该预算）。
 
 选中的 model 用于后台 extraction 和 consolidation，不用于同步 recall。Extraction 收到有边界的 conversation delta 和 manifest（已有记忆的标题、描述和正文：更新会整条替换正文，模型要看到旧内容才能保留仍然有效的事实），没有 project tools。启用后会将 conversation content 发送给选中的 model，产生额外 usage，但聊天和重启不等待这些请求。待处理快照在落盘前过滤常见敏感值；不包含 tools 和图片。后台失败最多尝试三次，延后重试；连续失败保留快照并显示安静状态，不弹出 transcript warning。整理（consolidation/顺带清扫）的失败同样降噪：单次失败静默退避，连续 3 轮仍失败才在顶栏亮黄灯，悬停可见最近一条失败原因（详情在会话 `memory/maintenance.log`）；任何一轮成功（含无任务）即熄灯并清零计数。会话替换导致的中止不计入失败、不亮灯。顶栏黄字旁有重试和归档两个小按钮：重试把次数清零再跑一次，归档把待处理快照收进会话归档并熄灯，两者都不永久删除。重启/替换 runtime 时取消模型请求，重新打开对应 Chat 后继续未完成工作；尚未打开的 Chat 不会自动创建 runtime 来处理任务。
 
-Recall 搜索三个所属层的全部 active entries，而不是只搜索最近 200 条；查询全文都拿来匹配，不截断；本地词项稀有度和文本长度参与排序，按相对相关性筛选（最佳得分一半以上）并在同层去重，另保底 8 条最佳词面匹配（得分再低也带，触发词直达的最多 3 条不计入），保证换个说法也找得到。输出用分层 token 预算（`estimateMemoryTokens`：非 ASCII 字符每字符约 1 token、ASCII 约 1/4 token；约 8000 token 总量：画像固定位 3500 ＋目录位 4200 ＋动态卡片用剩余额度；规矩头不计），不再是 20 KB 字节卡片；也不是语义向量检索。除画像和卡片外，上下文里常驻一份本轮可见记忆的 id 目录（`id | scope | name | 一句话摘要`，超出目录位预算时截断并标注；第一次整份发，之后只发变化），模型需要全文再用 `memory_get` 按需取，避免卡片截断导致“有但看不见”；卡片装不下时跳过该张、继续尝试后面更小的卡片，而不是整段停止；只要目录非空，上下文里就有它，不会出现“整轮看不到记忆”。
+Recall 搜索三个所属层的全部 active entries，而不是只搜索最近 200 条；查询全文都拿来匹配，不截断。本地排序是 BM25：名称里的词算 3 次、描述 2 次、正文 1 次；中文切成双字组并去掉一批没有区分度的常用双字组；记忆达到 10 条时，出现在 40% 以上记忆里的词不计分。Recall 按这个排序最多发 5 张卡片（包括触发词直达的），相同内容只发一次；一条都不相关时不发卡片。输出用分层 token 预算（`estimateMemoryTokens`：非 ASCII 字符每字符约 1 token、ASCII 约 1/4 token；约 8000 token 总量：画像固定位 3500 ＋目录位 4200 ＋动态卡片用剩余额度，且动态卡片至少有 2500；规矩头不计），不再是 20 KB 字节卡片；也不是语义向量检索。除画像和卡片外，上下文里常驻一份本轮可见记忆的 id 目录（`id | scope | name | 一句话摘要`，超出目录位预算时截断并标注；第一次整份发，之后只发变化），模型需要全文再用 `memory_get` 按需取，避免卡片截断导致“有但看不见”；卡片装不下时跳过该张、继续尝试后面更小的卡片，而不是整段停止；只要目录非空，上下文里就有它，不会出现“整轮看不到记忆”。
 
-记忆文件的 frontmatter 另有两个可选字段，缺失时按默认处理，旧文件无需迁移：`importance`（`high` / `normal` / `low`，排序乘子 1.3 / 1.0 / 0.7，缺失按 `normal`）和 `triggers`（2–6 条用户真实会说的口语短语，单条最多 60 字节）。当前消息命中某条记忆的 trigger（整句包含，或中文双字组重叠，英文要求整词命中）时，该记忆直接入选，按命中条数排序、最多 3 条，不受相对相关性筛选限制；其余记忆仍走上面的词项排序，得分乘以 `importance` 乘子。排序是只读的本地函数（`selectMemoriesForQuery`，`guaranteed` 默认为 8，设 0 恢复严格截断），Recall 与 `memory_search` 共用，不写任何文件，也没有使用计数或时间衰减。整理时另有本地只读的候选矛盾对（同一话题、共享至少两个稀有词，按纠正提示词优先排序，最多 10 对）随任务发给整理器核实：真矛盾按新胜旧合并（旧版本自动归档），同一话题但不矛盾则不动。抽取和整理时模型看得到已有的 `importance` 与 `triggers`；更新条目时省略它们（或给空数组）会保留原值，用户手写的标注不会被抹掉。
+记忆文件的 frontmatter 另有两个可选字段，缺失时按默认处理，旧文件无需迁移：`importance`（`high` / `normal` / `low`，排序乘子 1.3 / 1.0 / 0.7，缺失按 `normal`）和 `triggers`（2–6 条用户真实会说的口语短语，单条最多 60 字节）。当前消息命中某条记忆的 trigger（中文要求消息包含整条至少 3 个字的短语，其他文字要求每个词都整词出现）时，该记忆直接入选，按命中条数排序、最多 3 条，不受相对相关性筛选限制；其余记忆仍走上面的词项排序，得分乘以 `importance` 乘子。排序是只读的本地函数（`selectMemoriesForQuery`），Recall 与 `memory_search` 共用，不写任何文件，也没有使用计数或时间衰减。`memory_search` 按相对相关性筛选（最佳得分一半以上），另保底 8 条最佳词面匹配（`guaranteed` 默认为 8，设 0 恢复严格截断；触发词直达的不计入）；Recall 传 5 条保底和 5 条上限。整理时另有本地只读的候选矛盾对（同一话题、共享至少两个稀有词，按纠正提示词优先排序，最多 10 对）随任务发给整理器核实：真矛盾按新胜旧合并（旧版本自动归档），同一话题但不矛盾则不动。抽取和整理时模型看得到已有的 `importance` 与 `triggers`；更新条目时省略它们（或给空数组）会保留原值，用户手写的标注不会被抹掉。
 
 Global 层可以有一条固定的常驻画像 `global/用户画像`（`type: user`、`importance: high`，六节：称呼与身份背景、沟通与语言偏好、工作与授权习惯、长期环境与工具事实、正在推进的事、被纠正过的行为与教训）。整理器每轮整篇重写它；它不存在时，第一批整理任务会授权整理器仅凭同一批里的稳定事实创建初版（事实不足就跳过，绝不臆造）；抽取器对它的写入仍被忽略，模型对它的删除操作也被忽略。主对话模型也可以用 `memory_write` 直接创建或整段更新它（用户导入画像、明确要求记住或更正时），写入立即生效；旧版本进 `archive/`。它存在时放在 recall message 的最前面（上下文里已有同样内容时不再重发，见下方增量说明），不参与普通排序，因此不会重复注入；不存在时也不阻止目录与卡片注入。单条记忆正文上限为 10 KB（只算正文，标题摘要等头不计；读取与写入一致），画像整篇也必须在这个上限内，超出部分拆成普通记忆而不丢信息。
 
@@ -311,6 +330,27 @@ Memory Markdown files 是 source of truth：
     "provider": "anthropic",
     "model": "claude-opus-4-6",
     "thinkingLevel": "high"
+  }
+}
+```
+
+<a id="memorypicker"></a>
+#### memoryPicker（记忆挑选）
+
+Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆挑选”行选择。和其他助手不同，它不跟随主模型：关闭或没选模型时只用本地排序，打开后才在每条消息发出前向选中的模型发一次请求。
+
+- 模型看到的是当前可见记忆的序号、名称和描述（不含正文），再加上这条用户消息，然后回答该用哪几条，最多 5 条，可以一条都不选。选中的卡片取代本地排序的结果；常驻画像和目录照常发送。启用后这些内容都会发给选中的模型，私密记忆的名称和描述也在内，并产生额外 usage。消息里的常见敏感值先被过滤；含私钥的消息不发给模型，直接用本地排序。
+- 思考级别默认 `low`，也可以另选。自定义 `openai-completions` 服务默认不发 `reasoning_effort`（见 [models.md](models.md)），这时选什么档位都不生效，模型按自己的默认档运行，通常更慢；要让档位生效，需要在 `models.json` 里给这个模型或 Provider 打开 `compat.supportsReasoningEffort`。
+- 每次最多等 5 秒，不重试，不让消息的显示变慢：气泡立刻出现，等待期间可以停止，也可以继续发消息。运行中排队或引导的消息各有自己的一次挑选，等待发生在消息进入对话之后、下一次请求模型之前；所以引导消息会让下一步模型请求晚一次挑选的时间，第一条还在挑选时发出的第二条，要等两次挑选依次结束。超时只写日志，这条消息用本地排序；其他失败弹一次提示，同样用本地排序。连续失败 2 次后暂停 60 秒，这期间不再请求模型。
+- 目录按创建时间从旧到新排列，新记忆加在末尾，让请求开头保持不变、便于命中供应商的提示缓存。目录上限约 40000 token，超出时优先保留最近更新的；消息上限约 2000 token。
+
+```json
+{
+  "memoryPicker": {
+    "enabled": true,
+    "provider": "command-code",
+    "model": "z-ai/glm-5.3-flash",
+    "thinkingLevel": "low"
   }
 }
 ```

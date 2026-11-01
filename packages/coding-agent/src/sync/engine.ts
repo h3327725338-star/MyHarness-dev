@@ -89,6 +89,8 @@ import {
 } from "./util.ts";
 
 const MAX_OBJECT_BYTES = 200 * 1024 * 1024;
+/** This many records of one kind gone at once, and at least half of that kind: most likely a Data root that went empty or moved. */
+const MASS_DELETE_MIN = 20;
 /** Synchronous work between two yields of a long loop over every synced entity (as in scanLocalEntitiesAsync). */
 const SLICE_MS = 12;
 /**
@@ -1108,9 +1110,46 @@ export class SyncEngine {
 				deletedAt: now,
 			});
 		}
-		this.pendingUploads = operations.length;
-		this.pendingBytes = operations.reduce((total, operation) => total + operation.size, 0);
-		return operations;
+		const planned = this.holdMassDeletions(operations);
+		this.pendingUploads = planned.length;
+		this.pendingBytes = planned.reduce((total, operation) => total + operation.size, 0);
+		return planned;
+	}
+
+	/**
+	 * A deletion is published as "gone from this computer's scan", so an emptied or moved Data root would otherwise delete
+	 * everything on every computer. Such a deletion stays here and is reported; the records stay in the state, so it ends
+	 * by itself as soon as the files are back.
+	 */
+	private holdMassDeletions(operations: SyncOperation[]): SyncOperation[] {
+		const deletions = new Map<string, number>();
+		for (const operation of operations) {
+			if (operation.op === "delete") deletions.set(operation.kind, (deletions.get(operation.kind) ?? 0) + 1);
+		}
+		const totals = new Map<string, number>();
+		for (const record of Object.values(this.state.entities)) {
+			totals.set(record.kind, (totals.get(record.kind) ?? 0) + 1);
+		}
+		const held = new Set<string>();
+		for (const [kind, total] of totals) {
+			const count = deletions.get(kind) ?? 0;
+			const key = `mass-delete:${kind}`;
+			if (count < MASS_DELETE_MIN || count * 2 < total) {
+				this.clearIssue(key);
+				continue;
+			}
+			held.add(kind);
+			if (!this.state.issues?.[key]) {
+				this.noteIssue(
+					key,
+					"mass-delete",
+					`${count} of ${total} synced ${kind} records are missing from this computer, so their deletion was not published. Other computers keep them. Check that the data folder has not moved.`,
+				);
+			}
+		}
+		return held.size === 0
+			? operations
+			: operations.filter((operation) => operation.op !== "delete" || !held.has(operation.kind));
 	}
 
 	private async publishBatch(planned: SyncOperation[], onEach?: (operation: SyncOperation) => void): Promise<void> {

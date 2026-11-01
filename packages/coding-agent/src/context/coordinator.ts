@@ -111,7 +111,7 @@ export class AgentSessionContextCoordinator {
 
 	getSnapshot(): ContextBudgetSnapshot {
 		const snapshot = this.buildSnapshot();
-		if (!this.contextWindowExceeded || snapshot.effectiveWindow <= 0) return snapshot;
+		if (!this.contextWindowExceeded || snapshot.effectiveWindow <= 0 || this.managesOwnContext) return snapshot;
 		return {
 			...snapshot,
 			activeTokens: snapshot.effectiveWindow,
@@ -276,7 +276,7 @@ export class AgentSessionContextCoordinator {
 	}
 
 	markContextWindowExceeded(): void {
-		this.contextWindowExceeded = true;
+		if (!this.managesOwnContext) this.contextWindowExceeded = true;
 	}
 
 	resetAfterCompaction(): void {
@@ -319,6 +319,7 @@ export class AgentSessionContextCoordinator {
 	): Promise<ContextBudgetResult> {
 		const before = await this.buildProviderSnapshot(additionalMessages, context);
 		if (this.host.isCompacting()) return { status: "blocked", reason: "compaction-in-progress", snapshot: before };
+		if (this.managesOwnContext) return { status: "ok", snapshot: before };
 
 		// The automatic-compaction setting only controls whether we may try to
 		// recover the context.  It must never disable the provider hard gate.  In
@@ -389,6 +390,10 @@ export class AgentSessionContextCoordinator {
 		);
 	}
 
+	private get managesOwnContext(): boolean {
+		return this.host.getModel()?.managesOwnContext === true;
+	}
+
 	private getContextWindowRole(): ContextWindowRole {
 		return this.host.agentRole === "main" ? "main" : "subagent";
 	}
@@ -408,6 +413,7 @@ export class AgentSessionContextCoordinator {
 			compactionSettings: this.host.settingsManager.getCompactionSettings(),
 			autoCompactEnabled: this.host.settingsManager.getCompactionEnabled(),
 			configuredViaCli: this.host.contextWindowOverride !== undefined,
+			managesOwnContext: this.managesOwnContext,
 		});
 	}
 }

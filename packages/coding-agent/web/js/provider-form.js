@@ -7,7 +7,7 @@ import { Select } from "./select.js";
 import { post } from "./store.js";
 import { effortName, fmtTokens } from "./util.js";
 import { N_, t } from "./i18n.js";
-import { BASE_URL_EXAMPLE, aliasPairs, applyDetection, authModeOf, baseUrlProblem, buildModel, connectionReady, detectOutcome, detectRecord, fmtK, fromK, modelDraft, offeredLevels, parseModelIds, parseProviderJson } from "./provider-models.js";
+import { BASE_URL_EXAMPLE, aliasPairs, applyDetection, applyToTickedModels, authModeOf, baseUrlProblem, buildModel, connectionReady, coverOf, detectOutcome, detectRecord, fmtK, fromK, modelDraft, modelGaps, offeredLevels, parseModelIds, parseProviderJson, uniqueProviderId } from "./provider-models.js";
 
 const API_LABELS = {
 	"openai-completions": N_("OpenAI Chat Completions (most compatible services)"),
@@ -16,6 +16,19 @@ const API_LABELS = {
 	"google-generative-ai": N_("Google Gemini"),
 	"mistral-conversations": N_("Mistral Conversations"),
 };
+export const apiLabel = (type) => (API_LABELS[type] ? t(API_LABELS[type]) : type);
+/** The formats to choose from; `blank` names the choice of setting none on this layer. */
+export const apiOptions = (types, blank) => [...(blank ? [{ value: "", label: blank }] : []), ...(types?.length ? types : Object.keys(API_LABELS)).map((type) => ({ value: type, label: apiLabel(type) }))];
+const GAP_LABELS = { api: N_("No format"), baseUrl: N_("No Base URL"), key: N_("No API key") };
+
+/** Says which layer applies to this field and with what; a value of its own here stays and applies again once that layer is cleared. */
+function coverHint(cover, hasOwn, label = (value) => value) {
+	const value = label(cover.value);
+	if (!hasOwn) return cover.layer === "provider" ? t("Uses the global settings: {value}.", { value }) : t("Uses this key's: {value}.", { value });
+	return cover.layer === "provider"
+		? t("Covered by the global settings: {value}. What is here is kept and applies again once that is cleared.", { value })
+		: t("Covered by this key: {value}. What is here is kept and applies again once that is cleared.", { value });
+}
 /** Names of the IP protocol choices; the default one gets "(default)" after its name. */
 const IP_FAMILY_NAMES = { auto: N_("Auto"), ipv4: N_("IPv4 only"), ipv6: N_("IPv6 only") };
 const ipFamilyLabel = (family, defaultFamily) => (family === defaultFamily ? t("{name} (default)", { name: t(IP_FAMILY_NAMES[family]) }) : t(IP_FAMILY_NAMES[family]));
@@ -91,7 +104,8 @@ function draftFromConfig(id, config, previous) {
 		id,
 		raw: config,
 		name: config.name ?? "",
-		api: config.api ?? "openai-completions",
+		// Under the layers an empty format means this key leaves it to the layer that sets it.
+		api: config.api ?? (config.layered ? "" : "openai-completions"),
 		baseUrl: config.baseUrl ?? "",
 		// Empty = not set in models.json (the default applies); a choice, even "auto", is written to the file.
 		keepAlive: config.keepAliveSeconds === undefined ? "" : String(config.keepAliveSeconds),
@@ -111,7 +125,8 @@ function buildConfig(draft, defaults) {
 	// An empty Base URL is "not filled in yet": nothing is written for it, least of all the example address.
 	if (draft.baseUrl.trim()) config.baseUrl = draft.baseUrl.trim();
 	else delete config.baseUrl;
-	config.api = draft.api;
+	if (draft.api) config.api = draft.api;
+	else delete config.api;
 	const keepAlive = parseKeepAlive(draft.keepAlive, defaults).value;
 	if (keepAlive === undefined) delete config.keepAliveSeconds;
 	else config.keepAliveSeconds = keepAlive;
@@ -144,6 +159,7 @@ function validate(draft, defaults) {
 		if (!id) return t("Every model needs an ID.");
 		if (seen.has(id)) return t("Model ID “{id}” appears twice.", { id });
 		seen.add(id);
+		if (String(model.baseUrl ?? "").trim() && baseUrlProblem(model.baseUrl)) return t("The Base URL of “{id}” must be a full http:// or https:// address.", { id });
 		if (model.pricing) {
 			const rows = [model.pricing, ...(model.pricing.tiers || [])];
 			if (rows.some((row) => ["input", "output", "cacheRead", "cacheWrite"].some((key) => String(row[key]).trim() === "" || !Number.isFinite(Number(row[key])) || Number(row[key]) < 0)) || (model.pricing.tiers || []).some((row) => !Number.isSafeInteger(Number(row.inputTokensAbove)) || Number(row.inputTokensAbove) <= 0)) return t("Prices must be non-negative numbers; tier thresholds must be positive whole tokens.");
@@ -200,21 +216,52 @@ function Pricing({ value, onChange }) {
 	</div>`;
 }
 
+/** What the model itself sets, greyed when a layer above covers it: its format, its address and a key of its own. */
+function ModelLayerFields({ model, set, types, layers, storedKey, sharedKey }) {
+	const apiCover = coverOf("api", layers);
+	const urlCover = coverOf("baseUrl", layers);
+	const keyCover = layers.upper?.key ? "provider" : sharedKey ? "key" : null;
+	const gaps = modelGaps(model, { group: layers.upper, entry: layers.draft, hasKey: true });
+	const ownKey = !!storedKey && !model.removeKey;
+	return html`<${Field} label=${t("API format")} hint=${apiCover ? coverHint(apiCover, !!model.api, apiLabel) : null}>
+			<${Select} value=${model.api} disabled=${!!apiCover} ariaLabel=${t("API format")} onChange=${(next) => set({ api: next })} options=${apiOptions(types, t("Not set here"))} />
+			${gaps.includes("api") ? html`<span class="pf-hint pf-problem" role="alert">${t("No layer sets the format, so this model is not offered until it is filled in.")}</span>` : null}
+		<//>
+		<${Field} label=${t("Base URL")} hint=${urlCover ? coverHint(urlCover, !!model.baseUrl.trim()) : null}>
+			<input class="field mono" disabled=${!!urlCover} placeholder=${t("Not set here")} aria-label=${t("Base URL")} value=${model.baseUrl} onInput=${(e) => set({ baseUrl: e.target.value })} />
+			${gaps.includes("baseUrl") ? html`<span class="pf-hint pf-problem" role="alert">${t("No layer sets the address, so this model is not offered until it is filled in.")}</span>` : null}
+		<//>
+		<div class="col field-label"><span class="field-name">${t("API key")}</span>
+			${ownKey
+				? html`<div class=${`key-current ${keyCover ? "covered" : ""}`}><${Icon} name="key" size=${14} /><span class="grow dim mono">${storedKey.suffix ? `••••${storedKey.suffix}` : ""}</span><button type="button" class="btn sm ghost" onClick=${() => set({ removeKey: true, apiKey: "" })}>${t("Remove")}</button></div>`
+				: html`<input class="field mono" type="password" autocomplete="off" disabled=${!!keyCover} placeholder=${keyCover ? t("Not needed") : t("Only when this model needs a key of its own")} aria-label=${t("API key of {id}", { id: model.id.trim() })} value=${model.apiKey} onInput=${(e) => set({ apiKey: e.target.value })} />`}
+			${keyCover
+				? html`<span class="dim pf-hint">${ownKey
+					? (keyCover === "provider" ? t("Covered by the global API key. What is here is kept and applies again once that is removed.") : t("Covered by this key's API key. What is here is kept and applies again once that is removed."))
+					: (keyCover === "provider" ? t("Uses the global API key.") : t("Uses this key's API key."))}</span>`
+				: null}
+		</div>`;
+}
+
 /** One model of the provider: a summary row that opens into its settings. */
-function ModelCard({ model, open, onToggle, onChange, onRemove }) {
+function ModelCard({ model, open, onToggle, onChange, onRemove, types, layers, storedKey, sharedKey, ticked, onTick }) {
 	const set = (patch) => onChange({ ...model, ...patch });
 	// A switch the user flips by hand is theirs.
 	const touch = (key, patch) => set({ ...patch, touched: { ...model.touched, [key]: true } });
 	const d = model.detected || {};
 	const title = model.name.trim() || model.id.trim() || t("New model");
+	const hasKey = !!sharedKey || !!layers?.upper?.key || !!model.apiKey.trim() || (!!storedKey && !model.removeKey);
+	const gaps = layers ? modelGaps(model, { group: layers.upper, entry: layers.draft, hasKey }) : [];
 	return html`<div class=${`pf-model ${open ? "open" : ""}`}>
 		<div class="row pf-model-head">
+			${onTick ? html`<input type="checkbox" class="pf-tick" aria-label=${t("Select {name}", { name: title })} checked=${!!ticked} onChange=${(e) => onTick(e.target.checked)} />` : null}
 			<button type="button" class="pf-model-toggle grow" aria-expanded=${open} onClick=${onToggle}>
 				<${Icon} name="chevronRight" size=${13} class="disclose" />
 				<span class="truncate pf-model-title">${title}</span>
 				${model.id.trim() && title !== model.id.trim() ? html`<span class="dim mono truncate">${model.id.trim()}</span>` : null}
 			</button>
 			<span class="pf-model-badges">
+				${gaps.length ? html`<span class="badge danger" title=${t("No layer sets this, so the model is not offered until it is filled in.")}>${gaps.map((gap) => t(GAP_LABELS[gap])).join(" · ")}</span>` : null}
 				${model.reasoning ? html`<span class="badge" title=${levelSummary(model)}>${t("thinking")}</span>` : null}
 				${model.image ? html`<span class="badge">${t("images")}</span>` : null}
 				${fromK(model.contextWindow) ? html`<span class="dim">${fmtK(fromK(model.contextWindow))}</span>` : null}
@@ -227,6 +274,7 @@ function ModelCard({ model, open, onToggle, onChange, onRemove }) {
 					<${Field} label=${t("Model ID")}><input class="field mono" value=${model.id} autofocus=${!model.id} onInput=${(e) => set({ id: e.target.value })} /><//>
 					<${Field} label=${t("Display name")}><input class="field" placeholder=${t("Optional")} value=${model.name} onInput=${(e) => set({ name: e.target.value })} /><//>
 				</div>
+				${layers ? html`<${ModelLayerFields} model=${model} set=${set} types=${types} layers=${layers} storedKey=${storedKey} sharedKey=${sharedKey} />` : null}
 				<div class="pf-two">
 					<${KField} label=${t("Context window")} detected=${d.contextWindow} value=${model.contextWindow} onInput=${(v) => set({ contextWindow: v })} />
 					<${KField} label=${t("Max output")} detected=${d.maxTokens} value=${model.maxTokens} onInput=${(v) => set({ maxTokens: v })} />
@@ -255,10 +303,20 @@ function ModelCard({ model, open, onToggle, onChange, onRemove }) {
  * - keyArea: the provider's API key summary (rendered by the page; it has the "Manage API keys" entry)
  * - hasStoredKey: a key is already saved for this provider
  * - onSaved(id), onDirty(bool), footerStart: extra actions at the start of the footer (Delete provider)
+ * - asKey: this form edits one key of a provider, so it is called that
+ * - upper: what the layer above sets (name, baseUrl, api, key): it covers the same fields here
+ * - modelKeys: the keys saved for single models, as { modelId: { suffix } }
+ * - configured: this entry already has a key from outside the form (an environment variable, for example)
+ * - attachTo and seed, for a new key: the entry whose provider it joins, and the { id, baseUrl, api } it starts from
+ * - takenIds: the entry IDs a new key must not use
  */
-export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKey, onSaved, onDirty, footerStart }) {
+export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKey, onSaved, onDirty, footerStart, asKey, upper, modelKeys, configured, attachTo, seed, takenIds }) {
 	const isNew = !initial;
-	const makeDraft = () => (initial ? draftFromConfig(initial.id, initial.config) : draftFromConfig("", { api: "openai-completions", models: [] }));
+	const makeDraft = () => {
+		if (initial) return draftFromConfig(initial.id, initial.config);
+		if (seed) return draftFromConfig(seed.id, { layered: true, ...(seed.api ? { api: seed.api } : {}), ...(seed.baseUrl ? { baseUrl: seed.baseUrl } : {}), models: [] });
+		return draftFromConfig("", { layered: true, api: "openai-completions", models: [] });
+	};
 	const [draft, setDraft] = useState(makeDraft);
 	const [dirty, setDirty] = useState(false);
 	const [idTouched, setIdTouched] = useState(!isNew);
@@ -272,19 +330,36 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 	const [detect, setDetect] = useState({ status: "idle", message: "", notes: [], result: null });
 	// Models whose settings are open. A model added by hand opens at once.
 	const [openModels, setOpenModels] = useState(() => new Set());
+	// Models ticked to change together, and what to set on them.
+	const [ticked, setTicked] = useState(() => new Set());
+	const [batch, setBatch] = useState({ api: "", baseUrl: "", note: false });
 	const rootRef = useRef(null);
 	const alive = useRef(true);
 	// The detection answer arrives after an await: it is applied to the form as it is then, not as it was when asked.
 	const draftRef = useRef(draft);
 	draftRef.current = draft;
-	useEffect(() => () => void (alive.current = false), []);
+	useEffect(() => () => {
+		alive.current = false;
+		onDirty?.(false);
+	}, []);
 	useEffect(() => onDirty?.(dirty), [dirty]);
 	const patch = (next) => {
 		setDraft((current) => ({ ...current, ...next }));
 		setDirty(true);
 	};
 	const types = apiTypes?.length ? apiTypes : Object.keys(API_LABELS);
-	const ready = connectionReady(draft, { hasStoredKey });
+	const layered = draft.raw.layered === true;
+	const upperKey = upper?.key || null;
+	// What the requests of this key would use, from the top down; a key that leaves both to its models uses one of theirs.
+	const effective = {
+		...draft,
+		baseUrl: upper?.baseUrl || draft.baseUrl || draft.models.find((model) => model.baseUrl.trim())?.baseUrl || "",
+		api: upper?.api || draft.api || draft.models.find((model) => model.api)?.api || "",
+	};
+	const ready = connectionReady(effective, { hasStoredKey: hasStoredKey || !!upperKey });
+	// A key that serves every model of this entry; without one a model needs its own.
+	const sharedKey = hasStoredKey || !!configured || !!draft.apiKey.trim() || (draft.auth === "config" && !!draft.raw.apiKey);
+	const layers = layered ? { upper, draft: { ...draft, baseUrl: draft.baseUrl.trim() } } : null;
 	const keepAliveProblem = parseKeepAlive(draft.keepAlive, defaults).problem;
 	const headerProblem = sessionHeaderProblem(draft.sessionHeader);
 	const ipFamilies = defaults?.ipFamilies?.length ? defaults.ipFamilies : Object.keys(IP_FAMILY_NAMES);
@@ -326,13 +401,14 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 		try {
 			result = await withTimeout(
 				post("/api/providers/custom/detect", {
-					baseUrl: draft.baseUrl.trim(),
-					api: draft.api,
+					baseUrl: effective.baseUrl.trim(),
+					api: effective.api,
 					auth: draft.auth,
 					apiKey: draft.auth === "key" ? draft.apiKey : "",
 					configApiKey: draft.auth === "config" ? draft.raw.apiKey : undefined,
-					headers: draft.raw.headers,
-					id: isNew ? "" : draft.id,
+					// A new key under a provider with a global key asks with that key; nothing else of the other entry is used.
+					headers: draft.raw.headers ?? (isNew ? {} : undefined),
+					id: isNew ? (upperKey && attachTo ? attachTo : "") : draft.id,
 					modelIds: ids,
 				}),
 				DETECT_TIMEOUT_MS,
@@ -372,6 +448,32 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 		patch({ models: [...draft.models, model] });
 		setOpenModels((current) => new Set(current).add(model.uid));
 	};
+	const tick = (uid, on) =>
+		setTicked((current) => {
+			const next = new Set(current);
+			if (on) next.add(uid);
+			else next.delete(uid);
+			return next;
+		});
+	const applyBatch = () => {
+		const { movedDown, ...next } = applyToTickedModels(draft, ticked, batch);
+		patch(next);
+		setTicked(new Set());
+		setBatch({ api: "", baseUrl: "", note: movedDown });
+	};
+	/** The keys of single models this save changes: typed, removed, or following a Model ID that was edited. */
+	const modelKeyChanges = () => {
+		const keys = {};
+		const moves = {};
+		for (const model of draft.models) {
+			const id = model.id.trim();
+			const before = model.raw?.id;
+			if (before && before !== id && modelKeys?.[before]) moves[before] = id;
+			if (model.apiKey.trim()) keys[id] = model.apiKey.trim();
+			else if (model.removeKey) keys[id] = null;
+		}
+		return { modelKeys: keys, modelKeyMoves: moves };
+	};
 
 	const save = async () => {
 		let config;
@@ -393,10 +495,14 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 		setError("");
 		setBusy(true);
 		try {
-			const result = await post("/api/providers/custom/save", { id: draft.id.trim(), previousId: initial?.id, config, apiKey: draft.auth === "key" ? draft.apiKey : "" });
+			const result = await post("/api/providers/custom/save", { id: draft.id.trim(), previousId: initial?.id, config, apiKey: draft.auth === "key" ? draft.apiKey : "", ...(attachTo ? { attachTo } : {}), ...(view === "json" ? {} : modelKeyChanges()) });
 			if (!alive.current) return;
 			setDirty(false);
-			onSaved(draft.id.trim(), { missingBaseUrl: !!result?.missingBaseUrl });
+			await Promise.resolve(onSaved(draft.id.trim(), { missingBaseUrl: !!result?.missingBaseUrl })).catch(() => {});
+			if (!alive.current) return;
+			// What was just saved is now the starting point; typed keys are stored and leave the form.
+			if (view === "json") setDraft((current) => ({ ...current, apiKey: "" }));
+			else setDraft((current) => ({ ...current, raw: config, apiKey: "", models: current.models.map((model) => ({ ...model, raw: buildModel(model), apiKey: "", removeKey: false })) }));
 		} catch (e) {
 			if (alive.current) {
 				setError(e.message);
@@ -410,6 +516,8 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 		setView("form");
 		setError("");
 		setDetect({ status: "idle", message: "", notes: [], result: null });
+		setTicked(new Set());
+		setBatch({ api: "", baseUrl: "", note: false });
 		setDirty(false);
 	};
 
@@ -417,6 +525,14 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 	const authOptions = [{ value: "key", label: t("API key") }, { value: "config", label: t("Set in models.json") }];
 	const configHasKey = !!draft.raw.apiKey;
 	const detecting = detect.status === "loading";
+	const autoId = (name) => {
+		const slug = slugify(name);
+		return seed ? uniqueProviderId(slug || seed.id, takenIds ?? new Set()) : slug;
+	};
+	const someModelHas = (field) => draft.models.some((model) => String(model[field] ?? "").trim());
+	const notSetHint = (field) => (someModelHas(field) ? t("Not set here: the models below use their own.") : null);
+	const tickable = layered && draft.models.length > 1;
+	const allTicked = tickable && draft.models.every((model) => ticked.has(model.uid));
 	// What the notice says is worked out from the models that are still in the form: removing an entry the detection
 	// produced takes its part of the summary and the warnings naming it away, and the notice disappears with the last one.
 	const outcome = detect.status === "ok" ? detectOutcome(detect.result, draft.models) : null;
@@ -447,11 +563,11 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 				<div class="set-card-head"><strong>${t("Connection")}</strong></div>
 				<div class="set-card-body pf-fields">
 					<div class="pf-two">
-						<${Field} label=${t("Name")}><input class="field" autofocus=${isNew} placeholder=${t("e.g. My Gateway")} value=${draft.name} onInput=${(e) => patch({ name: e.target.value, ...(idTouched ? {} : { id: slugify(e.target.value) }) })} /><//>
-						<${Field} label=${t("Provider ID")} hint=${isNew ? t("Unique lowercase name used in settings.") : t("The ID cannot change after creation.")}><input class="field mono" disabled=${!isNew} placeholder="my-gateway" value=${draft.id} onInput=${(e) => (setIdTouched(true), patch({ id: e.target.value }))} /><//>
+						<${Field} label=${asKey ? t("Name of this key") : t("Name")}><input class="field" autofocus=${isNew} placeholder=${asKey ? t("e.g. Cheap group") : t("e.g. My Gateway")} value=${draft.name} onInput=${(e) => patch({ name: e.target.value, ...(idTouched ? {} : { id: autoId(e.target.value) }) })} /><//>
+						<${Field} label=${asKey ? t("Key ID") : t("Provider ID")} hint=${isNew ? t("Unique lowercase name used in settings.") : t("The ID cannot change after creation.")}><input class="field mono" disabled=${!isNew} placeholder="my-gateway" value=${draft.id} onInput=${(e) => (setIdTouched(true), patch({ id: e.target.value }))} /><//>
 					</div>
-					<${Field} label=${t("API format")}><${Select} value=${draft.api} ariaLabel=${t("API format")} onChange=${(next) => patch({ api: next })} options=${types.map((type) => ({ value: type, label: API_LABELS[type] ? t(API_LABELS[type]) : type }))} /><//>
-					<${Field} label=${t("Base URL")} hint=${draft.baseUrl.trim() ? undefined : t("Not filled in yet. The provider can be saved, but stays off until it has a Base URL.")}><input class="field mono example-placeholder" placeholder=${BASE_URL_EXAMPLE} aria-label=${t("Base URL")} value=${draft.baseUrl} onInput=${(e) => patch({ baseUrl: e.target.value })} /><//>
+					<${Field} label=${t("API format")} hint=${upper?.api ? coverHint({ layer: "provider", value: upper.api }, !!draft.api, apiLabel) : layered && !draft.api ? notSetHint("api") : null}><${Select} value=${draft.api} disabled=${!!upper?.api} ariaLabel=${t("API format")} onChange=${(next) => patch({ api: next })} options=${apiOptions(types, layered ? t("Not set here") : null)} /><//>
+					<${Field} label=${t("Base URL")} hint=${upper?.baseUrl ? coverHint({ layer: "provider", value: upper.baseUrl }, !!draft.baseUrl.trim()) : draft.baseUrl.trim() ? undefined : notSetHint("baseUrl") ?? t("Not filled in yet. The provider can be saved, but stays off until it has a Base URL.")}><input class="field mono example-placeholder" disabled=${!!upper?.baseUrl} placeholder=${BASE_URL_EXAMPLE} aria-label=${t("Base URL")} value=${draft.baseUrl} onInput=${(e) => patch({ baseUrl: e.target.value })} /><//>
 					<${Field} label=${t("Keep-alive time")} hint=${html`${t("An idle connection closes after this time. A longer time saves handshakes; if the server closes first, requests fail, so shorten it when that happens.")}${keepAliveProblem ? html`<span class="pf-problem" role="alert"> ${keepAliveProblem}</span>` : null}`}>
 						<${UnitGroup} value=${draft.keepAlive} onInput=${(v) => patch({ keepAlive: v })} unit=${t("seconds")} label=${t("Keep-alive time")} placeholder=${defaults?.keepAliveSeconds === undefined ? "" : String(defaults.keepAliveSeconds)} invalid=${!!keepAliveProblem} inputMode="numeric" />
 					<//>
@@ -464,11 +580,14 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 					<div class="col field-label"><span class="field-name">${t("Authentication")}</span>
 						<div class="row"><${Segmented} value=${draft.auth} onChange=${(v) => patch({ auth: v })} options=${authOptions} /></div>
 					</div>
-					${draft.auth === "key"
-						? hasStoredKey && keyArea
-							? keyArea
-							: html`<${Field} label=${t("API key")} hint=${t("Stored on this computer only, never in models.json.")}><input class="field mono" type="password" autocomplete="off" placeholder=${t("Paste the API key")} value=${draft.apiKey} onInput=${(e) => patch({ apiKey: e.target.value })} /><//>`
-						: html`<span class="dim pf-hint">${configHasKey ? t("The key is set in models.json (shown hidden). Use the JSON view to change it.") : (hasStoredKey ? t("models.json has no key for this provider yet. Add “apiKey” in the JSON view; until then the saved API key is used.") : t("models.json has no key for this provider yet. Add “apiKey” in the JSON view."))}</span>`}
+					<div class=${`col pf-key-area ${upperKey ? "covered" : ""}`}>
+						${draft.auth === "key"
+							? hasStoredKey && keyArea
+								? keyArea
+								: html`<${Field} label=${t("API key")} hint=${upperKey ? null : t("Stored on this computer only, never in models.json.")}><input class="field mono" type="password" autocomplete="off" disabled=${!!upperKey} placeholder=${t("Paste the API key")} value=${draft.apiKey} onInput=${(e) => patch({ apiKey: e.target.value })} /><//>`
+							: html`<span class="dim pf-hint">${configHasKey ? t("The key is set in models.json (shown hidden). Use the JSON view to change it.") : (hasStoredKey ? t("models.json has no key for this provider yet. Add “apiKey” in the JSON view; until then the saved API key is used.") : t("models.json has no key for this provider yet. Add “apiKey” in the JSON view."))}</span>`}
+						${upperKey ? html`<span class="dim pf-hint">${t("Covered by the global API key {suffix}. What is here is kept and applies again once that is removed.", { suffix: upperKey.suffix ? `••••${upperKey.suffix}` : "" })}</span>` : null}
+					</div>
 				</div>
 			</section>
 			<section class="set-card">
@@ -484,7 +603,21 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 						${notice ? html`<div class=${`notice ${notice.warn ? "warn" : ""}`} role="status">${notice.message}${notice.notes.map((note, i) => html`<div class="dim pf-hint" key=${i}>${note}</div>`)}</div>` : null}
 					</div>
 					${!draft.models.length ? html`<div class="dim pf-hint">${t("No model yet. Type its Model ID above and detect it, or add it manually.")}</div>` : null}
-					${draft.models.map((model) => html`<${ModelCard} key=${model.uid} model=${model} open=${openModels.has(model.uid)} onToggle=${() => toggleOpen(model.uid)} onChange=${(next) => updateModel(model.uid, next)} onRemove=${() => patch({ models: draft.models.filter((m) => m.uid !== model.uid) })} />`)}
+					${tickable
+						? html`<div class="pf-batch">
+							<label class="check-label sm"><input type="checkbox" checked=${allTicked} onChange=${(e) => setTicked(new Set(e.target.checked ? draft.models.map((model) => model.uid) : []))} /><span>${ticked.size ? t("{n} selected", { n: ticked.size }) : t("Select all")}</span></label>
+							<${Collapse} open=${ticked.size > 0}>
+								<div class="pf-batch-fields">
+									<${Select} value=${batch.api} disabled=${!!upper?.api} placeholder=${t("Set the format…")} ariaLabel=${t("Format of the selected models")} onChange=${(next) => setBatch((current) => ({ ...current, api: next, note: false }))} options=${apiOptions(types)} />
+									<input class="field mono" disabled=${!!upper?.baseUrl} placeholder=${t("Base URL (optional)")} aria-label=${t("Base URL of the selected models")} value=${batch.baseUrl} onInput=${(e) => setBatch((current) => ({ ...current, baseUrl: e.target.value, note: false }))} />
+									<button class="btn" disabled=${!batch.api && !(batch.baseUrl.trim() && !baseUrlProblem(batch.baseUrl))} onClick=${applyBatch}>${t("Apply")}</button>
+								</div>
+								${upper?.api || upper?.baseUrl ? html`<span class="dim pf-hint">${t("The global settings cover this for every model. Clear them there to set it per model.")}</span>` : null}
+							<//>
+							${batch.note ? html`<span class="dim pf-hint" role="status">${t("What this key set moved down onto its models, so the ones you did not tick keep using it.")}</span>` : null}
+						</div>`
+						: null}
+					${draft.models.map((model) => html`<${ModelCard} key=${model.uid} model=${model} open=${openModels.has(model.uid)} onToggle=${() => toggleOpen(model.uid)} onChange=${(next) => updateModel(model.uid, next)} onRemove=${() => patch({ models: draft.models.filter((m) => m.uid !== model.uid) })} types=${types} layers=${layers} storedKey=${modelKeys?.[model.raw?.id]} sharedKey=${sharedKey} ticked=${ticked.has(model.uid)} onTick=${tickable ? (on) => tick(model.uid, on) : null} />`)}
 				</div>
 			</section>
 			<div class="pf-advanced"><button class="link-btn" onClick=${() => switchView("json")}><${Icon} name="edit" size=${12} /> ${t("Edit as JSON (advanced)")}</button></div>`}
@@ -492,7 +625,7 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 			${footerStart || null}
 			<span class="grow" />
 			${dirty ? html`<span class="dim pf-hint">${t("Unsaved changes")}</span><button class="btn" disabled=${busy} onClick=${discard}>${t("Discard")}</button>` : null}
-			<button class="btn primary" disabled=${busy || (!dirty && !isNew)} onClick=${save}>${busy ? t("Saving…") : isNew ? t("Add provider") : t("Save")}</button>
+			<button class="btn primary" disabled=${busy || (!dirty && !isNew)} onClick=${save}>${busy ? t("Saving…") : isNew ? (asKey ? t("Add key") : t("Add provider")) : t("Save")}</button>
 		</div>
 	</div>`;
 }

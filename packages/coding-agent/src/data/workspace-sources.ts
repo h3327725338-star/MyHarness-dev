@@ -246,6 +246,51 @@ export interface StagedWorkspaceSourceUpload {
 	entries: Array<{ path: string; size: number; target: string; done: boolean }>;
 }
 
+/** A path inside a folder upload that has no name to store or would leave the folder. */
+export function isBadFolderPath(path: string): boolean {
+	return (
+		!path ||
+		path.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\\"))
+	);
+}
+
+/**
+ * Where each file of a folder goes below `directory`: the folder as `<prefix><name>`, every name cleaned and, with
+ * `shorten`, shortened as far as the longest path needs. `tooLong` lists the files past MAX_STORED_PATH at the end.
+ */
+export function planFolderTargets(
+	directory: string,
+	prefix: string,
+	name: string,
+	paths: string[],
+	shorten = true,
+): { storedName: string; targets: Map<string, string>; tooLong: string[] } {
+	const cleanedName = name.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").replace(/[. ]+$/g, "") || "file";
+	// Names are given in sorted order so `~2` suffixes do not depend on the order the browser listed the files in.
+	const sorted = [...paths].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+	let plan: { storedName: string; targets: Map<string, string>; tooLong: string[] } | undefined;
+	for (const cap of shorten ? SEGMENT_CAPS : SEGMENT_CAPS.slice(0, 1)) {
+		const storedName = `${prefix}${fitSegment(cleanedName, cap)}`;
+		const top: NameNode = { stored: storedName, children: new Map(), used: new Set() };
+		const targets = new Map<string, string>();
+		const tooLong: string[] = [];
+		for (const path of sorted) {
+			let node = top;
+			const parts = [directory, storedName];
+			for (const segment of path.split("/")) {
+				node = childName(node, segment, cap);
+				parts.push(node.stored);
+			}
+			const target = join(...parts);
+			if (target.length > MAX_STORED_PATH) tooLong.push(path);
+			targets.set(path, target);
+		}
+		plan = { storedName, targets, tooLong };
+		if (!tooLong.length) break;
+	}
+	return plan!;
+}
+
 function planItem(
 	root: string,
 	item: WorkspaceSourceUploadItem,
@@ -259,12 +304,7 @@ function planItem(
 	if (!item.files.length || (item.kind === "file" && item.files.length !== 1))
 		problems.push({ item: index, path: item.name, reason: "invalid_path" });
 	for (const file of item.files) {
-		const segments = file.path.split("/");
-		if (
-			!file.path ||
-			seen.has(file.path) ||
-			segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\\"))
-		)
+		if (seen.has(file.path) || isBadFolderPath(file.path))
 			problems.push({ item: index, path: file.path, reason: "invalid_path" });
 		else if (!Number.isSafeInteger(file.size) || file.size < 0)
 			problems.push({ item: index, path: file.path, reason: "invalid_size" });
@@ -291,38 +331,24 @@ function planItem(
 		problems.push({ item: index, path: file.path, reason: "path_too_long" });
 		return undefined;
 	}
-	// Names are given in sorted order so `~2` suffixes do not depend on the order the browser listed the files in;
-	// entries keep the request's order, which is how chunks address them.
-	const sorted = [...item.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-	let tooLong: string[] = [];
-	for (const cap of SEGMENT_CAPS) {
-		const storedName = `folder-${fitSegment(cleanedName, cap)}`;
-		const top: NameNode = { stored: storedName, children: new Map(), used: new Set() };
-		const targets = new Map<string, string>();
-		tooLong = [];
-		for (const file of sorted) {
-			let node = top;
-			const parts = [directory, storedName];
-			for (const segment of file.path.split("/")) {
-				node = childName(node, segment, cap);
-				parts.push(node.stored);
-			}
-			const target = join(...parts);
-			if (target.length > MAX_STORED_PATH) tooLong.push(file.path);
-			targets.set(file.path, target);
-		}
-		if (!tooLong.length) {
-			const entries = item.files.map((file) => ({
-				path: file.path,
-				size: file.size,
-				target: targets.get(file.path)!,
-				done: false,
-			}));
-			return { id, kind: "folder", name: item.name.slice(0, 255), directory, storedName, entries };
-		}
+	const { storedName, targets, tooLong } = planFolderTargets(
+		directory,
+		"folder-",
+		item.name,
+		item.files.map((file) => file.path),
+	);
+	if (tooLong.length) {
+		for (const path of tooLong) problems.push({ item: index, path, reason: "path_too_long" });
+		return undefined;
 	}
-	for (const path of tooLong) problems.push({ item: index, path, reason: "path_too_long" });
-	return undefined;
+	// Entries keep the request's order, which is how chunks address them.
+	const entries = item.files.map((file) => ({
+		path: file.path,
+		size: file.size,
+		target: targets.get(file.path)!,
+		done: false,
+	}));
+	return { id, kind: "folder", name: item.name.slice(0, 255), directory, storedName, entries };
 }
 
 /**

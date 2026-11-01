@@ -280,6 +280,66 @@ describe("Google Drive sync engine", () => {
 		expect(existsSync(join(b.dataRoot, "memory", "profile.md"))).toBe(false);
 	});
 
+	it("brings a memory put back after a deletion to the other computer", async () => {
+		const drive = new FakeDrive();
+		const a = device(drive, "desktop", "device-a");
+		const b = device(drive, "laptop", "device-b");
+		const memory = writeMemory(a.dataRoot, "keep this");
+		await sync(a, b);
+		const content = readFileSync(memory, "utf8");
+		rmSync(memory);
+		await sync(a, b);
+		expect(existsSync(join(b.dataRoot, "memory", "profile.md"))).toBe(false);
+
+		writeFileSync(memory, content);
+		await sync(a, b);
+		await sync(a, b);
+		expect(readFileSync(join(b.dataRoot, "memory", "profile.md"), "utf8")).toBe(content);
+		expect(readFileSync(memory, "utf8")).toBe(content);
+	});
+
+	it("does not publish the deletion of most of a kind, as when the Data root went empty, and lets smaller ones through", async () => {
+		const drive = new FakeDrive();
+		const a = device(drive, "desktop", "device-a");
+		const b = device(drive, "laptop", "device-b");
+		const memory = join(a.dataRoot, "memory");
+		mkdirSync(memory, { recursive: true });
+		const text = (index: number) =>
+			`---\nid: global/note-${index}\nname: Note ${index}\ndescription: shared\ntype: user\nscope: global\ncreatedAt: 2026-01-01T00:00:00.000Z\nupdatedAt: 2026-01-01T00:00:00.000Z\n---\n\nnote ${index}\n`;
+		for (let index = 0; index < 60; index++) writeFileSync(join(memory, `note-${index}.md`), text(index));
+		await sync(a, b);
+		const onLaptop = () => readdirSync(join(b.dataRoot, "memory")).filter((name) => name.startsWith("note-")).length;
+		expect(onLaptop()).toBe(60);
+		const held = () => a.engine.status().issues.filter((issue) => issue.reason === "mass-delete");
+
+		// A real clean-up: 25 of 60 is many, but not most of them.
+		for (let index = 0; index < 25; index++) rmSync(join(memory, `note-${index}.md`));
+		await sync(a, b);
+		expect(onLaptop()).toBe(35);
+		expect(held()).toHaveLength(0);
+
+		// Everything gone at once, and it stays that way over another pass.
+		const saved = new Map<string, string>();
+		for (let index = 25; index < 60; index++) {
+			saved.set(`note-${index}.md`, readFileSync(join(memory, `note-${index}.md`), "utf8"));
+			rmSync(join(memory, `note-${index}.md`));
+		}
+		const batches = drive.batchNames().length;
+		await sync(a, b);
+		await sync(a, b);
+		expect(onLaptop()).toBe(35);
+		expect(drive.batchNames()).toHaveLength(batches);
+		expect(held()).toHaveLength(1);
+		expect(held()[0]?.detail).toContain("35 of 35");
+
+		// The files come back: nothing to publish and nothing left to report.
+		for (const [name, content] of saved) writeFileSync(join(memory, name), content);
+		await sync(a, b);
+		expect(onLaptop()).toBe(35);
+		expect(drive.batchNames()).toHaveLength(batches);
+		expect(held()).toHaveLength(0);
+	});
+
 	it("merges both edits of the same memory until both devices hold the same text", async () => {
 		const drive = new FakeDrive();
 		const a = device(drive, "desktop", "device-a");

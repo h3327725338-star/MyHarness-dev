@@ -137,6 +137,7 @@ html[data-export-readonly="1"] .transcript img[src^="http"] {
 .thumb img { width: 100%; height: 100%; object-fit: cover; border-radius: var(--r-md); border: 1px solid var(--border-strong); }
 .thumb:has(.file-attachment) { width: 160px; }
 .file-attachment { height: 100%; display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--border-strong); border-radius: var(--r-md); font-size: var(--fs-xs); }
+.file-attachment-name { min-width: 0; display: flex; flex-direction: column; }
 .thumb-x { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-raised); border: 1px solid var(--border-strong); color: var(--text-2); }
 .thumb-x:hover { color: var(--danger); }
 /* An image thumbnail opens the shared lightbox: zoom cursor, a brightness lift and a one-pixel accent ring on hover.

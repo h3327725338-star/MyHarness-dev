@@ -1,6 +1,6 @@
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const DATA_ROOT_PREFIX = `myharness-vitest-data-${process.pid}-`;
 const ANY_DATA_ROOT_PREFIX = "myharness-vitest-data-";
@@ -123,17 +123,32 @@ function isIsolatedInheritedRoot(root: string): boolean {
 // provide dataRoot still bypass this setting, while default-storage tests get an
 // isolated root instead of registering temporary fixture directories in the
 // repository's data/workspaces registry.
-if (!process.env.MYHARNESS_DATA_ROOT || !isIsolatedInheritedRoot(process.env.MYHARNESS_DATA_ROOT)) {
-	cleanupStaleOwnedRoots();
-	state.ownedRoot ??= mkdtempSync(join(tmpdir(), DATA_ROOT_PREFIX));
-	process.env.MYHARNESS_DATA_ROOT = state.ownedRoot;
-	try {
-		writeFileSync(
-			join(state.ownedRoot, OWNER_MARKER),
-			JSON.stringify({ pid: process.pid, root: resolve(state.ownedRoot) }),
-			{ encoding: "utf8", flag: "wx", mode: 0o600 },
-		);
-	} catch {
-		// Direct process-exit cleanup still applies when the marker cannot be made.
+function ownedRoot(): string {
+	if (!state.ownedRoot) {
+		cleanupStaleOwnedRoots();
+		state.ownedRoot = mkdtempSync(join(tmpdir(), DATA_ROOT_PREFIX));
+		try {
+			writeFileSync(
+				join(state.ownedRoot, OWNER_MARKER),
+				JSON.stringify({ pid: process.pid, root: resolve(state.ownedRoot) }),
+				{ encoding: "utf8", flag: "wx", mode: 0o600 },
+			);
+		} catch {
+			// Direct process-exit cleanup still applies when the marker cannot be made.
+		}
 	}
+	return state.ownedRoot;
+}
+
+if (!process.env.MYHARNESS_DATA_ROOT || !isIsolatedInheritedRoot(process.env.MYHARNESS_DATA_ROOT)) {
+	process.env.MYHARNESS_DATA_ROOT = ownedRoot();
+}
+
+// The same for the agent folder. Without it a test that does not name its own writes to the real `~/.myharness/agent`:
+// the model a mode last used in chat-mode-state.json, run traces, an empty auth.json. Tests running side by side also
+// fight over those files. fd and rg stay reachable: an empty folder would otherwise download them for every test file.
+if (!process.env.MYHARNESS_CODING_AGENT_DIR || !isIsolatedInheritedRoot(process.env.MYHARNESS_CODING_AGENT_DIR)) {
+	const managedTools = join(homedir(), ".myharness", "agent", "bin");
+	if (existsSync(managedTools)) process.env.PATH = `${process.env.PATH}${delimiter}${managedTools}`;
+	process.env.MYHARNESS_CODING_AGENT_DIR = join(ownedRoot(), "agent");
 }

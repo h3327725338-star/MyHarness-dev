@@ -130,6 +130,7 @@ function createRunner(hub: WebHostHub, broadcast: (event: string, data: unknown)
 			const created = await hub.newSession(from, workspace?.rootPath, !workspace, schedule.mode, { forceNew: true });
 			const target = hub.get(created.slot);
 			if (!target) throw new Error("The new chat could not be opened.");
+			target.scheduledSessionId = target.session.sessionId;
 			const runModel = model ?? target.session.model;
 			if (runModel && (model || chosen.thinkingLevel))
 				await target.session.useModelInThisSession(runModel, chosen.thinkingLevel ?? target.session.thinkingLevel);
@@ -138,19 +139,29 @@ function createRunner(hub: WebHostHub, broadcast: (event: string, data: unknown)
 			} catch {
 				// The chat keeps the name the app gives it.
 			}
-			broadcast("workspaces_changed", {});
 			// The chat shows the task's message as the task's card, not as something the user typed.
 			target.session.sessionManager.appendCustomEntry(SCHEDULED_RUN_ENTRY, {
 				scheduleId: schedule.id,
 				title: schedule.title,
 				repeat: schedule.repeat,
 			});
-			await target.submit(schedule.text, { mode: "auto" });
+			// After the entry, so the sidebar's list already knows this chat belongs to the Scheduled tasks group.
+			broadcast("workspaces_changed", {});
+			target.scheduledRun = true;
+			try {
+				await target.submit(schedule.text, { mode: "auto" });
+			} catch (error) {
+				target.scheduledRun = false;
+				throw error;
+			}
 			return {
 				sessionId: target.session.sessionManager.getSessionId(),
 				sessionFile: target.session.sessionFile ?? undefined,
 				slot: created.slot,
-				finished: watch(created.slot),
+				// A message the user sends in this chat afterwards is told like in any other chat.
+				finished: watch(created.slot).finally(() => {
+					target.scheduledRun = false;
+				}),
 			};
 		},
 	};

@@ -16,7 +16,7 @@ import {
 	MIN_KEEP_ALIVE_SECONDS,
 } from "../../platform/process/http-dispatcher.ts";
 import { modelsJsonProviderLacksBaseUrl } from "../../providers/models/composer.ts";
-import type { ModelsJsonProvider } from "../../providers/models/config.ts";
+import type { ModelsJsonProvider, ModelsJsonProviderGroup } from "../../providers/models/config.ts";
 import {
 	CUSTOM_PROVIDER_API_TYPES,
 	type CustomProviderApiType,
@@ -24,6 +24,13 @@ import {
 	detectSpecifiedModels,
 	ProviderModelDiscoveryError,
 } from "../../providers/models/custom-provider-manager.ts";
+import {
+	groupCredentialId,
+	type MergeCandidate,
+	modelCredentialId,
+	suggestProviderMerges,
+	toLayeredEntry,
+} from "../../providers/models/layers.ts";
 import { NEBIUS_API_KEYS_URL, NEBIUS_CONSOLE_URL, NEBIUS_PROVIDER_ID } from "../../providers/models/nebius-preset.ts";
 import { providerSpendLedger } from "../../providers/runtime/provider-spend.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
@@ -56,6 +63,35 @@ function str(value: unknown, name: string): string {
 class LoginCancelled extends Error {}
 
 const HIDDEN = "__hidden__";
+
+/** A key typed for a layer: a field holding only spaces is a mistake, not "no key". */
+function typedLayerKey(value: unknown): string | undefined {
+	if (typeof value !== "string" || value === "") return undefined;
+	if (!value.trim()) throw new HttpError(400, "The API key is empty. Type the key, or leave the field empty.");
+	return value.trim();
+}
+
+/** What the top layer of a provider sets, as sent by the page; an empty field is left out. */
+function groupFields(payload: Record<string, unknown>): ModelsJsonProviderGroup {
+	const fields: ModelsJsonProviderGroup = {};
+	if (typeof payload.name === "string" && payload.name.trim()) fields.name = payload.name.trim();
+	if (typeof payload.baseUrl === "string" && payload.baseUrl.trim()) {
+		const baseUrl = payload.baseUrl.trim();
+		let protocol = "";
+		try {
+			protocol = new URL(baseUrl).protocol;
+		} catch {}
+		if (protocol !== "http:" && protocol !== "https:")
+			throw new HttpError(400, "The Base URL must be a full http:// or https:// address.");
+		fields.baseUrl = baseUrl;
+	}
+	if (typeof payload.api === "string" && payload.api) {
+		if (!(CUSTOM_PROVIDER_API_TYPES as readonly string[]).includes(payload.api))
+			throw new HttpError(400, `Unknown API format: ${payload.api}`);
+		fields.api = payload.api;
+	}
+	return fields;
+}
 
 /** models.json may hold literal keys: the browser only sees a placeholder for apiKey / model headers. Provider-level custom headers are shown and edited as plain text (user choice: simplest plaintext KV). */
 function redactProvider(config: ModelsJsonProvider): ModelsJsonProvider {
@@ -202,7 +238,7 @@ export function registerProviderRoutes(
 		const configEntries = new Map(
 			(
 				await manager()
-					.list()
+					.listResolved()
 					.catch(() => [])
 			).map((entry) => [entry.id, entry.config] as const),
 		);
@@ -230,6 +266,13 @@ export function registerProviderRoutes(
 				/** Defined in models.json: edited, renamed and deleted from its card. */
 				custom: configEntries.has(provider.id),
 				modelCount: provider.getModels().length,
+				settings: (provider.settings ?? []).map((setting) => ({
+					id: setting.id,
+					label: setting.label,
+					description: setting.description ?? null,
+					placeholder: setting.placeholder ?? null,
+					value: setting.get(),
+				})),
 				credentials: overview
 					? {
 							active: overview.active ?? null,
@@ -262,7 +305,7 @@ export function registerProviderRoutes(
 			payload.enabled &&
 			modelsJsonProviderLacksBaseUrl(
 				await manager()
-					.get(id)
+					.getResolved(id)
 					.catch(() => undefined),
 			)
 		) {
@@ -276,6 +319,25 @@ export function registerProviderRoutes(
 		await host.session.settingsManager.flush();
 		host.broadcast("models_changed", {});
 		return { ok: true };
+	});
+
+	server.route("POST", "/api/providers/setting", async ({ body }) => {
+		const payload = asObject(body);
+		const id = str(payload.id, "id");
+		const settingId = str(payload.setting, "setting");
+		if (typeof payload.value !== "string") throw new HttpError(400, "value must be a string");
+		const setting = runtime()
+			.getProviders()
+			.find((provider) => provider.id === id)
+			?.settings?.find((candidate) => candidate.id === settingId);
+		if (!setting) throw new HttpError(404, `Unknown setting ${settingId} of provider ${id}`);
+		try {
+			await setting.set(payload.value);
+		} catch (error) {
+			throw new HttpError(400, error instanceof Error ? error.message : String(error));
+		}
+		host.broadcast("models_changed", {});
+		return { ok: true, value: setting.get() };
 	});
 
 	server.route("POST", "/api/providers/api-key/add", async ({ body }) => {
@@ -394,10 +456,52 @@ export function registerProviderRoutes(
 	});
 
 	// ---- User-defined providers (models.json) --------------------------------------------
+	/** An entry that extends a provider an extension registered: its address also covers models the file does not list. */
+	const overlaysRegisteredProvider = (id: string) => runtime().getRegisteredProviderIds().includes(id);
+
+	/** A login, the ready-made Nebius entry and an extension's provider stay as they are: the layers do not apply to them. */
+	const staysOutOfLayers = async (id: string) =>
+		id === NEBIUS_PROVIDER_ID ||
+		overlaysRegisteredProvider(id) ||
+		(await runtime().getProviderCredentialOverview(id)).hasOAuth;
+
+	/** Entries that could be the same service as another. */
+	const mergeCandidates = async (): Promise<MergeCandidate[]> => {
+		const rt = runtime();
+		const custom = manager();
+		const raw = new Map((await custom.list()).map((entry) => [entry.id, entry.config] as const));
+		const groups = await custom.listGroups();
+		const candidates: MergeCandidate[] = [];
+		for (const { id, config } of await custom.listResolved()) {
+			if (await staysOutOfLayers(id)) continue;
+			const baseUrls = [config.baseUrl, ...(config.models ?? []).map((model) => model.baseUrl)];
+			candidates.push({
+				id,
+				name: raw.get(id)?.name ?? id,
+				groupId: config.group && Object.hasOwn(groups, config.group) ? config.group : undefined,
+				baseUrls: baseUrls.filter((url): url is string => !!url),
+				keyTokens: await rt.getApiKeyDigests(id),
+			});
+		}
+		return candidates;
+	};
+
 	server.route("GET", "/api/providers/custom", async () => {
-		const entries = await manager().list();
+		const rt = runtime();
+		rt.reloadCredentials();
+		const custom = manager();
+		const entries = await custom.list();
+		const groups = await custom.listGroups();
+		const modelKeysOf = async (entry: { id: string; config: ModelsJsonProvider }) => {
+			const keys: Record<string, { suffix: string | null }> = {};
+			for (const model of entry.config.models ?? []) {
+				const info = await rt.getLayerApiKeyInfo(modelCredentialId(entry.id, model.id));
+				if (info) keys[model.id] = info;
+			}
+			return keys;
+		};
 		return {
-			path: runtime().getModelsConfigPath() ?? null,
+			path: rt.getModelsConfigPath() ?? null,
 			apiTypes: [...CUSTOM_PROVIDER_API_TYPES],
 			/** Per-provider connection settings: what applies when a provider does not set them, and the allowed range. */
 			connectionDefaults: {
@@ -407,9 +511,117 @@ export function registerProviderRoutes(
 				ipFamily: DEFAULT_IP_FAMILY,
 				ipFamilies: [...IP_FAMILIES],
 			},
-			providers: entries.map((entry) => ({ id: entry.id, config: redactProvider(entry.config) })),
+			// The page always edits the layered form: nothing a model uses differs from what the file says now.
+			providers: await Promise.all(
+				entries.map(async (entry) => ({
+					id: entry.id,
+					config: redactProvider((await staysOutOfLayers(entry.id)) ? entry.config : toLayeredEntry(entry.config)),
+					modelKeys: await modelKeysOf(entry),
+				})),
+			),
+			groups: await Promise.all(
+				Object.entries(groups).map(async ([id, config]) => ({
+					id,
+					config,
+					key: (await rt.getLayerApiKeyInfo(groupCredentialId(id))) ?? null,
+				})),
+			),
+			mergeSuggestions: suggestProviderMerges(await mergeCandidates()),
 			hiddenPlaceholder: HIDDEN,
 		};
+	});
+
+	const reloadLayers = async () => {
+		await runtime().reloadConfig();
+		const configError = runtime().getError();
+		if (configError) throw new Error(configError);
+	};
+
+	/** Runs a change to models.json and the keys of its layers; when anything fails the file is what it was before. */
+	const changingLayers = async <T>(change: (custom: CustomProviderManager) => Promise<T>): Promise<T> => {
+		const custom = manager();
+		const snapshot = await custom.snapshot().catch(() => undefined);
+		let result: T;
+		try {
+			result = await change(custom);
+			await host.session.reconcileModelAfterConfigChange();
+		} catch (error) {
+			if (snapshot) await custom.restore(snapshot).catch(() => {});
+			await runtime()
+				.reloadConfig()
+				.catch(() => {});
+			if (error instanceof HttpError) throw error;
+			throw new HttpError(400, error instanceof Error ? error.message : String(error));
+		}
+		host.broadcast("models_changed", {});
+		host.broadcast("usage", host.usage());
+		return result;
+	};
+
+	/**
+	 * Saves the top layer of a provider. A provider that so far stands alone (`memberId`) becomes a group first, with that
+	 * entry as its only key. `apiKey` sets the key of the whole provider, `removeApiKey` takes it away.
+	 */
+	server.route("POST", "/api/providers/group/save", async ({ body }) => {
+		const payload = asObject(body);
+		const fields = groupFields(payload);
+		const typedKey = typedLayerKey(payload.apiKey);
+		const id = await changingLayers(async (custom) => {
+			const groupId =
+				typeof payload.id === "string" && payload.id
+					? payload.id
+					: await custom.ensureGroupFor(str(payload.memberId, "memberId"));
+			// A group always keeps a name: an emptied field leaves the name it had.
+			const previous = (await custom.listGroups())[groupId];
+			await custom.updateGroup(groupId, { ...fields, name: fields.name ?? previous?.name ?? groupId });
+			await reloadLayers();
+			if (typedKey) await runtime().setLayerApiKeys([[groupCredentialId(groupId), typedKey]]);
+			else if (payload.removeApiKey === true)
+				await runtime().setLayerApiKeys([[groupCredentialId(groupId), undefined]]);
+			return groupId;
+		});
+		return { ok: true, id };
+	});
+
+	/** A key of a group that entries came out of stays with them, and a group left empty takes its key with it. */
+	const settleGroupKeys = async (change: { moved: { id: string; fromGroup: string }[]; emptied: string[] }) => {
+		for (const { id, fromGroup } of change.moved) await runtime().adoptLayerApiKey(groupCredentialId(fromGroup), id);
+		await runtime().setLayerApiKeys(
+			change.emptied.map((groupId) => [groupCredentialId(groupId), undefined] as const),
+		);
+	};
+
+	/**
+	 * Makes entries the keys of one provider: `groupId` to join an existing one, otherwise a new one called `name`. Every
+	 * entry keeps its ID, its keys and its name, so settings and old chats that point at it keep working.
+	 */
+	server.route("POST", "/api/providers/group/merge", async ({ body }) => {
+		const payload = asObject(body);
+		const ids = Array.isArray(payload.ids)
+			? payload.ids.filter((id): id is string => typeof id === "string" && !!id)
+			: [];
+		if (ids.length === 0) throw new HttpError(400, "Choose at least one provider to merge.");
+		const id = await changingLayers(async (custom) => {
+			const change = await custom.mergeProviders({
+				ids,
+				groupId: typeof payload.groupId === "string" && payload.groupId ? payload.groupId : undefined,
+				name: typeof payload.name === "string" ? payload.name : undefined,
+			});
+			await settleGroupKeys(change);
+			await reloadLayers();
+			return change.groupId;
+		});
+		return { ok: true, id };
+	});
+
+	/** Takes a key out of its provider: it stands alone again and its models keep using what they use now. */
+	server.route("POST", "/api/providers/group/leave", async ({ body }) => {
+		const id = str(asObject(body).id, "id");
+		await changingLayers(async (custom) => {
+			await settleGroupKeys(await custom.leaveGroup(id));
+			await reloadLayers();
+		});
+		return { ok: true };
 	});
 
 	/**
@@ -524,6 +736,21 @@ export function registerProviderRoutes(
 		const newKey = typedKey?.trim() || undefined;
 		const keyLabel =
 			typeof payload.keyLabel === "string" && payload.keyLabel.trim() ? payload.keyLabel.trim() : "Default key";
+		// A model's own key: a string sets it, null removes it. `modelKeyMoves` follows a Model ID that was edited.
+		const modelKeyChanges: Array<readonly [string, string | undefined]> = [];
+		for (const [modelId, value] of Object.entries(
+			payload.modelKeys && typeof payload.modelKeys === "object"
+				? (payload.modelKeys as Record<string, unknown>)
+				: {},
+		)) {
+			const key = value === null ? undefined : typedLayerKey(value);
+			if (key || value === null) modelKeyChanges.push([modelCredentialId(id, modelId), key]);
+		}
+		const modelKeyMoves = Object.entries(
+			payload.modelKeyMoves && typeof payload.modelKeyMoves === "object"
+				? (payload.modelKeyMoves as Record<string, unknown>)
+				: {},
+		).filter((move): move is [string, string] => typeof move[1] === "string" && !!move[1]);
 		const custom = manager();
 		const snapshot = await custom.snapshot().catch(() => undefined);
 		let savedKey: { id: string; created: boolean } | undefined;
@@ -534,13 +761,18 @@ export function registerProviderRoutes(
 		const incoming = { ...(config as ModelsJsonProvider) };
 		if (typeof incoming.baseUrl !== "string" || !incoming.baseUrl.trim()) delete incoming.baseUrl;
 		else incoming.baseUrl = incoming.baseUrl.trim();
-		const missingBaseUrl = modelsJsonProviderLacksBaseUrl(incoming);
 		try {
+			// A new key added under a provider that so far stands alone makes that provider a group.
+			if (typeof payload.attachTo === "string" && payload.attachTo)
+				incoming.group = await custom.ensureGroupFor(payload.attachTo);
 			await custom.upsert(id, restoreSecrets(incoming, stored), previousId);
 			await runtime().reloadConfig();
 			const configError = runtime().getError();
 			if (configError) throw new Error(configError);
 			if (newKey) savedKey = await saveFormProviderKey(id, keyLabel, newKey);
+			for (const [from, to] of modelKeyMoves)
+				await runtime().moveLayerApiKey(modelCredentialId(id, from), modelCredentialId(id, to));
+			await runtime().setLayerApiKeys(modelKeyChanges);
 			await host.session.reconcileModelAfterConfigChange();
 		} catch (error) {
 			// Only a key this save added is removed again; a replaced one keeps the value it was just given.
@@ -563,10 +795,15 @@ export function registerProviderRoutes(
 				host.session.settingsManager.clearModelReferences(referenceProvider, model.id);
 			await host.session.settingsManager.flush();
 			host.broadcast("settings_changed", {});
+			await runtime()
+				.setLayerApiKeys(removedModels.map((model) => [modelCredentialId(id, model.id), undefined] as const))
+				.catch(() => {});
 		}
 		host.broadcast("models_changed", {});
 		host.broadcast("usage", host.usage());
-		// Without a Base URL the provider is saved but off: it offers no models until the address is filled in.
+		// Without a Base URL the provider is saved but off: it offers no models until the address is filled in. What its
+		// group sets counts as well.
+		const missingBaseUrl = modelsJsonProviderLacksBaseUrl(await custom.getResolved(id).catch(() => undefined));
 		return { ok: true, missingBaseUrl };
 	});
 
@@ -656,8 +893,29 @@ export function registerProviderRoutes(
 				.catch(() => undefined))
 		)
 			throw new HttpError(404, "No such provider in models.json");
+		await deleteEntries([id]);
+		return { ok: true };
+	});
+
+	/** Removes a whole provider of several keys, on the same terms as deleting one entry. */
+	server.route("POST", "/api/providers/group/delete", async ({ body }) => {
+		const payload = asObject(body);
+		const groupId = str(payload.id, "id");
+		const members = (await manager().list())
+			.filter((entry) => entry.config.group === groupId)
+			.map((entry) => entry.id);
+		if (members.length === 0) throw new HttpError(404, "No such provider in models.json");
+		const running = members.flatMap(runningOn);
+		if (running.length > 0 && payload.stopRunning !== true) return { ok: false, running };
+		await deleteEntries(members);
+		return { ok: true };
+	});
+
+	/** Stops the chats working on these entries and removes the entries, their keys and what points at them. */
+	const deleteEntries = async (ids: readonly string[]) => {
+		const removing = new Set(ids);
 		for (const candidate of hub?.all() ?? [host]) {
-			if (candidate.session.model?.provider !== id) continue;
+			if (!removing.has(candidate.session.model?.provider ?? "")) continue;
 			if (candidate.session.isCompacting) candidate.session.abortCompaction();
 			if (candidate.session.isRetrying) candidate.session.abortRetry();
 			await candidate.session.abort();
@@ -666,9 +924,16 @@ export function registerProviderRoutes(
 		const custom = manager();
 		const snapshot = await custom.snapshot();
 		try {
-			if (!(await custom.delete(id))) throw new HttpError(404, "No such provider in models.json");
-			await runtime().deleteProviderCredentials(id);
-			host.session.settingsManager.clearModelReferences(id, undefined, true);
+			const layerKeys: string[] = [];
+			for (const id of ids) {
+				const entry = await custom.get(id);
+				if (!(await custom.delete(id))) throw new HttpError(404, "No such provider in models.json");
+				await runtime().deleteProviderCredentials(id);
+				host.session.settingsManager.clearModelReferences(id, undefined, true);
+				for (const model of entry?.models ?? []) layerKeys.push(modelCredentialId(id, model.id));
+			}
+			for (const groupId of await custom.removeEmptyGroups()) layerKeys.push(groupCredentialId(groupId));
+			await runtime().setLayerApiKeys(layerKeys.map((id) => [id, undefined] as const));
 			await host.session.settingsManager.flush();
 			await runtime().reloadConfig();
 			await host.session.reconcileModelAfterConfigChange();
@@ -685,6 +950,5 @@ export function registerProviderRoutes(
 			);
 		}
 		host.broadcast("models_changed", {});
-		return { ok: true };
-	});
+	};
 }

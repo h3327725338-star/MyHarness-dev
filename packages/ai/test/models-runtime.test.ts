@@ -254,6 +254,21 @@ describe("Models runtime", () => {
 		expect(second.errors.get("flaky")?.message).toBe("fetch failed");
 	});
 
+	it("keeps the settings a provider stores itself", () => {
+		const settings = [{ id: "length", label: "Length", get: () => "1M", set: () => {} }];
+		const provider = createProvider({
+			id: "own-program",
+			auth: { apiKey: envKeyAuth(undefined) },
+			models: [],
+			settings,
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		expect(provider.settings).toBe(settings);
+	});
+
 	it("persists dynamic catalogs and restores them without network access", async () => {
 		const credentials = new InMemoryCredentialStore();
 		const modelsStore = new InMemoryModelsStore();

@@ -74,6 +74,18 @@ export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsStreamTransf
  * giving typed model lists to direct users of that provider. Inside a `Models`
  * collection providers are held as `Provider<Api>`.
  */
+/** One text value a provider stores itself. The strings are shown as they are, so they are written for the reader. */
+export interface ProviderSetting {
+	readonly id: string;
+	readonly label: string;
+	readonly description?: string;
+	readonly placeholder?: string;
+	/** Current value, as the field shows it. Must not throw. */
+	get(): string;
+	/** Validates and stores the value. Throws with a message for the user when it is not acceptable. */
+	set(value: string): void | Promise<void>;
+}
+
 export interface Provider<TApi extends Api = Api> {
 	readonly id: string;
 	readonly name: string;
@@ -95,6 +107,9 @@ export interface Provider<TApi extends Api = Api> {
 
 	/** Optional read-only provider diagnostics for settings and debug surfaces. */
 	readonly getDiagnostics?: () => Record<string, unknown>;
+
+	/** Optional values the provider stores itself, for a host to offer in its provider settings. */
+	readonly settings?: readonly ProviderSetting[];
 
 	/**
 	 * Current known models, sync. Static providers return their catalog;
@@ -580,6 +595,7 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	/** Fetch a dynamic model overlay. createProvider restores/persists it through ModelsStore. */
 	fetchModels?: (context: RefreshModelsContext) => Promise<readonly Model<TApi>[]>;
 	filterModels?: (models: readonly Model<TApi>[], credential: Credential | undefined) => readonly Model<TApi>[];
+	settings?: readonly ProviderSetting[];
 	/** Single implementation, or map keyed by `model.api` for mixed-API providers. */
 	api: ProviderStreams | Partial<Record<TApi, ProviderStreams>>;
 }
@@ -653,6 +669,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 				}
 			: undefined,
 		filterModels: input.filterModels,
+		settings: input.settings,
 		stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options)),
 		streamSimple: (model, context, options) =>
 			dispatch(model, (streams) => streams.streamSimple(model, context, options)),

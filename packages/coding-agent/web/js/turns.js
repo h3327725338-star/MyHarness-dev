@@ -505,7 +505,8 @@ export function* buildTurnsWork(items, ctx = { toolRuns: {} }, previous) {
 		}
 		if (!turn) startTurn(null, index, item);
 		turn.items.push(item);
-		turn.endedAt = Math.max(turn.endedAt || 0, item.ts || 0);
+		// A reply still on the page carries the time it started; once finished, also the time it ended (message_end).
+		turn.endedAt = Math.max(turn.endedAt || 0, item.endedAt || item.ts || 0);
 		if (item.kind === "assistant") turn.assistants.push(item);
 	};
 
@@ -517,9 +518,14 @@ export function* buildTurnsWork(items, ctx = { toolRuns: {} }, previous) {
 	if (repair) repair.turns = buildTurns(repair.items, ctx);
 
 	let processed = 0;
+	let before;
 	for (const turn of turns) {
 		if (++processed % 60 === 0) yield;
 		if (turn.standalone) continue;
+		// A message queued during the reply before it carries the time it was queued, until the chat is read again from
+		// the saved entries: its turn starts when that reply ended.
+		if (before?.endedAt > turn.startedAt) turn.startedAt = before.endedAt;
+		before = turn;
 		const list = turn.assistants;
 		const lastAssistant = list[list.length - 1];
 		for (let ai = 0; ai < list.length; ai++) {
@@ -686,20 +692,31 @@ export const OUTCOME_LABEL = {
 	unanswered: N_("No response"),
 };
 
+/** The next round of the conversation after a turn: a card such as a compaction marker can stand between two rounds. */
+export function nextRound(turns, index) {
+	for (let i = index + 1; i < turns.length; i++) if (!turns[i].standalone) return turns[i];
+	return undefined;
+}
+
 /**
- * Match a run_finished record to a turn: the newest turn that started at or before the run. A run that started with
- * the next turn's message belongs to that turn: a message sent with "interrupt" starts its run within moments of the
- * one it stopped, well inside the 5 s slack below.
+ * Match a run_finished record to the turn it ended: the newest run this turn was part of. One run can hold several
+ * turns, since a queued message is answered inside the run it was queued in. The run's end is then the end of the last
+ * of them only: the ones before it go by their own last reply (turnOutcome), as they do in a reopened chat, which has no
+ * run records. A run that started with the next turn's message belongs to that turn: a message sent with "interrupt"
+ * starts its run within moments of the one it stopped, well inside the 5 s slack below.
  */
 export function runForTurn(turn, runs, nextTurn) {
-	if (!turn.startedAt) return undefined;
-	const nextStart = nextTurn?.user?.ts;
+	// A message the server has not confirmed yet is in no run.
+	if (!turn.startedAt || turn.user?.pending) return undefined;
+	const nextStart = nextTurn?.user?.ts ?? nextTurn?.items?.[0]?.ts;
+	// The copy shown at once on the page is older than the run it may end, so it does not show that the run went on.
+	const nextInRun = (run) => !!nextStart && !nextTurn.user?.pending && nextStart < run.endedAt;
 	let best;
 	for (const run of Object.values(runs)) {
-		if (!run.startedAt) continue;
-		if (run.startedAt + 3000 < turn.startedAt) continue;
+		if (!run.startedAt || run.endedAt < turn.startedAt) continue;
 		if (turn.endedAt && run.startedAt > turn.endedAt + 5000) continue;
 		if (nextStart && run.startedAt >= nextStart - 250) continue;
+		if (nextInRun(run)) continue;
 		if (!best || run.startedAt > best.startedAt) best = run;
 	}
 	return best;
@@ -727,11 +744,14 @@ export const INTERRUPT_ENTRY = "web-interrupt";
  * saved transcript, so a reopened chat shows the same thing) and reports the run as "redirected". Chats saved before
  * that marker existed fall back to timing: the next message starting right where this turn's last entry was saved (a
  * person pressing Stop and then typing takes far longer). Only saved entries count there: a reply still on the page
- * carries the time it started, which for a long answer is long before the stop.
+ * carries the time it started, which for a long answer is long before the stop. A message queued before a Stop is saved
+ * right after it too, but it is not answered: its one last turn inherits the cancellation (agent-session.ts), while an
+ * interrupting message gets its answer.
  */
 const INTERRUPT_GAP_MS = 3_000;
 export function interruptedByNext(turn, next) {
 	if (turn?.interrupted) return true;
+	if (next?.lastAssistant?.stopReason === "aborted") return false;
 	const sentAt = next?.user?.ts;
 	const last = turn?.items?.[turn.items.length - 1];
 	if (!sentAt || !last?.id || last.liveId) return false;
@@ -740,7 +760,8 @@ export function interruptedByNext(turn, next) {
 }
 
 export function turnDuration(turn, run) {
-	if (run?.startedAt && run?.endedAt) return run.endedAt - run.startedAt;
+	// A run can hold earlier turns (runForTurn): this turn's share starts with the turn.
+	if (run?.startedAt && run?.endedAt) return run.endedAt - Math.max(run.startedAt, turn.startedAt || 0);
 	if (turn.startedAt && turn.endedAt && turn.endedAt > turn.startedAt) return turn.endedAt - turn.startedAt;
 	return 0;
 }

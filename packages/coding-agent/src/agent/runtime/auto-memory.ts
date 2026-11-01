@@ -110,7 +110,7 @@ interface AutoMemoryManagerOptions {
 	agentDir?: string;
 	dataRoot?: string;
 	workspaceId?: string;
-	onError?: (operation: "recall" | "extract" | "consolidate", error: Error) => void;
+	onError?: (operation: "recall" | "pick" | "extract" | "consolidate", error: Error) => void;
 	onStatus?: (status: MemoryMaintenanceStatus) => void;
 	modelRunner?: AutoMemoryModelRunner;
 }
@@ -132,6 +132,8 @@ export type AutoMemoryModelRunner = (options: {
 	settings: Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">>;
 	systemPrompt: string;
 	task: string;
+	/** Set for a request someone is waiting on: it ends with this signal and is not retried. */
+	urgent?: { signal: AbortSignal; timeoutMs: number };
 }) => Promise<string>;
 
 // 10KB 只算正文（标题摘要等头不计），常驻画像整篇也按这个来；普通条目仍要求写短。
@@ -256,6 +258,29 @@ const CONSOLIDATION_BATCH_SIZE = 20;
 // 词面排序保证的最低条数：阈值之外的最佳匹配也至少带这么多，保证“找得到”。
 // 用户拍板：保底 8 条（上下文开销最大一档）。触发词直达（最多 3 条）不计入此数。
 const MEMORY_SELECTION_GUARANTEED = 8;
+// Word pairs too common to say anything about a memory: on their own they only ever matched by accident.
+const MEMORY_RANKING_STOP_TERMS = new Set(
+	"什么 为什 怎么 这个 那个 一个 一下 不是 就是 可以 现在 在哪 哪儿 不用 有没 没有 是不 我的 我们 你的 你们 他们 这些 那些 这样 那样 还是 但是 因为 所以 如果 然后 还有 时候 的话 来着 一直 么我 么样 多少 哪个 哪些 怎样 最近 今天 这里 那里 知道 看看 帮我 给我 告诉 问题 东西 感觉 觉得 应该 需要 能够 大概 真的 到底 是否 已经 之前 之后 是啥 啥意 意思 你现 我这 这两 这么 那么 一样 比较 时复 复用 用户".split(
+		" ",
+	),
+);
+// A word found in more than this share of the memories does not help to tell them apart. With only a few memories
+// every word is in a large share of them, so the rule starts at ten.
+const RANKING_MAX_DOCUMENT_SHARE = 0.4;
+const RANKING_MIN_MEMORIES_FOR_SHARE = 10;
+// How many memories one turn's recall sends in full, however they were chosen.
+const RECALL_MAX_CARDS = 5;
+// The picked cards always get this much, even when the profile and the directory use up the total budget.
+const RECALL_CARD_TOKEN_FLOOR = 2500;
+// The Memory picker holds up the message. On GLM 5.3 flash with low effort really sent, 95% of 128 real picks finished within 5 s (median 2.4 s).
+const MEMORY_PICKER_TIMEOUT_MS = 5000;
+// After this many failed picks in a row the next messages stop waiting for the picker for a while.
+const MEMORY_PICKER_FAILURES_BEFORE_PAUSE = 2;
+const MEMORY_PICKER_PAUSE_MS = 60_000;
+// What the picker is sent, at most: the newest memories win when there are more than this holds (about 800 rows).
+const MEMORY_PICKER_DIRECTORY_TOKEN_BUDGET = 40_000;
+const MEMORY_PICKER_MESSAGE_TOKEN_BUDGET = 2000;
+const MEMORY_PICKER_DEFAULT_THINKING = "low";
 // 候选矛盾对上限：整理时喂给整理器的本地启发式候选，最多列这么多对，由模型核实。
 const MEMORY_CONTRADICTION_PAIR_LIMIT = 10;
 const CONSOLIDATION_MIN_CHANGES = 5;
@@ -339,6 +364,7 @@ export const AUTO_MEMORY_SYSTEM_PROMPT = loadSystemPrompt("session/auto-memory.m
 const MEMORY_EXTRACTOR_PROMPT = loadSystemPrompt("memory/extractor.md");
 
 const MEMORY_CONSOLIDATOR_PROMPT = loadSystemPrompt("memory/consolidator.md");
+const MEMORY_PICKER_PROMPT = loadSystemPrompt("memory/picker.md");
 
 function resolveProjectRoot(cwd: string): string {
 	try {
@@ -661,25 +687,77 @@ function memoryFingerprint(entry: MemoryEntry): string {
 	return `${entry.scope}:${entry.content.replace(/\s+/g, " ").trim().toLowerCase()}`;
 }
 
-/** TF-IDF relevance of every entry that shares a term with the query, times its importance weight, best first. */
-function rankLexically(queryTerms: Set<string>, entries: MemoryEntry[]): Array<{ entry: MemoryEntry; score: number }> {
-	if (queryTerms.size === 0) return [];
-	const documents = entries.map((entry) => ({
-		entry,
-		terms: lexicalTerms(`${entry.name}\n${entry.description}\n${entry.content}`),
-	}));
+/** The words of a text for ranking: Latin words whole, Han text in two-character pieces, without the stop pairs. */
+function rankingTerms(text: string): string[] {
+	const lower = text.toLowerCase();
+	// A full stop after the last word of a sentence is not part of that word; the + of c++ is.
+	const terms = (lower.match(/[a-z0-9][a-z0-9._+-]*/g) ?? [])
+		.map((word) => word.replace(/[._-]+$/, ""))
+		.filter((word) => word.length >= 2);
+	for (const run of lower.match(/\p{Script=Han}+/gu) ?? []) {
+		const characters = [...run];
+		for (let index = 0; index + 1 < characters.length; index++) {
+			const pair = `${characters[index]}${characters[index + 1]}`;
+			if (!MEMORY_RANKING_STOP_TERMS.has(pair)) terms.push(pair);
+		}
+	}
+	return terms;
+}
+
+function countTerms(terms: readonly string[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const term of terms) counts.set(term, (counts.get(term) ?? 0) + 1);
+	return counts;
+}
+
+/**
+ * BM25 relevance of every entry that shares a term with the query, times its importance weight, best first. A match in
+ * the name counts three times and in the description twice, and a word most memories contain is not used at all. The
+ * score is relative to a perfect match on all the query's words, so it can be compared between queries.
+ */
+function rankLexically(query: string, entries: MemoryEntry[]): Array<{ entry: MemoryEntry; score: number }> {
+	const documents = entries.map((entry) => {
+		const name = rankingTerms(entry.name);
+		const description = rankingTerms(entry.description);
+		const content = rankingTerms(entry.content);
+		return {
+			entry,
+			fields: [
+				[countTerms(name), 3],
+				[countTerms(description), 2],
+				[countTerms(content), 1],
+			] as const,
+			length: name.length + description.length + content.length,
+			terms: new Set([...name, ...description, ...content]),
+		};
+	});
+	if (documents.length === 0) return [];
+	const averageLength = documents.reduce((sum, document) => sum + document.length, 0) / documents.length || 1;
 	const frequencies = new Map<string, number>();
 	for (const document of documents) {
-		for (const term of queryTerms)
-			if (document.terms.has(term)) frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
+		for (const term of document.terms) frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
 	}
+	const count = documents.length;
+	const queryTerms = [...new Set(rankingTerms(query))].filter(
+		(term) =>
+			count < RANKING_MIN_MEMORIES_FOR_SHARE || (frequencies.get(term) ?? 0) / count <= RANKING_MAX_DOCUMENT_SHARE,
+	);
+	const rarity = (term: string): number => {
+		const frequency = frequencies.get(term) ?? 0;
+		return Math.log(1 + (count - frequency + 0.5) / (frequency + 0.5));
+	};
+	const perfect = queryTerms.reduce((sum, term) => sum + rarity(term), 0) || 1;
 	return documents
-		.map(({ entry, terms: documentTerms }) => {
+		.map(({ entry, fields, length }) => {
 			let score = 0;
 			for (const term of queryTerms) {
-				if (documentTerms.has(term)) score += Math.log(1 + entries.length / (frequencies.get(term) ?? 1));
+				let weighted = 0;
+				for (const [counts, weight] of fields) weighted += weight * (counts.get(term) ?? 0);
+				if (weighted > 0) {
+					score += (rarity(term) * (weighted * 2.2)) / (weighted + 1.2 * (0.25 + (0.75 * length) / averageLength));
+				}
 			}
-			return { entry, score: (score / Math.sqrt(Math.max(1, documentTerms.size))) * importanceWeight(entry) };
+			return { entry, score: (score / perfect) * importanceWeight(entry) };
 		})
 		.filter(({ score }) => score > 0)
 		.sort((a, b) => b.score - a.score || b.entry.updatedAt.localeCompare(a.entry.updatedAt));
@@ -693,9 +771,10 @@ function compactForMatch(text: string): string {
 }
 
 /**
- * How many of an entry's trigger phrases the query matches. A Chinese phrase matches when the whole phrase is
- * contained in the query or enough of its two-character groups are; a Latin phrase matches when every one of its
- * words is a whole word of the query, so a short abbreviation does not fire inside an unrelated word.
+ * How many of an entry's trigger phrases the query matches. A Chinese phrase matches when the whole phrase (at least
+ * three characters) is in the query; shared word pairs are not enough, they put unrelated memories first. A Latin phrase
+ * matches when every one of its words is a whole word of the query, so a short abbreviation does not fire inside an
+ * unrelated word.
  */
 function countTriggerHits(entry: MemoryEntry, queryCompact: string, queryTerms: Set<string>): number {
 	let hits = 0;
@@ -707,15 +786,40 @@ function countTriggerHits(entry: MemoryEntry, queryCompact: string, queryTerms: 
 			continue;
 		}
 		const compact = compactForMatch(trigger);
-		if (compact.length >= 2 && queryCompact.includes(compact)) {
-			hits++;
-			continue;
-		}
-		let overlap = 0;
-		for (const term of triggerTerms) if (queryTerms.has(term)) overlap++;
-		if (overlap >= Math.max(2, Math.ceil(triggerTerms.size / 2))) hits++;
+		if (compact.length >= 3 && queryCompact.includes(compact)) hits++;
 	}
 	return hits;
+}
+
+const oneLine = (value: string): string => value.replace(/\s+/g, " ").trim();
+
+/**
+ * The memories the Memory picker is shown, oldest first: a new memory joins at the end, so the long start of the request
+ * stays the same from message to message and the provider's prompt cache can serve it.
+ */
+function memoryPickerRows(pool: readonly MemoryEntry[]): MemoryEntry[] {
+	let tokens = 0;
+	const newestFirst = [...pool].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+	const shown = newestFirst.filter((entry) => {
+		tokens += estimateMemoryTokens(`${entry.name} | ${entry.description}\n`);
+		return tokens <= MEMORY_PICKER_DIRECTORY_TOKEN_BUDGET;
+	});
+	return shown.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+}
+
+/** The numbers in the picker's answer, as far as they point at a row and within the limit; undefined if there is no list. */
+function parseMemoryPick(output: string, rows: number): number[] | undefined {
+	const json = output.match(/\{[\s\S]*\}/)?.[0];
+	if (!json) return undefined;
+	let ids: unknown;
+	try {
+		ids = (JSON.parse(json) as { ids?: unknown }).ids;
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(ids)) return undefined;
+	const valid = ids.map(Number).filter((number) => Number.isInteger(number) && number >= 1 && number <= rows);
+	return [...new Set(valid)].slice(0, RECALL_MAX_CARDS);
 }
 
 export interface MemorySelection {
@@ -744,8 +848,8 @@ export interface MemorySelectionOptions {
  *
  * 1. Trigger route: entries whose trigger phrases match the query come first, most matches first, at most three,
  *    and are exempt from the relative-score cut of the second step.
- * 2. Lexical route: the existing TF-IDF relevance, multiplied by the importance weight (high 1.3, normal 1, low 0.7),
- *    keeping entries within half of the best weighted score.
+ * 2. Lexical route: the BM25 relevance of `rankLexically`, multiplied by the importance weight (high 1.3, normal 1,
+ *    low 0.7), keeping entries within half of the best weighted score.
  * 3. Guarantee: the best lexical matches below the cut are still kept until `guaranteed` (default 8) lexical
  *    entries are selected, so a paraphrased query still finds something. Only ranked (score > 0) entries qualify.
  * 4. Entries with the same body are listed once. The resident profile is skipped here: it is sent every turn.
@@ -758,7 +862,7 @@ export function selectMemoriesForQuery(
 	const pool = entries.filter((entry) => !isMemoryProfile(entry) && (!options.scope || entry.scope === options.scope));
 	const queryTerms = lexicalTerms(query);
 	const queryCompact = compactForMatch(query);
-	const lexical = rankLexically(queryTerms, pool);
+	const lexical = rankLexically(query, pool);
 	const lexicalScores = new Map(lexical.map(({ entry, score }) => [entry, score]));
 	const selected: MemorySelection[] = [];
 	const seen = new Set<string>();
@@ -1038,6 +1142,8 @@ export class AutoMemoryManager {
 	private readonly reportedErrors = new Set<string>();
 	/** 连续整理失败轮数：成功（含 noop）即清零；连续 3 轮才亮黄灯（降噪），灯上带最近失败原因。 */
 	private consolidationFailureStreak = 0;
+	private memoryPickerFailures = 0;
+	private memoryPickerPausedUntil = 0;
 	private backgroundQueue: Promise<void> = Promise.resolve();
 	private readonly disposeController = new AbortController();
 	private disposed = false;
@@ -1557,7 +1663,7 @@ export class AutoMemoryManager {
 		if (this.maintenanceStatus.phase === "warning") this.setMaintenanceStatus({ phase: "idle" });
 	}
 
-	private reportError(operation: "recall" | "extract" | "consolidate", error: unknown): void {
+	private reportError(operation: "recall" | "pick" | "extract" | "consolidate", error: unknown): void {
 		this.logMaintenance("error", { operation, ...describeMaintenanceError(error) });
 		const normalized = error instanceof Error ? error : new Error(String(error));
 		const key = `${operation}:${normalized.message}`;
@@ -1612,10 +1718,12 @@ export class AutoMemoryManager {
 			throw new Error(`Auto Memory 找不到已配置模型：${parameters.settings.provider}/${parameters.settings.model}`);
 		}
 
+		const urgent = parameters.urgent;
 		const abortController = new AbortController();
 		const onDispose = () => abortController.abort();
 		this.disposeController.signal.addEventListener("abort", onDispose, { once: true });
-		const timeout = setTimeout(() => abortController.abort(), AUTO_MEMORY_TIMEOUT_MS);
+		urgent?.signal.addEventListener("abort", onDispose, { once: true });
+		const timeout = setTimeout(() => abortController.abort(), urgent?.timeoutMs ?? AUTO_MEMORY_TIMEOUT_MS);
 		try {
 			const retry = this.options.settingsManager.getProviderRetrySettings();
 			const response = await runtime.completeSimple(
@@ -1633,9 +1741,10 @@ export class AutoMemoryManager {
 				{
 					reasoning: helperReasoning(model, parameters.settings.thinkingLevel),
 					signal: abortController.signal,
-					timeoutMs: sdkFirstByteTimeoutMs(model, this.options.settingsManager),
-					maxRetries: retry.maxRetries,
+					timeoutMs: urgent?.timeoutMs ?? sdkFirstByteTimeoutMs(model, this.options.settingsManager),
+					maxRetries: urgent ? 0 : retry.maxRetries,
 					maxRetryDelayMs: retry.maxRetryDelayMs,
+					...(urgent ? { temperature: 0 } : {}),
 					// 不写死输出上限：与主聊天一致走 provider 默认（思考与正文共用该预算）。
 					// Lets provider-level session headers (e.g. `x-opencode-session`) ride the
 					// conversation ID, like foreground chats do.
@@ -1690,6 +1799,72 @@ export class AutoMemoryManager {
 		} finally {
 			clearTimeout(timeout);
 			this.disposeController.signal.removeEventListener("abort", onDispose);
+			urgent?.signal.removeEventListener("abort", onDispose);
+		}
+	}
+
+	/**
+	 * Which memories the Memory picker model chooses for this message, best first. Undefined when the picker is off, has
+	 * no model, is paused after failures or fails now: the caller then uses the local ranking. An empty list is an answer.
+	 */
+	private async pickMemories(
+		query: string,
+		pool: readonly MemoryEntry[],
+		signal: AbortSignal | undefined,
+	): Promise<MemoryEntry[] | undefined> {
+		const configured = this.options.settingsManager.getMemoryPickerSettings();
+		if (!configured.enabled || !configured.provider || !configured.model) return undefined;
+		if (pool.length === 0 || signal?.aborted || Date.now() < this.memoryPickerPausedUntil) return undefined;
+		let message: string;
+		try {
+			message = truncateToTokenBudget(sanitizeMemoryText(query), MEMORY_PICKER_MESSAGE_TOKEN_BUDGET);
+		} catch {
+			// A message with a private key in it stays on this computer.
+			return undefined;
+		}
+		const rows = memoryPickerRows(pool);
+		const deadline = new AbortController();
+		const onAbort = () => deadline.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(onAbort, MEMORY_PICKER_TIMEOUT_MS);
+		const ended = new Promise<never>((_resolve, reject) => {
+			deadline.signal.addEventListener("abort", () => reject(new Error("Memory picker timed out")), { once: true });
+		});
+		try {
+			// Racing the deadline too: a provider that ignores the abort must not hold up the message.
+			const output = await Promise.race([
+				ended,
+				this.runModel({
+					cwd: this.options.cwd,
+					settings: {
+						provider: configured.provider,
+						model: configured.model,
+						thinkingLevel: configured.thinkingLevel ?? MEMORY_PICKER_DEFAULT_THINKING,
+					},
+					systemPrompt: MEMORY_PICKER_PROMPT,
+					task: `Saved memories (number | name | when it applies):\n${rows.map((entry, index) => `${index + 1} | ${oneLine(entry.name)} | ${oneLine(entry.description)}`).join("\n")}\n\nUser's message:\n${message}`,
+					urgent: { signal: deadline.signal, timeoutMs: MEMORY_PICKER_TIMEOUT_MS },
+				}),
+			]);
+			const numbers = parseMemoryPick(output, rows.length);
+			if (!numbers) throw new Error(`Memory picker answered without a list of memories: ${output.slice(0, 200)}`);
+			this.memoryPickerFailures = 0;
+			return numbers.map((number) => rows[number - 1]);
+		} catch (error) {
+			if (signal?.aborted || this.disposed) return undefined;
+			this.memoryPickerFailures += 1;
+			if (this.memoryPickerFailures >= MEMORY_PICKER_FAILURES_BEFORE_PAUSE) {
+				this.memoryPickerPausedUntil = Date.now() + MEMORY_PICKER_PAUSE_MS;
+			}
+			// A slow answer now and then is expected and costs nothing but the better pick; anything else needs fixing.
+			if (deadline.signal.aborted)
+				this.logMaintenance("memory-picker-timeout", { timeoutMs: MEMORY_PICKER_TIMEOUT_MS });
+			else this.reportError("pick", error);
+			return undefined;
+		} finally {
+			clearTimeout(timer);
+			deadline.abort();
+			signal?.removeEventListener("abort", onAbort);
 		}
 	}
 
@@ -1705,8 +1880,9 @@ export class AutoMemoryManager {
 	 * 本轮的召回消息。`earlier` 是模型上下文里已有的召回消息的 details（按顺序）：给了就只发上下文里还没有的部分
 	 * （规矩头只发一次、画像变了才重发、目录只发增删改的行、已发过且内容没变的卡片不再发），没有新东西时返回
 	 * undefined。这样旧召回可以一直留在上下文里，前缀不变，下一轮能命中供应商的提示缓存。不给时发完整召回。
+	 * `signal` 结束正在等的 Memory picker 请求（用户按了停止）。
 	 */
-	async recall(query: string, earlier?: readonly unknown[]): Promise<CustomMessage | undefined> {
+	async recall(query: string, earlier?: readonly unknown[], signal?: AbortSignal): Promise<CustomMessage | undefined> {
 		if (this.disposed) return undefined;
 		const settings = this.getSettings();
 		if (!settings) return undefined;
@@ -1720,16 +1896,24 @@ export class AutoMemoryManager {
 		}
 		if (candidates.length === 0) return undefined;
 
-		// Recall must never delay sending the user's message. The selected model is
-		// still used for background extraction and consolidation; retrieval itself
-		// is a bounded local operation that only reads. The resident user profile, when it exists, goes
-		// first on every turn; the query only ranks the other memories.
+		// The Auto Memory model is for background extraction and consolidation only. The cards come from the Memory picker
+		// when it is on and answers within its time limit, else from the local ranking, which only reads. The resident
+		// user profile, when it exists, goes first on every turn; the query only chooses among the other memories.
 		let selected: MemoryEntry[];
 		try {
 			const profile = candidates.find(isMemoryProfile);
+			const picked = await this.pickMemories(
+				query,
+				candidates.filter((entry) => !isMemoryProfile(entry)),
+				signal,
+			);
 			selected = [
 				...(profile ? [profile] : []),
-				...selectMemoriesForQuery(query, candidates).map(({ entry }) => entry),
+				...(picked ??
+					selectMemoriesForQuery(query, candidates, {
+						guaranteed: RECALL_MAX_CARDS,
+						limit: RECALL_MAX_CARDS,
+					}).map(({ entry }) => entry)),
 			];
 		} catch (error) {
 			this.reportError("recall", error);
@@ -1812,8 +1996,11 @@ export class AutoMemoryManager {
 			details.directory = { full: true, rows: full.rows, ...(full.cut !== undefined ? { cut: full.cut } : {}) };
 		if (directoryText) sections.push(directoryText);
 
-		// 卡片额度按整份画像与目录计算，所以每轮新发的内容不会比以前多。
-		const budget = RECALL_TOTAL_TOKEN_BUDGET - profileTokens - estimateMemoryTokens(full.text);
+		// 卡片额度按整份画像与目录计算，但至少留够选中的几张，不会因为画像和目录占满就一张也发不出去。
+		const budget = Math.max(
+			RECALL_CARD_TOKEN_FLOOR,
+			RECALL_TOTAL_TOKEN_BUDGET - profileTokens - estimateMemoryTokens(full.text),
+		);
 		let cardTokens = 0;
 		const sentCards: Record<string, string> = {};
 		for (const entry of cards) {

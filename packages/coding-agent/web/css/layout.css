@@ -45,6 +45,7 @@
 .nav-btn { display: flex; align-items: center; gap: 8px; height: var(--h-row); padding: 0 8px; border-radius: var(--r-md); color: var(--text-2); width: 100%; text-align: left; transition: background var(--t-fast) var(--ease), color var(--t-fast); }
 .nav-btn:hover { background: var(--surface-hover); color: var(--text); }
 .nav-btn.primary-nav { color: var(--text); font-weight: 550; }
+.nav-btn.on, .nav-btn.on:hover { background: var(--surface-select); color: var(--text); }
 .nav-btn .kbd { margin-left: auto; opacity: 0; transition: opacity var(--t-fast); }
 .nav-btn:hover .kbd { opacity: 1; }
 /* The hover-only shortcut hint keeps its room while invisible: in a narrow sidebar it gives way entirely, so a longer
@@ -77,6 +78,7 @@
 .ws-row .actions { display: flex; gap: 0; opacity: 0; transition: opacity var(--t-fast); }
 .ws-row:hover .actions, .ws-row:focus-within .actions { opacity: 1; }
 .ws-row .ws-unread { margin-left: -2px; }
+.ws-row .ws-count { flex: none; font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 /* A workspace whose folder was removed: a weak low-saturation mark beside its name. Theme tokens only
    (--warn adapts to all three schemes); transform + opacity over --t-base keeps the existing motion language. */
 .ws-missing { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 16px; height: 16px; margin-left: 2px; color: var(--warn); opacity: 0.65; transition: opacity var(--t-base) var(--ease), transform var(--t-base) var(--ease); animation: fade-in var(--t-base) var(--ease); }
@@ -89,6 +91,10 @@
 .chat-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) 44px; align-items: center; height: var(--h-row); padding: 0 4px 0 22px; border-radius: var(--r-md); cursor: pointer; color: var(--text-2); position: relative; transition: background var(--t-fast), color var(--t-fast), box-shadow var(--t-fast); }
 .chat-row:hover { background: var(--surface-hover); color: var(--text); }
 .chat-row.current { background: var(--surface-select); color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
+/* The Scheduled tasks page covers the chat: the page's own button is what is selected now, and the chat's row is a row
+   like any other (a click on it goes back to the chat). */
+.sidebar.page-open .chat-row.current { box-shadow: inset 0 0 0 var(--accent); }
+.sidebar.page-open .chat-row.current:not(:hover) { background: transparent; color: var(--text-2); }
 /* The one status slot, at the head of the row and always 16px wide (the title still starts where it always did).
    Every glyph shares the same grid cell and fades through `.leaving`; colours are theme tokens only (--accent, the
    spinner's --border-strong ring, --accent-line glow), so all three schemes restyle the indicator together. */
@@ -163,6 +169,15 @@
 .main-header { display: flex; align-items: center; gap: 6px; height: 44px; padding: 0 10px 0 14px; flex: none; border-bottom: 1px solid var(--border); }
 /* Project sources page (sources-page.js): covers the conversation area, which stays mounted (and running) below it. */
 .sources-page { position: absolute; inset: 0; z-index: 50; display: flex; flex-direction: column; background: var(--bg-panel); animation: fade-only var(--t-base) var(--ease) both; }
+/* Scheduled tasks page (schedules.js), the same place. It fades in while its content rises a little, and leaves a bit
+   faster than it came: only opacity and transform move, so nothing is laid out again on the way. */
+.schedules-page { position: absolute; inset: 0; z-index: 50; display: flex; flex-direction: column; background: var(--bg-panel); opacity: 0; transition: opacity var(--t-fast) var(--ease); }
+/* The column keeps its width and place, and the scrollbar sits at the page's edge: an editor that grows past the page
+   gets a scrollbar without moving anything. */
+.schedules-page > .sources-body { max-width: none; margin: 0; padding-inline: max(20px, calc((100% - 720px) / 2)); scrollbar-gutter: stable; transform: translateY(8px); transition: transform var(--t-fast) var(--ease); }
+.schedules-page.shown { opacity: 1; transition-duration: var(--t-base); }
+.schedules-page.shown > .sources-body { transform: none; transition-duration: var(--t-slow); }
+.schedules-page:not(.shown) { pointer-events: none; }
 .sources-head { padding-left: 8px; border-bottom-color: var(--border); }
 .sources-title { min-width: 0; font-weight: 650; }
 .sources-kind { flex: none; font-size: var(--fs-sm); }

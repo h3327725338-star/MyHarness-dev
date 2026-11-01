@@ -4,15 +4,12 @@ workflow 总览见[根目录的 GitHub 自动化维护文档](../docs/maintenanc
 
 ## 正式 CI baseline
 
-`.github/workflows/ci.yml` 的 `build-check-test` job 使用固定 matrix：
+`.github/workflows/ci.yml` 的 `build-check-test` job 固定使用 `windows-2025`。
 
-- `windows-2022`
-- `windows-2025`
-
-两边都是 GitHub-hosted Windows x64 runner，每次正常 push / pull request 触发都
-执行相同的 `npm ci --ignore-scripts`、release/privacy audit、`ffmpeg-static`
-rebuild、build、check、fd/ripgrep 安装和 test 流程；两边必须同时通过。不得使用
-`windows-latest`，也不在这条正式 CI baseline 中加入 Linux/macOS job。
+这是 GitHub-hosted Windows x64 runner，每次正常 push / pull request 触发都执行
+`npm ci --ignore-scripts`、release/privacy audit、`ffmpeg-static` rebuild、build、
+check、fd/ripgrep 安装和 test 流程。不得使用 `windows-latest`，也不在这条正式 CI
+baseline 中加入 Linux/macOS job。
 
 这是 GitHub Windows Server 自动化 baseline，不是用户平台支持矩阵。MyHarness 面向
 Windows 桌面 x64；不能据此写成“只支持 Windows Server”，也不能声称已经逐一验证

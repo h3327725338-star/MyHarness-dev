@@ -1,6 +1,7 @@
 import {
 	type Api,
 	type ApiKeyAuth,
+	type ApiKeyCredential,
 	type AssistantMessageEventStream,
 	type AuthContext,
 	type AuthInteraction,
@@ -20,6 +21,7 @@ import {
 	type StreamOptions,
 } from "@myharness/ai";
 import { getApiProvider } from "@myharness/ai/compat";
+import type { UpperLayerCredential } from "../credentials/runtime.ts";
 import {
 	clearConfigValueCache,
 	getConfigValueEnvVarNames,
@@ -210,9 +212,11 @@ function applyModelsJson(
 	}));
 	for (const definition of config.models ?? []) {
 		const existingIndex = models.findIndex((model) => model.id === definition.id);
-		const defaults = existingIndex >= 0 ? models[existingIndex] : models[0];
+		// Under the layered rule nothing is borrowed from another model: a value no layer set is reported, not guessed.
+		const defaults = existingIndex >= 0 ? models[existingIndex] : config.layered ? undefined : models[0];
 		// Without an address there is nothing to send a request to: the model stays in models.json but is not offered.
 		if (!(definition.baseUrl ?? config.baseUrl ?? defaults?.baseUrl)) continue;
+		if (config.layered && !(definition.api ?? config.api ?? defaults?.api)) continue;
 		const model = modelFromJson(providerId, definition, config, defaults);
 		if (existingIndex >= 0) models[existingIndex] = model;
 		else models.push(model);
@@ -291,8 +295,16 @@ function configuredApiKey(
 	return extension?.apiKey ?? (config?.authMode === "apiKey" ? undefined : config?.apiKey);
 }
 
-/** `authMode: "config"`: the key written in models.json is used even when a key is saved in the credential store. */
-function prefersConfiguredKey(config: ModelsJsonProvider | undefined, rawKey: string | undefined): boolean {
+/**
+ * `authMode: "config"`: the key written in models.json is used even when a key is saved in the credential store. A key
+ * set for the whole provider group still wins over it, as every value of an upper layer does.
+ */
+function prefersConfiguredKey(
+	config: ModelsJsonProvider | undefined,
+	rawKey: string | undefined,
+	credential: ApiKeyCredential | undefined,
+): boolean {
+	if ((credential as UpperLayerCredential | undefined)?.upperLayer) return false;
 	return config?.authMode === "config" && rawKey !== undefined;
 }
 
@@ -349,7 +361,7 @@ function composeApiKeyAuth(
 				key: await interaction.prompt({ type: "secret", message: "Enter API key" }),
 			})),
 		check: async (input) => {
-			if (input.credential && !prefersConfiguredKey(config, rawKey)) {
+			if (input.credential && !prefersConfiguredKey(config, rawKey, input.credential)) {
 				if (inherited?.check) return inherited.check(input);
 				if (input.credential.key) return { type: "api_key", source: "stored credential" };
 				const resolved = await inherited?.resolve(input);
@@ -369,7 +381,7 @@ function composeApiKeyAuth(
 		},
 		resolve: async (input) => {
 			let result: AuthResult | undefined;
-			if (input.credential && !prefersConfiguredKey(config, rawKey)) {
+			if (input.credential && !prefersConfiguredKey(config, rawKey, input.credential)) {
 				result = inherited
 					? await inherited.resolve(input)
 					: input.credential.key

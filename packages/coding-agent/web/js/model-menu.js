@@ -37,10 +37,11 @@ export function modelRefLabel(models, ref) {
  * - models: the GET /api/models answer (null while loading)
  * - selected: { provider, model } of the current choice (empty = the main model)
  * - mainOption: offer "Use the main model" first
+ * - mainLabel: what that first row is called when choosing it means something else (no model at all)
  * - onPick({ provider, model }), onPickMain()
  * - disabled: rows can be looked at but not chosen
  */
-export function ModelMenu({ models, selected, mainOption, onPick, onPickMain, disabled, footer, fullText = false }) {
+export function ModelMenu({ models, selected, mainOption, mainLabel, onPick, onPickMain, disabled, footer, fullText = false }) {
 	const [query, setQuery] = useState("");
 	const rows = useMemo(() => {
 		const list = searchModels(models?.providers, query).map(({ provider, model }) => ({ key: keyOf(provider.id, model.id), provider, model }));
@@ -84,8 +85,8 @@ export function ModelMenu({ models, selected, mainOption, onPick, onPickMain, di
 				const cls = `pop-item model-row ${row.key === hiRow?.key ? "hi" : ""} ${on ? "active" : ""}`;
 				const hover = (e) => row.key !== hiRow?.key && pointerMoved(e) && setHi(row.key);
 				if (row.main) {
-					return html`<button key="main" role="option" aria-selected=${on} class=${cls} disabled=${disabled} onMouseMove=${hover} onClick=${() => pickRow(row)} title=${t("Same model and thinking effort as the main chat")}>
-						<span class=${`${fullText ? "model-menu-full-text" : "truncate"} grow`}>${t("Use the main model")}</span>
+					return html`<button key="main" role="option" aria-selected=${on} class=${cls} disabled=${disabled} onMouseMove=${hover} onClick=${() => pickRow(row)} title=${mainLabel || t("Same model and thinking effort as the main chat")}>
+						<span class=${`${fullText ? "model-menu-full-text" : "truncate"} grow`}>${mainLabel || t("Use the main model")}</span>
 						${on ? html`<${Icon} name="check" size=${13} class="model-row-check" />` : null}
 					</button>`;
 				}
@@ -203,6 +204,7 @@ export function EffortSlider({ levels, value, onChange, disabled, autoFocus, onD
  * which keep the effort a new chat has ("chat").
  */
 export function jobDefaultEffort(jobId, levels) {
+	if (jobId === "memoryPicker" && levels.includes("low")) return "low";
 	return jobId === "scheduledTasks" ? "chat" : levels.at(-1);
 }
 
@@ -239,14 +241,15 @@ export function EffortPicker({ levels, value, onChange, disabled, placement = "t
 /**
  * The model of a helper-model setting, with its effort next to it. `value` is { provider, model, thinkingLevel };
  * choosing "Use the main model" clears all three, so the model and its effort are both inherited. `jobId` names the
- * setting, for what its "Default" effort stands for (jobDefaultEffort).
+ * setting, for what its "Default" effort stands for (jobDefaultEffort). `noModelLabel` names the empty choice for a
+ * setting where no model does not mean the main model.
  */
-export function ModelRefPicker({ models, value, onChange, disabled, label, jobId }) {
+export function ModelRefPicker({ models, value, onChange, disabled, label, jobId, noModelLabel }) {
 	const anchor = useRef(null);
 	const [open, setOpen] = useState(false);
 	const v = value || {};
 	// The same name the composer's model chip shows (a renamed model reads the same everywhere); the ID is the tooltip.
-	const text = modelRefName(models, v);
+	const text = !v.model && noModelLabel ? noModelLabel : modelRefName(models, v);
 	const title = v.model || text;
 	const levels = modelEfforts(findModel(models, v.provider, v.model));
 	return html`<span class="model-ref">
@@ -256,7 +259,7 @@ export function ModelRefPicker({ models, value, onChange, disabled, label, jobId
 				<${Chevron} />
 			</button>
 			<${Popover} anchor=${anchor} open=${open} onClose=${() => setOpen(false)} placement="bottom" align="end" width=${360} maxHeight=${360} class="model-pop model-ref-pop">
-				<${ModelMenu} models=${models} selected=${v} mainOption fullText
+				<${ModelMenu} models=${models} selected=${v} mainOption mainLabel=${noModelLabel} fullText
 					onPickMain=${() => (setOpen(false), onChange({ provider: undefined, model: undefined, thinkingLevel: undefined }))}
 					onPick=${(ref) => (setOpen(false), onChange({ ...ref, thinkingLevel: undefined }))} />
 			<//>

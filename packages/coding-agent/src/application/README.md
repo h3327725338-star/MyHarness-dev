@@ -30,6 +30,8 @@
 | `provider-settings.ts` | `ProviderSettingsUseCase`：Provider 启用/禁用后同步当前模型 | `agent/runtime`、`config/settings` |
 | `nebius-setup.ts` | `NebiusSetupUseCase`：用一个 Token Factory Key 配好 Nebius——读取账户模型列表核对 Key、写入 `models.json`、保存 Key、给还没有自己模型的工作配模型（主模型和提交说明用 DeepSeek V4.1 Flash 1017，其余用 Nemotron 模型；主模型只在没有可用主模型时设置） | `providers/models`、`providers/credentials`、`config/settings`、`agent/runtime` |
 | `workspace-session.ts` | `WorkspaceSessionUseCase`：Workspace 下的 Session 列表、删除 | `session/manager`、`session/storage` |
+| `produced-files.ts` | 判断对话在项目文件夹里做出来的文件和文件夹（`write` 工具报告新建的，或创建时间落在对话工具运行期间的；整个新建的文件夹算一项）哪些可以随产出删除（之后被改过、Git 跟踪、可能是还留着的对话做的、够不到回收站的保留），并通过桌面端放进回收站 | `session/artifacts`、`session/memory`、`git/repository` |
+| `workspace-removal.ts` | 移除工作区时统计并删除选中的对话、产出和记忆，顺序为记忆、产出、逐个对话、最后放回收站；移除整个工作区时连同上传文件、工具输出和遗留文件夹一起删 | `session/artifacts`、`session/memory`、`session/storage` |
 
 每个用例通过自己的 `*Host` 接口或参数向前端要它需要的能力（显示状态、询问用户、切换会话目录），不直接导入任何前端代码。
 

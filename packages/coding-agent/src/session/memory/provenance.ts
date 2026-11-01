@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getWorkspaceSessionsDir, getWorkspacesDir, parseSessionDataPath } from "../../config/paths/index.ts";
+import { scanSessionLines } from "../storage/jsonl/line-scan.ts";
 import { SESSIONS_INDEX_FILE_NAME, SESSIONS_INDEX_VERSION } from "../storage/jsonl/sessions-index.ts";
-import { flushSessionWrites } from "../storage/jsonl/write-batch.ts";
 import { mapLimited } from "./store.ts";
 
 // A memory_write result is one JSONL line; only lines holding this exact text are parsed.
@@ -11,8 +11,6 @@ const NEEDLE = Buffer.from('"toolName":"memory_write"');
 // profile's first version (`已创建用户画像：`) is never a chat's own memory.
 const CREATED_LINE = /^已记住：([^\s（]+)（/u;
 const CHUNK_BYTES = 1024 * 1024;
-// Lines longer than this (pasted files, images) are skipped unread: a memory_write result is a few hundred bytes.
-const MAX_LINE_BYTES = 4 * 1024 * 1024;
 
 interface ParsedLine {
 	type?: unknown;
@@ -80,78 +78,16 @@ export interface MemoryWriteCreation {
  */
 export async function readMemoryWriteCreations(sessionPath: string): Promise<Map<string, MemoryWriteCreation>> {
 	const created = new Map<string, MemoryWriteCreation>();
-	flushSessionWrites(sessionPath);
-	let handle: fs.promises.FileHandle;
-	try {
-		handle = await fs.promises.open(sessionPath, "r");
-	} catch {
-		return created;
-	}
-	try {
-		const chunk = Buffer.allocUnsafe(CHUNK_BYTES);
-		let carry = Buffer.alloc(0);
-		let headerTime: number | undefined;
-		let headerRead = false;
-		let skipping = false;
-		const scan = (region: Buffer) => {
-			let from = 0;
-			if (!headerRead) {
-				const end = region.indexOf(10);
-				const header = region.subarray(0, end < 0 ? region.length : end).toString("utf8");
-				try {
-					const parsed = JSON.parse(header) as { type?: unknown; timestamp?: unknown };
-					const time =
-						parsed?.type === "session" && typeof parsed.timestamp === "string"
-							? Date.parse(parsed.timestamp)
-							: Number.NaN;
-					if (Number.isFinite(time)) headerTime = time;
-				} catch {
-					// No usable header: no entry is treated as inherited.
-				}
-				headerRead = true;
-				from = end < 0 ? region.length : end + 1;
-			}
-			for (let hit = region.indexOf(NEEDLE, from); hit >= 0; hit = region.indexOf(NEEDLE, from)) {
-				const start = region.lastIndexOf(10, hit) + 1;
-				const stop = region.indexOf(10, hit);
-				const end = stop < 0 ? region.length : stop;
-				const result = createdIds(region.subarray(start, end).toString("utf8"), headerTime);
-				for (const id of result?.ids ?? []) {
-					const creation = created.get(id) ?? { entryIds: [], chatStartedAt: headerTime };
-					if (result?.entryId) creation.entryIds.push(result.entryId);
-					if (result?.time !== undefined)
-						creation.lastResultAt = Math.max(creation.lastResultAt ?? 0, result.time);
-					created.set(id, creation);
-				}
-				from = end + 1;
-			}
-		};
-		for (;;) {
-			const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
-			if (bytesRead === 0) break;
-			let data = chunk.subarray(0, bytesRead);
-			if (skipping) {
-				const newline = data.indexOf(10);
-				if (newline < 0) continue;
-				data = data.subarray(newline + 1);
-				skipping = false;
-			}
-			const joined = carry.length ? Buffer.concat([carry, data]) : data;
-			const last = joined.lastIndexOf(10);
-			if (last >= 0) scan(joined.subarray(0, last));
-			carry = Buffer.from(joined.subarray(last + 1));
-			if (carry.length > MAX_LINE_BYTES) {
-				carry = Buffer.alloc(0);
-				skipping = true;
-				headerRead = true;
-			}
+	// An unreadable history proves nothing: what was found so far stands (deletion keeps the rest).
+	await scanSessionLines(sessionPath, [NEEDLE], (line, header) => {
+		const result = createdIds(line, header.time);
+		for (const id of result?.ids ?? []) {
+			const creation = created.get(id) ?? { entryIds: [], chatStartedAt: header.time };
+			if (result?.entryId) creation.entryIds.push(result.entryId);
+			if (result?.time !== undefined) creation.lastResultAt = Math.max(creation.lastResultAt ?? 0, result.time);
+			created.set(id, creation);
 		}
-		if (carry.length && !skipping) scan(carry);
-	} catch {
-		// An unreadable history proves nothing: keep what was found so far (deletion keeps the rest).
-	} finally {
-		await handle.close().catch(() => undefined);
-	}
+	});
 	return created;
 }
 

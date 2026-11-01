@@ -38,6 +38,7 @@ import type {
 	GitIntegrationSettings,
 	GitOperationMode,
 	GitPushSettings,
+	MemoryPickerSettings,
 	NotificationSound,
 	PackageSource,
 	PopupNotificationSettings,
@@ -76,6 +77,7 @@ export type {
 	GitIntegrationSettings,
 	GitOperationMode,
 	GitPushSettings,
+	MemoryPickerSettings,
 	NotificationSound,
 	PackageSource,
 	PopupNotificationSettings,
@@ -682,7 +684,13 @@ export class SettingsManager {
 			changed = true;
 		}
 
-		for (const field of ["autoMemory", "conversationNaming", "subAgent", "visionAssistant"] as const) {
+		for (const field of [
+			"autoMemory",
+			"conversationNaming",
+			"memoryPicker",
+			"subAgent",
+			"visionAssistant",
+		] as const) {
 			const configured = this.globalSettings[field];
 			if (configured?.provider === providerId && (modelId === undefined || configured.model === modelId)) {
 				this.globalSettings[field] = { ...configured, enabled: false };
@@ -910,6 +918,19 @@ export class SettingsManager {
 	setConversationNamingSettings(settings: AutoMemorySettings): void {
 		this.globalSettings.conversationNaming = { ...settings };
 		this.markModified("conversationNaming");
+		this.save();
+	}
+
+	getMemoryPickerSettings(): MemoryPickerSettings & { enabled: boolean } {
+		return {
+			...this.globalSettings.memoryPicker,
+			enabled: this.globalSettings.memoryPicker?.enabled ?? false,
+		};
+	}
+
+	setMemoryPickerSettings(settings: MemoryPickerSettings): void {
+		this.globalSettings.memoryPicker = { ...settings };
+		this.markModified("memoryPicker");
 		this.save();
 	}
 

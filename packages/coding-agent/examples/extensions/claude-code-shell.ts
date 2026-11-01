@@ -15,8 +15,9 @@
  * managesOwnContext. MyHarness shows how full the window is and neither gates on it nor compacts. "Compact now" is passed
  * on to `claude`.
  *
- * To use it, copy this file to ~/.myharness/agent/extensions/ and restart MyHarness. `claude` must be installed and signed
- * in on that computer. It runs with bypassPermissions, so `claude`'s own tools do not ask before they act.
+ * The Windows installer carries this file and loads it by itself. From source, copy it to ~/.myharness/agent/extensions/
+ * and restart MyHarness; a copy there takes over from the bundled one. `claude` must be installed and signed in on that
+ * computer. It runs with bypassPermissions, so `claude`'s own tools do not ask before they act.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";

@@ -51,15 +51,14 @@
 
 ## CI baseline 与用户平台
 
-正式的 `.github/workflows/ci.yml` 只使用两个 GitHub-hosted Windows x64 runner：
-`windows-2022` 和 `windows-2025`。它们通过 matrix 对每次正常 CI 触发分别执行
-相同的安装、release/privacy audit、`ffmpeg-static` rebuild、build、check、搜索
-工具安装和 test 流程；两边都必须通过。不得改回 `windows-latest`，也不要为这项
-基线新增 Linux/macOS CI。
+正式的 `.github/workflows/ci.yml` 只使用一个 GitHub-hosted Windows x64 runner：
+`windows-2025`。每次正常 CI 触发都在它上面执行安装、release/privacy audit、
+`ffmpeg-static` rebuild、build、check、搜索工具安装和 test 流程。不得改回
+`windows-latest`，也不要为这项基线新增 Linux/macOS CI。
 
 这是 GitHub CI baseline，不是最终用户支持矩阵。MyHarness 的用户平台是 Windows
 桌面 x64；不能把 GitHub Windows Server runner 写成“只支持 Windows Server”，也
-不能仅凭这两个 runner 声称已经逐一验证 Windows 10 或 Windows 11 的每个桌面版本。
+不能仅凭这个 runner 声称已经逐一验证 Windows 10 或 Windows 11 的每个桌面版本。
 
 机器可检查的约束应由 workflow、脚本和测试执行；本文件及其他 Prompt 只负责说明
 项目规则和路由，不能替代这些检查。

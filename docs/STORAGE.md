@@ -126,9 +126,35 @@ remain and mark the source chat deleted. The deletion UI offers an unchecked opt
 delete artifacts too; that removes the original files and their derived references,
 not other chats' output. Bulk chat deletion follows the same backend default.
 
-Removing a Workspace still only unregisters it: project files and chats are not
-deleted. Its optional artifact-deletion choice removes only that Workspace's
-artifacts; keeping them leaves them available globally. Deleting artifacts refuses
+Files and folders a chat made in the project folder count as that chat's output even
+though they live outside the Data root. A file counts when the chat's write results
+mark it as created, or when it was born while one of the chat's tools that can make
+files ran, so what a shell command or a script made counts too. An edited or
+overwritten file does not count, nor does anything the chat's history cannot place in
+time: the output of a chat deleted earlier, or of a background job after the chat's
+last entry. A folder the chat made that holds nothing else goes as one item. Turning
+on artifacts moves them to the Recycle Bin through the desktop host, never a hard
+delete. A file stays in place when someone changed it after the chat last did, when
+Git tracks it (unless the chat itself started that repository and nobody committed
+since), when a chat that stays was working at that moment or wrote it too, or when no
+desktop host is present to reach the Recycle Bin. The search does not enter
+`.myharness`, links, the app's data or old installed packages, and does not run at
+all for a chat at the home folder or a drive's root. A file the user created in the
+same moment as a tool ran cannot be told apart: the dialog lists what would go. The
+chat goes first and the files after, so a failed move leaves them on disk and the
+response names how many stayed.
+
+Removing a Workspace unregisters it, and its three optional switches, all off by
+default, delete that Workspace's chats, artifacts (project files included, by the
+rule above) and memories in this mode, so that re-adding the folder does not bring
+back what was chosen. Deleting the chats of a whole Workspace also deletes their
+uploads and tool results, and the folders left by chats deleted one by one, since no
+chat can use them any more. With all three off, chats, artifacts and memories stay
+and come back when the folder is added again; artifacts remain available globally.
+Empty chats open in the Workspace close and leave no file either way. The project
+folder itself is never deleted. A Workspace also registered in the other mode, or
+holding chats of it, keeps whatever those chats share. A running chat in the
+Workspace refuses the removal with nothing deleted. Deleting artifacts refuses
 symbolic links/junctions rather than traversing indirect user-owned targets.
 
 ## Rich-file extraction cache

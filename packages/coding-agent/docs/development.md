@@ -16,7 +16,7 @@ Settings、导航、Action、确认、反馈和键盘焦点行为的统一 contr
 Session 或 Workspace 流程需要偏离，必须保留其数据关系并在代码中说明原因。
 
 CI 的正式 baseline 见 [GitHub 自动化维护文档](../../../docs/maintenance/github-automation.md)：
-只使用 `windows-2022` 和 `windows-2025`，两边执行相同流程且都必须通过。它们是
+只使用 `windows-2025`。它是
 GitHub Windows Server 验证环境，不等于最终用户 Windows 桌面版本支持矩阵。
 
 ## 环境准备

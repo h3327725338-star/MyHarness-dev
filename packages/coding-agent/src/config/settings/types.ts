@@ -214,6 +214,12 @@ export interface SessionContinuitySettings {
 /** Background conversation naming; shares the helper-model selection contract. */
 export interface ConversationNamingSettings extends AutoMemorySettings {}
 
+/**
+ * The model that reads the memory directory before each message and chooses what the main model sees. Unlike the other
+ * helpers it never follows the main model: off, or on with no model, leaves only the local keyword ranking.
+ */
+export interface MemoryPickerSettings extends AutoMemorySettings {}
+
 export interface VisionAssistantSettings {
 	enabled?: boolean; // default: true (takes the images only with a model of its own until turned on by the user)
 	provider?: string;
@@ -399,6 +405,7 @@ export interface Settings {
 	subAgent?: SubAgentSettings; // Global-only inspection sub-agent configuration; Bash guard is not a sandbox
 	autoMemory?: AutoMemorySettings; // Global-only long-term memory configuration
 	conversationNaming?: ConversationNamingSettings; // Global-only background conversation naming
+	memoryPicker?: MemoryPickerSettings; // Global-only model that chooses the memories for each message
 	sessionContinuity?: SessionContinuitySettings; // Global-only cross-session search and hand-off notes
 	visionAssistant?: VisionAssistantSettings; // Global-only dedicated image analysis configuration
 	fallbackModel?: FallbackModelSettings; // Global-only model that takes over when the main model keeps failing

@@ -6,7 +6,7 @@
 
 MyHarness 是 npm / TypeScript / ESM monorepo，面向 Windows 桌面 x64。用户交互使用同一份 Web UI，可通过本机浏览器或独立 Electron Windows 桌面宿主打开；桌面入口与边界见 `packages/desktop/README.md`。旧终端聊天、print、JSON 输出、RPC、TUI 包和终端组件 API 均不属于当前产品。
 
-正式 GitHub CI 使用 `windows-2022` 和 `windows-2025` matrix；两边执行相同验证且必须通过。它们是 CI runner，不是最终用户桌面支持矩阵，不代表逐一验证 Windows 10/11 的每个版本。
+正式 GitHub CI 只使用 `windows-2025`。它是 CI runner，不是最终用户桌面支持矩阵，不代表逐一验证 Windows 10/11 的每个版本。
 
 项目采用 Apache-2.0；继承代码与第三方组件 attribution 见 `LICENSE`、`NOTICE` 和 `THIRD_PARTY_NOTICES.md`。
 

@@ -13,6 +13,7 @@ import { findEntriesHeldByCopies, readMemoryWriteCreations } from "../../memory/
 import {
 	deleteSessionMemories,
 	describeSessionMemories,
+	mapLimited,
 	type SessionMemoryProvenance,
 	withMemoryLock,
 } from "../../memory/store.ts";
@@ -174,7 +175,7 @@ export interface SessionDeleteSummary {
 }
 
 /** What the chat's history says about its memories, read before the chat moves; copies are looked up when needed. */
-async function readSessionMemoryProvenance(sessionPath: string): Promise<SessionMemoryProvenance> {
+export async function readSessionMemoryProvenance(sessionPath: string): Promise<SessionMemoryProvenance> {
 	return {
 		createdByTool: await readMemoryWriteCreations(sessionPath),
 		heldByCopies: (entryIds) => findEntriesHeldByCopies(sessionPath, entryIds),
@@ -198,36 +199,57 @@ async function countRealFiles(
 	kind: "artifacts" | "uploads" | "tool-results",
 ): Promise<{ files: number; bytes: number }> {
 	const total = { files: 0, bytes: 0 };
-	const visit = async (directory: string, depth: number): Promise<void> => {
-		let entries: import("node:fs").Dirent[];
-		try {
-			entries = await readdir(directory, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		await Promise.all(
-			entries.map(async (entry) => {
-				if (entry.isSymbolicLink()) return;
-				const full = join(directory, entry.name);
-				if (entry.isDirectory()) return visit(full, depth + 1);
-				if (!entry.isFile() || isBookkeepingFile(entry.name, depth, kind)) return;
-				total.files++;
-				try {
-					total.bytes += (await stat(full)).size;
-				} catch {
-					// Still counted: the file is there, only its size is unknown.
-				}
-			}),
-		);
-	};
 	try {
 		const stats = await lstat(root);
 		if (stats.isSymbolicLink() || !stats.isDirectory()) return total;
 	} catch {
 		return total;
 	}
-	await visit(root, 0);
+	// One level at a time with a few requests out: a Workspace can hold hundreds of thousands of files, and asking for
+	// them all at once held the server for half a second.
+	let folders = [root];
+	for (let depth = 0; folders.length > 0; depth++) {
+		const below: string[] = [];
+		const files: string[] = [];
+		await mapLimited(folders, 16, async (directory) => {
+			const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+			for (const entry of entries) {
+				if (entry.isSymbolicLink()) continue;
+				const full = join(directory, entry.name);
+				if (entry.isDirectory()) below.push(full);
+				else if (entry.isFile() && !isBookkeepingFile(entry.name, depth, kind)) files.push(full);
+			}
+		});
+		total.files += files.length;
+		await mapLimited(files, 32, async (file) => {
+			try {
+				total.bytes += (await stat(file)).size;
+			} catch {
+				// Still counted: the file is there, only its size is unknown.
+			}
+		});
+		folders = below;
+	}
 	return total;
+}
+
+const addCounts = (...parts: Array<{ files: number; bytes: number }>) =>
+	parts.reduce((sum, part) => ({ files: sum.files + part.files, bytes: sum.bytes + part.bytes }), {
+		files: 0,
+		bytes: 0,
+	});
+
+/** The files one chat folder holds: artifacts that may go with the chat, uploads and tool results that stay. */
+export async function countSessionFolderFiles(
+	sessionDir: string,
+): Promise<Pick<SessionDeleteSummary, "artifacts" | "history">> {
+	const [artifacts, conversationUploads, sessionUploads, toolResults] = await Promise.all([
+		countRealFiles(join(sessionDir, "artifacts"), "artifacts"),
+		countRealFiles(join(sessionDir, "conversation", "uploads"), "uploads"),
+		countRealFiles(join(sessionDir, "uploads"), "uploads"),
+		countRealFiles(join(sessionDir, "tool-results"), "tool-results"),
+	]);
+	return { artifacts, history: { uploads: addCounts(conversationUploads, sessionUploads), toolResults } };
 }
 
 /**
@@ -237,11 +259,6 @@ async function countRealFiles(
  */
 export async function summarizeSessionDeletion(sessionPath: string): Promise<SessionDeleteSummary> {
 	const scope = parseSessionDataPath(sessionPath);
-	const add = (...parts: Array<{ files: number; bytes: number }>) =>
-		parts.reduce((sum, part) => ({ files: sum.files + part.files, bytes: sum.bytes + part.bytes }), {
-			files: 0,
-			bytes: 0,
-		});
 	if (!scope) {
 		const base = dirname(sessionPath);
 		const [uploads, toolResults] = await Promise.all([
@@ -255,18 +272,14 @@ export async function summarizeSessionDeletion(sessionPath: string): Promise<Ses
 		};
 	}
 	const sessionDir = getSessionDir(scope.dataRoot, scope.workspaceId, scope.sessionId);
-	const [artifacts, conversationUploads, sessionUploads, toolResults, memories] = await Promise.all([
-		countRealFiles(join(sessionDir, "artifacts"), "artifacts"),
-		countRealFiles(join(sessionDir, "conversation", "uploads"), "uploads"),
-		countRealFiles(join(sessionDir, "uploads"), "uploads"),
-		countRealFiles(join(sessionDir, "tool-results"), "tool-results"),
+	const [folder, memories] = await Promise.all([
+		countSessionFolderFiles(sessionDir),
 		readSessionMemoryProvenance(sessionPath).then((provenance) =>
 			describeSessionMemories(scope.dataRoot, scope, provenance),
 		),
 	]);
 	return {
-		artifacts,
-		history: { uploads: add(conversationUploads, sessionUploads), toolResults },
+		...folder,
 		memories: {
 			owned: memories.owned.map(({ id, name, scope: memoryScope }) => ({ id, name, scope: memoryScope })),
 			shared: memories.shared,
@@ -387,7 +400,12 @@ async function deleteSessionDirectory(
 	sessionPath: string,
 	sessionDir: string,
 	scope: SessionDataPathInfo,
-	options: { deleteArtifacts?: boolean; deleteMemory?: boolean; deleteAttachments?: boolean },
+	options: {
+		deleteArtifacts?: boolean;
+		deleteMemory?: boolean;
+		deleteAttachments?: boolean;
+		artifactsIndexed?: boolean;
+	},
 ): Promise<DeleteResult> {
 	const keepAttachments = options.deleteAttachments !== true;
 	// An empty artifacts scaffold (reports/tests/temporary) is not worth keeping or marking as orphaned.
@@ -497,7 +515,7 @@ async function deleteSessionDirectory(
 			return failed;
 		}
 		if (keepArtifacts) preserveArtifactOrigin(scope, sessionPath, join(tombstone, "metadata", "session.json"));
-		refreshSessionArtifactIndexes(scope);
+		if (keepArtifacts || options.artifactsIndexed !== true) refreshSessionArtifactIndexes(scope);
 		// A removed session must not be resurrected by a pending batch timer or a stale index row.
 		dropPendingSessionWritesUnder(sessionDir);
 		removeIndexEntryForPath(sessionPath);
@@ -505,6 +523,27 @@ async function deleteSessionDirectory(
 		return { ok: true, method: "unlink" };
 	} finally {
 		activeTombstones.delete(tombstone);
+	}
+}
+
+/**
+ * Remove a chat folder whose chat was deleted earlier, when nothing the user keeps is left in it. A folder that still
+ * holds a chat, an artifact or a memory that stays is left alone.
+ */
+export async function deleteLeftoverSessionFolder(
+	sessionDir: string,
+	options: { deleteArtifacts: boolean; deleteMemory: boolean },
+): Promise<void> {
+	const conversation = join(sessionDir, "conversation");
+	const names = await readdir(conversation).catch(() => [] as string[]);
+	if (names.some((name) => name.endsWith(".jsonl"))) return;
+	if (!options.deleteArtifacts && hasRealFile(join(sessionDir, "artifacts"))) return;
+	if (!options.deleteMemory && hasMarkdown(join(sessionDir, "memory"))) return;
+	try {
+		assertDirectTree(sessionDir);
+		await rm(sessionDir, { recursive: true, force: true });
+	} catch {
+		// It holds nothing that shows anywhere; the next removal or start-up cleanup gets another chance.
 	}
 }
 
@@ -518,6 +557,8 @@ async function deleteSessionDirectory(
  * the conversation reference is removed and the attachment bytes stay on disk ("仅删引用").
  * `deleteMemory` also removes the memories this chat owns alone (see deleteSessionMemories). A chat folder is deleted
  * all-or-nothing: `code: "in-use"` means a file of it is open in another program and nothing was deleted.
+ * `artifactsIndexed`: the caller already took this chat's artifacts out of the derived indexes, so a chat that keeps none
+ * does not rewrite them (a Workspace's chats are deleted in one go).
  */
 export async function deleteSessionFile(
 	sessionPath: string,
@@ -526,6 +567,7 @@ export async function deleteSessionFile(
 		deleteArtifacts?: boolean;
 		deleteMemory?: boolean;
 		deleteAttachments?: boolean;
+		artifactsIndexed?: boolean;
 	} = {},
 ): Promise<DeleteResult> {
 	const target = deleteTarget(sessionPath);

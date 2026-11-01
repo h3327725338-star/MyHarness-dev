@@ -15,12 +15,14 @@
 | `manager/cwd.ts` | 会话记录的工作目录不存在时的检查与提示（`getMissingSessionCwdIssue` 只读检查、`assertSessionCwdExists` 不存在时抛 `MissingSessionCwdError`） |
 | `mode-state.ts` | `ModeStateStore`：coding/general 两套本地偏好（上次会话、默认模型、草稿、个人提示），带锁读写 `chat-mode-state.json`，不是第二套 Settings |
 | `artifacts/store.ts` | 会话 `artifacts/`（reports/tests/temporary）的创建、按会话列举、派生索引刷新、删除聊天后的孤儿标记；读写前拒绝 symlink/junction |
+| `artifacts/written-files.ts` | `readWrittenFiles()`：从对话 JSONL 的 write/edit 结果读出这次对话写过哪些文件、是否新建、最后写入时间（比文件头时间早的条目是从父对话继承的，不算）；`readChatActivity()` 再加上工作目录和会产生文件的工具运行时间段（每条工具结果到它前一条记录之间，只读和搜索类工具不算；后台任务算到这一轮结束，以及之后再查看它的时候）；是否算产出、能否放进回收站由 `application/use-cases/produced-files.ts` 判断 |
 | `projection/index.ts` | 从条目树到上下文：`buildSessionContext()`、`buildContextEntries()`、`getLatestCompactionEntry()`、环检测 |
 | `storage/jsonl/index.ts` | JSONL 的解析与容错、文件头读取、追加与重写、会话目录与元数据、列表扫描、搬迁；`moveSessionToWorkspace()` 把整个会话目录移到同一 Data root 的另一个工作区（合并工作区时用） |
 | `storage/jsonl/parse-cache.ts` | 按文件字节预算（32 MiB）淘汰的解析缓存，文件身份/大小/修改时间校验，完整追加前缀增量续读；恢复诊断文件重新读取 |
 | `storage/jsonl/write-batch.ts` | user/assistant 消息 75ms / 256KiB 合批 durable append；关键条目、读操作、正常关闭、轮次结束和 bridge 公告边界 flush |
 | `storage/jsonl/tail-window.ts` | 有明确完整性与缺失父节点标记的原始尾窗，仅预览/诊断，不可替代完整会话或模型上下文 |
-| `storage/jsonl/file-operations.ts` | `deleteSessionFile()`：删除聊天全有或全无（要删的部分先改名移进 `<data>/trash/`，有文件被别的程序占用就什么都不删并返回 `code: "in-use"`；勾了删记忆而记忆锁正被提取或整理占着时同样什么都不删，返回 `code: "memory-busy"`），默认保留产出、上传附件、工具结果和 memory 目录，勾选时连带删除只属于这次聊天的记忆；`summarizeSessionDeletion()` 给删除确认框计数 |
+| `storage/jsonl/file-operations.ts` | `deleteSessionFile()`：删除聊天全有或全无（要删的部分先改名移进 `<data>/trash/`，有文件被别的程序占用就什么都不删并返回 `code: "in-use"`；勾了删记忆而记忆锁正被提取或整理占着时同样什么都不删，返回 `code: "memory-busy"`），默认保留产出、上传附件、工具结果和 memory 目录，勾选时连带删除只属于这次聊天的记忆；`summarizeSessionDeletion()` 给删除确认框计数；`deleteLeftoverSessionFolder()` 在移除整个工作区时清掉逐个删除对话留下的文件夹 |
+| `storage/jsonl/line-scan.ts` | `scanSessionLines()`：按字节扫描对话文件，只解码含指定文本的行，超长行直接跳过；记忆来源判定和对话写过的文件（`artifacts/written-files.ts`）共用。`scanSessionLineHeads()`：每行都给开头 640 字节（超长行也给），读工具运行时间用 |
 | `storage/jsonl/sessions-index.ts` | 每个 Workspace 会话目录下的持久列表边车（`.sessions-index.json`）：写入时标脏、读取时刷新，供列表扫描用 |
 | `history/records.ts`、`history/index-store.ts` | 历史检索的派生记录：用户消息与回复正文（不含工具输出、思考、附件），带 entry id、时间、是否在当前分支；内存缓存＋会话 `metadata/history-index.json`，每次按文件 inode/大小/mtime/头部哈希校验，失配即重建 |
 | `history/search.ts`、`history/read.ts`、`history/candidates.ts` | 本地关键词＋中文相邻字搜索（不调模型、可取消、分片让出事件循环）；按消息读前后文（沿该消息自己的分支）或当前分支尾部；按工作区/模式/归档定候选范围，`findSessionFileById()` 按 id 定位 |

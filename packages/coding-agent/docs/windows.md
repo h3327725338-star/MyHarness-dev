@@ -14,8 +14,8 @@ Agent 的 bash/pwsh 工具和 Web 终端拿到的 PATH，除了服务进程启�
 注册表每分钟最多在后台重读一次；`reg.exe` 无法原样输出的非 ASCII 条目会被跳过。
 
 MyHarness 的用户平台是 Windows 桌面 x64。GitHub Actions 的正式 CI baseline 使用
-`windows-2022` 和 `windows-2025` 两个 Windows Server x64 runner；它们只表示
-自动化 workflow 在这两个环境中的验证，不表示 MyHarness 只支持 Windows Server，
+`windows-2025` 这一个 Windows Server x64 runner；它只表示
+自动化 workflow 在这个环境中的验证，不表示 MyHarness 只支持 Windows Server，
 也不表示已经逐一验证 Windows 10/11 的每个桌面版本。
 
 ## 自定义 Shell 路径

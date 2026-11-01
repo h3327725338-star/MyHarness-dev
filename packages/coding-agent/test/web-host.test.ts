@@ -28,9 +28,12 @@ import { registerProviderRoutes } from "../src/modes/web/routes-providers.ts";
 import { registerSessionRoutes } from "../src/modes/web/routes-sessions.ts";
 import { registerSettingsRoutes } from "../src/modes/web/routes-settings.ts";
 import { registerTranslateRoutes } from "../src/modes/web/routes-translate.ts";
+import { configureHttpDispatcher } from "../src/platform/process/http-dispatcher.ts";
 import { AuthStorage } from "../src/providers/credentials/auth-storage.ts";
 import { ModelRuntime } from "../src/providers/runtime/index.ts";
 import { SessionManager } from "../src/session/manager/index.ts";
+import { flushSessionWrites } from "../src/session/storage/jsonl/write-batch.ts";
+import { SCHEDULED_RUN_ENTRY } from "../src/session/types.ts";
 import { showPopupNotification } from "../src/utils/popup-notification.ts";
 import { startBackgroundBatch } from "./suite/background-batch.ts";
 import { getMessageText, type Harness } from "./suite/harness.ts";
@@ -42,6 +45,15 @@ vi.mock("../src/utils/popup-notification.ts", async (importOriginal) => {
 });
 
 const showPopupMock = vi.mocked(showPopupNotification);
+
+// The desktop app's Recycle Bin, for the tests that delete project files; otherwise there is no desktop host, as usual.
+const desktopHost = vi.hoisted(() => ({
+	channel: undefined as undefined | { request: (command: Record<string, unknown>) => Promise<unknown> },
+}));
+vi.mock("../src/tools/workspace.ts", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/tools/workspace.ts")>();
+	return { ...actual, desktopWorkspaceChannel: () => desktopHost.channel ?? actual.desktopWorkspaceChannel() };
+});
 
 /** The kinds of the items the page shows: every turn also stores a hidden note with the current time. */
 const shownKinds = (items: any[]) =>
@@ -80,6 +92,28 @@ describe("Web host (real runtime with a faux provider)", () => {
 		});
 		return dir;
 	}
+
+	it("exposes the Memory picker setting, off by default, and saves the model chosen for it", async () => {
+		const fx = await start();
+		const row = async () => (await fx.get("/api/settings")).items.find((item: any) => item.id === "memoryPicker");
+		expect(await row()).toMatchObject({
+			section: "Assistants",
+			type: "modelRef",
+			note: "enabled",
+			noModelLabel: "No model (keywords only)",
+			value: { enabled: false },
+		});
+		await fx.post("/api/settings", {
+			id: "memoryPicker",
+			value: { enabled: true, provider: "command-code", model: "z-ai/glm-5.3-flash", thinkingLevel: "low" },
+		});
+		expect((await row()).value).toEqual({
+			enabled: true,
+			provider: "command-code",
+			model: "z-ai/glm-5.3-flash",
+			thinkingLevel: "low",
+		});
+	});
 
 	it("exposes the naming helper setting and generates a background title after a completed reply", async () => {
 		const fx = await start();
@@ -441,6 +475,32 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(await content()).toBe(true);
 		await draft({ text: "", attachments: [] });
 		expect(await content()).toBe(false);
+	});
+
+	it("lists the chats scheduled tasks started, and says so of an open one before it is saved", async () => {
+		const fx = await start();
+		const initial = await fx.get("/api/state");
+		const path = initial.session.file;
+		const host = fx.hub.get(initial.slot)!;
+		expect((await fx.get("/api/slots")).slots[0].scheduled).toBe(false);
+		host.scheduledSessionId = host.session.sessionId;
+		expect((await fx.get("/api/slots")).slots[0].scheduled).toBe(true);
+		expect((await fx.get("/api/sessions/scheduled")).sessions).toEqual([]);
+		const manager = host.session.sessionManager;
+		manager.appendCustomEntry(SCHEDULED_RUN_ENTRY, { scheduleId: "s1", title: "Morning" });
+		manager.appendMessage({ role: "user", content: "check the mail", timestamp: Date.now() });
+		await fx.post("/api/sessions/archive", { path }, initial.slot);
+		expect((await fx.get("/api/sessions/scheduled")).sessions).toEqual([]);
+		await fx.post("/api/sessions/archive", { path, archived: false }, initial.slot);
+		const listed = (await fx.get("/api/sessions/scheduled")).sessions;
+		expect(listed.map((info: any) => info.path)).toEqual([path]);
+		expect(listed[0].scheduled).toBe(true);
+		// The other mode has its own list.
+		expect((await fx.get("/api/sessions/scheduled?mode=general")).sessions).toEqual([]);
+		// A fork in place starts another chat in this slot, and that one is the user's own.
+		const message = manager.getEntries().find((entry) => entry.type === "message")!;
+		await fx.post("/api/sessions/fork", { entryId: message.id, position: "at" }, initial.slot);
+		expect((await fx.get("/api/slots")).slots[0].scheduled).toBe(false);
 	});
 
 	it("archives a deferred draft without inventing messages and restores it from disk", async () => {
@@ -853,6 +913,7 @@ describe("Web host (real runtime with a faux provider)", () => {
 		const expected = {
 			artifacts: { files: 1, bytes: 5 },
 			history: { uploads: { files: 1, bytes: 3 }, toolResults: { files: 1, bytes: 2 } },
+			writtenFiles: { files: 0, bytes: 0, kept: 0, items: 0, list: [] },
 			memories: { owned: [{ id: "global/owned", name: "owned", scope: "global" }], shared: 1, retired: 1 },
 		};
 		const impact = (path: string, slot?: string) =>
@@ -870,9 +931,214 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(await impact(draft, next.slot)).toEqual({
 			artifacts: { files: 0, bytes: 0 },
 			history: { uploads: { files: 0, bytes: 0 }, toolResults: { files: 0, bytes: 0 } },
+			writtenFiles: { files: 0, bytes: 0, kept: 0, items: 0, list: [] },
 			memories: { owned: [], shared: 0, retired: 0 },
 		});
 		await expect(impact(join(fx.project, "unknown.jsonl"))).rejects.toThrow("404: Unknown session");
+	});
+
+	/** A desktop host whose Recycle Bin removes the files it is given, or refuses every one of them. */
+	function fakeRecycleBin(works = true) {
+		const recycled: string[][] = [];
+		desktopHost.channel = {
+			request: async (command) => {
+				if (command.channel !== "recycle") throw new Error("not this test's request");
+				recycled.push(command.paths as string[]);
+				if (works) for (const file of command.paths as string[]) rmSync(file, { recursive: true });
+				return { done: true };
+			},
+		};
+		cleanups.push(() => {
+			desktopHost.channel = undefined;
+		});
+		return recycled;
+	}
+
+	/** What the write tool leaves in a chat's history after it created this file. */
+	function recordCreatedFile(manager: SessionManager, file: string) {
+		writeFileSync(file, "abc");
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-write",
+			toolName: "write",
+			content: [{ type: "text", text: `Successfully wrote 3 bytes to ${file}` }],
+			details: { created: true, additions: 1, deletions: 0 },
+			isError: false,
+			timestamp: Date.now(),
+		});
+		flushSessionWrites(manager.getSessionFile()!);
+	}
+
+	/** A shell command as a chat records it: the call, the file appearing while it runs, then the result. */
+	function recordShellRun(manager: SessionManager, make: () => void) {
+		manager.appendMessage(fauxAssistantMessage([fauxToolCall("bash", { command: "make" }, { id: "call-bash" })]));
+		make();
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-bash",
+			toolName: "bash",
+			content: [{ type: "text", text: "done" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		flushSessionWrites(manager.getSessionFile()!);
+	}
+
+	it("counts what a chat's shell commands made in the project, a whole new folder as one item", async () => {
+		const fx = await start();
+		const recycled = fakeRecycleBin();
+		fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+		const { slot } = await fx.post("/api/sessions/new", {});
+		await fx.post("/api/prompt", { text: "render it" }, slot);
+		await fx.waitFor("run_finished", (data) => data.slot === slot);
+		const owner = fx.hub.get(slot)!;
+		const path = owner.session.sessionFile!;
+		// Long enough for "there before the run" to be told apart from "made by it".
+		writeFileSync(join(fx.project, "mine.txt"), "mine");
+		await new Promise((resolve) => setTimeout(resolve, 2600));
+		const shot = join(fx.project, "shot.png");
+		const video = join(fx.project, "video");
+		recordShellRun(owner.session.sessionManager, () => {
+			writeFileSync(shot, "abcd");
+			mkdirSync(video);
+			writeFileSync(join(video, "frame.png"), "abcde");
+		});
+		const { writtenFiles } = await fx.get(`/api/sessions/delete-impact?path=${encodeURIComponent(path)}`, slot);
+		expect(writtenFiles).toEqual({
+			files: 2,
+			bytes: 9,
+			kept: 0,
+			items: 2,
+			list: [
+				{ path: shot, bytes: 4 },
+				{ path: video, bytes: 5, files: 1, folder: true },
+			],
+		});
+		const other = await fx.post("/api/sessions/new", {});
+		expect(await fx.post("/api/sessions/delete", { path, deleteArtifacts: true }, other.slot)).toEqual({ ok: true });
+		expect(existsSync(shot)).toBe(false);
+		expect(existsSync(video)).toBe(false);
+		expect(recycled).toEqual([[shot, video]]);
+		expect(readFileSync(join(fx.project, "mine.txt"), "utf8")).toBe("mine");
+	}, 20_000);
+
+	it("keeps what another chat in the folder may have made, until that chat goes too", async () => {
+		const fx = await start();
+		const recycled = fakeRecycleBin();
+		const ran = async (text: string) => {
+			fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+			const { slot } = await fx.post("/api/sessions/new", {});
+			await fx.post("/api/prompt", { text }, slot);
+			await fx.waitFor("run_finished", (data) => data.slot === slot);
+			return {
+				slot,
+				manager: fx.hub.get(slot)!.session.sessionManager,
+				path: fx.hub.get(slot)!.session.sessionFile!,
+			};
+		};
+		const first = await ran("first");
+		const second = await ran("second");
+		const shot = join(fx.project, "shot.png");
+		// Long enough for this file to be told apart from what the runs above could have made.
+		await new Promise((resolve) => setTimeout(resolve, 2600));
+		for (const { manager } of [first, second])
+			manager.appendMessage(fauxAssistantMessage([fauxToolCall("bash", { command: "make" }, { id: "call-bash" })]));
+		writeFileSync(shot, "abcd");
+		for (const { manager } of [first, second]) {
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-bash",
+				toolName: "bash",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: Date.now(),
+			});
+			flushSessionWrites(manager.getSessionFile()!);
+		}
+		const impact = async (chat: { path: string; slot: string }) =>
+			(await fx.get(`/api/sessions/delete-impact?path=${encodeURIComponent(chat.path)}`, chat.slot)).writtenFiles;
+		expect(await impact(first)).toEqual({
+			files: 0,
+			bytes: 0,
+			kept: 1,
+			items: 1,
+			list: [{ path: shot, bytes: 4, kept: "other-chat" }],
+		});
+		await fx.post("/api/sessions/delete", { path: first.path, deleteArtifacts: true }, first.slot);
+		expect(recycled).toEqual([]);
+		expect(existsSync(shot)).toBe(true);
+		// Now nothing else can claim it: it goes with the chat that is left.
+		expect(await impact(second)).toEqual({ files: 1, bytes: 4, kept: 0, items: 1, list: [{ path: shot, bytes: 4 }] });
+		await fx.post("/api/sessions/delete", { path: second.path, deleteArtifacts: true }, second.slot);
+		expect(recycled).toEqual([[shot]]);
+		expect(existsSync(shot)).toBe(false);
+	}, 20_000);
+
+	it("counts the project files a chat created as its artifacts and recycles them only with that switch on", async () => {
+		const fx = await start();
+		const chat = async (text: string) => {
+			fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+			const { slot } = await fx.post("/api/sessions/new", {});
+			await fx.post("/api/prompt", { text }, slot);
+			await fx.waitFor("run_finished", (data) => data.slot === slot);
+			const owner = fx.hub.get(slot)!;
+			const file = join(fx.project, `${text}.html`);
+			recordCreatedFile(owner.session.sessionManager, file);
+			return { slot, file, path: owner.session.sessionFile! };
+		};
+		const impact = async (path: string, slot: string) =>
+			(await fx.get(`/api/sessions/delete-impact?path=${encodeURIComponent(path)}`, slot)).writtenFiles;
+
+		// Outside the desktop app nothing can go to a Recycle Bin, so nothing is offered and nothing moves.
+		const noHost = await chat("no-host");
+		expect(await impact(noHost.path, noHost.slot)).toEqual({
+			files: 0,
+			bytes: 0,
+			kept: 1,
+			items: 1,
+			list: [{ path: noHost.file, bytes: 3, kept: "no-recycle-bin" }],
+		});
+		expect(await fx.post("/api/sessions/delete", { path: noHost.path, deleteArtifacts: true }, noHost.slot)).toEqual({
+			ok: true,
+		});
+		expect(existsSync(noHost.file)).toBe(true);
+		// Out of the way: a file born moments before another chat's tool runs would pass for that chat's work.
+		rmSync(noHost.file);
+
+		const recycled = fakeRecycleBin();
+		const going = await chat("going");
+		expect(await impact(going.path, going.slot)).toEqual({
+			files: 1,
+			bytes: 3,
+			kept: 0,
+			items: 1,
+			list: [{ path: going.file, bytes: 3 }],
+		});
+		expect(await fx.post("/api/sessions/delete", { path: going.path, deleteArtifacts: true }, going.slot)).toEqual({
+			ok: true,
+		});
+		expect(recycled).toEqual([[going.file]]);
+		expect(existsSync(going.file)).toBe(false);
+		expect(existsSync(going.path)).toBe(false);
+
+		// The switch is off: the chat goes, the file stays and the Recycle Bin is not asked.
+		const staying = await chat("staying");
+		await fx.post("/api/sessions/delete", { path: staying.path }, staying.slot);
+		expect(existsSync(staying.path)).toBe(false);
+		expect(existsSync(staying.file)).toBe(true);
+		expect(recycled).toHaveLength(1);
+		rmSync(staying.file);
+
+		// A file that would not go is reported, and it is still there.
+		fakeRecycleBin(false);
+		const refused = await chat("refused");
+		expect(
+			await fx.post("/api/sessions/delete", { path: refused.path, deleteArtifacts: true }, refused.slot),
+		).toEqual({
+			ok: true,
+			filesKept: [refused.file],
+		});
+		expect(existsSync(refused.file)).toBe(true);
 	});
 
 	it.skipIf(process.platform !== "win32")(
@@ -2488,6 +2754,207 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(kept.baseUrl).toBeUndefined();
 	});
 
+	it("organizes old entries into one provider of several keys: suggested, merged only when asked, nothing they use changes", async () => {
+		configureHttpDispatcher();
+		const fx = await start();
+		const modelsPath = join(process.env.MYHARNESS_CODING_AGENT_DIR as string, "models.json");
+		const seen: Array<{ url: string; authorization: string | undefined }> = [];
+		const endpoint = await startEndpoint((request, response) => {
+			seen.push({ url: request.url ?? "", authorization: request.headers.authorization });
+			request.resume();
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				`data: ${JSON.stringify({ id: "1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "hello" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\ndata: [DONE]\n\n`,
+			);
+		});
+		const entry = (name: string) => ({
+			name,
+			baseUrl: endpoint.baseUrl,
+			api: "openai-completions",
+			models: [{ id: `${name}-model`, contextWindow: 10_000_000, maxTokens: 1000 }],
+		});
+		await fx.post("/api/providers/custom/save", { id: "pro", config: entry("pro"), apiKey: "sk-pro-1111" });
+		await fx.post("/api/providers/custom/save", { id: "plus", config: entry("plus"), apiKey: "sk-plus-2222" });
+		await fx.post("/api/providers/custom/save", {
+			id: "elsewhere",
+			config: { ...entry("elsewhere"), baseUrl: "http://192.0.2.1:9/v1" },
+			apiKey: "sk-else-3333",
+		});
+		const onDisk = () => JSON.parse(readFileSync(modelsPath, "utf8"));
+		const custom = () => fx.get("/api/providers/custom");
+		// Sends a prompt, waits for this one to finish and answers what its request looked like.
+		const requestOf = async (text: string) => {
+			const finished = () => fx.events.filter((entry) => entry.event === "run_finished").length;
+			const before = finished();
+			const sent = seen.length;
+			await fx.post("/api/prompt", { text });
+			await vi.waitFor(() => expect(finished()).toBeGreaterThan(before), { timeout: 15_000 });
+			expect(seen.length).toBeGreaterThan(sent);
+			return seen.at(-1);
+		};
+
+		await fx.post("/api/model", { provider: "plus", id: "plus-model" });
+		expect(await requestOf("first")).toEqual({ url: "/v1/chat/completions", authorization: "Bearer sk-plus-2222" });
+
+		// Same host: suggested and ticked. Reading the page writes nothing.
+		const before = readFileSync(modelsPath, "utf8");
+		const listed = await custom();
+		expect(listed.mergeSuggestions).toHaveLength(1);
+		expect(listed.mergeSuggestions[0].members.map((member: any) => [member.id, member.sure])).toEqual([
+			["pro", true],
+			["plus", true],
+		]);
+		expect(listed.providers.find((p: any) => p.id === "plus").config.layered).toBe(true);
+		expect(readFileSync(modelsPath, "utf8")).toBe(before);
+		expect(JSON.stringify(listed)).not.toMatch(/sk-(pro|plus|else)/);
+
+		// Merged on request, with a backup first; the same chat goes on with the same model.
+		expect(await fx.post("/api/providers/group/merge", { ids: ["pro", "plus"], name: "Relay" })).toEqual({
+			ok: true,
+			id: "relay",
+		});
+		expect(readFileSync(`${modelsPath}.before-merge.bak`, "utf8")).toBe(before);
+		expect(onDisk().providerGroups.relay).toEqual({ name: "Relay" });
+		expect(onDisk().providers.plus.group).toBe("relay");
+		expect((await custom()).mergeSuggestions).toEqual([]);
+		expect((await fx.get("/api/state")).model).toMatchObject({ provider: "plus", id: "plus-model" });
+		expect(await requestOf("second")).toEqual({ url: "/v1/chat/completions", authorization: "Bearer sk-plus-2222" });
+
+		// The global key and address now apply to all keys; the page only ever sees the last characters.
+		const saved = await fx.post("/api/providers/group/save", {
+			id: "relay",
+			name: "Relay One",
+			baseUrl: endpoint.baseUrl,
+			api: "",
+			apiKey: "sk-group-9999",
+		});
+		expect(saved).toEqual({ ok: true, id: "relay" });
+		const grouped = await custom();
+		expect(grouped.groups).toEqual([
+			{ id: "relay", config: { name: "Relay One", baseUrl: endpoint.baseUrl }, key: { suffix: "9999" } },
+		]);
+		expect(JSON.stringify(grouped)).not.toContain("sk-group");
+		expect(JSON.stringify(onDisk())).not.toContain("sk-group");
+		expect(await requestOf("third")).toEqual({ url: "/v1/chat/completions", authorization: "Bearer sk-group-9999" });
+
+		// A form with what a wrong address covered by the global one: the covered value stays in the file.
+		await fx.post("/api/providers/custom/save", {
+			id: "pro",
+			previousId: "pro",
+			config: { ...grouped.providers.find((p: any) => p.id === "pro").config, baseUrl: "http://192.0.2.2:9/v1" },
+		});
+		expect(onDisk().providers.pro.baseUrl).toBe("http://192.0.2.2:9/v1");
+		const row = (await fx.get("/api/providers")).providers.find((p: any) => p.id === "pro");
+		expect(row).toMatchObject({ baseUrl: endpoint.baseUrl, missingBaseUrl: false, configured: true });
+
+		// Removing the global key brings each key's own back; it was never touched.
+		await fx.post("/api/providers/group/save", {
+			id: "relay",
+			name: "Relay One",
+			baseUrl: endpoint.baseUrl,
+			removeApiKey: true,
+		});
+		expect((await custom()).groups[0].key).toBeNull();
+		expect(await requestOf("fourth")).toEqual({ url: "/v1/chat/completions", authorization: "Bearer sk-plus-2222" });
+
+		// Refused input leaves the file as it was.
+		const unchanged = readFileSync(modelsPath, "utf8");
+		await expect(fx.post("/api/providers/group/save", { id: "relay", baseUrl: "not a url" })).rejects.toThrow(/^400/);
+		await expect(fx.post("/api/providers/group/save", { id: "relay", api: "made-up" })).rejects.toThrow(/^400/);
+		await expect(fx.post("/api/providers/group/merge", { ids: [] })).rejects.toThrow(/^400/);
+		await expect(fx.post("/api/providers/group/merge", { ids: ["ghost"], name: "X" })).rejects.toThrow(/^400/);
+		expect(readFileSync(modelsPath, "utf8")).toBe(unchanged);
+
+		// A key that leaves stands alone with what it used, and the provider goes with its last key.
+		await fx.post("/api/providers/group/leave", { id: "pro" });
+		expect(onDisk().providers.pro.group).toBeUndefined();
+		expect(onDisk().providers.pro.baseUrl).toBe(endpoint.baseUrl);
+		expect(onDisk().providerGroups.relay).toBeDefined();
+		expect(await fx.post("/api/providers/group/delete", { id: "relay" })).toEqual({ ok: true });
+		expect(onDisk().providers.plus).toBeUndefined();
+		expect(onDisk().providerGroups.relay).toBeUndefined();
+		expect((await custom()).providers.map((p: any) => p.id).sort()).toEqual(["elsewhere", "pro"]);
+		await expect(fx.post("/api/providers/group/delete", { id: "relay" })).rejects.toThrow(/^404/);
+	}, 30_000);
+
+	it("adds a key under a provider, sets a model's own key, and takes them away with what they belong to", async () => {
+		const fx = await start({ authFile: true });
+		const modelsPath = join(process.env.MYHARNESS_CODING_AGENT_DIR as string, "models.json");
+		const onDisk = () => JSON.parse(readFileSync(modelsPath, "utf8"));
+		const auth = () => readFileSync(join(process.env.MYHARNESS_CODING_AGENT_DIR as string, "auth.json"), "utf8");
+		const base = { layered: true, baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions" };
+		await fx.post("/api/providers/custom/save", {
+			id: "first",
+			config: { ...base, name: "First", models: [{ id: "m1" }] },
+			apiKey: "sk-first",
+		});
+
+		// A second key attached to a provider that so far stood alone makes it a group.
+		await fx.post("/api/providers/custom/save", {
+			id: "second",
+			attachTo: "first",
+			config: { ...base, name: "Second", models: [{ id: "own-key" }, { id: "other" }] },
+			modelKeys: { "own-key": "sk-model-7777" },
+		});
+		expect(onDisk().providers.first.group).toBe("first");
+		expect(onDisk().providers.second.group).toBe("first");
+		const listed = await fx.get("/api/providers/custom");
+		const second = listed.providers.find((p: any) => p.id === "second");
+		expect(second.modelKeys).toEqual({ "own-key": { suffix: "7777" } });
+		expect(JSON.stringify(listed)).not.toContain("sk-model");
+		// Only the model with a key of its own can be used, since nothing above it has one.
+		const offered = (await fx.get("/api/models")).providers.find((p: any) => p.id === "second");
+		expect(offered.models.map((m: any) => m.id)).toEqual(["own-key"]);
+		expect((await fx.get("/api/providers")).providers.find((p: any) => p.id === "second")).toMatchObject({
+			configured: true,
+			authSource: "stored",
+		});
+
+		// An edited Model ID keeps its key, an empty field changes nothing, null removes it.
+		const config = second.config;
+		await fx.post("/api/providers/custom/save", {
+			id: "second",
+			previousId: "second",
+			config: { ...config, models: [{ id: "renamed" }, { id: "other" }] },
+			modelKeyMoves: { "own-key": "renamed" },
+			modelKeys: { other: "" },
+		});
+		const moved = (await fx.get("/api/providers/custom")).providers.find((p: any) => p.id === "second");
+		expect(moved.modelKeys).toEqual({ renamed: { suffix: "7777" } });
+		await fx.post("/api/providers/custom/save", {
+			id: "second",
+			previousId: "second",
+			config: { ...moved.config },
+			modelKeys: { renamed: null },
+		});
+		expect((await fx.get("/api/providers/custom")).providers.find((p: any) => p.id === "second").modelKeys).toEqual(
+			{},
+		);
+		expect(auth()).not.toContain("sk-model-7777");
+
+		// A model removed from the list takes its key along; deleting the last key takes the provider's record.
+		await fx.post("/api/providers/custom/save", {
+			id: "second",
+			previousId: "second",
+			config: { ...moved.config },
+			modelKeys: { other: "sk-gone-1234" },
+		});
+		expect(auth()).toContain("sk-gone-1234");
+		await fx.post("/api/providers/custom/save", {
+			id: "second",
+			previousId: "second",
+			config: { ...moved.config, models: [{ id: "renamed" }] },
+		});
+		expect(auth()).not.toContain("sk-gone-1234");
+		await fx.post("/api/providers/custom/delete", { id: "second" });
+		expect(onDisk().providerGroups.first).toBeDefined();
+		await fx.post("/api/providers/group/save", { id: "first", name: "First", apiKey: "sk-top-5555" });
+		expect(auth()).toContain("sk-top-5555");
+		await fx.post("/api/providers/custom/delete", { id: "first" });
+		expect(onDisk().providerGroups?.first).toBeUndefined();
+		expect(auth()).not.toContain("sk-top-5555");
+	}, 30_000);
+
 	it("asks before deleting a provider that running tasks use, and stops them when told to", async () => {
 		const fx = await start();
 		// A chat completion that never answers keeps the task running until it is aborted.
@@ -2582,6 +3049,232 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect((await fx.get("/api/sessions/unbound")).sessions.map((s: any) => s.path)).not.toContain(
 			before.session.file,
 		);
+	});
+
+	it("closes the empty chats of a removed workspace, so a new chat there belongs to it when the folder returns", async () => {
+		const fx = await start();
+		const project = tempDir("myharness-web-returning-project");
+		const { workspace } = await fx.post("/api/workspaces/add", { path: project });
+		const blank = await fx.post("/api/sessions/new", { rootPath: project });
+		expect(blank.created).toBe(true);
+		const blankFile = fx.hub.get(blank.slot)!.session.sessionFile!;
+		expect(await fx.post("/api/workspaces/remove", { id: workspace.id })).toEqual({ ok: true });
+		expect(fx.hub.get(blank.slot)).toBeUndefined();
+		expect(existsSync(blankFile)).toBe(false);
+
+		const again = await fx.post("/api/workspaces/add", { path: project });
+		expect(again.workspace.id).toBe(workspace.id);
+		const fresh = await fx.post("/api/sessions/new", { rootPath: project });
+		expect(fresh.created).toBe(true);
+		const status = (await fx.get("/api/slots")).slots.find((slot: any) => slot.slot === fresh.slot);
+		expect(status).toMatchObject({ unbound: false, cwd: project });
+		expect((await fx.get("/api/state", fresh.slot)).workspace.id).toBe(workspace.id);
+	});
+
+	it("tells the sidebar when a chat left open belongs to the folder that was added back", async () => {
+		const fx = await start();
+		const project = tempDir("myharness-web-reattached-project");
+		const { workspace } = await fx.post("/api/workspaces/add", { path: project });
+		const { slot } = await fx.post("/api/sessions/new", { rootPath: project });
+		fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+		await fx.post("/api/prompt", { text: "keep me" }, slot);
+		await fx.waitFor("run_finished", (data) => data.slot === slot);
+		const unboundOf = (data: any) => data.slots?.find((item: any) => item.slot === slot)?.unbound;
+		fx.events.length = 0;
+		await fx.post("/api/workspaces/remove", { id: workspace.id });
+		await fx.waitFor("slots", (data) => unboundOf(data) === true);
+		fx.events.length = 0;
+		await fx.post("/api/workspaces/add", { path: project });
+		await fx.waitFor("slots", (data) => unboundOf(data) === false);
+	});
+
+	describe("removing a workspace with what the user switched on", () => {
+		/** A second workspace with one finished chat that made an artifact, a project file and memories of each kind. */
+		async function populatedWorkspace(fx: Fixture) {
+			const project = tempDir("myharness-web-removed-project");
+			const { workspace } = await fx.post("/api/workspaces/add", { path: project });
+			const { slot } = await fx.post("/api/sessions/new", { rootPath: project });
+			fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+			await fx.post("/api/prompt", { text: "make something" }, slot);
+			await fx.waitFor("run_finished", (data) => data.slot === slot);
+			const owner = fx.hub.get(slot)!;
+			const manager = owner.session.sessionManager;
+			const path = owner.session.sessionFile!;
+			const sessionId = manager.getSessionId();
+			const sessionDir = dirname(dirname(path));
+			const dataRoot = manager.getDataRoot()!;
+			const artifact = join(sessionDir, "artifacts", "reports", "report.md");
+			writeFileSync(artifact, "12345");
+			const projectFile = join(project, "made.html");
+			recordCreatedFile(manager, projectFile);
+			const memory = (scope: string, name: string, updatedBy: string) =>
+				`---\nid: ${scope}/${name}\nname: ${name}\ndescription: d\ntype: project\nscope: ${scope}\nsourceSessionId: ${sessionId}\nupdatedBy: ${updatedBy}\n---\n\nbody\n`;
+			const workspaceMemories = join(dataRoot, "workspaces", workspace.id, "memory");
+			mkdirSync(workspaceMemories, { recursive: true });
+			const workspaceMemory = join(workspaceMemories, "of-workspace.md");
+			writeFileSync(workspaceMemory, memory("workspace", "of-workspace", "another-chat"));
+			mkdirSync(join(dataRoot, "memory"), { recursive: true });
+			const ownedGlobal = join(dataRoot, "memory", "only-this-chat.md");
+			writeFileSync(ownedGlobal, memory("global", "only-this-chat", sessionId));
+			const sharedGlobal = join(dataRoot, "memory", "also-consolidated.md");
+			writeFileSync(sharedGlobal, memory("global", "also-consolidated", "consolidation"));
+			const stranger = join(dataRoot, "memory", "another-chats.md");
+			writeFileSync(
+				stranger,
+				"---\nid: global/another-chats\nname: another-chats\ndescription: d\ntype: project\nscope: global\nsourceSessionId: someone-else\nupdatedBy: someone-else\n---\n\nbody\n",
+			);
+			return {
+				project,
+				workspace,
+				slot,
+				path,
+				artifact,
+				projectFile,
+				workspaceMemory,
+				ownedGlobal,
+				sharedGlobal,
+				stranger,
+			};
+		}
+		const remove = (fx: Fixture, id: string, parts: Record<string, boolean> = {}) =>
+			fx.post("/api/workspaces/remove", { id, ...parts });
+
+		it("reports what it would take, and takes nothing unless asked", async () => {
+			const fx = await start();
+			fakeRecycleBin();
+			const made = await populatedWorkspace(fx);
+			expect(await fx.get(`/api/workspaces/delete-impact?id=${made.workspace.id}`)).toEqual({
+				chats: 1,
+				artifacts: { files: 1, bytes: 5 },
+				history: { uploads: { files: 0, bytes: 0 }, toolResults: { files: 0, bytes: 0 } },
+				writtenFiles: { files: 1, bytes: 3, kept: 0, items: 1, list: [{ path: made.projectFile, bytes: 3 }] },
+				memories: {
+					owned: [
+						{ id: "workspace/of-workspace", name: "of-workspace", scope: "workspace" },
+						{ id: "global/only-this-chat", name: "only-this-chat", scope: "global" },
+					],
+					shared: 1,
+					retired: 0,
+				},
+			});
+			await expect(fx.get("/api/workspaces/delete-impact?id=unknown")).rejects.toThrow("404: Unknown workspace");
+
+			expect(await remove(fx, made.workspace.id)).toEqual({ ok: true });
+			for (const file of [made.path, made.artifact, made.projectFile, made.workspaceMemory, made.ownedGlobal])
+				expect(existsSync(file)).toBe(true);
+			// As before: adding the folder again brings the chats back.
+			await fx.post("/api/workspaces/add", { path: made.project });
+			const listed = await fx.get(`/api/workspaces/sessions?path=${encodeURIComponent(made.project)}`);
+			expect(listed.sessions.map((chat: any) => chat.path)).toContain(made.path);
+		});
+
+		it("deletes the chats, artifacts and memories that were switched on, and they stay gone when the folder returns", async () => {
+			const fx = await start();
+			const recycled = fakeRecycleBin();
+			const made = await populatedWorkspace(fx);
+			expect(
+				await remove(fx, made.workspace.id, { deleteChats: true, deleteArtifacts: true, deleteMemory: true }),
+			).toEqual({ ok: true });
+			for (const file of [made.path, made.artifact, made.projectFile, made.workspaceMemory, made.ownedGlobal])
+				expect(existsSync(file)).toBe(false);
+			expect(recycled).toEqual([[made.projectFile]]);
+			// Another writer's mark, and another chat's memory, are not this workspace's to delete.
+			for (const file of [made.sharedGlobal, made.stranger]) expect(existsSync(file)).toBe(true);
+			// The project folder itself stays.
+			expect(existsSync(made.project)).toBe(true);
+			expect((await fx.get("/api/workspaces")).workspaces.some((w: any) => w.id === made.workspace.id)).toBe(false);
+			await fx.post("/api/workspaces/add", { path: made.project });
+			const listed = await fx.get(`/api/workspaces/sessions?path=${encodeURIComponent(made.project)}`);
+			expect(listed.sessions).toEqual([]);
+			expect((await fx.get("/api/sessions/unbound")).sessions.map((chat: any) => chat.path)).not.toContain(
+				made.path,
+			);
+		});
+
+		it("treats each switch on its own", async () => {
+			const fx = await start();
+			const recycled = fakeRecycleBin();
+			const made = await populatedWorkspace(fx);
+			const statePath = join(dirname(made.ownedGlobal), "state.json");
+			writeFileSync(
+				statePath,
+				JSON.stringify({
+					version: 1,
+					sessions: {
+						[basename(dirname(dirname(dirname(made.path))))]: { lastEntryId: "kept", updatedAt: "2026-01-01" },
+					},
+					consolidation: {},
+				}),
+			);
+			// Memories only: the chat stays and keeps its cursor, or its old messages would turn into memories again.
+			await remove(fx, made.workspace.id, { deleteMemory: true });
+			expect(existsSync(made.workspaceMemory)).toBe(false);
+			expect(existsSync(made.ownedGlobal)).toBe(false);
+			expect(existsSync(made.path)).toBe(true);
+			expect(existsSync(made.artifact)).toBe(true);
+			expect(existsSync(made.projectFile)).toBe(true);
+			expect(recycled).toEqual([]);
+			expect(readFileSync(statePath, "utf8")).toContain('"lastEntryId":"kept"');
+
+			// Artifacts only: the chat and its file in the Recycle Bin part ways.
+			await fx.post("/api/workspaces/add", { path: made.project });
+			await remove(fx, made.workspace.id, { deleteArtifacts: true });
+			expect(existsSync(made.artifact)).toBe(false);
+			expect(existsSync(made.projectFile)).toBe(false);
+			expect(existsSync(made.path)).toBe(true);
+
+			// Chats only: another chat's artifacts stay as well.
+			await fx.post("/api/workspaces/add", { path: made.project });
+			mkdirSync(dirname(made.artifact), { recursive: true });
+			writeFileSync(join(dirname(made.artifact), "second.md"), "12");
+			await remove(fx, made.workspace.id, { deleteChats: true });
+			expect(existsSync(made.path)).toBe(false);
+			expect(existsSync(join(dirname(made.artifact), "second.md"))).toBe(true);
+		});
+
+		it("takes only this mode's part of a workspace that stays in the other mode", async () => {
+			const fx = await start();
+			fakeRecycleBin();
+			const made = await populatedWorkspace(fx);
+			await fx.post("/api/workspaces/add", { path: made.project, mode: "general" });
+			const impact = await fx.get(`/api/workspaces/delete-impact?id=${made.workspace.id}`);
+			// The workspace's memories serve the other mode too; they are judged like any other, and another chat wrote this one.
+			expect(impact.memories.owned).toEqual([
+				{ id: "global/only-this-chat", name: "only-this-chat", scope: "global" },
+			]);
+			await remove(fx, made.workspace.id, { deleteChats: true, deleteArtifacts: true, deleteMemory: true });
+			expect(existsSync(made.path)).toBe(false);
+			expect(existsSync(made.ownedGlobal)).toBe(false);
+			expect(existsSync(made.workspaceMemory)).toBe(true);
+			const general = await fx.get("/api/workspaces?mode=general");
+			expect(general.workspaces.some((w: any) => w.id === made.workspace.id)).toBe(true);
+		});
+
+		it("refuses while one of its chats runs and deletes nothing", async () => {
+			const fx = await start();
+			fakeRecycleBin();
+			const made = await populatedWorkspace(fx);
+			let release: () => void = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			fx.faux.setResponses([
+				async () => {
+					await gate;
+					return fauxAssistantMessage([fauxText("slow answer")]);
+				},
+			]);
+			void fx.post("/api/prompt", { text: "slow task" }, made.slot);
+			// The first prompt's events are already there, so its state is what tells that this one started.
+			await vi.waitFor(async () => expect((await fx.get("/api/state", made.slot)).active).toBe(true));
+			await expect(remove(fx, made.workspace.id, { deleteChats: true })).rejects.toThrow(
+				"409: Stop the running tasks in this workspace before deleting its chats or memories.",
+			);
+			expect(existsSync(made.path)).toBe(true);
+			expect((await fx.get("/api/workspaces")).workspaces.some((w: any) => w.id === made.workspace.id)).toBe(true);
+			release();
+			await vi.waitFor(async () => expect((await fx.get("/api/state", made.slot)).active).toBe(false));
+		});
 	});
 
 	it("deletes a workspace's artifacts while a chat of another workspace runs, but not while one of its own does", async () => {

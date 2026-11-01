@@ -589,7 +589,7 @@ function withoutDeleting(patch) {
 	if (!deletingPaths.size) return patch;
 	const keep = (list) => (Array.isArray(list) ? list.filter((item) => !deletingPaths.has(deletingKey(item.path))) : list);
 	const next = { ...patch };
-	for (const key of ["archived", "unbound"]) if (key in next) next[key] = keep(next[key]);
+	for (const key of ["archived", "unbound", "scheduled"]) if (key in next) next[key] = keep(next[key]);
 	if (next.sessions) next.sessions = Object.fromEntries(Object.entries(next.sessions).map(([root, list]) => [root, keep(list)]));
 	return next;
 }
@@ -1255,7 +1255,7 @@ async function fetchWorkspaceLists(mode, slot) {
 	if (current) targets.add(current.rootPath);
 	const aux = scheduleAuxLists(mode, slot);
 	try {
-		await Promise.all([...targets.values()].filter((root) => root !== GENERAL_KEY && root !== ARCHIVED_KEY).map((root) => loadSessions(root, mode)).concat(aux.loads));
+		await Promise.all([...targets.values()].filter((root) => root !== GENERAL_KEY && root !== ARCHIVED_KEY && root !== SCHEDULED_KEY).map((root) => loadSessions(root, mode)).concat(aux.loads));
 	} finally {
 		// The first screen is served only now: the slow lists may start asking for their quiet moment.
 		// A quiet main thread happens while the requests above are still in flight, so arming earlier would let them race.
@@ -1271,11 +1271,22 @@ export async function loadArchived(mode = uiMode()) {
 	emit();
 }
 
+export async function loadScheduled(mode = uiMode()) {
+	try {
+		const data = await api(`/api/sessions/scheduled?mode=${mode}`, { slot: "" });
+		patchLists(mode, { scheduled: data.sessions });
+	} catch (error) { setListError(SCHEDULED_KEY, listFailure(error), mode); }
+	emit();
+}
+
 /** Key of the "General" group (chats that belong to no workspace) in the sidebar's expanded / error maps. */
 export const GENERAL_KEY = "<general>";
 
 /** Key of the "Archived" group: archived chats hide from their groups and are restored from this sidebar entry. */
 export const ARCHIVED_KEY = "<archived>";
+
+/** Key of the "Scheduled tasks" group: the chats scheduled tasks started, out of their usual groups. */
+export const SCHEDULED_KEY = "<scheduled>";
 
 // The unbound and the archived list are the two slowest requests the page ever makes: on the server each one reads
 // every saved chat file from disk. They used to start with the rest of the sidebar's data and made the first screen
@@ -1301,6 +1312,9 @@ function scheduleAuxLists(mode, slot) {
 	if (generalOpen || currentUnbound) loads.push(loadUnbound(mode));
 	else armers.push(() => idleListLoad(mode, "unbound", loadUnbound, chatSlot));
 	armers.push(() => idleListLoad(mode, "archived", loadArchived, chatSlot));
+	// The chats of this list are left out of the other groups, so an open group, or one already shown, is read now.
+	if ((state.view[expandedKey(mode)] || {})[SCHEDULED_KEY] || listsByMode[mode].scheduled !== undefined) loads.push(loadScheduled(mode));
+	else armers.push(() => idleListLoad(mode, "scheduled", loadScheduled, chatSlot));
 	return { loads, arm: () => { for (const arm of armers) arm(); } };
 }
 
@@ -2137,7 +2151,7 @@ function connectEvents() {
 	on("dialogs", (d) => (d.slot ? set({ dialogs: d.requests }) : set({ boot: { ...state.boot, dialogs: d.requests } })));
 	on("surface", (d) => set({ surface: d }));
 	on("editor_text", (d, slot) => slot === activeSlot && set({ editorInsert: { text: d.text, nonce: Date.now() } }));
-	on("notice", (d) => toast(d.message, d.type === "error" ? "error" : d.type === "warning" ? "warning" : "info", d.type === "error" ? 10000 : 6000));
+	on("notice", (d) => toast(serverText(d.message, d.message), d.type === "error" ? "error" : d.type === "warning" ? "warning" : "info", d.type === "error" ? 10000 : 6000));
 	on("shutdown", () => set({ shutdown: true }));
 	on("slots", (d) => {
 		if (state.restarting) return;
@@ -2216,7 +2230,7 @@ function connectEvents() {
 			const index = findLive(d.liveId);
 			if (index >= 0) {
 				const items = state.items.slice();
-				items[index] = { ...d.item, liveId: d.liveId, id: items[index].id, final: true };
+				items[index] = { ...d.item, liveId: d.liveId, id: items[index].id, final: true, endedAt: d.endedAt };
 				state.items = items;
 				emit();
 				return;
@@ -2224,7 +2238,7 @@ function connectEvents() {
 			// Missed from its start (see message_update): show the finished reply, unless a transcript read already
 			// brought the saved copy of it.
 			if (d.item?.kind === "assistant" && !state.items.some((entry) => entry.kind === "assistant" && sameAssistantMessage(entry, d.item)))
-				appendStreamedItem({ ...d.item, liveId: d.liveId, final: true });
+				appendStreamedItem({ ...d.item, liveId: d.liveId, final: true, endedAt: d.endedAt });
 			return;
 		}
 		// A user/custom message that was already appended at message_start is replaced by its final form.
@@ -2375,7 +2389,11 @@ function connectEvents() {
 	});
 	// Scheduled tasks (schedules.js): the list changed here or arrived by sync, a new card, cards dismissed.
 	on("schedules_changed", () => window.dispatchEvent(new CustomEvent("myharness:schedules-changed")));
-	on("schedule_notice", (d) => window.dispatchEvent(new CustomEvent("myharness:schedule-notice", { detail: d.notice && d.sound ? { ...d.notice, sound: d.sound } : d.notice })));
+	on("schedule_notice", (d) => {
+		window.dispatchEvent(new CustomEvent("myharness:schedule-notice", { detail: d.notice && d.sound ? { ...d.notice, sound: d.sound } : d.notice }));
+		// A run that started or ended has saved its chat by now: the group lists it even after that chat is closed.
+		void attempt(() => loadScheduled(), { quiet: true });
+	});
 	on("schedule_notices", (d) => window.dispatchEvent(new CustomEvent("myharness:schedule-notices", { detail: d.notices })));
 	on("sync_applied", async (d, slot) => {
 		state.modePreferencesNonce += 1;

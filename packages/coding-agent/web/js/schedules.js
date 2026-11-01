@@ -1,12 +1,13 @@
-// Scheduled tasks: reminders, Agent tasks and emails at set times (packages/coding-agent/src/schedules/). The Settings
-// page lists and edits them; the corner cards (attention-cards.js) show a reminder when it is due, a time missed while
+// Scheduled tasks: reminders, Agent tasks and emails at set times (packages/coding-agent/src/schedules/). The page the
+// sidebar opens over the conversation lists and edits them; the corner cards (attention-cards.js) show a reminder when it is due, a time missed while
 // MyHarness was off, an Agent task that started, finished or failed, and an email that was sent or not. A new card plays
-// the notification sound (Settings → Notifications). The list syncs with Google Drive to the user's other computers; the
-// cards belong to this computer. When the app is not in front, a card also comes as a system notification.
-import { Empty, html, Icon, Segmented, Spinner, Toggle, useEffect, useState } from "./ui.js";
+// the notification sound (Settings → Notifications) and, when the app is not in front, also comes as a system
+// notification; see `present` for the cards of Agent tasks. The list syncs with Google Drive to the user's other
+// computers; the cards belong to this computer.
+import { autofocusOnMount, Empty, html, Icon, motionEnabled, Segmented, Spinner, Toggle, useEffect, usePresence, useState } from "./ui.js";
 import { playNotificationSound } from "./notification-sounds.js";
 import { Select } from "./select.js";
-import { api, post, state, toast, useStore } from "./store.js";
+import { api, chatTucked, post, setView, state, toast, useStore } from "./store.js";
 import { actions, confirmDialog } from "./actions.js";
 import { serverText, t } from "./i18n.js";
 import { getLang } from "./lang.js";
@@ -121,15 +122,18 @@ registerCardKind("schedule", (card, actionId) => {
 const shown = new Set();
 
 /**
- * Show a card (once per notice). A new one plays the notification sound, except for a task that only started, and also
- * notifies when the app is not in front.
+ * Show a card (once per notice). A task that only started asks nothing of the user, so it is a card and nothing more. The
+ * end of an Agent task's run is told by the chat that ran it (WebHost.announceTaskEnd), one sound and one notification
+ * that follow the Notifications settings, so here it is a card too. Any other new card plays the notification sound and
+ * also notifies when the app is not in front.
  */
 function present(notice, fresh) {
 	const card = noticeCard(notice);
 	showCard(card);
 	if (!fresh || shown.has(notice.id)) return;
 	shown.add(notice.id);
-	if (notice.type !== "started") playNotificationSound(notice.sound);
+	if (notice.type === "started" || (notice.kind === "agent" && notice.slot)) return;
+	playNotificationSound(notice.sound);
 	if (appFocused() && document.visibilityState === "visible") return;
 	void showNotification({
 		title: notice.title,
@@ -183,13 +187,25 @@ export function ScheduleCards() {
 // ---------------------------------------------------------------------------------------------------------------------
 // Settings page
 
+// The last list read: the page opens with it at once, and the fresh one replaces it when it arrives.
+let lastSchedules = null;
+const readSchedules = () =>
+	api("/api/schedules", { slot: "" }).then((value) => {
+		lastSchedules = value;
+		return value;
+	});
+/** The pointer is on the way to the page's button: the very first open shows the list, not a spinner. */
+export const preloadSchedules = () => {
+	if (!lastSchedules) void readSchedules().catch(() => undefined);
+};
+
 function useSchedules() {
-	const [data, setData] = useState(null);
+	const [data, setData] = useState(lastSchedules);
 	const [error, setError] = useState("");
 	useEffect(() => {
 		let cancelled = false;
 		const load = () =>
-			api("/api/schedules", { slot: "" })
+			readSchedules()
 				.then((value) => {
 					if (cancelled) return;
 					setData(value);
@@ -206,7 +222,7 @@ function useSchedules() {
 			clearInterval(timer);
 		};
 	}, []);
-	return { data, error, reload: () => api("/api/schedules", { slot: "" }).then(setData) };
+	return { data, error, reload: () => readSchedules().then(setData) };
 }
 
 const pad = (value) => String(value).padStart(2, "0");
@@ -484,8 +500,62 @@ function ScheduleRow({ schedule, data, onEdit }) {
 	</div>`;
 }
 
-/** Settings → Scheduled tasks. */
-export function SchedulesPage() {
+/** Time the page takes to leave (--t-fast in tokens.css, and a little more so it is gone for sure). */
+const PAGE_EXIT_MS = 110;
+
+/** Open the page. It remembers the chat it was opened from: leaving that chat closes the page. */
+const openSchedulesPage = () => {
+	// The page lies over the conversation: with the conversation tucked away it would open out of sight.
+	if (chatTucked()) actions.showConversation(true);
+	setView({ schedulesPage: { slot: state.activeSlot } });
+};
+const closeSchedulesPage = () => {
+	setView({ schedulesPage: null });
+	document.querySelector(".composer-input")?.focus();
+};
+export const toggleSchedulesPage = () => (state.view.schedulesPage ? closeSchedulesPage() : openSchedulesPage());
+
+/**
+ * Covers the conversation area while open; the chat below stays mounted, so going back finds it exactly as it was
+ * (scroll position, a running task, the draft). Esc goes back, unless it has something closer to close: a field being
+ * typed in, the editor, an open list, or a dialog above the page.
+ */
+export function SchedulesPageHost() {
+	const page = useStore((s) => s.view.schedulesPage);
+	const slot = useStore((s) => s.activeSlot);
+	const open = !!page && slot === page.slot;
+	useEffect(() => {
+		if (page && !open) setView({ schedulesPage: null });
+	}, [page, open]);
+	useEffect(() => {
+		if (!open) return undefined;
+		const onKey = (event) => {
+			if (event.key !== "Escape") return;
+			if (event.target.closest?.("input, textarea, select, [contenteditable]")) return;
+			const { settingsOpen, providerEditor, palette, dialog } = state.view;
+			if (settingsOpen || providerEditor || palette || dialog) return;
+			if (document.querySelector(".overlay-host:not(.closing), .lightbox-scrim, .schedules-page .schedule-editor, .schedules-page .popover")) return;
+			event.preventDefault();
+			// Esc in the chat below stops a running task; here it only goes back.
+			event.stopPropagation();
+			closeSchedulesPage();
+		};
+		window.addEventListener("keydown", onKey, true);
+		return () => window.removeEventListener("keydown", onKey, true);
+	}, [open]);
+	const { mounted, shown } = usePresence(open, motionEnabled() ? PAGE_EXIT_MS : 0);
+	if (!mounted) return null;
+	return html`<section class=${`schedules-page ${shown ? "shown" : ""}`} aria-label=${t("Scheduled tasks")} inert=${!open}>
+		<header class="main-header sources-head">
+			<button class="icon-btn" ref=${autofocusOnMount} title=${t("Back")} aria-label=${t("Back")} onClick=${closeSchedulesPage}><${Icon} name="arrowLeft" size=${17} /></button>
+			<span class="sources-title truncate">${t("Scheduled tasks")}</span>
+		</header>
+		<div class="sources-body"><${SchedulesPage} /></div>
+	</section>`;
+}
+
+/** The list and the editor of the page. */
+function SchedulesPage() {
 	const { data, error, reload } = useSchedules();
 	// null: closed; {}: a new task; a task: editing it.
 	const [editing, setEditing] = useState(null);
@@ -496,7 +566,7 @@ export function SchedulesPage() {
 	};
 	return html`<section class="set-card">
 		<div class="set-card-head">
-			<div class="col grow"><strong>${t("Scheduled tasks")}</strong><span class="set-card-desc">${t("Reminders, Agent tasks and emails at set times. With Google Drive sync they reach your other computers too: a reminder pops up on every computer that is on, an Agent task or an email runs only on the computer you choose.")}</span></div>
+			<div class="col grow"><span class="set-card-desc">${t("Reminders, Agent tasks and emails at set times. The chat of each run is kept in the Scheduled tasks group on the left. With Google Drive sync they reach your other computers too: a reminder pops up on every computer that is on, an Agent task or an email runs only on the computer you choose.")}</span></div>
 			${editing ? null : html`<button class="btn primary" onClick=${() => setEditing({})}><${Icon} name="plus" size=${14} />${t("New task")}</button>`}
 		</div>
 		<div class="set-card-body">

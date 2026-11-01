@@ -7,13 +7,22 @@ import {
 	type StoredApiKeyInfo,
 } from "./api-key-collection.ts";
 
+/** A key that came from a layer above the provider it is read for (see providers/models/layers.ts). */
+export type UpperLayerCredential = ApiKeyCredential & { upperLayer?: true };
+
 /** Async credential store overlay for non-persistent runtime API keys. */
 export class RuntimeCredentials implements ApiKeyCollectionStore {
 	private readonly store: CredentialStore;
 	private readonly overrides = new Map<string, string>();
+	private upperLayer: ((providerId: string) => string | undefined) | undefined;
 
 	constructor(store: CredentialStore) {
 		this.store = store;
+	}
+
+	/** Names the credential that, when it exists, is used instead of the provider's own. */
+	setUpperLayer(resolve: (providerId: string) => string | undefined): void {
+		this.upperLayer = resolve;
 	}
 
 	/**
@@ -39,7 +48,11 @@ export class RuntimeCredentials implements ApiKeyCollectionStore {
 
 	async read(providerId: string): Promise<Credential | undefined> {
 		const override = this.overrides.get(providerId);
-		return override ? { type: "api_key", key: override } : this.store.read(providerId);
+		if (override) return { type: "api_key", key: override };
+		const upperId = this.upperLayer?.(providerId);
+		const upper = upperId ? await this.store.read(upperId) : undefined;
+		if (upper?.type === "api_key") return { ...upper, upperLayer: true } as UpperLayerCredential;
+		return this.store.read(providerId);
 	}
 
 	/** Read the persisted credential without applying a process-local runtime override. */

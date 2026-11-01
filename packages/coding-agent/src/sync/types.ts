@@ -73,7 +73,8 @@ export type SyncIssueReason =
 	| "missing-object"
 	| "too-large"
 	| "invalid-record"
-	| "apply-failed";
+	| "apply-failed"
+	| "mass-delete";
 
 /** A problem that retrying does not fix: a damaged remote batch, a file over the size limit, a refused record. */
 export interface SyncIssue {

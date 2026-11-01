@@ -712,6 +712,202 @@ describe("Web UI: a run ended by an interrupting message", () => {
 	});
 });
 
+describe("Web UI: one run holding several turns", () => {
+	const load = () => import(new URL("turns.js", webDir).href);
+	const user = (ts: number, text: string, extra: Record<string, unknown> = {}) => ({
+		kind: "user",
+		id: `u${ts}`,
+		ts,
+		text,
+		images: [],
+		...extra,
+	});
+	const cancelled = {
+		runId: 1,
+		outcome: "cancelled",
+		startedAt: 1_000,
+		endedAt: 30_000,
+		error: "Request was aborted",
+	};
+
+	it("gives the run's end to its last turn only: the first reply finished, the queued message was stopped", async () => {
+		const { buildTurns, nextRound, runForTurn, turnOutcome } = await load();
+		// Queued 500 ms into the run, so it carries that time while the page has not read the saved entries.
+		const turns = buildTurns(
+			[
+				user(1_000, "first"),
+				assistant([{ type: "text", text: "answer" }], { ts: 1_010, liveId: "l1", endedAt: 20_000 }),
+				user(1_500, "second"),
+				assistant([], {
+					ts: 20_010,
+					liveId: "l2",
+					endedAt: 29_000,
+					stopReason: "aborted",
+					error: "Request was aborted",
+				}),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		const runs = { 1: cancelled };
+		const first = runForTurn(turns[0], runs, nextRound(turns, 0));
+		const second = runForTurn(turns[1], runs, nextRound(turns, 1));
+		expect(first).toBeUndefined();
+		expect(second).toBe(cancelled);
+		expect(turnOutcome(turns[0], { run: first })).toBe("completed");
+		expect(turnOutcome(turns[1], { run: second })).toBe("cancelled");
+	});
+
+	it("shows the same rounds as cancelled when the chat is reopened, which has no run records", async () => {
+		const { buildTurns, nextRound, runForTurn, turnOutcome } = await load();
+		const turns = buildTurns(
+			[
+				user(1_000, "first"),
+				assistant([{ type: "text", text: "answer" }], { id: "a1", ts: 20_000 }),
+				user(20_004, "second"),
+				assistant([], { id: "a2", ts: 29_000, stopReason: "aborted", error: "Request was aborted" }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(turns.map((turn: any, i: number) => runForTurn(turn, {}, nextRound(turns, i)))).toEqual([
+			undefined,
+			undefined,
+		]);
+		expect(turns.map((turn: any) => turnOutcome(turn, {}))).toEqual(["completed", "cancelled"]);
+	});
+
+	it("finds the last turn across three messages and across a card between two rounds", async () => {
+		const { buildTurns, nextRound, runForTurn } = await load();
+		const three = buildTurns(
+			[
+				user(1_000, "a"),
+				assistant([], { ts: 5_000 }),
+				user(1_200, "b"),
+				assistant([], { ts: 9_000 }),
+				user(1_400, "c"),
+				assistant([], { ts: 12_000 }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(three.map((turn: any, i: number) => runForTurn(turn, { 1: cancelled }, nextRound(three, i)))).toEqual([
+			undefined,
+			undefined,
+			cancelled,
+		]);
+		const compacted = buildTurns(
+			[
+				user(1_000, "a"),
+				assistant([], { ts: 5_000 }),
+				{ kind: "compaction", id: "c1", ts: 6_000 },
+				assistant([], { ts: 7_000 }),
+				user(8_000, "b"),
+				assistant([], { ts: 12_000 }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(compacted[1].standalone).toBeTruthy();
+		expect(runForTurn(compacted[0], { 1: cancelled }, nextRound(compacted, 0))).toBeUndefined();
+		expect(runForTurn(compacted[3], { 1: cancelled }, nextRound(compacted, 3))).toBe(cancelled);
+	});
+
+	it("keeps each run with its own turn when the next message starts a run of its own", async () => {
+		const { buildTurns, nextRound, runForTurn } = await load();
+		const redirected = { runId: 1, outcome: "redirected", startedAt: 1_000, endedAt: 10_000 };
+		const answered = { runId: 2, outcome: "completed", startedAt: 10_020, endedAt: 15_000 };
+		const runs = { 1: redirected, 2: answered };
+		const turns = buildTurns(
+			[
+				user(1_000, "a"),
+				assistant([], { ts: 9_900, stopReason: "aborted" }),
+				user(10_010, "b"),
+				assistant([], { ts: 14_000 }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(runForTurn(turns[0], runs, nextRound(turns, 0))).toBe(redirected);
+		expect(runForTurn(turns[1], runs, nextRound(turns, 1))).toBe(answered);
+		// The interrupting message's copy on the page is older than the stop it causes: the stopped run stays with its turn.
+		const waiting = buildTurns(
+			[
+				user(1_000, "a"),
+				assistant([], { ts: 9_900, stopReason: "aborted" }),
+				user(9_000, "b", { pending: true, id: undefined }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(runForTurn(waiting[0], { 1: redirected }, nextRound(waiting, 0))).toBe(redirected);
+		expect(runForTurn(waiting[1], { 1: redirected }, undefined)).toBeUndefined();
+	});
+
+	it("counts only a turn's own share of the run, and starts a queued turn when the reply before it ended", async () => {
+		const { buildTurns, turnDuration } = await load();
+		const turns = buildTurns(
+			[
+				user(1_000, "first"),
+				assistant([{ type: "text", text: "answer" }], { ts: 1_010, liveId: "l1", endedAt: 20_000 }),
+				user(1_500, "second"),
+				assistant([], { ts: 20_010, liveId: "l2", stopReason: "aborted" }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(turnDuration(turns[0], undefined)).toBe(19_000);
+		expect(turns[1].startedAt).toBe(20_000);
+		expect(turnDuration(turns[1], cancelled)).toBe(10_000);
+		// A run with one turn is timed as a whole.
+		expect(turnDuration({ startedAt: 1_005 }, { startedAt: 1_000, endedAt: 9_000 })).toBe(7_995);
+		expect(turnDuration({ startedAt: 900 }, { startedAt: 1_000, endedAt: 9_000 })).toBe(8_000);
+	});
+
+	it("does not take a stop with a message waiting for an interrupt, in a saved chat", async () => {
+		const { buildTurns, interruptedByNext } = await load();
+		// Both end aborted: the waiting message got its one last turn, saved right after the stop.
+		const stopped = buildTurns(
+			[
+				user(1_000, "first"),
+				assistant([], { id: "a1", ts: 2_825, stopReason: "aborted" }),
+				user(2_834, "second"),
+				assistant([], { id: "a2", ts: 2_837, stopReason: "aborted" }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(interruptedByNext(stopped[0], stopped[1])).toBe(false);
+		// An old chat's interrupting message, without the marker, is answered.
+		const interrupted = buildTurns(
+			[
+				user(1_000, "first"),
+				assistant([], { id: "a1", ts: 2_825, stopReason: "aborted" }),
+				user(2_834, "second"),
+				assistant([{ type: "text", text: "answer" }], { id: "a2", ts: 9_000 }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		expect(interruptedByNext(interrupted[0], interrupted[1])).toBe(true);
+	});
+
+	it("translates how Providers report a stop", async () => {
+		const { serverText } = await import(new URL("i18n.js", webDir).href);
+		const { getLang, setLang } = await import(new URL("lang.js", webDir).href);
+		const previous = getLang();
+		try {
+			setLang("zh-CN");
+			for (const text of [
+				"Request was aborted",
+				"Request was aborted.",
+				"Request aborted",
+				"This operation was aborted",
+				"The operation was aborted",
+			]) {
+				expect(serverText(text)).toBe("请求已中止。");
+			}
+			expect(serverText("Retry cancelled")).toBe("重试已取消。");
+			expect(serverText("Request was aborted by the proxy")).toBe("Request was aborted by the proxy");
+			setLang("en");
+			expect(serverText("Request was aborted")).toBe("Request was aborted");
+		} finally {
+			setLang(previous);
+		}
+	});
+});
+
 describe("Web UI: process summary status", () => {
 	it("keeps earlier blocks neutral for every task outcome, including failed local actions", async () => {
 		const { processSummaryState } = await import(new URL("process-summary.js", webDir).href);
@@ -1852,6 +2048,46 @@ describe("Web UI: actions.js removeWorkspace drops the row before the server ans
 		await run;
 		expect(rowIds()).toEqual(["w1", "w2"]);
 	});
+
+	it("leaves the removed folder when the chat on screen goes with the workspace or is still empty", async () => {
+		const newSession = vi.spyOn(actions.actions, "newSession").mockResolvedValue(undefined);
+		store.state.activeSlot = "t1";
+		const remove = async (onScreenId: string, choice: unknown, hasContent = true) => {
+			store.state.snap = { workspace: { id: onScreenId } };
+			store.state.slots = [{ slot: "t1", hasContent }];
+			// The refresh after it fails here: this stub has no snapshot to give, and only the call before it matters.
+			const run = removeWorkspace("w1", "One").catch(() => undefined);
+			await flush();
+			resolveConfirm(choice);
+			await flush();
+			release!(reply({ ok: true }));
+			let done = false;
+			void run.then(() => {
+				done = true;
+			});
+			for (let i = 0; i < 40 && !done; i += 1) {
+				await flush();
+				releaseList?.(reply({ workspaces: [], currentPath: null, currentSessionFile: null }));
+			}
+			await run;
+		};
+		try {
+			await remove("w1", { deleteChats: false, deleteArtifacts: true });
+			await remove("w2", { deleteChats: true });
+			expect(newSession).not.toHaveBeenCalled();
+			await remove("w1", { deleteChats: true });
+			expect(newSession.mock.calls).toEqual([[undefined, { unbound: true }]]);
+			newSession.mockClear();
+			// An empty chat must not keep working in a folder that has left the list.
+			await remove("w1", { deleteChats: false }, false);
+			expect(newSession.mock.calls).toEqual([[undefined, { unbound: true }]]);
+		} finally {
+			newSession.mockRestore();
+			store.state.snap = null;
+			store.state.slots = [];
+			store.state.activeSlot = null;
+		}
+	});
 });
 
 describe("Web UI: store.js first-screen ordering of the unbound and archived lists", () => {
@@ -2550,5 +2786,241 @@ describe("Web UI: provider JSON view accepts an entry copied with its key", () =
 	it("still reports broken JSON and non-objects", () => {
 		expect(models.parseProviderJson(`{ "api": `, "anthropic").error).toBe("syntax");
 		expect(models.parseProviderJson("[]", "anthropic")).toEqual({ error: "not-object" });
+	});
+});
+
+describe("Web UI: the three layers of a provider", () => {
+	const noCredentials = { active: null, apiKeys: [], hasOAuth: false, runtimeOverride: false };
+	const providerOf = (id: string, over: Record<string, unknown> = {}) => ({
+		id,
+		name: id,
+		enabled: true,
+		configured: false,
+		authSource: null,
+		credentials: noCredentials,
+		...over,
+	});
+	const savedKey = { ...noCredentials, apiKeys: [{ id: "k", label: "Default key", suffix: "abcd", active: true }] };
+
+	it("gives a group one row, where its first key would have been, and every other entry a row of its own", () => {
+		const providers = ["alone", "muse", "other", "ds"].map((id) => providerOf(id));
+		const custom = {
+			groups: [{ id: "oc", config: { name: "OpenCode" }, key: null }],
+			providers: [
+				{ id: "alone", config: { name: "Alone" } },
+				{ id: "muse", config: { name: "oc-muse", group: "oc" } },
+				{ id: "ds", config: { name: "oc-ds", group: "oc" } },
+			],
+		};
+		const rows = models.providerTree(providers, custom);
+		expect(rows.map((row: { id: string }) => row.id)).toEqual(["alone", "group:oc", "other"]);
+		expect(rows[1].members.map((member: { provider: { id: string } }) => member.provider.id)).toEqual(["muse", "ds"]);
+		expect(rows.map((row: unknown) => models.rowName(row))).toEqual(["Alone", "OpenCode", "other"]);
+		expect(models.findRow(rows, "ds")).toBe(rows[1]);
+		expect(models.findRow(rows, "group:oc")).toBe(rows[1]);
+		expect(models.findRow(rows, "missing")).toBeUndefined();
+	});
+
+	it("treats an entry whose group is gone as standing alone", () => {
+		const rows = models.providerTree([providerOf("a")], {
+			groups: [],
+			providers: [{ id: "a", config: { group: "gone" } }],
+		});
+		expect(rows).toHaveLength(1);
+		expect(rows[0].id).toBe("a");
+		expect(rows[0].group).toBeNull();
+	});
+
+	it("applies the layers only to entries with the layered rule, and never to a login or Nebius", () => {
+		const layered = { config: { layered: true } };
+		expect(models.isLayeredMember({ provider: providerOf("a"), entry: layered })).toBe(true);
+		expect(models.isLayeredMember({ provider: providerOf("a"), entry: { config: {} } })).toBe(false);
+		expect(models.isLayeredMember({ provider: providerOf("a"), entry: undefined })).toBe(false);
+		expect(models.isLayeredMember({ provider: providerOf("nebius"), entry: layered })).toBe(false);
+		expect(models.isLayeredMember({ provider: providerOf("a", { supportsOAuth: true }), entry: layered })).toBe(
+			false,
+		);
+		const login = providerOf("a", { credentials: { ...noCredentials, hasOAuth: true } });
+		expect(models.isLayeredMember({ provider: login, entry: layered })).toBe(false);
+	});
+
+	it("names what no layer sets, and nothing that any layer does", () => {
+		const nothing = { group: undefined, entry: {}, hasKey: false };
+		expect(models.modelGaps({ id: "m" }, nothing)).toEqual(["api", "baseUrl", "key"]);
+		for (const layers of [
+			{ group: { api: "a", baseUrl: "u" }, entry: {}, hasKey: true },
+			{ group: undefined, entry: { api: "a", baseUrl: "u" }, hasKey: true },
+		]) {
+			expect(models.modelGaps({ id: "m" }, layers)).toEqual([]);
+		}
+		expect(
+			models.modelGaps({ id: "m", api: "a", baseUrl: "u" }, { group: undefined, entry: {}, hasKey: true }),
+		).toEqual([]);
+		// Spaces in a field being typed are not an address.
+		expect(
+			models.modelGaps({ id: "m", api: "a", baseUrl: "  " }, { group: undefined, entry: {}, hasKey: true }),
+		).toEqual(["baseUrl"]);
+	});
+
+	it("does not take a key of the group or of one model for a key of the entry", () => {
+		// The server reports all of these as "stored".
+		const stored = { configured: true, authSource: "stored" };
+		expect(models.entryHasSharedKey(providerOf("a", stored))).toBe(false);
+		expect(models.entryHasSharedKey(providerOf("a", { ...stored, credentials: savedKey }))).toBe(true);
+		expect(
+			models.entryHasSharedKey(providerOf("a", { ...stored, credentials: { ...noCredentials, hasOAuth: true } })),
+		).toBe(true);
+		expect(
+			models.entryHasSharedKey(
+				providerOf("a", { ...stored, credentials: { ...noCredentials, runtimeOverride: true } }),
+			),
+		).toBe(true);
+		expect(models.entryHasSharedKey(providerOf("a", { configured: true, authSource: "models.json" }))).toBe(true);
+		expect(models.entryHasSharedKey(providerOf("a", { configured: true, authSource: "environment" }))).toBe(true);
+		expect(models.entryHasSharedKey(providerOf("a"))).toBe(false);
+		// Nothing is known about what is saved: the status the server gives is all there is.
+		expect(models.entryHasSharedKey(providerOf("a", { ...stored, credentials: null }))).toBe(true);
+	});
+
+	it("counts the models that lack something on every layer", () => {
+		const config = {
+			layered: true,
+			api: "openai-completions",
+			baseUrl: "https://relay.example/v1",
+			models: [{ id: "one" }, { id: "two" }],
+		};
+		const modelOnly = providerOf("a", { configured: true, authSource: "stored" });
+		// One of two models has a key of its own, so the other has none.
+		expect(
+			models.memberGapCount(
+				{ provider: modelOnly, entry: { config, modelKeys: { one: { suffix: "1111" } } } },
+				null,
+			),
+		).toBe(1);
+		// A key of the entry or of the group serves both.
+		const keyed = providerOf("a", { configured: true, authSource: "stored", credentials: savedKey });
+		expect(models.memberGapCount({ provider: keyed, entry: { config } }, null)).toBe(0);
+		expect(
+			models.memberGapCount({ provider: modelOnly, entry: { config } }, { config: {}, key: { suffix: "2222" } }),
+		).toBe(0);
+		// A value of the group fills in for what the entry leaves empty.
+		const empty = { layered: true, models: [{ id: "one" }] };
+		expect(models.memberGapCount({ provider: keyed, entry: { config: empty } }, null)).toBe(1);
+		expect(
+			models.memberGapCount(
+				{ provider: keyed, entry: { config: empty } },
+				{ config: { api: "a", baseUrl: "u" }, key: null },
+			),
+		).toBe(0);
+		// An entry under the old rule is not judged by this one.
+		expect(models.memberGapCount({ provider: modelOnly, entry: { config: { models: [{ id: "one" }] } } }, null)).toBe(
+			0,
+		);
+	});
+
+	it("reports what a field holds across the keys, a model's value only where its key has none", () => {
+		const member = (config: Record<string, unknown>) => ({ entry: { config } });
+		expect(models.memberValues([member({ api: "a" }), member({ api: "a" })], "api")).toEqual({
+			values: ["a"],
+			differ: false,
+		});
+		expect(models.memberValues([member({ api: "a" }), member({ api: "b" })], "api")).toEqual({
+			values: ["a", "b"],
+			differ: true,
+		});
+		const below = member({ models: [{ id: "x", api: "c" }, { id: "y", api: "d" }, { id: "z" }] });
+		expect(models.memberValues([below], "api")).toEqual({ values: ["c", "d"], differ: true });
+		const covered = member({ api: "a", models: [{ id: "x", api: "c" }] });
+		expect(models.memberValues([covered], "api")).toEqual({ values: ["a"], differ: false });
+		expect(models.memberValues([member({})], "api")).toEqual({ values: [], differ: false });
+	});
+
+	it("says which layer covers a model's value, the top one first", () => {
+		const draft = { raw: { layered: true }, api: "from-key", baseUrl: "  https://key.example  " };
+		expect(models.coverOf("api", { upper: { api: "from-top" }, draft })).toEqual({
+			layer: "provider",
+			value: "from-top",
+		});
+		expect(models.coverOf("api", { upper: {}, draft })).toEqual({ layer: "key", value: "from-key" });
+		expect(models.coverOf("baseUrl", { upper: null, draft })).toEqual({ layer: "key", value: "https://key.example" });
+		expect(models.coverOf("api", { upper: null, draft: { raw: { layered: true }, api: "" } })).toBeNull();
+		// Under the old rule the value of the entry does not cover its models.
+		expect(models.coverOf("api", { upper: null, draft: { raw: {}, api: "from-key" } })).toBeNull();
+	});
+
+	it("finds an ID no other entry has", () => {
+		expect(models.uniqueProviderId("relay", new Set())).toBe("relay");
+		expect(models.uniqueProviderId("relay", new Set(["relay", "relay-2"]))).toBe("relay-3");
+		expect(models.uniqueProviderId("", new Set(["provider"]))).toBe("provider-2");
+	});
+
+	describe("setting a format or an address on the ticked models", () => {
+		const draftOf = (over: Record<string, unknown> = {}) => {
+			const first = models.modelDraft({ id: "one" });
+			const second = models.modelDraft({ id: "two", api: "own-format" });
+			return { raw: { layered: true }, api: "", baseUrl: "", models: [first, second], ...over };
+		};
+
+		it("changes only the ticked models when the key sets nothing", () => {
+			const draft = draftOf();
+			const result = models.applyToTickedModels(draft, new Set([draft.models[0].uid]), {
+				api: "anthropic-messages",
+			});
+			expect(result.models.map((model: { api: string }) => model.api)).toEqual(["anthropic-messages", "own-format"]);
+			expect(result.movedDown).toBe(false);
+			expect("api" in result).toBe(false);
+		});
+
+		it("moves the key's own value down, so the models not ticked keep using it", () => {
+			const draft = draftOf({ api: "key-format", baseUrl: "https://key.example/v1" });
+			const result = models.applyToTickedModels(draft, new Set([draft.models[0].uid]), {
+				api: "anthropic-messages",
+				baseUrl: " https://other.example ",
+			});
+			expect(result.models.map((model: { api: string }) => model.api)).toEqual(["anthropic-messages", "key-format"]);
+			expect(result.models.map((model: { baseUrl: string }) => model.baseUrl)).toEqual([
+				"https://other.example",
+				"https://key.example/v1",
+			]);
+			expect(result.api).toBe("");
+			expect(result.baseUrl).toBe("");
+			expect(result.movedDown).toBe(true);
+		});
+
+		it("leaves the field that was not set alone", () => {
+			const draft = draftOf({ api: "key-format", baseUrl: "https://key.example/v1" });
+			const result = models.applyToTickedModels(draft, new Set([draft.models[0].uid]), {
+				api: "anthropic-messages",
+			});
+			expect(result.models.map((model: { baseUrl: string }) => model.baseUrl)).toEqual(["", ""]);
+			expect("baseUrl" in result).toBe(false);
+		});
+
+		it("does not touch the entry's value under the old rule, where a model's own value wins anyway", () => {
+			const draft = draftOf({ raw: {}, api: "key-format" });
+			const result = models.applyToTickedModels(draft, new Set([draft.models[0].uid]), {
+				api: "anthropic-messages",
+			});
+			expect(result.models.map((model: { api: string }) => model.api)).toEqual(["anthropic-messages", "own-format"]);
+			expect("api" in result).toBe(false);
+			expect(result.movedDown).toBe(false);
+		});
+	});
+
+	it("saves a model's own format and address, and takes them out when they are emptied", () => {
+		const draft = models.modelDraft({ id: "m", api: "old", baseUrl: "https://old.example" });
+		expect(draft.api).toBe("old");
+		expect(draft.baseUrl).toBe("https://old.example");
+		expect(draft.apiKey).toBe("");
+		expect(models.buildModel(draft)).toMatchObject({ id: "m", api: "old", baseUrl: "https://old.example" });
+		expect(models.buildModel({ ...draft, api: "new", baseUrl: "  https://new.example  " })).toMatchObject({
+			api: "new",
+			baseUrl: "https://new.example",
+		});
+		const cleared = models.buildModel({ ...draft, api: "", baseUrl: "   " });
+		expect("api" in cleared).toBe(false);
+		expect("baseUrl" in cleared).toBe(false);
+		// A key typed for the model goes to the credential store, never into models.json.
+		expect("apiKey" in models.buildModel({ ...draft, apiKey: "typed" })).toBe(false);
 	});
 });

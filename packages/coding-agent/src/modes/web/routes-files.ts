@@ -28,6 +28,7 @@ import {
 } from "../../config/paths/attachments.ts";
 import { getAttachmentDir, getDataDir } from "../../config/paths/index.ts";
 import { decodeUploadChunk, MAX_UPLOAD_BYTES, writeUploadChunk } from "../../data/upload-chunks.ts";
+import { isBadFolderPath, planFolderTargets } from "../../data/workspace-sources.ts";
 import {
 	artifactScope,
 	listArtifacts,
@@ -67,7 +68,7 @@ import { resolveLocalFile, runLocalFileAction } from "./local-files.ts";
 import { registerOfficePreview, registerOfficeRoutes } from "./office.ts";
 import { collectSessionChanges } from "./session-changes.ts";
 import { attributeConversationFiles, type ConversationAttribution, isElsewhereOwned } from "./session-ownership.ts";
-import { RUN_CHANGES_ENTRY, splitAttachmentText } from "./wire.ts";
+import { attachmentName, RUN_CHANGES_ENTRY, splitAttachmentText } from "./wire.ts";
 
 const MAX_TEXT_BYTES = 1.5 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -482,16 +483,10 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 	// New uploads land in the workspace attachment library with a manifest beside the file.
 	// Where one new upload goes: the workspace attachment library when the session has one, else the legacy
 	// `uploads/<id>/` folder beside the session file.
-	const prepareAttachment = async (rawName: string) => {
-		const name =
-			path
-				.basename(rawName.replaceAll("\\", "/"))
-				.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
-				.replace(/[. ]+$/g, "") || "file";
+	const attachmentHome = async () => {
 		const manager = host.session.sessionManager;
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new HttpError(409, "No current session.");
-		const storedName = `attachment-${name}`;
 		const workspaceId = manager.getWorkspaceId?.();
 		const sessionId = manager.getSessionId?.();
 		const dataRoot = manager.getDataRoot?.() ?? getDataDir();
@@ -501,12 +496,32 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			? getAttachmentDir(library.dataRoot, library.workspaceId, library.sessionId, id)
 			: path.join(path.dirname(sessionFile), "uploads", id);
 		await mkdir(directory, { recursive: true });
-		return { name, storedName, id, library, directory, target: path.join(directory, storedName) };
+		return { id, library, directory };
 	};
-	// Record a written upload the same way for one-request and chunked uploads.
-	const recordAttachment = (prepared: Awaited<ReturnType<typeof prepareAttachment>>, size: number) => {
+	const prepareAttachment = async (rawName: string) => {
+		const name =
+			path
+				.basename(rawName.replaceAll("\\", "/"))
+				.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+				.replace(/[. ]+$/g, "") || "file";
+		const storedName = `attachment-${name}`;
+		const home = await attachmentHome();
+		const target = path.join(home.directory, storedName);
+		return { name, storedName, ...home, target, part: `${target}.part`, inFolder: false };
+	};
+	// Record a written upload the same way for one-request and chunked uploads. A file of a folder has only its address:
+	// the one manifest of the folder was written when the folder was planned.
+	const recordAttachment = (
+		prepared: Awaited<ReturnType<typeof prepareAttachment>>,
+		size: number,
+		mime = guessAttachmentMime(prepared.name),
+	) => {
 		const { name, storedName, id, library, directory, target } = prepared;
 		host.inputTouched = true;
+		if (prepared.inFolder) {
+			const reference = library ? toAttachmentRelativePath(library.dataRoot, target) : target;
+			return { name: attachmentName(reference), path: reference, id: reference, mime, size };
+		}
 		if (library) {
 			const relativePath = toAttachmentRelativePath(library.dataRoot, target);
 			const manifest = {
@@ -514,7 +529,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 				id,
 				originalName: name,
 				storedName,
-				mime: guessAttachmentMime(name),
+				mime,
 				size,
 				createdAt: new Date().toISOString(),
 				relativePath,
@@ -528,7 +543,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 				id: path.basename(directory),
 				originalName: name,
 				storedName,
-				mime: guessAttachmentMime(name),
+				mime,
 				size,
 				createdAt: new Date().toISOString(),
 				relativePath: target,
@@ -560,13 +575,66 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		string,
 		{ prepared: Awaited<ReturnType<typeof prepareAttachment>>; size: number; written: number }
 	>();
+	// A picked folder keeps its tree on disk, so the Agent reads it as the folder it was. All its paths are planned at
+	// once (names that end up the same get their `~2` whichever file comes first); each file then goes up through `begin`
+	// with the id answered here, and a file is taken off the plan when its upload begins. The names stay as they were
+	// and a long path is not refused: the data folder alone can take most of 260 characters, and Node reads and writes
+	// past that limit on Windows.
+	const uploadFolders = new Map<
+		string,
+		{ home: Awaited<ReturnType<typeof attachmentHome>>; targets: Map<string, string> }
+	>();
+	server.route("POST", "/api/files/upload/folder", async ({ body }) => {
+		const payload = body as { name?: unknown; files?: unknown } | null;
+		if (typeof payload?.name !== "string" || !Array.isArray(payload.files) || !payload.files.length)
+			throw new HttpError(400, "Expected a folder name and its files.");
+		const paths = new Set<string>();
+		let total = 0;
+		for (const raw of payload.files) {
+			const file = raw as { path?: unknown; size?: unknown } | null;
+			const size = Number(file?.size);
+			if (typeof file?.path !== "string" || isBadFolderPath(file.path) || paths.has(file.path))
+				throw new HttpError(400, "Invalid file path");
+			if (!Number.isSafeInteger(size) || size < 0) throw new HttpError(400, "Invalid file size");
+			paths.add(file.path);
+			total += size;
+		}
+		const home = await attachmentHome();
+		const { storedName, targets } = planFolderTargets(home.directory, "attachment-", payload.name, [...paths], false);
+		const target = path.join(home.directory, storedName);
+		const name = storedName.slice("attachment-".length);
+		recordAttachment(
+			{ name, storedName, ...home, target, part: `${target}.part`, inFolder: false },
+			total,
+			"inode/directory",
+		);
+		uploadFolders.set(home.id, { home, targets });
+		return { folderId: home.id };
+	});
+	const prepareFolderFile = async (folderId: unknown, relative: unknown) => {
+		const folder = typeof folderId === "string" ? uploadFolders.get(folderId) : undefined;
+		if (!folder) throw new HttpError(404, "This upload is no longer available.");
+		const target = typeof relative === "string" ? folder.targets.get(relative) : undefined;
+		if (!target) throw new HttpError(400, "Unknown file in this upload.");
+		folder.targets.delete(relative as string);
+		if (!folder.targets.size) uploadFolders.delete(folderId as string);
+		await mkdir(path.dirname(target), { recursive: true });
+		const name = path.basename(target);
+		const id = randomUUID();
+		// The part file stays out of the tree: it could not collide with a real `<name>.part` of the folder there.
+		const part = path.join(folder.home.directory, `${id}.part`);
+		return { ...folder.home, id, name, storedName: name, target, part, inFolder: true };
+	};
 	server.route("POST", "/api/files/upload/begin", async ({ body }) => {
-		const payload = body as { name?: unknown; size?: unknown } | null;
+		const payload = body as { name?: unknown; size?: unknown; folderId?: unknown; path?: unknown } | null;
 		const size = Number(payload?.size);
 		if (typeof payload?.name !== "string" || !Number.isSafeInteger(size) || size < 0)
 			throw new HttpError(400, "Expected a file name and size.");
 		if (size > MAX_UPLOAD_BYTES) throw new HttpError(413, "Files must be 500 MiB or smaller.");
-		const prepared = await prepareAttachment(payload.name);
+		const prepared =
+			payload.folderId === undefined
+				? await prepareAttachment(payload.name)
+				: await prepareFolderFile(payload.folderId, payload.path);
 		chunkedUploads.set(prepared.id, { prepared, size, written: 0 });
 		return { uploadId: prepared.id };
 	});
@@ -581,7 +649,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		if (typeof payload?.data !== "string") throw new HttpError(400, "Expected base64 data.");
 		try {
 			upload.written = writeUploadChunk(
-				`${upload.prepared.target}.part`,
+				upload.prepared.part,
 				Number(payload.offset),
 				decodeUploadChunk(payload.data),
 				upload.size,
@@ -594,7 +662,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 	server.route("POST", "/api/files/upload/finish", async ({ body }) => {
 		const payload = body as { uploadId?: unknown } | null;
 		const upload = chunkedUpload(payload?.uploadId);
-		const part = `${upload.prepared.target}.part`;
+		const { part } = upload.prepared;
 		if (upload.size === 0 && upload.written === 0) await writeFile(part, Buffer.alloc(0));
 		else if (upload.written !== upload.size) throw new HttpError(409, "The file has not been fully uploaded.");
 		if (existsSync(upload.prepared.target)) throw new HttpError(409, "The file already exists.");
@@ -636,8 +704,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		mtime?: number;
 		mimeType?: string | null;
 	} {
-		const base = path.basename(absolute);
-		const name = base.startsWith("attachment-") ? base.slice("attachment-".length) || base : base;
+		const name = attachmentName(absolute);
 		try {
 			const stat = statSync(absolute);
 			if (!stat.isFile()) return { name, path: absolute, exists: false };
@@ -737,7 +804,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			throw new HttpError(404, "Attachment has been deleted.");
 		}
 		if (!stat.isFile()) throw new HttpError(404, "Attachment has been deleted.");
-		streamDownload(res, absolute, uploadMeta(absolute).name, stat.size);
+		streamDownload(res, absolute, path.posix.basename(uploadMeta(absolute).name), stat.size);
 	});
 
 	// Attachments of one conversation (sidebar groups them per chat): scanned off the persisted branch,
@@ -791,8 +858,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			try {
 				meta = uploadMeta(resolveUploadPath(uploadPath));
 			} catch {
-				const base = String(uploadPath).replace(/\\/g, "/").split("/").pop() || String(uploadPath);
-				meta = { name: base.replace(/^attachment-/, "") || base, path: uploadPath, exists: false };
+				meta = { name: attachmentName(String(uploadPath)), path: uploadPath, exists: false };
 			}
 			return { ...meta, messageId: ref.messageId, ts: ref.ts };
 		});

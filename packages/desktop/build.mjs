@@ -24,7 +24,7 @@ const destination = join(output, `release-${stamp}`);
 mkdirSync(stage, { recursive: true });
 const result = spawnSync(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '--version'], { stdio: 'inherit' });
 if (result.status !== 0) throw new Error('TypeScript unavailable');
-for (const name of ['main.cjs', 'preload.cjs', 'service-entry.cjs', 'windows-job.cjs', 'browser-view.cjs', 'browser-bookmarks.cjs', 'browser-help.cjs', 'browser-speed-dial.cjs', 'browser-input.cjs', 'browser-passwords.cjs', 'browser-permissions.cjs', 'browser-downloads.cjs', 'browser-page-helpers.cjs', 'browser-tab-preload.cjs', 'legacy-prefs.cjs', 'notification-routing.cjs', 'preview-links.cjs', 'app-prefs.cjs', 'zoom.cjs', 'browser-dark.cjs', 'browser-language.cjs', 'browser-sync.cjs', 'browser-web-mail.cjs', 'browser-web-mail-send.cjs', 'ui-language.cjs', 'start-page.cjs', 'app-context-menu.cjs']) cpSync(join(here, name), join(stage, name));
+for (const name of ['main.cjs', 'preload.cjs', 'service-entry.cjs', 'windows-job.cjs', 'browser-view.cjs', 'browser-bookmarks.cjs', 'browser-help.cjs', 'browser-speed-dial.cjs', 'browser-input.cjs', 'browser-passwords.cjs', 'browser-permissions.cjs', 'browser-downloads.cjs', 'browser-page-helpers.cjs', 'browser-tab-preload.cjs', 'legacy-prefs.cjs', 'notification-routing.cjs', 'preview-links.cjs', 'app-prefs.cjs', 'zoom.cjs', 'browser-dark.cjs', 'browser-language.cjs', 'browser-sync.cjs', 'browser-web-mail.cjs', 'browser-web-mail-send.cjs', 'ui-language.cjs', 'start-page.cjs', 'app-context-menu.cjs', 'bundled-extensions.cjs']) cpSync(join(here, name), join(stage, name));
 const runtime = join(stage, 'runtime');
 const copied = new Set();
 const installed = new Map();
@@ -75,8 +75,11 @@ copyPackage('koffi', here, join(stage, 'node_modules'));
   for (const file of ['darkreader.js', 'LICENSE', 'package.json']) cpSync(join(darkreader, file), join(runtime, 'node_modules', 'darkreader', file));
 }
 cpSync(join(root, 'system-prompts'), join(runtime, 'system-prompts'), { recursive: true });
+// Extensions stay TypeScript, loaded as any user extension is, so they have a folder of their own outside the package copies.
+const { BUNDLED_EXTENSIONS } = createRequire(import.meta.url)('./bundled-extensions.cjs');
+for (const name of BUNDLED_EXTENSIONS) cpSync(join(root, 'packages/coding-agent/examples/extensions', name), join(runtime, 'extensions', name));
 writeFileSync(join(stage, 'runtime.json'), JSON.stringify(installer ? {} : { workingDirectory: resolve(process.env.MYHARNESS_DESKTOP_CWD || root) }));
-writeFileSync(join(stage, 'package.json'), JSON.stringify({ name: 'myharness-desktop', productName: 'MyHarness', version: '0.0.6', main: 'main.cjs', author: 'MyHarness', description: 'MyHarness Windows desktop', license: 'Apache-2.0' }));
+writeFileSync(join(stage, 'package.json'), JSON.stringify({ name: 'myharness-desktop', productName: 'MyHarness', version: '0.0.7', main: 'main.cjs', author: 'MyHarness', description: 'MyHarness Windows desktop', license: 'Apache-2.0' }));
 // The SVG is drawn at a high density first: at the default 72 dpi its 32-unit box would be scaled up blurry.
 await sharp(join(root, 'packages/coding-agent/web/favicon.svg'), { density: 600 }).resize(256, 256).png().toFile(join(stage, 'icon.png'));
 // ICO of PNG frames (Windows Vista and later). The taskbar, title bar and tray pick the small frames; with only a
@@ -102,6 +105,6 @@ const kind = installer
   : { appId: 'com.myharness.desktop', target: 'dir' };
 // Chromium's own strings (form messages, error pages) in the two languages MyHarness speaks; another system language
 // falls back to English there. The other locales are 50-odd files of about 45 MB.
-await build({ projectDir: stage, config: { appId: kind.appId, productName: 'MyHarness', electronVersion, electronDist, electronLanguages: ['en-US', 'zh-CN', 'zh-TW'], asar: false, npmRebuild: false, directories: { output: destination }, files: ['*.cjs', '*.json', '*.png', '*.ico'], extraFiles: [{ from: join(stage, 'runtime/system-prompts'), to: 'resources/app/runtime/system-prompts' }, { from: join(stage, 'runtime/node_modules'), to: 'resources/app/runtime/node_modules' }, { from: join(stage, 'node_modules'), to: 'resources/app/node_modules' }], win: { target: [{ target: kind.target, arch: ['x64'] }], icon, signExecutable: false }, ...(kind.nsis ? { nsis: kind.nsis } : {}) } });
+await build({ projectDir: stage, config: { appId: kind.appId, productName: 'MyHarness', electronVersion, electronDist, electronLanguages: ['en-US', 'zh-CN', 'zh-TW'], asar: false, npmRebuild: false, directories: { output: destination }, files: ['*.cjs', '*.json', '*.png', '*.ico'], extraFiles: [{ from: join(stage, 'runtime/system-prompts'), to: 'resources/app/runtime/system-prompts' }, { from: join(stage, 'runtime/extensions'), to: 'resources/app/runtime/extensions' }, { from: join(stage, 'runtime/node_modules'), to: 'resources/app/runtime/node_modules' }, { from: join(stage, 'node_modules'), to: 'resources/app/node_modules' }], win: { target: [{ target: kind.target, arch: ['x64'] }], icon, signExecutable: false }, ...(kind.nsis ? { nsis: kind.nsis } : {}) } });
 console.log(`DESKTOP_EXECUTABLE=${join(destination, 'win-unpacked/MyHarness.exe')}`);
 if (installer) console.log(`DESKTOP_INSTALLER=${join(destination, `MyHarness-Setup-${JSON.parse(readFileSync(join(stage, 'package.json'), 'utf8')).version}.exe`)}`);

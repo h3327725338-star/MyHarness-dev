@@ -21,7 +21,7 @@ import type { ChatMode, SessionInfo } from "../../types.ts";
  * the full conversation text.
  */
 
-export const SESSIONS_INDEX_VERSION = 1;
+export const SESSIONS_INDEX_VERSION = 2;
 export const SESSIONS_INDEX_FILE_NAME = ".sessions-index.json";
 /** First user message kept per row, truncated to this many characters. */
 export const SESSIONS_INDEX_PREVIEW_MAX_CHARS = 500;
@@ -47,6 +47,7 @@ export interface SessionIndexEntry {
 	lastTs: number;
 	msgCount: number;
 	blank: boolean;
+	scheduled: boolean;
 	mode: ChatMode;
 	cwd: string;
 	workspaceId?: string;
@@ -138,6 +139,7 @@ function entryFromJson(raw: unknown, fallbackPath: string): SessionIndexEntry | 
 		lastTs: record.lastTs,
 		msgCount: record.msgCount,
 		blank: record.blank,
+		scheduled: record.scheduled === true,
 		mode: record.mode === "general" ? "general" : "coding",
 		cwd: typeof record.cwd === "string" ? record.cwd : "",
 		workspaceId: typeof record.workspaceId === "string" ? record.workspaceId : undefined,
@@ -317,6 +319,7 @@ export function sessionInfoFromIndexEntry(entry: SessionIndexEntry): SessionInfo
 		modified: new Date(entry.lastTs),
 		messageCount: entry.msgCount,
 		blank: entry.blank,
+		scheduled: entry.scheduled,
 		firstMessage: entry.preview || "(no messages)",
 		allMessagesText: entry.preview,
 	};
@@ -358,6 +361,7 @@ export function recordIndexEntry(
 		lastTs: modifiedMs,
 		msgCount: info.messageCount,
 		blank: info.blank === true,
+		scheduled: info.scheduled === true,
 		mode: info.mode === "general" ? "general" : "coding",
 		cwd: info.cwd,
 		workspaceId: info.workspaceId,

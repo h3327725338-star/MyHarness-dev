@@ -4,6 +4,7 @@ import type { ThinkingLevel } from "@myharness/agent-core";
 import type { ImageContent } from "@myharness/ai";
 import { modelsAreEqual } from "@myharness/ai/compat";
 import { AUTO_MEMORY_SYSTEM_PROMPT } from "../../agent/runtime/auto-memory.ts";
+import { ATTACHED_FILES_HEADER } from "../../config/paths/attachments.ts";
 import { buildContextBreakdown } from "../../context/context-breakdown.ts";
 import { WorktreeMergedRecords } from "../../git/worktrees/merged-records.ts";
 import { readImageBytes, storedSessionImage } from "../../session/storage/jsonl/image-files.ts";
@@ -118,9 +119,12 @@ export function registerCoreRoutes(server: WebHttpServer, host: WebHost): void {
 					})
 					.filter((ref) => ref.length > 0)
 			: [];
-		const header = "Attached files (use read to inspect):";
 		const refs = attachments.map((ref) => JSON.stringify(ref)).join("\n");
-		const text = attachments.length ? (rawText ? `${header}\n${refs}\n\n${rawText}` : `${header}\n${refs}`) : rawText;
+		const text = attachments.length
+			? rawText
+				? `${ATTACHED_FILES_HEADER}\n${refs}\n\n${rawText}`
+				: `${ATTACHED_FILES_HEADER}\n${refs}`
+			: rawText;
 		if (!text && images.length === 0) throw new HttpError(400, "Empty message");
 		const modeRaw = payload.mode;
 		const mode =

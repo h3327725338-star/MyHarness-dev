@@ -8,6 +8,19 @@ import {
 	normalizeConversationTitle,
 	validateConversationTitle,
 } from "../../agent/runtime/conversation-title.ts";
+import {
+	findProducedFiles,
+	type OtherChat,
+	type ProducedFiles,
+	recycleProducedFiles,
+	summarizeProducedFiles,
+} from "../../application/use-cases/produced-files.ts";
+import {
+	removeWorkspaceData,
+	summarizeWorkspaceRemoval,
+	WorkspaceRemovalError,
+	type WorkspaceRemovalTarget,
+} from "../../application/use-cases/workspace-removal.ts";
 import { WorkspaceSessionUseCase } from "../../application/use-cases/workspace-session.ts";
 import { getDataDir, getWorkspacesDir } from "../../config/paths/index.ts";
 import {
@@ -22,10 +35,11 @@ import {
 	type WorkspaceSourceUploadItem,
 	writeWorkspaceSourceChunk,
 } from "../../data/workspace-sources.ts";
+import type { Workspace } from "../../data/workspace-store.ts";
 import { buildReplayHtml } from "../../exports/html/replay/build.ts";
 import { buildExportTooLargeBody, ReplayExportTooLargeError } from "../../exports/html/replay/limits.ts";
 import { isWorktreeCopyPath } from "../../git/worktrees/merged-records.ts";
-import { deleteWorkspaceArtifacts } from "../../session/artifacts/store.ts";
+import { readChatActivity } from "../../session/artifacts/written-files.ts";
 import {
 	buildSessionContinuation,
 	SESSION_CONTINUATION_TYPE,
@@ -47,6 +61,7 @@ import {
 	type SessionInfo,
 	type SessionTreeNode,
 } from "../../session/types.ts";
+import { desktopWorkspaceChannel } from "../../tools/workspace.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
 import type { WebHost } from "./host.ts";
 import { HttpError, type RequestContext, type WebHttpServer } from "./http-server.ts";
@@ -416,6 +431,7 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 			modified: info.modified.getTime(),
 			messageCount: info.messageCount,
 			blank: info.blank === true,
+			scheduled: info.scheduled === true,
 			parentSessionPath: info.parentSessionPath ?? null,
 			copy: isWorktreeCopyPath(host.runtimeHost.services.agentDir, info.cwd),
 			pinned: markers?.pinned ?? existsSync(`${info.path}.pinned`),
@@ -464,6 +480,8 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 			requestMode(payload.mode),
 		);
 		if (!result.ok || !result.workspace) throw new HttpError(400, result.error ?? "Failed to add workspace");
+		// Chats still open in this folder belong to it again: the sidebar has to hear so.
+		host.broadcast("workspaces_changed", {});
 		return {
 			workspace: {
 				id: result.workspace.workspaceId,
@@ -560,28 +578,142 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 		return { ok: true };
 	});
 
+	const dataRootOf = () => host.session.sessionManager.getDataRoot() ?? getDataDir();
+	/** The chats that stay around these folders: in the same one, or in a Workspace inside or around it. */
+	const otherChatsAround = async (going: readonly string[], folders: readonly string[]): Promise<OtherChat[]> => {
+		const goingKeys = new Set(going.map((path) => pathIdentityKey(path)));
+		const near = new Set(folders);
+		for (const { rootPath } of host.workspaceStore.list())
+			if (folders.some((folder) => isPathInsideRoot(rootPath, folder) || isPathInsideRoot(folder, rootPath)))
+				near.add(rootPath);
+		const working = new Set(
+			hub.all().flatMap((open) => {
+				const file = open.session.sessionFile;
+				return file && (open.status.active || !open.session.isIdle) ? [pathIdentityKey(file)] : [];
+			}),
+		);
+		const chats = new Map<string, OtherChat>();
+		for (const list of await Promise.all([...near].map((folder) => useCase.listSessions(folder)))) {
+			for (const info of list) {
+				const key = pathIdentityKey(info.path);
+				if (goingKeys.has(key)) continue;
+				chats.set(key, {
+					path: info.path,
+					created: info.created.getTime(),
+					modified: info.modified.getTime(),
+					busy: working.has(key),
+				});
+			}
+		}
+		return [...chats.values()];
+	};
+	/** What deleting this one chat's artifacts reaches, and what stays of it. */
+	const producedByChat = async (path: string, canRecycle: boolean): Promise<ProducedFiles> => {
+		const activity = await readChatActivity(path);
+		return findProducedFiles([activity], {
+			dataRoot: dataRootOf(),
+			canRecycle,
+			others: await otherChatsAround([path], activity.cwd ? [activity.cwd] : []),
+		});
+	};
+	/** What a removal from this chat mode reaches. A Workspace in both modes keeps what belongs to the other one. */
+	const workspaceRemovalTarget = async (workspace: Workspace, mode: ChatMode): Promise<WorkspaceRemovalTarget> => {
+		const all = await useCase.listSessions(workspace.rootPath);
+		const chats = all.filter((info) => getChatMode(info) === mode);
+		const chatPaths = chats.map((info) => info.path);
+		return {
+			dataRoot: dataRootOf(),
+			workspaceId: workspace.workspaceId,
+			chatPaths,
+			sharedWithOtherMode:
+				(workspace.modes ?? ["coding"]).some((other) => other !== mode) || chats.length !== all.length,
+			others: await otherChatsAround(chatPaths, [workspace.rootPath]),
+		};
+	};
+
 	/**
-	 * Only un-registers the Workspace (plus the chats' artifact files when `deleteArtifacts` is true). The folder, its
-	 * project files and every chat stay exactly where they are; the chats simply belong to no Workspace afterwards (see
-	 * `SessionManager.isUnbound`). Open chats keep running.
+	 * Empty chats open in a Workspace that leaves this mode hold nothing, and must not stay behind: one would sit in a
+	 * folder that is no longer listed, and come back as the new chat when the folder is added again.
 	 */
-	server.route("POST", "/api/workspaces/remove", ({ body }) => {
+	const closeEmptyWorkspaceChats = async (workspace: Workspace, mode: ChatMode): Promise<void> => {
+		for (const open of hub.all()) {
+			if (open.session.sessionManager.getMode() !== mode) continue;
+			if (open.workspace?.workspaceId !== workspace.workspaceId) continue;
+			if (open.status.hasContent || !open.session.isIdle || open.completionActive || open.gitTask) continue;
+			if (open.slotId === host.slotId || hub.all().length === 1) continue;
+			const file = open.session.sessionFile;
+			await hub.closeSlot(open);
+			if (file) await deleteSessionFile(file, { permanent: true, deleteArtifacts: true, deleteAttachments: true });
+		}
+	};
+
+	/** What the "Remove workspace?" dialog shows before anything is deleted. Read-only, asynchronous I/O only. */
+	server.route("GET", "/api/workspaces/delete-impact", async ({ url }) => {
+		const id = asString(url.searchParams.get("id"), "id");
+		const mode = requestMode(url.searchParams.get("mode"));
+		const workspace = host.workspaceStore.getById(id, mode);
+		if (!workspace) throw new HttpError(404, "Unknown workspace");
+		return summarizeWorkspaceRemoval(await workspaceRemovalTarget(workspace, mode), {
+			canRecycle: desktopWorkspaceChannel() !== undefined,
+		});
+	});
+
+	/**
+	 * Un-registers the Workspace. By default that is all: the folder, its project files and every chat stay where they are
+	 * and the chats belong to no Workspace afterwards (see `SessionManager.isUnbound`), and open chats keep running. The
+	 * user may also delete its chats, its artifacts (with the files its chats created in the project, which go to the
+	 * Recycle Bin) and its memories; the Workspace's running chats are stopped first by the user, never here.
+	 */
+	server.route("POST", "/api/workspaces/remove", async ({ body }) => {
 		const input = asObject(body);
 		const id = asString(input.id, "id");
-		if (input.deleteArtifacts !== undefined && typeof input.deleteArtifacts !== "boolean")
-			throw new HttpError(400, "deleteArtifacts must be a boolean");
+		for (const name of ["deleteChats", "deleteArtifacts", "deleteMemory"]) {
+			if (input[name] !== undefined && typeof input[name] !== "boolean")
+				throw new HttpError(400, `${name} must be a boolean`);
+		}
+		const deleteChats = input.deleteChats === true;
+		const deleteArtifacts = input.deleteArtifacts === true;
+		const deleteMemory = input.deleteMemory === true;
 		const mode = requestMode(input.mode);
 		const workspace = host.workspaceStore.getById(id, mode);
 		if (!workspace) throw new HttpError(404, "Unknown workspace");
-		if (input.deleteArtifacts === true) {
-			// Only this Workspace's own running chats can be writing the artifacts about to go; chats elsewhere keep running.
+		let filesKept: string[] = [];
+		if (deleteChats || deleteArtifacts || deleteMemory) {
+			// Only this Workspace's own running chats can be writing what is about to go; chats elsewhere keep running.
 			if (hub.all().some((open) => open.status.active && open.workspace?.workspaceId === workspace.workspaceId))
-				throw new HttpError(409, "Stop the running tasks in this workspace before deleting its artifacts.");
-			deleteWorkspaceArtifacts(host.session.sessionManager.getDataRoot() ?? getDataDir(), workspace.workspaceId);
+				throw new HttpError(
+					409,
+					deleteChats || deleteMemory
+						? "Stop the running tasks in this workspace before deleting its chats or memories."
+						: "Stop the running tasks in this workspace before deleting its artifacts.",
+				);
+			const target = await workspaceRemovalTarget(workspace, mode);
+			if (deleteChats) for (const path of target.chatPaths) await releaseSessionSlots(path);
+			try {
+				filesKept = await removeWorkspaceData(target, {
+					deleteChats,
+					deleteArtifacts,
+					deleteMemory,
+					channel: desktopWorkspaceChannel(),
+					onChatDeleted: (path) => setSessionMarker(path, ".pinned", false),
+				});
+			} catch (error) {
+				if (!(error instanceof WorkspaceRemovalError)) throw error;
+				host.broadcast("workspaces_changed", {});
+				throw new HttpError(
+					409,
+					error.code === "in-use"
+						? "A file of this workspace is open in another program. Close it and try again."
+						: error.code === "memory-busy"
+							? "Memories are being updated right now. Try again in a moment."
+							: error.message,
+				);
+			}
 		}
+		await closeEmptyWorkspaceChats(workspace, mode);
 		if (!host.workspaceStore.remove(id, mode)) throw new HttpError(500, "Could not save the workspace list.");
 		host.broadcast("workspaces_changed", {});
-		return { ok: true };
+		return filesKept.length ? { ok: true, filesKept } : { ok: true };
 	});
 
 	// Neither route touches the session the request came from: it keeps running in its own slot.
@@ -655,6 +787,19 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 		}
 		const page = paginateSessionSummaries(sessions, pagination);
 		return pagination ? { sessions: page.sessions, total: page.total } : { sessions: page.sessions };
+	});
+	/** Chats scheduled tasks started, across every Workspace: the sidebar's "Scheduled tasks" group. */
+	server.route("GET", "/api/sessions/scheduled", async ({ url }) => {
+		const mode = requestMode(url.searchParams.get("mode"));
+		const infos = await SessionManager.listAll(sessionDir());
+		const sessions: ReturnType<typeof sessionSummary>[] = [];
+		for (let index = 0; index < infos.length; index += ARCHIVED_SCAN_SLICE) {
+			for (const info of infos.slice(index, index + ARCHIVED_SCAN_SLICE))
+				if (info.scheduled && getChatMode(info) === mode && !isArchivedSession(info))
+					sessions.push(sessionSummary(info));
+			if (index + ARCHIVED_SCAN_SLICE < infos.length) await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		return { sessions };
 	});
 	/** Set or clear a marker file next to the session's JSONL (`.archived`, `.pinned`); the session data is not touched. */
 	const setSessionMarker = async (path: string, suffix: string, on: boolean): Promise<void> => {
@@ -734,9 +879,13 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 		const path = asString(input.path, "path");
 		await assertKnownSession(path, true);
 		await releaseSessionSlots(path);
+		const deleteArtifacts = input.deleteArtifacts === true;
+		const channel = desktopWorkspaceChannel();
+		// Read while the chat is still there. The project files go only once the chat is gone: if it is refused, nothing moved.
+		const produced = deleteArtifacts ? (await producedByChat(path, channel !== undefined)).files : [];
 		const deleted = await deleteSessionFile(path, {
 			permanent: true,
-			deleteArtifacts: input.deleteArtifacts === true,
+			deleteArtifacts,
 			deleteMemory: input.deleteMemory === true,
 		});
 		if (!deleted.ok)
@@ -749,20 +898,29 @@ export function registerSessionRoutes(server: WebHttpServer, host: WebHost, hub:
 						: (deleted.error ?? "Failed to delete the chat."),
 			);
 		await setSessionMarker(path, ".pinned", false);
+		const filesKept = await recycleProducedFiles(
+			produced.filter((file) => !file.kept).map((file) => file.path),
+			channel,
+		);
 		host.broadcast("workspaces_changed", {});
-		return { ok: true };
+		return filesKept.length ? { ok: true, filesKept } : { ok: true };
 	});
 
 	/**
-	 * What the delete confirmation shows before anything is deleted: the chat's artifact files, the uploads and tool
-	 * results that stay, and the memories "Also delete this chat's memories" would remove (`owned`, plus `retired`:
-	 * archived memory text of this chat alone) or keep because another chat, consolidation or a restore also wrote them,
-	 * or a copy of the chat still carries them (`shared`). Read-only, asynchronous I/O only.
+	 * What the delete confirmation shows before anything is deleted: the chat's artifact files and the files it created in
+	 * the project (`writtenFiles`; turning on artifacts moves those to the Recycle Bin), the uploads and tool results that
+	 * stay, and the memories "Also delete this chat's memories" would remove (`owned`, plus `retired`: archived memory text
+	 * of this chat alone) or keep because another chat, consolidation or a restore also wrote them, or a copy of the chat
+	 * still carries them (`shared`). Read-only, asynchronous I/O only.
 	 */
 	server.route("GET", "/api/sessions/delete-impact", async ({ url }) => {
 		const path = asString(url.searchParams.get("path"), "path");
 		await assertKnownSession(path, true);
-		return summarizeSessionDeletion(path);
+		const [summary, produced] = await Promise.all([
+			summarizeSessionDeletion(path),
+			producedByChat(path, desktopWorkspaceChannel() !== undefined),
+		]);
+		return { ...summary, writtenFiles: summarizeProducedFiles(produced) };
 	});
 
 	server.route("POST", "/api/sessions/clear", async ({ body }) => {

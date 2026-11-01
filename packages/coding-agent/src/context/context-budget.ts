@@ -65,6 +65,8 @@ export interface ContextRuntimePolicy {
 	budgetLimit: number;
 	autoCompactEnabled: boolean;
 	windowSource: ContextWindowSource;
+	/** The model's own program compacts: the window is only reported, never a reason to block or compact. */
+	managesOwnContext: boolean;
 }
 
 /** The single runtime context state consumed by UI, gates and lifecycle checks. */
@@ -252,6 +254,7 @@ export function resolveContextRuntimePolicy(options: {
 	compactionSettings: CompactionSettings;
 	autoCompactEnabled: boolean;
 	configuredViaCli: boolean;
+	managesOwnContext?: boolean;
 }): ContextRuntimePolicy {
 	const configuredValid =
 		options.configuredContextWindow !== undefined &&
@@ -293,6 +296,7 @@ export function resolveContextRuntimePolicy(options: {
 		budgetLimit,
 		autoCompactEnabled: options.autoCompactEnabled,
 		windowSource,
+		managesOwnContext: options.managesOwnContext === true,
 	};
 }
 
@@ -315,8 +319,9 @@ export function computeContextBudgetSnapshot(
 		budgetLimit: policy.budgetLimit,
 		activeTokens: estimate.tokens,
 		percent,
-		overBudget: policy.effectiveWindow > 0 && estimate.tokens >= policy.budgetLimit,
+		overBudget: !policy.managesOwnContext && policy.effectiveWindow > 0 && estimate.tokens >= policy.budgetLimit,
 		shouldAutoCompact:
+			!policy.managesOwnContext &&
 			policy.effectiveWindow > 0 &&
 			policy.autoCompactThresholdTokens > 0 &&
 			estimate.tokens >= policy.autoCompactThresholdTokens,

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import {
 	type Api,
@@ -55,6 +56,7 @@ import {
 	ProviderModelDiscoveryError,
 } from "../models/custom-provider-manager.ts";
 import { DisabledProviderPolicy } from "../models/disabled.ts";
+import { groupCredentialId, MODEL_KEY_SOURCE, modelCredentialId } from "../models/layers.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "../models/store.ts";
 import { providerSpendLedger } from "./provider-spend.ts";
 
@@ -171,6 +173,11 @@ export class ModelRuntime implements Models {
 		this.modelsStore = modelsStore;
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.modelRefreshTimeoutMs = modelRefreshTimeoutMs;
+		// A key set for a whole provider group is what every entry of the group reads as its credential.
+		this.credentials.setUpperLayer((providerId) => {
+			const group = this.config.getProvider(providerId)?.group;
+			return group ? groupCredentialId(group) : undefined;
+		});
 		this.models = createModels({ credentials: this.credentials, modelsStore });
 		this.catalogModels = createModels({ credentials: this.credentials, modelsStore });
 		this.activeProviderIds = new Set(config.getProviderIds());
@@ -250,13 +257,68 @@ export class ModelRuntime implements Models {
 			return;
 		}
 		try {
-			this.catalogModels.setProvider(composeModelProvider(providerId, base, this.config, extension));
+			const composed = composeModelProvider(providerId, base, this.config, extension);
+			this.catalogModels.setProvider(base || extension ? composed : this.withModelKeys(composed));
 			this.compositionErrors.delete(providerId);
 		} catch (error) {
 			this.compositionErrors.set(providerId, error instanceof Error ? error.message : String(error));
 			if (base) this.catalogModels.setProvider(base);
 			else this.catalogModels.deleteProvider(providerId);
 		}
+	}
+
+	/**
+	 * An entry of models.json with no key of its own can still have models that do: it then counts as configured and offers
+	 * those models only. Which key a request uses is decided in `getAuth`, the one place that knows the model.
+	 */
+	private withModelKeys(provider: Provider): Provider {
+		const apiKey = provider.auth.apiKey;
+		const config = this.config.getProvider(provider.id);
+		if (!apiKey?.check || !config?.models?.length) return provider;
+		const upperCheck = apiKey.check;
+		const models = config.models;
+		return {
+			...provider,
+			auth: {
+				...provider.auth,
+				apiKey: {
+					...apiKey,
+					check: async (input) => {
+						const upper = await upperCheck(input);
+						if (upper) return upper;
+						for (const model of models) {
+							const own = await this.credentials.readStoredCredential(modelCredentialId(provider.id, model.id));
+							if (own?.type === "api_key") return { type: "api_key", source: MODEL_KEY_SOURCE };
+						}
+						return undefined;
+					},
+				},
+			},
+			filterModels: (list, credential) =>
+				credential || configuredRequestAuthStatus(config, undefined)?.configured
+					? list
+					: list.filter((model) => this.snapshot.storedProviders.has(modelCredentialId(provider.id, model.id))),
+		};
+	}
+
+	/** Under an entry that only its models have keys for, a model without its own key has none. */
+	private modelHasKey(model: Model<Api>): boolean {
+		return (
+			this.snapshot.auth.get(model.provider)?.source !== MODEL_KEY_SOURCE ||
+			this.snapshot.storedProviders.has(modelCredentialId(model.provider, model.id))
+		);
+	}
+
+	/** The model's own key, when no layer above it has one: a key of the group or of the entry wins. */
+	private async modelLayerKey(model: Model<Api>): Promise<string | undefined> {
+		const config = this.config.getProvider(model.provider);
+		if (!config) return undefined;
+		const own = await this.credentials.read(modelCredentialId(model.provider, model.id));
+		if (own?.type !== "api_key" || !own.key) return undefined;
+		if (await this.credentials.read(model.provider)) return undefined;
+		if (configuredRequestAuthStatus(config, this.extensionProviders.get(model.provider))?.configured)
+			return undefined;
+		return own.key;
 	}
 
 	private syncActiveProviders(): void {
@@ -283,7 +345,8 @@ export class ModelRuntime implements Models {
 			available: all.filter(
 				(model) =>
 					this.snapshot.configuredProviders.has(model.provider) &&
-					this.disabledProviders.isEnabled(model.provider),
+					this.disabledProviders.isEnabled(model.provider) &&
+					this.modelHasKey(model),
 			),
 		};
 	}
@@ -676,7 +739,11 @@ export class ModelRuntime implements Models {
 		const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
 		const models = this.models.getProvider(providerId) ? this.models : this.catalogModels;
 		if (typeof providerOrModel === "string") return models.getAuth(providerOrModel, overrides);
-		const resolution = await models.getAuth(providerOrModel, overrides);
+		const modelKey = overrides.apiKey === undefined ? await this.modelLayerKey(providerOrModel) : undefined;
+		const resolution = await models.getAuth(
+			providerOrModel,
+			modelKey ? { ...overrides, apiKey: modelKey } : overrides,
+		);
 		if (!resolution) return undefined;
 		const configuredHeaders = resolveConfiguredModelHeaders(
 			providerOrModel,
@@ -854,6 +921,64 @@ export class ModelRuntime implements Models {
 		await this.refresh({ allowNetwork: false });
 	}
 
+	/** Sets or, without a key, removes the keys of layers that are not providers themselves (models/layers.ts). */
+	async setLayerApiKeys(
+		changes: ReadonlyArray<readonly [credentialId: string, key: string | undefined]>,
+	): Promise<void> {
+		let changed = false;
+		for (const [credentialId, key] of changes) {
+			if (key !== undefined) {
+				await this.credentials.modify(credentialId, async () => ({ type: "api_key", key }));
+				changed = true;
+			} else if (await this.credentials.readStoredCredential(credentialId)) {
+				await this.credentials.delete(credentialId);
+				changed = true;
+			}
+		}
+		if (changed) await this.refreshAfterCredentialMutation();
+	}
+
+	/** What may be shown of a layer's key; undefined when it has none. */
+	async getLayerApiKeyInfo(credentialId: string): Promise<{ suffix: string | null } | undefined> {
+		const overview = await this.credentials.getProviderCredentialOverview(credentialId);
+		const active = overview.apiKeys.find((key) => key.active);
+		return active ? { suffix: active.suffix ?? null } : undefined;
+	}
+
+	/** Moves a layer's key to another credential ID: a model that got a new ID keeps its key. */
+	async moveLayerApiKey(fromId: string, toId: string): Promise<void> {
+		const key = (await this.credentials.listStoredApiKeys(fromId)).find((candidate) => candidate.active);
+		if (!key) return;
+		await this.credentials.modify(toId, async () => key.credential);
+		await this.credentials.delete(fromId);
+		await this.refreshAfterCredentialMutation();
+	}
+
+	/**
+	 * Makes a group's key the key in use for one of its former entries, next to the keys the entry already has: it keeps
+	 * using the key it was using inside the group.
+	 */
+	async adoptLayerApiKey(credentialId: string, providerId: string): Promise<void> {
+		const source = (await this.credentials.listStoredApiKeys(credentialId)).find((key) => key.active);
+		if (!source) return;
+		const keys = await this.credentials.listStoredApiKeys(providerId);
+		const existing = keys.find((key) => sameApiKeyCredential(key.credential, source.credential));
+		const used = new Set(keys.map((key) => key.label.toLocaleLowerCase()));
+		let label = "Provider key";
+		for (let index = 2; used.has(label.toLocaleLowerCase()); index++) label = `Provider key ${index}`;
+		const keyId = existing?.id ?? (await this.credentials.addApiKey(providerId, label, source.credential)).id;
+		await this.credentials.activateApiKey(providerId, keyId);
+		await this.refreshAfterCredentialMutation();
+	}
+
+	/** Digests that are equal only when two providers hold the same saved key, for telling that apart without the key. */
+	async getApiKeyDigests(providerId: string): Promise<string[]> {
+		const keys = await this.credentials.listStoredApiKeys(providerId);
+		return keys.flatMap((key) =>
+			key.credential.key ? [createHash("sha256").update(key.credential.key).digest("hex")] : [],
+		);
+	}
+
 	/**
 	 * @deprecated Provider credentials are shared by every model capability.
 	 * Retained as a compatibility no-op for callers compiled against the older split store.
@@ -893,6 +1018,10 @@ export class ModelRuntime implements Models {
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
+		const group = this.config.getProvider(providerId)?.group;
+		if (group && this.snapshot.storedProviders.has(groupCredentialId(group))) {
+			return { configured: true, source: "stored" };
+		}
 		const configured = configuredRequestAuthStatus(
 			this.config.getProvider(providerId),
 			this.extensionProviders.get(providerId),
@@ -902,6 +1031,7 @@ export class ModelRuntime implements Models {
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		if (configured) return configured;
 		const check = this.snapshot.auth.get(providerId);
+		if (check?.source === MODEL_KEY_SOURCE) return { configured: true, source: "stored" };
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 

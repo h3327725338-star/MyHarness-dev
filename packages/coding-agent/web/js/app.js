@@ -24,7 +24,7 @@ import { useWorkspaceTitle } from "./workspace-title.js";
 import { WindowControls } from "./window-controls.js";
 import { AppZoomBadge } from "./app-zoom.js";
 import { AttentionCards } from "./attention-cards.js";
-import { ScheduleCards } from "./schedules.js";
+import { ScheduleCards, SchedulesPageHost } from "./schedules.js";
 import { SourcesPageHost } from "./sources-page.js";
 import { clip, fmtBytes, plural } from "./util.js";
 import { count, t, N_, serverText } from "./i18n.js";
@@ -57,7 +57,7 @@ function StatusPill() {
 	const last = snap.lastRun;
 	if (last && OUTCOME_UI[last.outcome]) {
 		const ui = OUTCOME_UI[last.outcome];
-		return html`<span class=${`status-pill ${ui.cls}`} role="status" title=${last.error || t(ui.label)}><${Icon} name=${ui.icon} size=${13} /><span class="pill-text">${t(ui.label)}</span></span>`;
+		return html`<span class=${`status-pill ${ui.cls}`} role="status" title=${serverText(last.error, t(ui.label))}><${Icon} name=${ui.icon} size=${13} /><span class="pill-text">${t(ui.label)}</span></span>`;
 	}
 	return null;
 }
@@ -210,11 +210,9 @@ export function Toasts() {
 }
 
 export function ConfirmModal({ dialog }) {
-	const [deleteArtifacts, setDeleteArtifacts] = useState(false);
 	return html`<${Modal} title=${dialog.title} onClose=${() => resolveConfirm(false)} width=${480}
-		footer=${html`<button class="btn" autofocus=${dialog.artifactChoice} onClick=${() => resolveConfirm(false)}>${dialog.cancelLabel || t("Cancel")}</button><button class=${`btn ${dialog.danger ? "danger solid" : "primary"}`} autofocus=${!dialog.artifactChoice} onClick=${() => resolveConfirm(dialog.artifactChoice ? { deleteArtifacts } : true)}>${dialog.confirmLabel}</button>`}>
+		footer=${html`<button class="btn" onClick=${() => resolveConfirm(false)}>${dialog.cancelLabel || t("Cancel")}</button><button class=${`btn ${dialog.danger ? "danger solid" : "primary"}`} autofocus onClick=${() => resolveConfirm(true)}>${dialog.confirmLabel}</button>`}>
 		<div class="pre-wrap">${dialog.message}</div>
-		${dialog.artifactChoice ? html`<label class="row"><input type="checkbox" checked=${deleteArtifacts} onChange=${(e) => setDeleteArtifacts(e.target.checked)} />${t("Also permanently delete artifacts")}</label><p class="dim">${deleteArtifacts ? t("Artifact files and their workspace/global references will be removed. Project files are not affected.") : t("Artifacts and their origin remain available in workspace/global indexes.")}</p>` : null}
 		${dialog.detail ? html`<pre class="git-lines">${dialog.detail}</pre>` : null}
 	<//>`;
 }
@@ -234,6 +232,72 @@ function DeleteOption({ icon, label, detail, checked, disabled, onChange, childr
 }
 
 const MEMORY_SCOPE_LABELS = { global: N_("Global"), workspace: N_("Workspace"), session: N_("This chat") };
+const KEPT_FILE_REASONS = { changed: N_("Changed later, stays"), committed: N_("In Git, stays"), "other-chat": N_("Another chat was working then, stays"), "no-recycle-bin": N_("Needs the desktop app, stays") };
+
+/** A delete dialog's numbers, asked for when it opens: undefined while counting, null when the count failed (the switches still work then). */
+function useDeleteImpact(address) {
+	const [impact, setImpact] = useState(undefined);
+	useEffect(() => {
+		let live = true;
+		api(address, { slot: "" }).then(
+			(value) => live && setImpact(value ?? null),
+			() => live && setImpact(null),
+		);
+		return () => {
+			live = false;
+		};
+	}, [address]);
+	return impact;
+}
+
+/**
+ * The "Artifacts" switch of both delete dialogs: the artifact files and the files the chats created in the project count
+ * as one, because to the user both are what the chat made. "Show which" lists the project files, and why some stay.
+ */
+function ArtifactsOption({ impact, checked, onChange, emptyDetail }) {
+	const [open, setOpen] = useState(false);
+	const loading = impact === undefined;
+	const art = impact?.artifacts ?? { files: 0, bytes: 0 };
+	const written = impact?.writtenFiles ?? { files: 0, bytes: 0, kept: 0, list: [] };
+	const going = art.files + written.files;
+	const counted = { files: count(going, "file"), size: fmtBytes(art.bytes + written.bytes), kept: count(written.kept, "file") };
+	const detail = loading ? t("Counting…") : !impact ? t("Count unavailable") : going ? (written.kept ? t("{files} · {size} · {kept} stay", counted) : t("{files} · {size}", counted)) : written.kept ? t("{kept} stay, see the list", counted) : emptyDetail;
+	const more = (written.items ?? written.list.length) - written.list.length;
+	const link = written.list.length ? html`<button type="button" class="link-btn" onClick=${() => setOpen((value) => !value)}>${open ? t("Hide list") : t("Show which")}</button>` : null;
+	return html`<${DeleteOption} icon="layers" label=${t("Artifacts")} detail=${detail} checked=${checked} disabled=${loading || (impact && going === 0)} onChange=${onChange}>${link}<//>
+		<${Collapse} open=${open && written.list.length > 0}><ul class="del-list">
+			${art.files ? html`<li>${t("{files} in the artifacts folder", { files: count(art.files, "file") })}</li>` : null}
+			${written.list.map((file) => html`<li key=${file.path} title=${file.path}>${file.path.split(/[\\/]/).pop()}${file.folder ? html`/${file.files ? html`<span class="dim">${count(file.files, "file")}</span>` : null}` : null}${file.kept ? html`<span class="dim">${t(KEPT_FILE_REASONS[file.kept] ?? file.kept)}</span>` : null}</li>`)}
+			${more > 0 ? html`<li class="dim">${t("and {count} more", { count: more })}</li>` : null}
+			${written.incomplete ? html`<li class="dim">${t("This folder is too big to look through in full: what was not reached stays.")}</li>` : null}
+		</ul><//>`;
+}
+
+/** The memory switch of both delete dialogs. */
+function MemoriesOption({ impact, label, emptyDetail, checked, onChange }) {
+	const [open, setOpen] = useState(false);
+	const loading = impact === undefined;
+	const owned = impact?.memories?.owned ?? [];
+	const shared = impact?.memories?.shared ?? 0;
+	// Old versions that only these chats wrote and that go with their memories even when none of them is active any more.
+	const retired = impact?.memories?.retired ?? 0;
+	const detail = loading
+		? t("Counting…")
+		: !impact
+			? t("Count unavailable")
+			: owned.length
+				? shared
+					? t("{memories} · {shared} also tied to other chats or consolidation stay", { memories: count(owned.length, "memory", "memories"), shared })
+					: count(owned.length, "memory", "memories")
+				: retired
+					? t("{versions} in the archive", { versions: count(retired, "old version") })
+					: shared
+						? t("{memories} also tied to other chats or consolidation stay", { memories: count(shared, "memory", "memories") })
+						: emptyDetail;
+	const link = owned.length ? html`<button type="button" class="link-btn" onClick=${() => setOpen((value) => !value)}>${open ? t("Hide list") : t("Show which")}</button>` : null;
+	return html`<${DeleteOption} icon="brain" label=${label} detail=${detail} checked=${checked} disabled=${loading || (impact && owned.length === 0 && !retired)} onChange=${onChange}>${link}<//>
+		<${Collapse} open=${open && owned.length > 0}><ul class="del-list">${owned.map((memory) => html`<li key=${memory.id}>${memory.name || memory.id}<span class="dim">${t(MEMORY_SCOPE_LABELS[memory.scope] ?? memory.scope)}</span></li>`)}</ul><//>`;
+}
 
 /**
  * "Delete this chat?": the messages always go; artifacts and the memories that came only from this chat are switches
@@ -243,43 +307,10 @@ const MEMORY_SCOPE_LABELS = { global: N_("Global"), workspace: N_("Workspace"), 
 export function DeleteChatModal({ dialog }) {
 	const [deleteArtifacts, setDeleteArtifacts] = useState(false);
 	const [deleteMemory, setDeleteMemory] = useState(false);
-	const [showMemories, setShowMemories] = useState(false);
-	// undefined while counting, null when the count failed (the switches still work then).
-	const [impact, setImpact] = useState(undefined);
-	useEffect(() => {
-		let live = true;
-		api(`/api/sessions/delete-impact?path=${encodeURIComponent(dialog.path)}`, { slot: "" }).then(
-			(value) => live && setImpact(value ?? null),
-			() => live && setImpact(null),
-		);
-		return () => {
-			live = false;
-		};
-	}, [dialog.path]);
-	const loading = impact === undefined;
-	const art = impact?.artifacts ?? { files: 0, bytes: 0 };
-	const owned = impact?.memories?.owned ?? [];
-	const shared = impact?.memories?.shared ?? 0;
-	// Old versions that only this chat wrote and that go with its memories even when none of them is active any more.
-	const retired = impact?.memories?.retired ?? 0;
+	const impact = useDeleteImpact(`/api/sessions/delete-impact?path=${encodeURIComponent(dialog.path)}`);
 	// Uploads and tool outputs stay on disk: copies of this chat (forks, worktree copies) may still point at them.
 	const keptFiles = (impact?.history?.uploads?.files ?? 0) + (impact?.history?.toolResults?.files ?? 0);
 	const historyDetail = keptFiles ? t("All messages · {kept} stay", { kept: count(keptFiles, "attachment") }) : t("All messages in this chat");
-	const artifactDetail = loading ? t("Counting…") : !impact ? t("Count unavailable") : art.files ? t("{files} · {size}", { files: count(art.files, "file"), size: fmtBytes(art.bytes) }) : t("This chat saved no artifacts");
-	const memoryDetail = loading
-		? t("Counting…")
-		: !impact
-			? t("Count unavailable")
-			: owned.length
-				? shared
-					? t("{memories} · {shared} shared with other chats stay", { memories: count(owned.length, "memory", "memories"), shared })
-					: count(owned.length, "memory", "memories")
-				: retired
-					? t("{versions} in the archive", { versions: count(retired, "old version") })
-					: t("No memories came from only this chat");
-	const showLink = owned.length
-		? html`<button type="button" class="link-btn" onClick=${() => setShowMemories((open) => !open)}>${showMemories ? t("Hide list") : t("Show which")}</button>`
-		: null;
 	return html`<${Modal} title=${t("Delete this chat?")} subtitle=${t("“{title}” will be permanently deleted. This cannot be undone.", { title: dialog.title })} width=${440} class="delete-chat" onClose=${() => resolveConfirm(false)}
 		footer=${html`<button class="btn" autofocus onClick=${() => resolveConfirm(false)}>${t("Cancel")}</button><button class="btn danger solid" onClick=${() => resolveConfirm({ deleteArtifacts, deleteMemory })}>${t("Delete")}</button>`}>
 		<div class="del-rows">
@@ -288,11 +319,34 @@ export function DeleteChatModal({ dialog }) {
 				<span class="del-text"><span class="del-label">${t("Chat history")}</span><span class="del-detail" title=${keptFiles ? t("Uploaded files and tool outputs stay on disk, because copies of this chat may still use them.") : undefined}>${historyDetail}</span></span>
 				<span class="del-pill">${t("Always deleted")}</span>
 			</div>
-			<${DeleteOption} icon="layers" label=${t("Artifacts")} detail=${artifactDetail} checked=${deleteArtifacts} disabled=${loading || (impact && art.files === 0)} onChange=${setDeleteArtifacts} />
-			<${DeleteOption} icon="brain" label=${t("Memories from this chat")} detail=${memoryDetail} checked=${deleteMemory} disabled=${loading || (impact && owned.length === 0 && !retired)} onChange=${setDeleteMemory}>${showLink}<//>
-			<${Collapse} open=${showMemories && owned.length > 0}><ul class="del-list">${owned.map((memory) => html`<li key=${memory.id}>${memory.name || memory.id}<span class="dim">${t(MEMORY_SCOPE_LABELS[memory.scope] ?? memory.scope)}</span></li>`)}</ul><//>
+			<${ArtifactsOption} impact=${impact} checked=${deleteArtifacts} onChange=${setDeleteArtifacts} emptyDetail=${t("This chat saved no artifacts")} />
+			<${MemoriesOption} impact=${impact} label=${t("Memories from this chat")} emptyDetail=${t("No memories came from only this chat")} checked=${deleteMemory} onChange=${setDeleteMemory} />
 		</div>
-		<p class="del-hint">${t("Files this chat wrote into your project folder are never deleted here.")}</p>
+		<p class="del-hint">${t("Turning on Artifacts moves the project files listed to the Recycle Bin. Everything else in the project folder stays.")}</p>
+	<//>`;
+}
+
+/**
+ * "Remove workspace?": it always leaves the list; its chats, artifacts and memories go only with their switches on, each
+ * with its count (`GET /api/workspaces/delete-impact`). Behaves like DeleteChatModal.
+ */
+export function RemoveWorkspaceModal({ dialog }) {
+	const [deleteChats, setDeleteChats] = useState(false);
+	const [deleteArtifacts, setDeleteArtifacts] = useState(false);
+	const [deleteMemory, setDeleteMemory] = useState(false);
+	const impact = useDeleteImpact(`/api/workspaces/delete-impact?id=${encodeURIComponent(dialog.id)}&mode=${encodeURIComponent(dialog.mode)}`);
+	const loading = impact === undefined;
+	const chats = impact?.chats ?? 0;
+	const keptFiles = (impact?.history?.uploads?.files ?? 0) + (impact?.history?.toolResults?.files ?? 0);
+	const chatDetail = loading ? t("Counting…") : !impact ? t("Count unavailable") : chats ? (keptFiles ? t("{chats} · {kept} stay", { chats: count(chats, "chat"), kept: count(keptFiles, "attachment") }) : count(chats, "chat")) : t("No chats in this workspace");
+	return html`<${Modal} title=${t("Remove workspace?")} subtitle=${t("“{name}” leaves the list. Its chats, artifacts and memories are deleted only if you turn them on. The project folder itself is never deleted.", { name: dialog.name })} width=${440} class="delete-chat" onClose=${() => resolveConfirm(false)}
+		footer=${html`<button class="btn" autofocus onClick=${() => resolveConfirm(false)}>${t("Cancel")}</button><button class="btn danger solid" onClick=${() => resolveConfirm({ deleteChats, deleteArtifacts, deleteMemory })}>${t("Remove")}</button>`}>
+		<div class="del-rows">
+			<${DeleteOption} icon="chat" label=${t("Chat history")} detail=${chatDetail} checked=${deleteChats} disabled=${loading || (impact && chats === 0)} onChange=${setDeleteChats} />
+			<${ArtifactsOption} impact=${impact} checked=${deleteArtifacts} onChange=${setDeleteArtifacts} emptyDetail=${t("This workspace has no artifacts")} />
+			<${MemoriesOption} impact=${impact} label=${t("Memories")} emptyDetail=${t("This workspace has no memories to delete")} checked=${deleteMemory} onChange=${setDeleteMemory} />
+		</div>
+		<p class="del-hint">${t("Turning on Artifacts moves the project files listed to the Recycle Bin. Everything else in the project folder stays.")}</p>
 	<//>`;
 }
 
@@ -351,7 +405,8 @@ function DialogOverlayHost() {
 		<${Overlay} show=${type === "confirm"}>${type === "confirm" ? html`<${ConfirmModal} dialog=${dialog} />` : null}<//>
 		<${Overlay} show=${type === "input"}>${type === "input" ? html`<${InputModal} dialog=${dialog} />` : null}<//>
 		<${Overlay} show=${type === "close-app"}>${type === "close-app" ? html`<${CloseAppModal} />` : null}<//>
-		<${Overlay} show=${type === "delete-chat"}>${type === "delete-chat" ? html`<${DeleteChatModal} dialog=${dialog} />` : null}<//>`;
+		<${Overlay} show=${type === "delete-chat"}>${type === "delete-chat" ? html`<${DeleteChatModal} dialog=${dialog} />` : null}<//>
+		<${Overlay} show=${type === "remove-workspace"}>${type === "remove-workspace" ? html`<${RemoveWorkspaceModal} dialog=${dialog} />` : null}<//>`;
 }
 
 function BootDialogHost() {
@@ -589,6 +644,7 @@ export function App() {
 			<${Transcript} />
 			${exportReadOnly() ? null : html`<${Composer} />`}
 			${exportReadOnly() ? null : html`<${SourcesPageHost} />`}
+			${exportReadOnly() ? null : html`<${SchedulesPageHost} />`}
 			${toastsOutside ? null : html`<${Toasts} />`}
 			<${AppZoomBadge} />
 			${exportReadOnly() ? null : html`<${FloatingQuoteToolbar} />`}

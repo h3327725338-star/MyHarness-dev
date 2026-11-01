@@ -835,6 +835,11 @@ export interface Model<TApi extends Api> {
 	inputCapabilitiesKnown?: boolean;
 	cost: ModelCost;
 	contextWindow: number;
+	/**
+	 * The provider's own program keeps and compacts the conversation. `contextWindow` still describes how much it holds,
+	 * so an interface can show how full it is, but a host must not gate requests on it or compact on the model's behalf.
+	 */
+	managesOwnContext?: boolean;
 	maxTokens: number;
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */

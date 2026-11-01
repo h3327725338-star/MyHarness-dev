@@ -295,10 +295,14 @@ export function assertDirectTree(root: string): void {
  * walks every Workspace and rewrites the whole global index (52 s of uninterrupted work on a data root holding 1,400
  * Workspaces and 227,000 artifacts, which froze every other request while it ran), while removing one Workspace can only
  * drop that Workspace's entries. A Workspace without artifacts — a folder that was just created, for instance — hence
- * rewrites no index at all.
+ * rewrites no index at all. `onlySessions` limits it to those Sessions, for a Workspace that stays in the other chat mode.
  */
-export function deleteWorkspaceArtifacts(dataRoot: string, workspaceId: string): void {
-	const sessionIds = directories(join(getWorkspaceDir(dataRoot, workspaceId), "sessions"));
+export function deleteWorkspaceArtifacts(
+	dataRoot: string,
+	workspaceId: string,
+	onlySessions?: readonly string[],
+): void {
+	const sessionIds = onlySessions ?? directories(join(getWorkspaceDir(dataRoot, workspaceId), "sessions"));
 	const roots = sessionIds.map((sessionId) => ({
 		sessionId,
 		path: join(getSessionDir(dataRoot, workspaceId, sessionId), "artifacts"),

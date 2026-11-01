@@ -32,6 +32,11 @@ See these complete provider examples:
 
 Extensions can register either a complete myharness-ai `Provider` or use the legacy provider-config form. Prefer a complete provider when custom authentication, filtering, refresh, or streaming behavior is required. MyHarness composes `models.json` overrides above registered native providers.
 
+A complete provider has two more options for a program that runs by itself behind the provider:
+
+- `settings` on `createProvider` lists text values the provider stores itself (`id`, `label`, optional `description` and `placeholder`, `get()`, `set(value)`). They appear on the provider's card in Settings → Providers. `set` throws with a message for the user when the value is not acceptable; the strings are shown as written, without translation.
+- `managesOwnContext: true` on a model says its program keeps and compacts the conversation. The context meter still measures against `contextWindow`, but MyHarness does not block requests on it or compact automatically. A manual compaction still fires `session_before_compact`, so the extension can run its program's own compaction and return the result as `compaction`.
+
 ```typescript
 import { createProvider } from "@myharness/ai";
 import { openAICompletionsApi } from "@myharness/ai/api/openai-completions.lazy";

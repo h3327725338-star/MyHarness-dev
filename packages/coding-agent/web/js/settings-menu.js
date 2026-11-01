@@ -33,6 +33,7 @@ const SETTING_ICONS = {
 	"terminal-progress": "terminal",
 	"popup-notifications": "alertCircle",
 	"auto-memory": "book",
+	"memory-picker": "book",
 	"sub-agent": "tree",
 	"code-intelligence": "sparkle",
 	"vision-assistant": "eye",

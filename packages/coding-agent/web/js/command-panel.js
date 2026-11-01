@@ -1246,7 +1246,7 @@ function workspaceScreen(w) {
 				label: t("Remove from list"),
 				icon: "x",
 				danger: true,
-				desc: t("Its folder and chats are kept; the chats stay available without a workspace."),
+				desc: t("Asks first what to delete with it. The project folder itself is never deleted."),
 				onEnter: async (c) => (c.close(), await actions.removeWorkspace(w.id, w.name)),
 			},
 		],

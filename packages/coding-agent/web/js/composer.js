@@ -19,7 +19,7 @@ import { retryReason } from "./retry-reason.js";
 import { SubAgentBar, runningTasks } from "./sub-agents.js";
 
 import { drafts, registerRestartDraft, takeCarriedDraft } from "./restart-state.js";
-import { invalidateAttachmentCaches } from "./attachments.js";
+import { attachmentParts, invalidateAttachmentCaches } from "./attachments.js";
 import { chatModeOf, draftFromServer } from "./chat-modes.js";
 import { clipLine, formatQuotes, quoteFromSelection } from "./quote-text.js";
 import { clearQuoteHighlights, paintQuotes } from "./quote-highlight.js";
@@ -628,17 +628,26 @@ export function Composer() {
 		importing.current = true;
 		setLoadingFiles(true);
 		try {
+			// A picked folder keeps its tree: its files are stored in their places below one folder, pictures too, and the
+			// server plans the places first. A file's path comes without the folder's own name.
+			const inFolder = (file) => file.webkitRelativePath.slice(file.webkitRelativePath.indexOf("/") + 1);
+			const folderFiles = picked.filter((file) => file.webkitRelativePath && file.size <= MAX_UPLOAD_BYTES);
+			let folderId;
+			if (folderFiles.length) {
+				const top = folderFiles[0].webkitRelativePath.split("/")[0];
+				({ folderId } = await post("/api/files/upload/folder", { name: top, files: folderFiles.map((file) => ({ path: inFolder(file), size: file.size })) }, targetSlot));
+			}
 			// One file at a time, and a file that is not an inline image goes up in chunks: no batch, and no large file,
 			// is ever held whole in memory. A file that fails or is too large is skipped; the rest still go.
 			for (const file of picked) {
 				if (file.size > MAX_UPLOAD_BYTES) { toast(`${file.name}: ${t("Files must be 500 MiB or smaller.")}`, "warning"); continue; }
 				try {
 					let attachment;
-					if (file.type.startsWith("image/") && file.size <= INLINE_IMAGE_BYTES) {
+					if (file.type.startsWith("image/") && file.size <= INLINE_IMAGE_BYTES && !file.webkitRelativePath) {
 						attachment = await fileToImage(file);
 						if (state.snap?.model && !state.snap.model.input.includes("image")) toast(t("The current model does not list image input; the image may be ignored or trigger the vision assistant if enabled."), "warning", 6000);
 					} else {
-						const { uploadId } = await post("/api/files/upload/begin", { name: file.name, size: file.size }, targetSlot);
+						const { uploadId } = await post("/api/files/upload/begin", { name: file.name, size: file.size, ...(file.webkitRelativePath ? { folderId, path: inFolder(file) } : {}) }, targetSlot);
 						await sendFileInChunks(file, (offset, data) => post("/api/files/upload/chunk", { uploadId, offset, data }, targetSlot));
 						const uploaded = await post("/api/files/upload/finish", { uploadId }, targetSlot);
 						attachment = { name: uploaded.name, path: uploaded.path, id: uploaded.id ?? uploaded.path, mime: uploaded.mime ?? file.type ?? null, size: uploaded.size ?? file.size ?? null };
@@ -654,6 +663,7 @@ export function Composer() {
 			}
 			// Newly uploaded files appear in the sidebar's per-chat group at once.
 			try { invalidateAttachmentCaches(); } catch { /* sidebar hook is optional */ }
+		} catch (error) { toast(serverText(error.message, t("Could not read the file.")), "error");
 		} finally { importing.current = false; setLoadingFiles(false); }
 	};
 	const importFiles = useRef(addFiles);
@@ -897,7 +907,8 @@ const send = async (mode) => {
 					const zoomable = !img.path;
 					const open = (e) => { if (e.target.closest(".thumb-x")) return; openImageLightbox(img.url, img.name); };
 					const onKey = (e) => { if (e.target.closest(".thumb-x")) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openImageLightbox(img.url, img.name); } };
-					return html`<div class="thumb" key=${i} role=${zoomable ? "button" : undefined} tabindex=${zoomable ? 0 : undefined} aria-label=${zoomable ? t("Preview image {name}", { name: img.name }) : undefined} onClick=${zoomable ? open : undefined} onKeyDown=${zoomable ? onKey : undefined}>${img.path ? html`<span class="file-attachment" title=${img.path}><${Icon} name="file" size=${18} /><span class="truncate">${img.name}</span></span>` : html`<img src=${img.url} alt=${img.name} />`}<button class="thumb-x" aria-label=${t("Remove attachment")} onClick=${(e) => { e.stopPropagation(); setImages(images.filter((_, j) => j !== i)); }}><${Icon} name="x" size=${11} /></button></div>`;
+					const { file: fileName, folder } = img.path ? attachmentParts(img.name) : {};
+					return html`<div class="thumb" key=${i} role=${zoomable ? "button" : undefined} tabindex=${zoomable ? 0 : undefined} aria-label=${zoomable ? t("Preview image {name}", { name: img.name }) : undefined} onClick=${zoomable ? open : undefined} onKeyDown=${zoomable ? onKey : undefined}>${img.path ? html`<span class="file-attachment" title=${folder ? img.name : img.path}><${Icon} name="file" size=${18} /><span class="file-attachment-name"><span class="truncate">${fileName}</span>${folder ? html`<span class="truncate dim">${folder}</span>` : null}</span></span>` : html`<img src=${img.url} alt=${img.name} />`}<button class="thumb-x" aria-label=${t("Remove attachment")} onClick=${(e) => { e.stopPropagation(); setImages(images.filter((_, j) => j !== i)); }}><${Icon} name="x" size=${11} /></button></div>`;
 				})}</div>` : null}
 				${loadingFiles ? html`<div class="branch-note dim" role="status"><${Spinner} />${t("Loading files…")}</div>` : null}
 				<${DraftEditor} apiRef=${area} class="composer-input" value=${text} placeholder=${placeholder} placeholderShort=${placeholderShort}

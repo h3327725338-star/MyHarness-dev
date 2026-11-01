@@ -9,7 +9,7 @@ export interface AttachmentManifest {
 	id: string;
 	/** Sanitized display name (`attachment-<cleaned>` basename is stored separately). */
 	originalName: string;
-	/** File name on disk (`attachment-<cleaned>`). */
+	/** File name on disk (`attachment-<cleaned>`); for an uploaded folder, the folder holding its tree. */
 	storedName: string;
 	mime: string;
 	size: number;
@@ -43,6 +43,30 @@ export function guessAttachmentMime(fileName: string): string {
 /** Data-root-relative posix reference for an absolute attachment file. */
 export function toAttachmentRelativePath(dataRoot: string, absolutePath: string): string {
 	return relative(resolve(dataRoot), resolve(absolutePath)).split(sep).join("/");
+}
+
+/** Header of the attachment lines a message starts with (one JSON string per line, see splitAttachmentText in wire.ts). */
+export const ATTACHED_FILES_HEADER = "Attached files (use read to inspect):";
+
+/**
+ * The attachment lines of a message as the Agent gets them. History keeps data-root-relative references, which stay
+ * valid when the data folder moves or syncs to another computer, but the Agent's tools resolve a relative path against
+ * the working directory, so the model is given the full path. Anything else in the text is left as it is.
+ */
+export function withAbsoluteAttachmentPaths(text: string, dataRoot: string): string {
+	if (!text.startsWith(ATTACHED_FILES_HEADER)) return text;
+	const lines = text.split("\n");
+	for (let index = 1; index < lines.length; index += 1) {
+		let value: unknown;
+		try {
+			value = JSON.parse(lines[index]!.trim());
+		} catch {
+			break;
+		}
+		if (typeof value !== "string" || !value) break;
+		if (value.startsWith("workspaces/")) lines[index] = JSON.stringify(resolve(dataRoot, value).split(sep).join("/"));
+	}
+	return lines.join("\n");
 }
 
 /** Write (or overwrite) one attachment folder's manifest. The folder must already exist. */

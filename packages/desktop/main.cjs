@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Notification, Tray, Menu, na
 const { spawn } = require('node:child_process');
 const { mkdirSync, appendFileSync, readFileSync, existsSync, copyFileSync } = require('node:fs');
 const { createHash } = require('node:crypto');
-const { join, resolve } = require('node:path');
+const { isAbsolute, join, resolve } = require('node:path');
 const { homedir } = require('node:os');
 const { createBrowser, httpUrl } = require('./browser-view.cjs');
 const { readLegacyPrefs } = require('./legacy-prefs.cjs');
@@ -228,6 +228,15 @@ async function migratePrefs(url) {
   } catch (error) { log(`外观偏好迁移失败：${error.message}`); }
   return '';
 }
+// Files of a deleted chat that sit in the user's own folders go to the Recycle Bin, one by one: one that cannot go stays
+// where it is, and the service checks afterwards which are still there.
+async function recycleFiles(paths) {
+  for (const path of Array.isArray(paths) ? paths : []) {
+    if (typeof path !== 'string' || !isAbsolute(path)) continue;
+    await shell.trashItem(path).catch((error) => log(`无法放进回收站：${error.message}`));
+  }
+  return { done: true };
+}
 function startService(restart) {
   serviceUrl = undefined;
   let requestedRestart;
@@ -253,7 +262,7 @@ function startService(restart) {
     });
   }
   child.once('spawn', () => {
-    try { job.assign(child.pid); child.send({ type: 'start', entry, args: ['--port', String(restart?.port || 0), '--no-open', ...(restart?.session ? ['--session', restart.session] : ['--continue'])], loader }); }
+    try { job.assign(child.pid); child.send({ type: 'start', entry, args: ['--port', String(restart?.port || 0), '--no-open', ...(app.isPackaged ? require('./bundled-extensions.cjs').bundledExtensionArgs(__dirname, agentDir) : []), ...(restart?.session ? ['--session', restart.session] : ['--continue'])], loader }); }
     catch (error) { child.kill(); void errorPage(`${say('Could not set up the service process group: ', '无法建立服务进程管理：')}${error.message}`); }
   });
   child.once('error', (error) => { clearTimeout(timeout); void errorPage(`${say('The local service failed to start: ', '本地服务启动失败：')}${error.message}`); });
@@ -265,7 +274,7 @@ function startService(restart) {
     if (message?.type === 'myharness:browser-command') {
       const requestId = String(message.requestId || '');
       Promise.resolve()
-        .then(() => (message.action === 'workspace' ? workspaceRequest(message.command, Number(message.timeoutMs) || 15000) : browser.command(message.command, { agent: true })))
+        .then(() => (message.action === 'recycle' ? recycleFiles(message.command?.paths) : message.action === 'workspace' ? workspaceRequest(message.command, Number(message.timeoutMs) || 15000) : browser.command(message.command, { agent: true })))
         .then((value) => { try { child.send({ type: 'myharness:browser-result', requestId, ok: true, value }); } catch (error) { log(`无法回传浏览器命令结果：${error.message}`); } })
         .catch((error) => { try { child.send({ type: 'myharness:browser-result', requestId, ok: false, error: error?.message || String(error) }); } catch { /* child already gone */ } });
       return;

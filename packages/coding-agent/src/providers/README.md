@@ -28,8 +28,9 @@
 | 文件 | 内容 |
 | --- | --- |
 | `config.ts` | `ModelConfig`：`models.json` 的只读快照（不含凭证） |
+| `layers.ts` | 三层结构（Provider → 密钥 → 模型）的规则：上层优先的解析、把旧条目转成等价的三层写法、合并建议、全局和模型 Key 的凭证 ID |
 | `composer.ts` | 把一个 Provider 的配置组合成可用的 Provider/模型；请求头与兼容请求配置解析；API Key 缓存 |
-| `custom-provider-manager.ts` | 用户自定义 Provider 的增删改、模型发现、把发现结果写回 `models.json` |
+| `custom-provider-manager.ts` | 用户自定义 Provider 的增删改、合并和移出、模型发现、把发现结果写回 `models.json` |
 | `nebius-preset.ts` | Nebius Token Factory 预设：Base URL、控制台链接、DeepSeek V4.1 Flash 1017 和 Nemotron 模型条目（按账户模型列表里的拼写取用）、各项工作用哪个模型（`NEBIUS_ROLE_PLAN`） |
 | `thinking-capability.ts` | 判断一个模型的 Thinking Effort 能力来自哪里（官方文档 > 模型目录 > 探测） |
 | `official-effort.ts` | Provider 官方文档明确写出的“请求档位 → 实际档位” |
@@ -81,6 +82,7 @@
 - 环境变量只在对应 Provider 已存在时参与认证解析，本身不会创建 Provider。
 - 不按模型名猜测 Thinking 能力；顺序固定为官方文档 > 模型目录 > 探测。
 - `models.json`、`auth.json` 的写入必须保留现有的锁和原子替换。
+- 运行时只读解析后的值：`ModelConfig.load` 把三层编译成原来的形状，`(provider, modelId)` 和指向它们的 Session、设置不因此改变。整理配置（转三层、合并、移出）不得改变任何模型实际用的地址、格式和密钥（`provider-layers.test.ts`）。
 - 恢复策略有预算上限，改动时确认不会把同一个 Provider 故障变成无限循环（`agent-session-provider-recovery.test.ts`）。
 - 用户文档：`docs/providers.md`、`docs/models.md`、`docs/custom-provider.md`、`docs/security.md`。
-- 相关测试：`model-runtime-*.test.ts`、`model-resolver.test.ts`、`model-registry.test.ts`、`models-store.test.ts`、`configured-providers.test.ts`、`custom-provider-manager.test.ts`、`auth-storage.test.ts`、`runtime-credentials.test.ts`、`resolve-config-value.test.ts`、`account-connections.test.ts`、`mail-connections.test.ts`、`thinking-probe.test.ts`、`official-effort.test.ts`、`balance-tracker.test.ts`、`phase7-provider-architecture.test.ts`。
+- 相关测试：`model-runtime-*.test.ts`、`model-resolver.test.ts`、`model-registry.test.ts`、`models-store.test.ts`、`configured-providers.test.ts`、`custom-provider-manager.test.ts`、`provider-layers.test.ts`、`auth-storage.test.ts`、`runtime-credentials.test.ts`、`resolve-config-value.test.ts`、`account-connections.test.ts`、`mail-connections.test.ts`、`thinking-probe.test.ts`、`official-effort.test.ts`、`balance-tracker.test.ts`、`phase7-provider-architecture.test.ts`。

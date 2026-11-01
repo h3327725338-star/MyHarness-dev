@@ -12,14 +12,8 @@ concurrency:
 
 jobs:
   build-check-test:
-    name: CI / ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - windows-2022
-          - windows-2025
-    runs-on: ${{ matrix.os }}
+    name: CI / windows-2025
+    runs-on: windows-2025
     steps:
       - name: Checkout
         uses: actions/checkout@v4

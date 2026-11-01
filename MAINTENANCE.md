@@ -41,10 +41,10 @@ Electron 桌面宿主位于独立的 `packages/desktop`，不进入 Coding Agent
 
 ## CI baseline 与用户平台
 
-正式 GitHub CI 是 `.github/workflows/ci.yml`，固定使用 `windows-2022` 和
-`windows-2025` 两个 GitHub-hosted Windows x64 runner。matrix 两边执行相同的
-`npm ci --ignore-scripts`、release/privacy audit、`ffmpeg-static` rebuild、build、
-check、搜索工具安装和 test 流程；两边都必须通过，不能使用 `windows-latest`。
+正式 GitHub CI 是 `.github/workflows/ci.yml`，固定使用 `windows-2025` 这一个
+GitHub-hosted Windows x64 runner，执行 `npm ci --ignore-scripts`、release/privacy
+audit、`ffmpeg-static` rebuild、build、check、搜索工具安装和 test 流程，不能使用
+`windows-latest`。
 
 这是自动化验证 baseline，不是最终用户支持矩阵。MyHarness 面向 Windows 桌面 x64，
 不能把 CI 的 Windows Server runner 写成“只支持 Windows Server”，也不能声称已

@@ -51,6 +51,11 @@ export class ProviderSettingsUseCase {
 			this.settingsManager.setAutoMemorySettings({ ...autoMemory, enabled: false });
 		}
 
+		const memoryPicker = this.settingsManager.getMemoryPickerSettings();
+		if (memoryPicker.provider === providerId && memoryPicker.enabled) {
+			this.settingsManager.setMemoryPickerSettings({ ...memoryPicker, enabled: false });
+		}
+
 		const subAgent = this.settingsManager.getSubAgentSettings();
 		if (subAgent.provider === providerId && subAgent.enabled) {
 			this.settingsManager.setSubAgentSettings({ ...subAgent, enabled: false });

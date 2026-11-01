@@ -172,7 +172,7 @@ export class DesktopWorkspaceChannel {
 	request(command: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
 		const requestId = `w${++this.nextId}-${Date.now().toString(36)}`;
 		const { channel: _channel, ...payload } = command;
-		const action = _channel === "workspace" ? "workspace" : "browser";
+		const action = _channel === "workspace" || _channel === "recycle" ? _channel : "browser";
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(requestId);

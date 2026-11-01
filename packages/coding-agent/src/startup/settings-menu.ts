@@ -102,6 +102,7 @@ export const SETTINGS_MENU: ReadonlyArray<SettingsMenuItem> = [
 	{ id: "default-model", label: "Default Model", description: "选择主用模型", kind: "submenu" },
 	{ id: "fallback-model", label: "Fallback Model", description: "主模型故障时自动接管", kind: "submenu" },
 	{ id: "auto-memory", label: "Auto Memory", description: "记忆偏好和项目事实", kind: "submenu" },
+	{ id: "memory-picker", label: "Memory Picker", description: "用选定的模型挑选每条消息要用的记忆", kind: "submenu" },
 	{ id: "sub-agent", label: "Sub Agent", description: "并行调查复杂任务", kind: "submenu" },
 	{ id: "web-search", label: "Web Search", description: "联网搜索", kind: "submenu" },
 	{ id: "code-intelligence", label: "Code Intelligence", description: "管理可选语义模块", kind: "submenu" },

@@ -563,6 +563,7 @@ async function collectSessionMemoryOwnership(
 	dataRoot: string,
 	location: { workspaceId: string; sessionId: string },
 	provenance: SessionMemoryProvenance,
+	scopes: { global: boolean; workspace: boolean } = { global: true, workspace: true },
 ): Promise<MemoryOwnership> {
 	const resolved = path.resolve(dataRoot);
 	const { sessionId } = location;
@@ -695,8 +696,8 @@ async function collectSessionMemoryOwnership(
 		});
 	};
 	const [globalScope, workspaceScope, sessionOwned, sessionArchives] = await Promise.all([
-		scanScope(paths.globalDir, "global"),
-		scanScope(paths.workspaceDir, "workspace"),
+		scopes.global ? scanScope(paths.globalDir, "global") : [],
+		scopes.workspace ? scanScope(paths.workspaceDir, "workspace") : [],
 		scanSession(),
 		markdownFiles(path.join(paths.sessionDir, "archive"), checked),
 	]);
@@ -748,8 +749,15 @@ export async function describeSessionMemories(
 	return { owned, shared, retired };
 }
 
-/** Drop a deleted chat from the extraction cursor and consolidation bookkeeping in state.json. Caller owns the lock. */
-async function forgetSessionMemoryState(dataRoot: string, sessionId: string): Promise<void> {
+/**
+ * Drop deleted chats from the extraction cursor and consolidation bookkeeping in state.json, and a Workspace whose
+ * memories are gone from the latter. Caller owns the lock.
+ */
+async function forgetSessionMemoryState(
+	dataRoot: string,
+	sessionIds: readonly string[],
+	workspaceId?: string,
+): Promise<void> {
 	const statePath = path.join(path.resolve(dataRoot), "memory", "state.json");
 	assertDirectPath(statePath);
 	let state: { version?: unknown; sessions?: unknown; consolidation?: unknown };
@@ -760,14 +768,23 @@ async function forgetSessionMemoryState(dataRoot: string, sessionId: string): Pr
 	}
 	if (!state || state.version !== 1) return;
 	let changed = false;
-	if (state.sessions && typeof state.sessions === "object" && sessionId in state.sessions) {
-		delete (state.sessions as Record<string, unknown>)[sessionId];
-		changed = true;
+	const gone = new Set(sessionIds);
+	if (state.sessions && typeof state.sessions === "object") {
+		for (const sessionId of gone) {
+			if (!(sessionId in state.sessions)) continue;
+			delete (state.sessions as Record<string, unknown>)[sessionId];
+			changed = true;
+		}
 	}
 	if (state.consolidation && typeof state.consolidation === "object") {
-		for (const value of Object.values(state.consolidation as Record<string, { sessionIds?: unknown }>)) {
-			if (!value || !Array.isArray(value.sessionIds) || !value.sessionIds.includes(sessionId)) continue;
-			value.sessionIds = value.sessionIds.filter((id) => id !== sessionId);
+		const consolidation = state.consolidation as Record<string, { sessionIds?: unknown }>;
+		if (workspaceId !== undefined && workspaceId in consolidation) {
+			delete consolidation[workspaceId];
+			changed = true;
+		}
+		for (const value of Object.values(consolidation)) {
+			if (!value || !Array.isArray(value.sessionIds) || !value.sessionIds.some((id) => gone.has(id))) continue;
+			value.sessionIds = value.sessionIds.filter((id) => !gone.has(id));
 			changed = true;
 		}
 	}
@@ -778,12 +795,14 @@ async function forgetSessionMemoryState(dataRoot: string, sessionId: string): Pr
  * Delete a chat's memories: its own memory folder and the global/workspace memories that describeSessionMemories
  * finds it owns alone (with their archives, and retired histories that are entirely its own). Shared memories, the
  * resident profile and pending quarantine are kept. A file that cannot be removed (open elsewhere) is left in place.
- * Caller owns the lock (withMemoryLock); ownership is decided again here, inside it.
+ * Caller owns the lock (withMemoryLock); ownership is decided again here, inside it. `keepCursor` is for a chat that
+ * stays: its extraction cursor is what stops the same messages from being turned into memories again.
  */
 export async function deleteSessionMemories(
 	dataRoot: string,
 	location: { workspaceId: string; sessionId: string },
 	provenance: SessionMemoryProvenance,
+	options: { keepCursor?: boolean } = {},
 ): Promise<{ deleted: number; failed: number }> {
 	const resolved = path.resolve(dataRoot);
 	const ownership = await collectSessionMemoryOwnership(resolved, location, provenance);
@@ -804,9 +823,135 @@ export async function deleteSessionMemories(
 	} catch {
 		failed++;
 	}
-	await forgetSessionMemoryState(resolved, location.sessionId);
+	if (!options.keepCursor) await forgetSessionMemoryState(resolved, [location.sessionId]);
 	await refreshMemoryIndexes(resolved);
 	return { deleted, failed };
+}
+
+/** One chat of a Workspace being removed, with what its history says about its memories. */
+export interface WorkspaceMemoryChat {
+	sessionId: string;
+	provenance: SessionMemoryProvenance;
+}
+
+/**
+ * The chats among these that may own a memory, found with one read of each memory file: going through every memory once
+ * per chat takes minutes on a Workspace with hundreds of chats and a large library. `wholeWorkspace` means the
+ * Workspace's own memories go regardless of who wrote them, so only global memories need an owner.
+ */
+async function chatsNamedByMemories(
+	dataRoot: string,
+	workspaceId: string,
+	chats: readonly WorkspaceMemoryChat[],
+	wholeWorkspace: boolean,
+): Promise<Set<string>> {
+	const globalDir = path.join(dataRoot, "memory");
+	const folders = wholeWorkspace
+		? [globalDir]
+		: [globalDir, path.join(getWorkspaceDir(dataRoot, workspaceId), "memory")];
+	const checked = new Set<string>();
+	const files: string[] = [];
+	for (const folder of folders) {
+		for (const directory of [folder, path.join(folder, "archive")])
+			for (const name of await markdownFiles(directory, checked)) files.push(path.join(directory, name));
+	}
+	const named = new Set<string>();
+	await mapLimited(files, 32, async (file) => {
+		const raw = await readFrontmatterText(file).catch(() => "");
+		for (const match of raw.matchAll(/^(?:sourceSessionId|updatedBy):\s*["']?([^\s"']+)/gmu)) named.add(match[1]!);
+	});
+	return new Set(
+		chats
+			.filter((chat) => named.has(chat.sessionId) || chat.provenance.createdByTool.size > 0)
+			.map((chat) => chat.sessionId),
+	);
+}
+
+/**
+ * What removing a Workspace together with its memories takes: with `wholeWorkspace` every memory of the Workspace, and
+ * from each of the given chats its own folder and the memories it owns alone (as for one deleted chat). Without it the
+ * Workspace stays in the other chat mode, so its memories are judged like the global ones.
+ */
+export async function describeWorkspaceMemories(
+	dataRoot: string,
+	workspaceId: string,
+	chats: readonly WorkspaceMemoryChat[],
+	wholeWorkspace: boolean,
+): Promise<SessionMemoryImpact> {
+	const resolved = path.resolve(dataRoot);
+	const named = await chatsNamedByMemories(resolved, workspaceId, chats, wholeWorkspace);
+	const impacts = await mapLimited(chats, 8, (chat) =>
+		collectSessionMemoryOwnership(
+			resolved,
+			{ workspaceId, sessionId: chat.sessionId },
+			chat.provenance,
+			named.has(chat.sessionId) ? { global: true, workspace: !wholeWorkspace } : { global: false, workspace: false },
+		),
+	);
+	const result: SessionMemoryImpact = { owned: [], shared: 0, retired: 0 };
+	if (wholeWorkspace) {
+		const directory = path.join(getWorkspaceDir(resolved, workspaceId), "memory");
+		const checked = new Set<string>();
+		const names = await markdownFiles(directory, checked);
+		const versions = await mapLimited(names, 16, (name) => readVersion(path.join(directory, name)));
+		names.forEach((name, index) => {
+			const base = name.slice(0, -3);
+			result.owned.push({
+				path: path.relative(resolved, path.join(directory, name)).replace(/\\/g, "/"),
+				id: text(versions[index]?.frontmatter.id) ?? `workspace/${base}`,
+				name: text(versions[index]?.frontmatter.name) ?? base,
+				scope: "workspace",
+			});
+		});
+		const active = new Set(names);
+		for (const name of await markdownFiles(path.join(directory, "archive"), checked)) {
+			const base = ARCHIVE_NAME.exec(name)?.[1];
+			if (!base || !active.has(`${base}.md`)) result.retired++;
+		}
+	}
+	for (const impact of impacts) {
+		result.owned.push(...impact.owned);
+		result.shared += impact.shared;
+		result.retired += impact.retired;
+	}
+	return result;
+}
+
+/** The chats among these that have anything to remove when their memories go. Read before anything moves. */
+export async function chatsWithMemories(
+	dataRoot: string,
+	workspaceId: string,
+	chats: readonly WorkspaceMemoryChat[],
+	wholeWorkspace: boolean,
+): Promise<Set<string>> {
+	const resolved = path.resolve(dataRoot);
+	const found = await chatsNamedByMemories(resolved, workspaceId, chats, wholeWorkspace);
+	await mapLimited(chats, 16, async ({ sessionId }) => {
+		const { sessionDir } = getMemoryPaths({ dataRoot: resolved, workspaceId, sessionId });
+		const checked = new Set<string>();
+		if ((await markdownFiles(sessionDir, checked)).length > 0) found.add(sessionId);
+		else if ((await markdownFiles(path.join(sessionDir, "archive"), checked)).length > 0) found.add(sessionId);
+	});
+	return found;
+}
+
+/**
+ * The Workspace's own memories (with `wholeWorkspace`: its memory folder, archives included) and the bookkeeping of the
+ * chats deleted with it. Global memories and other Workspaces are not touched. Caller owns the lock.
+ */
+export async function deleteWorkspaceMemories(
+	dataRoot: string,
+	workspaceId: string,
+	options: { wholeWorkspace: boolean; forgetSessionIds: readonly string[] },
+): Promise<void> {
+	const resolved = path.resolve(dataRoot);
+	if (options.wholeWorkspace) {
+		const directory = path.join(getWorkspaceDir(resolved, workspaceId), "memory");
+		assertDirectTree(directory);
+		await fs.promises.rm(directory, { recursive: true, force: true });
+	}
+	await forgetSessionMemoryState(resolved, options.forgetSessionIds, options.wholeWorkspace ? workspaceId : undefined);
+	await refreshMemoryIndexes(resolved);
 }
 
 /**

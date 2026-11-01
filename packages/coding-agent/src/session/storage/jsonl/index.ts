@@ -40,16 +40,17 @@ import {
 } from "../../../data/workspace-store.ts";
 import { writeFileAtomicallySync, writeFileDurablySync } from "../../../utils/atomic-write.ts";
 import { normalizePath, pathIdentityKey, resolvePath } from "../../../utils/paths.ts";
-import type {
-	FileEntry,
-	SessionEntry,
-	SessionHeader,
-	SessionInfo,
-	SessionJsonlDiagnostic,
-	SessionJsonlDiagnostics,
-	SessionJsonlIssueKind,
-	SessionListProgress,
-	SessionMessageEntry,
+import {
+	type FileEntry,
+	SCHEDULED_RUN_ENTRY,
+	type SessionEntry,
+	type SessionHeader,
+	type SessionInfo,
+	type SessionJsonlDiagnostic,
+	type SessionJsonlDiagnostics,
+	type SessionJsonlIssueKind,
+	type SessionListProgress,
+	type SessionMessageEntry,
 } from "../../types.ts";
 import {
 	lineReferencesImageFiles,
@@ -853,6 +854,8 @@ interface SessionScan {
 	messageCount: number;
 	/** Nothing but the header and the model / thinking setup has been seen (see SessionInfo.blank). */
 	blank: boolean;
+	/** A scheduled task started this chat (see SessionInfo.scheduled). */
+	scheduled: boolean;
 	firstMessage: string;
 	allMessages: string[];
 	textChars: number;
@@ -937,6 +940,7 @@ function applySessionScanLine(scan: SessionScan, line: string): void {
 	}
 	if (entry.type !== "model_change" && entry.type !== "thinking_level_change") scan.blank = false;
 	if (entry.type === "session_info") scan.name = entry.name?.trim() || undefined;
+	if (entry.type === "custom" && entry.customType === SCHEDULED_RUN_ENTRY) scan.scheduled = true;
 	if (entry.type !== "message") return;
 	scan.messageCount++;
 	const activityTime = getMessageActivityTime(entry);
@@ -1009,6 +1013,8 @@ function sessionInfoFromScan(filePath: string, scan: SessionScan, mtime: Date): 
 		modified,
 		messageCount: scan.messageCount,
 		blank: scan.blank,
+		// A chat continued from a task's chat holds the same entry, but that chat is the user's own.
+		scheduled: scan.scheduled && !header.parentSession,
 		firstMessage: scan.firstMessage || "(no messages)",
 		allMessagesText: scan.allMessages.join(" "),
 	};
@@ -1036,6 +1042,7 @@ async function buildSessionInfoUncached(filePath: string): Promise<SessionInfo |
 						invalid: false,
 						messageCount: 0,
 						blank: true,
+						scheduled: false,
 						firstMessage: "",
 						allMessages: [],
 						textChars: 0,

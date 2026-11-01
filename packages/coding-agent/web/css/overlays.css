@@ -191,8 +191,8 @@
 .set-control .model-ref .select { height: var(--h-control); }
 .set-control .model-ref .model-ref-btn { height: auto; min-height: var(--h-control); white-space: normal; }
 .set-control .model-ref > .picker-anchor:not(.model-ref-effort-anchor) { flex: 1 1 auto; min-width: 0; }
-.set-control .model-ref-effort-anchor { flex: none; min-width: 0; max-width: 112px; }
-.set-control .model-ref-effort { flex: none; max-width: 112px; }
+.set-control .model-ref-effort-anchor { flex: none; min-width: 0; max-width: 136px; }
+.set-control .model-ref-effort { flex: none; max-width: 136px; }
 .set-control .model-ref-text { display: block; flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 /* Keep the row contract on narrow desktops without squeezing the label to a few characters. */
 @media (max-width: 760px) {
@@ -243,8 +243,32 @@
 .prov-empty { padding: 8px 10px; }
 .prov-head { display: flex; align-items: center; gap: 12px; padding: 2px 2px 0; }
 .prov-title { font-size: 16px; font-weight: 650; }
-.prov-path { padding: 0 2px; }
+/* The layers of a provider: its global settings, then its keys, each a summary row that opens into its form. */
+.prov-global-body { padding: 14px 16px 16px; }
+.prov-global-foot { gap: 8px; }
+.prov-keys-head { padding: 2px 2px 0; gap: 8px; }
+.prov-keys-head strong { font-size: var(--fs-body); font-weight: 650; }
+.prov-key { min-width: 0; }
+.prov-key-head { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); }
+.prov-key-toggle { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 40px; text-align: left; color: var(--text); }
+.prov-key-name { font-weight: 600; }
+.prov-key-count { flex: none; font-size: var(--fs-xs); }
+/* A key's form hangs off its row like the models hang off a key: one line down the side instead of a box in a box. */
+.prov-key-body { margin: 12px 0 0 8px; padding-left: 12px; border-left: 2px solid var(--border); }
+.prov-key.settled > .collapse > .collapse-inner { overflow: visible; }
+.prov-actions { gap: 8px; padding: 2px 2px 8px; }
+.prov-suggest { background: var(--accent-soft); border-color: var(--accent-line); }
+.prov-suggest-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 16px 14px; border-top-color: var(--accent-line) !important; }
+.prov-suggest-item { display: flex; flex-direction: column; gap: 2px; }
+.prov-suggest-item + .prov-suggest-item { padding-top: 12px; border-top: 1px solid var(--accent-line); }
+.prov-suggest-row { display: flex; min-height: 26px; }
+.prov-suggest-name { flex: none; max-width: 45%; }
+.prov-suggest-foot { gap: 8px; margin-top: 6px; }
+.prov-suggest-foot > .field { min-width: 0; max-width: 240px; margin-right: auto; }
 .key-current { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 4px 6px 4px 12px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg-inset); color: var(--text-2); }
+/* A value on the layer above applies instead of this one. It stays, greyed, and applies again once that one is cleared. */
+.key-current.covered, .pf-key-area.covered .key-current { opacity: var(--disabled-opacity); }
+.pf-key-area { gap: 6px; }
 .key-list { display: flex; flex-direction: column; padding: 6px 16px; }
 .key-row { display: flex; align-items: center; gap: 10px; min-height: 44px; border-top: 1px solid var(--border); }
 .key-row:first-child { border-top: 0; }
@@ -327,6 +351,11 @@
 .pf-model { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-panel); }
 .pf-model-head { gap: 8px; min-height: 38px; padding: 0 6px 0 10px; }
 .pf-model-body { gap: 14px; padding: 12px 12px 14px; border-top: 1px solid var(--border); }
+.pf-tick { flex: none; margin: 0; }
+/* Ticked models change together: the choice folds in under "Select all" once one is ticked. */
+.pf-batch { display: flex; flex-direction: column; gap: 6px; padding: 2px 10px; }
+.pf-batch > .check-label { align-self: flex-start; }
+.pf-batch-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; padding: 2px 0 4px; }
 .pf-switches { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .pf-levels { display: flex; flex-wrap: wrap; gap: 6px; }
 .pf-detect { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-inset); }
@@ -505,7 +534,8 @@
 /* The switch itself: a transparent button laid over the whole row, above the icon, the text and the drawn switch, so a
    click anywhere on the row (the switch included) lands on it; only the label's link is raised above it. */
 .del-hit { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: pointer; }
-.del-hit:disabled { cursor: default; }
+/* Dimming a row's text gives it its own stacking order, so the link cannot rise above a switch that does nothing anyway. */
+.del-hit:disabled { cursor: default; pointer-events: none; }
 .del-hit:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; border-radius: 0; }
 .del-row.opt:hover:not(.off) { background: var(--surface-hover); }
 .del-row.opt.on, .del-row.opt.on:hover { background: color-mix(in srgb, var(--danger) 7%, transparent); }
@@ -532,7 +562,7 @@
 .git-instr-toggle:hover .disclose { color: var(--text); }
 .git-instr.off .set-text { opacity: 0.55; }
 
-/* Settings → Scheduled tasks (schedules.js): a row per task (kind, what and when, its switches), the editor in place. */
+/* The Scheduled tasks page (schedules.js): a row per task (kind, what and when, its switches), the editor in place. */
 .set-row.schedule-row { grid-template-columns: auto minmax(0, 1fr) auto; column-gap: 12px; }
 .set-row.schedule-row.off .set-control { opacity: 1; }
 .set-row.schedule-row.off .schedule-kind { opacity: 0.55; }

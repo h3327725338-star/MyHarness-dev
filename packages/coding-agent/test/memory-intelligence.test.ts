@@ -314,14 +314,18 @@ describe("memory annotations and recall", () => {
 				description: "杂项备注",
 			}),
 		);
-		const results = selectMemoriesForQuery("部署发布流程怎么走", [...strong, ...weak]);
+		// “发布”不能出现在太多记忆里，否则它不再参与排序。
+		const others = Array.from({ length: 20 }, (_, index) =>
+			entry({ id: `global/other-${index}`, name: "其他", content: "完全无关的笔记", description: "其他" }),
+		);
+		const results = selectMemoriesForQuery("部署发布流程怎么走", [...strong, ...weak, ...others]);
 		expect(results).toHaveLength(8);
 		expect(results.map((result) => result.entry.id).slice(0, 2)).toEqual(["global/strong-0", "global/strong-1"]);
 		const scores = results.map((result) => result.score);
 		expect([...scores].sort((a, b) => b - a)).toEqual(scores);
 	});
 
-	it("matches trigger phrases by whole phrase, shared two-character groups and whole Latin words", () => {
+	it("matches trigger phrases by whole phrase and whole Latin words", () => {
 		const entries = [
 			entry({ id: "global/plain", name: "Plain", content: "p", triggers: ["别讲术语"] }),
 			entry({ id: "global/rank", name: "Rank", content: "r", triggers: ["上次那个要不要先给排名"] }),
@@ -333,12 +337,43 @@ describe("memory annotations and recall", () => {
 				.map((result) => result.entry.id)
 				.sort();
 		expect(pick("你别讲术语了")).toEqual(["global/plain"]);
-		expect(pick("你别给我讲术语")).toEqual(["global/plain"]);
-		expect(pick("要不要先给排名")).toEqual(["global/rank"]);
+		expect(pick("你别给我讲术语")).toEqual([]); // shared word pairs are not enough
+		expect(pick("上次那个要不要先给排名呢")).toEqual(["global/rank"]);
+		expect(pick("要不要先给排名")).toEqual([]);
 		expect(pick("CI 又挂了")).toEqual(["global/ci"]);
 		expect(pick("this decision is specific")).toEqual([]);
-		expect(pick("讲人话")).toEqual([]); // one shared group is not enough
+		expect(pick("讲人话")).toEqual([]);
 		expect(pick("请说人话")).toEqual(["global/two"]);
+	});
+
+	it("does not rank by words that say nothing or that most memories contain", () => {
+		const others = Array.from({ length: 20 }, (_, index) =>
+			entry({ id: `global/other-${index}`, name: "笔记", content: "数据库备份的流程", description: "笔记" }),
+		);
+		const entries = [
+			entry({ id: "global/group", name: "群名称", content: "这两个群是什么", description: "群名称" }),
+			...others,
+		];
+		// “什么”和“这两”是停用词，“备份”出现在绝大多数记忆里。
+		expect(selectMemoriesForQuery("为什么我这两天没备份", entries)).toEqual([]);
+		expect(selectMemoriesForQuery("群名称是哪个", entries).map((result) => result.entry.id)).toEqual([
+			"global/group",
+		]);
+	});
+
+	it("counts a match in the name above the same match in the body", () => {
+		const others = Array.from({ length: 10 }, (_, index) =>
+			entry({ id: `global/other-${index}`, name: "笔记", content: "别的内容", description: "笔记" }),
+		);
+		const entries = [
+			entry({ id: "global/body", name: "笔记", content: "提到一次控油", description: "笔记" }),
+			entry({ id: "global/name", name: "控油", content: "别的内容提到一次", description: "笔记" }),
+			...others,
+		];
+		expect(selectMemoriesForQuery("怎么控油", entries).map((result) => result.entry.id)).toEqual([
+			"global/name",
+			"global/body",
+		]);
 	});
 
 	it("ranks high above normal above low at equal relevance", () => {

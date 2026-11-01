@@ -11,10 +11,23 @@ import { openWorkspaceFile } from "./local-files.js";
 
 export const ATTACH_HEADER = "Attached files (use read to inspect):";
 
-/** Display name of an uploaded file: the basename without the server's `attachment-` prefix. */
+/**
+ * Display name of an uploaded file: the basename without the server's `attachment-` prefix. A file of an uploaded
+ * folder keeps its place in the folder: `uploads/<id>/attachment-top/sub/a.txt` is `top/sub/a.txt`. Mirrors wire.ts.
+ */
 export function attachmentName(value) {
+	const parts = String(value ?? "").replace(/\\/g, "/").replace(/\/+$/, "").split("/");
+	const uploads = parts.indexOf("uploads");
+	const top = uploads < 0 ? -1 : parts.findIndex((part, index) => index > uploads && part.startsWith("attachment-"));
+	if (top >= 0 && top < parts.length - 1) return [parts[top].slice("attachment-".length) || parts[top], ...parts.slice(top + 1)].join("/");
 	const leaf = basename(String(value ?? ""));
 	return leaf.startsWith("attachment-") ? leaf.slice("attachment-".length) || leaf : leaf;
+}
+
+/** The file name and the folder it is in ("" for a lone file) of a display name from attachmentName. */
+export function attachmentParts(name) {
+	const slash = String(name ?? "").lastIndexOf("/");
+	return slash < 0 ? { file: name, folder: "" } : { file: name.slice(slash + 1), folder: name.slice(0, slash) };
 }
 
 /**
@@ -188,6 +201,7 @@ function downloadAttachment(path, name) {
 /** One attachment card: name, size, download and content reading. Missing files say deleted. */
 export function AttachmentCard({ path, name, compact = false }) {
 	const display = name || attachmentName(path);
+	const { file: fileName, folder } = attachmentParts(display);
 	const meta = useAttachmentMeta(path);
 	const [full, setFull] = useState(null);
 	const [fullOpen, setFullOpen] = useState(false);
@@ -228,7 +242,7 @@ export function AttachmentCard({ path, name, compact = false }) {
 		if (downloading) return;
 		setDownloading(true);
 		setDownloadError("");
-		downloadAttachment(path, display)
+		downloadAttachment(path, fileName)
 			.catch((error) => setDownloadError(serverText(error.message, t("Download failed."))))
 			.finally(() => setDownloading(false));
 	};
@@ -254,8 +268,8 @@ export function AttachmentCard({ path, name, compact = false }) {
 		<span class=${`attach-main${workspace && info ? " is-openable" : ""}`} role=${workspace && info ? "button" : undefined} tabindex=${workspace && info ? 0 : undefined}
 			onClick=${workspace && info ? openInWorkspace : undefined}
 			onKeyDown=${workspace && info ? (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openInWorkspace()) : undefined}>
-			<span class="attach-name truncate">${display}</span>
-			<span class="attach-sub dim">${missing ? t("Deleted") : info ? fmtBytes(info.size) : meta?.error ? serverText(meta.error.message, t("Unavailable")) : t("Loading…")}</span>
+			<span class="attach-name truncate">${fileName}</span>
+			<span class="attach-sub dim truncate">${missing ? t("Deleted") : info ? fmtBytes(info.size) : meta?.error ? serverText(meta.error.message, t("Unavailable")) : t("Loading…")}${folder ? ` · ${folder}` : ""}</span>
 		</span>
 		${missing
 			? html`<span class="badge">${t("Deleted")}</span>`

@@ -208,9 +208,17 @@ export interface SessionInfo {
 	 * chat was created (no message, name, label, operation card or other entry).
 	 */
 	blank?: boolean;
+	/** A scheduled task started this chat (it holds a `SCHEDULED_RUN_ENTRY`): the sidebar keeps these in a group of their own. */
+	scheduled?: boolean;
 	firstMessage: string;
 	allMessagesText: string;
 }
+
+/**
+ * Custom entry written just before the message a scheduled Agent task sends (routes-schedules.ts): which task it is, so
+ * the chat shows that message as the task's card and is known as a chat of that task.
+ */
+export const SCHEDULED_RUN_ENTRY = "scheduled-run";
 
 export type SessionListProgress = (loaded: number, total: number) => void;
 

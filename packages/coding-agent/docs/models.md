@@ -9,6 +9,7 @@ Add custom providers and models (Ollama, vLLM, LM Studio, proxies) through **Pro
 - [Full Example](#full-example)
 - [Supported APIs](#supported-apis)
 - [Provider Configuration](#provider-configuration)
+- [Provider Layers](#provider-layers)
 - [Model Configuration](#model-configuration)
 - [覆盖已注册 Provider](#overriding-registered-providers)
 - [Per-model Overrides](#per-model-overrides)
@@ -27,6 +28,7 @@ Open `/settings`, choose **Providers**, then **添加 Provider** and **创建自
 - one Provider-level API-key collection shared by the main model and Vision Assistant
 - explicit image and reasoning capability declarations
 - connection tests and later Provider/model editing
+- three layers for relays that serve many models: one Provider, several keys, and per-model formats, addresses and keys (see [Provider Layers](#provider-layers))
 
 The UI is intended for common compatible APIs. The Connection card edits one provider-level session header name directly (a single `自定义请求头` box, e.g. `x-opencode-session`; the value is always the current conversation ID, empty turns it off). Direct `models.json` editing is still required for static custom `headers`, per-model headers, command-based key resolution, detailed compatibility overrides, overlays for an already registered Provider, and other advanced fields documented below.
 
@@ -235,13 +237,66 @@ A provider-level session header name (`sessionHeader`, e.g. `x-opencode-session`
 }
 ```
 
+## Provider Layers
+
+One service, such as a relay, can hold several keys, each key its own models, and each model its own format. There are three fixed layers and no deeper nesting:
+
+| Layer | Where in `models.json` | What it sets |
+|-------|------------------------|--------------|
+| Provider | `providerGroups.<id>` | `name`, `baseUrl`, `api`; its API key is saved in `auth.json` |
+| Key | an entry of `providers`, with `group` naming its Provider | `name`, `baseUrl`, `api` and the entry's usual fields; its API keys are the entry's usual saved keys |
+| Model | an item of that entry's `models` | `name`, `baseUrl`, `api`; its API key is saved in `auth.json` |
+
+```json
+{
+  "providerGroups": {
+    "relay": { "name": "My relay" }
+  },
+  "providers": {
+    "relay-cheap": {
+      "name": "Cheap group",
+      "group": "relay",
+      "layered": true,
+      "authMode": "apiKey",
+      "baseUrl": "https://relay.example/v1",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-x" }, { "id": "gpt-y" }]
+    },
+    "relay-claude": {
+      "name": "Claude group",
+      "group": "relay",
+      "layered": true,
+      "authMode": "apiKey",
+      "models": [{ "id": "claude-z", "baseUrl": "https://relay.example", "api": "anthropic-messages" }]
+    }
+  }
+}
+```
+
+**The rule:** Base URL, API format and API key are each looked up separately from the top down, and the first layer with a value applies. A layer left empty lets the layers below decide.
+
+- Nothing is guessed. When no layer has a format or an address, the model is not offered and the Web UI marks it red. There is no fallback to another model's value under this rule.
+- A covered value is not deleted. It stays in the file, the Web UI shows it greyed with what covers it, and it applies again once the upper layer is cleared.
+- Names are the user's own: nothing is added to them, and a model without a name shows its ID. Other surfaces show an entry as `Provider · Key`, or the key's name alone when it already starts with the Provider's name.
+- MyHarness does not rotate or fail over between keys.
+- A service that needs a different address per format (with `/v1` and without) must leave the upper Base URL empty and set it lower down, as in the example above.
+
+`group` is the ID of the Provider an entry belongs to; a `group` with no matching `providerGroups` item counts as none. `layered: true` applies the rule inside the entry. **An entry without `layered` keeps the older rule, where a model's own `api` and `baseUrl` win over the entry's.** A value on its group still comes first.
+
+Keys are never written to `models.json` by these layers. The Provider's key is saved in `auth.json` under `group:<groupId>` and a model's under `model:<entryId>:<modelId>`. The Provider's key comes first, and also beats `authMode: "config"`; then whatever the entry uses (see `authMode` above); then the model's own. An entry that only its models have keys for counts as configured and offers just those models.
+
+Entries from before the layers keep working as they are, and reading them changes nothing. The Web UI edits an equivalent layered form (a value all models share goes on the entry, a value they disagree on stays on the models, and what the older rule borrowed from the first model is written down), which is written when you save or merge. OAuth logins, overlays of registered Providers and the Nebius preset stay out of the layers.
+
+Merging entries into a new Provider only sets `group` and adds the `providerGroups` item, so entry IDs, settings, old conversations and what each model uses stay the same. Joining a Provider that already has values of its own makes those values apply, and the Web UI says so before you confirm. The file as it was is kept as `models.json.before-merge.bak`. The Web UI suggests merges by the host of the Base URL, not by name: the same host is ticked from the start; another host of the same main domain, or the same key, is offered as "may be the same" and left for you to tick.
+
 ## Model Configuration
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `id` | Yes | — | Model identifier (passed to the API) |
 | `name` | No | `id` | Human-readable model label. Used for matching (`--model` patterns) and shown as secondary model detail text. |
-| `api` | No | provider's `api` | Override provider's API for this model |
+| `api` | No | provider's `api` | Override provider's API for this model. Under `layered: true` it applies only when no layer above sets one (see [Provider Layers](#provider-layers)) |
+| `baseUrl` | No | provider's `baseUrl` | Override provider's address for this model, under the same rule as `api` |
 | `reasoning` | No | `false` | Supports extended thinking |
 | `thinkingLevelMap` | No | omitted | Maps MyHarness thinking levels to provider values and marks unsupported levels (see below) |
 | `thinkingLevelStatus` | No | omitted | Left by older versions that tested the levels with real requests; ignored and no longer written. The runtime only reads `thinkingLevelMap` |

@@ -1,6 +1,6 @@
 // Sidebar: workspaces and their chats. Rows use a fixed status slot at the head and a fixed time slot at the end, so titles never shift.
 import { html, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, Icon, Menu, MenuItem, MenuSep, Modal, Overlay, Resizer, Spinner, COLLAPSE_MS, FoldIn, ListSlot, autofocusOnMount, motionEnabled, useHeightGlide, usePresence, useRetainedRows } from "./ui.js";
-import { GENERAL_KEY, api, applyColumnWidths, freshRowKey, loadArchived, loadSessions, loadUnbound, loadWorkspaces, playingChatsKey, post, setView, state, useStore } from "./store.js";
+import { GENERAL_KEY, SCHEDULED_KEY, api, applyColumnWidths, freshRowKey, loadArchived, loadScheduled, loadSessions, loadUnbound, loadWorkspaces, playingChatsKey, post, setView, state, useStore } from "./store.js";
 import { actions } from "./actions.js";
 import { FolderPicker } from "./folder-picker.js";
 import { t, serverText } from "./i18n.js";
@@ -13,6 +13,7 @@ import { ModeSwitch, ModeTasks } from "./mode-switch.js";
 import { ExportSidebarFoot, exportReadOnly } from "./export-mode.js";
 import { WorkspaceSettings } from "./workspace-settings.js";
 import { openSourcesPage } from "./sources-page.js";
+import { preloadSchedules, toggleSchedulesPage } from "./schedules.js";
 import { peekSidebarEnter, peekSidebarLeave } from "./sidebar-peek.js";
 
 // The chat lists look a key up for every chat several times on every render (a mode switch renders a group of 500
@@ -119,7 +120,12 @@ const ChatRow = memo(function ChatRow({ info, current, slot, currentFile, sound 
 		const next = value.trim();
 		if (save && next && next !== info.name) await actions.renameSession(info.path, next);
 	};
-	const open = () => !editing && !current && actions.openSession(info.path);
+	const open = () => {
+		if (editing) return;
+		// A click on a chat always shows that chat, also the one under the Scheduled tasks page.
+		if (state.view.schedulesPage) setView({ schedulesPage: null });
+		if (!current) actions.openSession(info.path);
+	};
 	return html`<div class="chat-entry">
 	<div class=${`chat-row ${current ? "current" : ""}`} role="button" tabindex="0" title=${title} onClick=${open} onDblClick=${startEdit} onKeyDown=${(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && (e.preventDefault(), open())}>
 		${editing
@@ -166,10 +172,11 @@ function selectWorkspaceChats(sessions, { filter, slotsByFile, archived, current
 /**
  * A workspace and its chats, or (`general`) the "General" group: the chats that belong to no workspace. General is only
  * a place in the sidebar. It has no folder and is not a workspace; the chats keep the storage they already have.
+ * `general scheduled` is the same kind of place for the chats scheduled tasks started: it only lists them.
  * `showAll`/`onShowAll` make the "show more" state controlled (the virtualized list owns it, because the height
  * estimate must know it); without them the group keeps that state itself (the General group).
  */
-function Workspace({ workspace, general = false, archived = false, error, isCurrent, open, sessions, filter, currentFile, slotsByFile, drafts, hasUnreadResult, expandKey, title, showAll: controlledShowAll = undefined, onShowAll = undefined }) {
+function Workspace({ workspace, general = false, archived = false, scheduled = false, error, isCurrent, open, sessions, filter, currentFile, slotsByFile, drafts, hasUnreadResult, expandKey, title, showAll: controlledShowAll = undefined, onShowAll = undefined }) {
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const mode = useStore((s) => s.view.chatMode);
 	const playing = usePlayingChats();
@@ -195,7 +202,8 @@ function Workspace({ workspace, general = false, archived = false, error, isCurr
 	const shown = showAll || filter ? list : list.slice(0, CHAT_ROWS_SHOWN);
 	// Fully expanded, a long group scrolls inside a box of CHAT_ROWS_SHOWN rows instead of pushing the sidebar away.
 	const capped = showAll && !filter && list.length > CHAT_ROWS_SHOWN;
-	const reload = () => (archived ? loadArchived() : general ? loadUnbound() : loadSessions(workspace.rootPath));
+	const reload = () => (archived ? loadArchived() : scheduled ? loadScheduled() : general ? loadUnbound() : loadSessions(workspace.rootPath));
+	const listOnly = archived || scheduled;
 	const create = () => (general ? actions.newSession(undefined, { unbound: true }) : actions.newSession(workspace.rootPath));
 	const note = error ? html`<div class="dim side-note">${error} <button class="link-btn" onClick=${reload}>${t("Retry")}</button></div>`
 		: sessions === undefined ? html`<div class="dim side-note">${t("Loading…")}</div>`
@@ -211,11 +219,12 @@ function Workspace({ workspace, general = false, archived = false, error, isCurr
 			${general ? null : html`<${Icon} name="folder" size=${15} class="ws-folder" />`}
 			${editing ? html`<input class="field title-edit" autofocus ref=${autofocusOnMount} aria-label=${t("Rename")} value=${alias} onInput=${(e) => setAlias(e.target.value)} onClick=${(e) => e.stopPropagation()} onKeyDown=${(e) => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); saveAlias(); } else if (e.key === "Escape") setEditing(false); }} />` : html`<span class="name truncate">${workspace.name}</span>`}
 			${!general && !archived && workspace.missing ? html`<span class="ws-missing" title=${t("Local folder is missing")} aria-label=${t("Local folder is missing")} role="img"><${Icon} name="alertTriangle" size=${12} /></span>` : null}
+			${scheduled ? html`<span class="dim ws-count">${list.length}</span>` : null}
 			${hasUnreadResult ? html`<span class="dot accent ws-unread" title=${t("Unread result")} />` : null}
 			<span class="grow" />
 			<span class="actions" onClick=${(e) => e.stopPropagation()}>
-				${!archived ? html`<button class="icon-btn sm" data-export-offline="true" title=${general ? t("New chat without a workspace") : t("New chat in this workspace")} aria-label=${general ? t("New chat without a workspace") : t("New chat in this workspace")} onClick=${create}><${Icon} name="plus" size=${15} /></button>` : null}
-				${!archived ? html`<${Menu} align="end" trigger=${({ toggle: tg }) => html`<button class="icon-btn sm" aria-label=${t("Workspace actions")} onClick=${tg}><${Icon} name="more" size=${15} /></button>`} width=${200}>
+				${!listOnly ? html`<button class="icon-btn sm" data-export-offline="true" title=${general ? t("New chat without a workspace") : t("New chat in this workspace")} aria-label=${general ? t("New chat without a workspace") : t("New chat in this workspace")} onClick=${create}><${Icon} name="plus" size=${15} /></button>` : null}
+				${!listOnly ? html`<${Menu} align="end" trigger=${({ toggle: tg }) => html`<button class="icon-btn sm" aria-label=${t("Workspace actions")} onClick=${tg}><${Icon} name="more" size=${15} /></button>`} width=${200}>
 					${(close) => html`
 						<${MenuItem} icon="plus" label=${t("New chat")} onClick=${() => (close(), create())} />
 						<${MenuItem} icon="refresh" label=${t("Reload chats")} onClick=${() => (close(), reload())} />
@@ -604,9 +613,15 @@ export function Sidebar() {
 	const searchRef = useRef(null);
 	const sidebarOpen = useStore((s) => s.view.sidebarOpen);
 	const slotsByFile = useMemo(() => new Map(slots.filter((s) => s.sessionFile).map((s) => [pathKey(s.sessionFile), s])), [slots]);
+	const schedulesOpen = useStore((s) => !!s.view.schedulesPage);
+	// The chats scheduled tasks started are listed in their own group and left out of the others: the saved ones, and the
+	// open ones whose first message is not saved yet. A chat opened again after a restart is known from the saved list.
+	const scheduledFiles = useMemo(() => new Set([...(ws.scheduled || []).map((info) => pathKey(info.path)), ...slots.filter((s) => s.scheduled && s.sessionFile).map((s) => pathKey(s.sessionFile))]), [ws.scheduled, slots]);
+	const isScheduledSlot = (s) => !!s.sessionFile && scheduledFiles.has(pathKey(s.sessionFile));
 	// Workspaces that hold at least one chat with an unread result (matched by the folder the chat runs in).
-	const unreadRoots = new Set(slots.filter((s) => !s.unbound && hasUnread(s, currentFile)).map((s) => pathKey(s.cwd)));
-	const unreadUnbound = slots.some((s) => s.unbound && hasUnread(s, currentFile));
+	const unreadRoots = new Set(slots.filter((s) => !s.unbound && !isScheduledSlot(s) && hasUnread(s, currentFile)).map((s) => pathKey(s.cwd)));
+	const unreadUnbound = slots.some((s) => s.unbound && !isScheduledSlot(s) && hasUnread(s, currentFile));
+	const unreadScheduled = slots.some((s) => isScheduledSlot(s) && hasUnread(s, currentFile));
 	// A session that is open but not saved to disk yet is not in the saved list; it is listed from its slot so it can
 	// always be switched back to. That is a chat that runs or holds a first message, and also the chat on screen while it
 	// is still empty: a chat that was just created is the current row of the place it belongs to.
@@ -626,7 +641,7 @@ export function Sidebar() {
 		const byRoot = new Map();
 		const savedByRoot = new Map(ws.list.map((workspace) => [pathKey(workspace.rootPath), new Set((ws.sessions[workspace.rootPath] || []).map((info) => pathKey(info.path)))]));
 		for (const slot of slots) {
-			if (!listable(slot) || slot.unbound) continue;
+			if (!listable(slot) || slot.unbound || isScheduledSlot(slot)) continue;
 			const key = pathKey(slot.cwd);
 			const saved = savedByRoot.get(key);
 			if (!saved || saved.has(pathKey(slot.sessionFile))) continue;
@@ -636,23 +651,32 @@ export function Sidebar() {
 			byRoot.set(key, rows);
 		}
 		const listed = new Set((ws.unbound || []).map((info) => pathKey(info.path)));
-		const unbound = slots.filter((slot) => slot.unbound && listable(slot) && !listed.has(pathKey(slot.sessionFile))).map(row);
+		const unbound = slots.filter((slot) => slot.unbound && listable(slot) && !isScheduledSlot(slot) && !listed.has(pathKey(slot.sessionFile))).map(row);
+		const scheduledSaved = new Set((ws.scheduled || []).map((info) => pathKey(info.path)));
+		const scheduled = slots.filter((slot) => slot.scheduled && listable(slot) && !scheduledSaved.has(pathKey(slot.sessionFile))).map(row);
 		// The stand-in row of a new chat, until the chat's real row (which takes over its key) is listed.
 		if (freshRow && !slots.some((slot) => freshRowKey(slot.slot) === freshRow.key && listable(slot))) {
 			const standIn = { rowKey: freshRow.key, path: freshRow.key, name: "", modified: Date.now(), unsaved: true, copy: false, empty: true };
 			if (freshRow.group === GENERAL_KEY) unbound.unshift(standIn);
 			else byRoot.set(pathKey(freshRow.group), [standIn, ...(byRoot.get(pathKey(freshRow.group)) || [])]);
 		}
-		return { byRoot, unbound };
-	}, [slots, ws, activeSlot, freshRow]);
-	const unboundChats = useMemo(() => (ws.unbound === undefined ? undefined : [...unsaved.unbound, ...ws.unbound]), [unsaved, ws.unbound]);
+		return { byRoot, unbound, scheduled };
+	}, [slots, ws, activeSlot, freshRow, scheduledFiles]);
+	const notScheduled = useCallback((info) => !info.scheduled && !scheduledFiles.has(pathKey(info.path)), [scheduledFiles]);
+	const unboundChats = useMemo(() => (ws.unbound === undefined ? undefined : [...unsaved.unbound, ...ws.unbound.filter(notScheduled)]), [unsaved, ws.unbound, notScheduled]);
+	const scheduledChats = useMemo(() => [...unsaved.scheduled, ...(ws.scheduled || [])], [unsaved, ws.scheduled]);
+	// The group of the chat on screen is open: going to a task's chat from its card shows where that chat lives.
+	const shownScheduled = !!shownFile && scheduledFiles.has(pathKey(shownFile));
+	useEffect(() => {
+		if (shownScheduled && !state.view[expandKey]?.[SCHEDULED_KEY]) setView({ [expandKey]: { ...state.view[expandKey], [SCHEDULED_KEY]: true } });
+	}, [shownScheduled, shownFile, expandKey]);
 	// The chats one workspace group lists: the saved ones, plus an open chat that is not saved yet. Shared by the
 	// rendered group and the virtualized list's height estimates, so both always agree.
 	const sessionsOf = useCallback((rootPath) => {
-		const saved = ws.sessions[rootPath];
+		const saved = ws.sessions[rootPath]?.filter(notScheduled);
 		const extra = unsaved.byRoot.get(pathKey(rootPath));
 		return saved && extra ? [...extra, ...saved] : saved;
-	}, [ws.sessions, unsaved]);
+	}, [ws.sessions, unsaved, notScheduled]);
 	// One space at a time: chats in worktree copies, or chats in the main checkout. The space follows the chat on screen
 	// (entering a copy or returning switches it); the other space stays reachable in a folded section at the bottom.
 	const inCopy = !!allSlots.find((slot) => slot.slot === activeSlot)?.copy;
@@ -678,19 +702,21 @@ export function Sidebar() {
 		applyColumnWidths();
 	};
 	// While hidden the sidebar is only seen as a peek (sidebar-peek.js), where its own button keeps it open.
-	return html`<aside class=${`sidebar${sidebarOpen ? "" : " is-collapsed"}`} aria-label=${t("Workspaces and chats")} onPointerEnter=${peekSidebarEnter} onPointerLeave=${peekSidebarLeave}>
+	return html`<aside class=${`sidebar${sidebarOpen ? "" : " is-collapsed"}${schedulesOpen ? " page-open" : ""}`} aria-label=${t("Workspaces and chats")} onPointerEnter=${peekSidebarEnter} onPointerLeave=${peekSidebarLeave}>
 		<div class="sidebar-top">
 			<div class="brand"><${ModeSwitch} /><span class="grow">MyHarness</span>
 				<button class="icon-btn sm" title=${withShortcut(sidebarOpen ? t("Hide sidebar") : t("Show sidebar"), "sidebar", shortcuts)} aria-label=${sidebarOpen ? t("Hide sidebar") : t("Show sidebar")} onClick=${() => setView({ sidebarOpen: !sidebarOpen })}><${Icon} name="sidebar" size=${16} /></button></div>
 			<${ModeTasks} />
 			<button class="nav-btn primary-nav" data-export-offline="true" onClick=${() => actions.newChat()} title=${t("New chat in Default (it belongs to no workspace)")}><${Icon} name="edit" size=${16} />${t("New chat")}</button>
 			<button class="nav-btn" onClick=${() => setView({ palette: true })}><${Icon} name="search" size=${16} />${t("Search & commands")}${shortcutFor("palette", shortcuts) ? html`<span class="kbd">${shortcutFor("palette", shortcuts)}</span>` : null}</button>
+			${exportReadOnly() ? null : html`<button class=${`nav-btn ${schedulesOpen ? "on" : ""}`} aria-pressed=${schedulesOpen} onPointerEnter=${preloadSchedules} onClick=${toggleSchedulesPage}><${Icon} name="clock" size=${16} />${t("Scheduled tasks")}</button>`}
 		</div>
 		<div class="sidebar-search"><input ref=${searchRef} class="field sm" placeholder=${t("Filter chats…")} value=${filterText} onInput=${(e) => setFilterText(e.target.value)} aria-label=${t("Filter chats")} /></div>
 		<div class="sidebar-scroll" key=${mode}>
 			<div class="side-section"><span class="grow">${t("Workspaces")}</span><${AddWorkspaceButton} onPickExisting=${addWorkspace} onCreateNew=${() => setCreating(true)} /></div>
 			${renderGroups(hereList, spaceSessionsOf)}
 			<${Workspace} general workspace=${{ rootPath: GENERAL_KEY, name: inCopy ? t("Copy chats") : t("Default") }} error=${ws.errors[GENERAL_KEY]} isCurrent=${!currentWorkspaceRoot && !!currentFile} open=${expanded[GENERAL_KEY] === undefined ? true : !!expanded[GENERAL_KEY]} sessions=${unboundHere} filter=${filter} currentFile=${shownFile} slotsByFile=${slotsByFile} drafts=${drafts} hasUnreadResult=${unreadUnbound} expandKey=${expandKey} />
+			<${FoldIn} content=${scheduledChats.length ? html`<${Workspace} general scheduled workspace=${{ rootPath: SCHEDULED_KEY, name: t("Scheduled tasks") }} title=${t("Chats that scheduled tasks started")} error=${ws.errors[SCHEDULED_KEY]} isCurrent=${shownScheduled} open=${!!expanded[SCHEDULED_KEY]} sessions=${scheduledChats} filter=${filter} currentFile=${shownFile} slotsByFile=${slotsByFile} drafts=${drafts} hasUnreadResult=${unreadScheduled} expandKey=${expandKey} />` : null} />
 			${showOther ? html`<div class="side-other">
 				<button class="side-section side-other-head" aria-expanded=${otherOpen} onClick=${() => setOtherOpen(!otherOpen)}
 					title=${inCopy ? t("Chats in the main checkout. Returning to the main copy shows them again.") : t("Chats that run in worktree copies. Entering a copy shows them again.")}>

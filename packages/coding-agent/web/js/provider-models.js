@@ -85,6 +85,11 @@ export function modelDraft(model = {}, detected = {}) {
 		contextWindow: toK(model.contextWindow ?? DEFAULT_CONTEXT),
 		maxTokens: toK(model.maxTokens ?? DEFAULT_MAX_TOKENS),
 		pricing: model.cost ? { ...model.cost, tiers: (model.cost.tiers || []).map((tier) => ({ ...tier })) } : null,
+		// This model's own format and address; "" = not set here. A key typed for it goes to the credential store.
+		api: model.api ?? "",
+		baseUrl: model.baseUrl ?? "",
+		apiKey: "",
+		removeKey: false,
 		detected,
 	};
 }
@@ -121,6 +126,11 @@ export function buildModel(draft) {
 		if (Object.keys(map).length) model.thinkingLevelMap = map;
 		else delete model.thinkingLevelMap;
 	}
+	if (draft.api) model.api = draft.api;
+	else delete model.api;
+	const baseUrl = String(draft.baseUrl ?? "").trim();
+	if (baseUrl) model.baseUrl = baseUrl;
+	else delete model.baseUrl;
 	return model;
 }
 
@@ -288,6 +298,136 @@ export function connectionReady(draft, { hasStoredKey }) {
 	if (!draft.api) return false;
 	if (draft.auth === "key") return !!draft.apiKey.trim() || hasStoredKey;
 	return true;
+}
+
+// ---- The three layers of a provider: the provider itself, its keys and their models (see providers/models/layers.ts). -----
+
+/**
+ * An entry the layers apply to. A login, an extension's provider (the server sends those without `layered`) and the
+ * ready-made Nebius entry stay as they are.
+ */
+export const isLayeredMember = ({ provider, entry }) =>
+	entry?.config?.layered === true && provider.id !== "nebius" && !provider.supportsOAuth && !provider.credentials?.hasOAuth;
+
+/**
+ * One row per top-level provider, in the order of the list: a group with its keys as `members`, or an entry that stands
+ * alone as its only key. A group's row is where its first key would have been.
+ */
+export function providerTree(providers, custom) {
+	const entries = new Map((custom?.providers || []).map((entry) => [entry.id, entry]));
+	const groups = new Map((custom?.groups || []).map((group) => [group.id, group]));
+	const rows = [];
+	const rowOfGroup = new Map();
+	for (const provider of providers) {
+		const entry = entries.get(provider.id);
+		const group = entry?.config?.group ? groups.get(entry.config.group) : undefined;
+		if (!group) {
+			rows.push({ id: provider.id, group: null, members: [{ provider, entry }] });
+			continue;
+		}
+		let row = rowOfGroup.get(group.id);
+		if (!row) {
+			row = { id: `group:${group.id}`, group, members: [] };
+			rowOfGroup.set(group.id, row);
+			rows.push(row);
+		}
+		row.members.push({ provider, entry });
+	}
+	return rows;
+}
+
+/** What the page calls a row: the group's name, else the key's own name, else its ID. */
+export const rowName = (row) => row.group?.config?.name || row.members[0]?.entry?.config?.name || row.members[0]?.provider.name || row.members[0]?.provider.id;
+
+/** The row a provider entry is shown in, asked for by its row ID or by the ID of one of its keys. */
+export const findRow = (rows, id) => rows.find((row) => row.id === id || row.members.some((member) => member.provider.id === id));
+
+/** What no layer sets for a model, as "api", "baseUrl" and "key": such a model is marked, nothing is guessed for it. */
+export function modelGaps(model, { group, entry, hasKey }) {
+	const gaps = [];
+	if (!(group?.api || entry?.api || model.api)) gaps.push("api");
+	if (!(group?.baseUrl || entry?.baseUrl || String(model.baseUrl ?? "").trim())) gaps.push("baseUrl");
+	if (!hasKey) gaps.push("key");
+	return gaps;
+}
+
+/**
+ * Whether this entry itself has a key, which then serves all its models: one saved for it, a login, or one from outside
+ * MyHarness. The server also reports "stored" for a key of the group or of a single model, so that alone does not say.
+ */
+export function entryHasSharedKey(provider) {
+	const credentials = provider.credentials;
+	if (!credentials) return !!provider.configured;
+	return credentials.apiKeys?.length > 0 || !!credentials.hasOAuth || !!credentials.runtimeOverride || (!!provider.configured && provider.authSource !== "stored");
+}
+
+/** How many saved models of a key lack something on every layer. */
+export function memberGapCount({ provider, entry }, group) {
+	if (!entry?.config?.layered) return 0;
+	// A key from the provider or from this entry serves every model; otherwise a model needs its own.
+	const shared = !!group?.key || entryHasSharedKey(provider);
+	return (entry.config.models ?? []).filter((model) => modelGaps(model, { group: group?.config, entry: entry.config, hasKey: shared || !!entry.modelKeys?.[model.id] }).length > 0).length;
+}
+
+/**
+ * What a field holds on every key of a provider, for the warning before a value on top replaces them: `differ` when the
+ * keys use different values now.
+ */
+export function memberValues(members, field) {
+	const values = new Set();
+	for (const { entry } of members) {
+		const config = entry?.config;
+		if (config?.[field]) values.add(config[field]);
+		for (const model of config?.models ?? []) if (!config?.[field] && model[field]) values.add(model[field]);
+	}
+	return { values: [...values], differ: values.size > 1 };
+}
+
+/** A value on the layer above covers a model's: what is left of the model's own stays where it is. */
+export function coverOf(field, { upper, draft }) {
+	if (upper?.[field]) return { layer: "provider", value: upper[field] };
+	const own = draft?.raw?.layered ? String(draft[field] ?? "").trim() : "";
+	return own ? { layer: "key", value: own } : null;
+}
+
+/** The first ID from this base no other entry has. */
+export function uniqueProviderId(base, taken) {
+	const name = base || "provider";
+	if (!taken.has(name)) return name;
+	for (let index = 2; ; index++) {
+		const candidate = `${name}-${index}`;
+		if (!taken.has(candidate)) return candidate;
+	}
+}
+
+/**
+ * Sets a format and / or address on the ticked models. Under the layered rule a value of the key would cover them, so it
+ * moves down onto its models first: the ones not ticked keep using exactly what they use now.
+ */
+export function applyToTickedModels(draft, ticked, { api, baseUrl }) {
+	const layered = draft.raw?.layered === true;
+	const keyApi = layered ? draft.api : "";
+	const keyUrl = layered ? String(draft.baseUrl ?? "").trim() : "";
+	const url = String(baseUrl ?? "").trim();
+	const models = draft.models.map((model) => {
+		const on = ticked.has(model.uid);
+		const next = { ...model };
+		if (api) {
+			if (on) next.api = api;
+			else if (keyApi) next.api = keyApi;
+		}
+		if (url) {
+			if (on) next.baseUrl = url;
+			else if (keyUrl) next.baseUrl = keyUrl;
+		}
+		return next;
+	});
+	return {
+		models,
+		...(api && keyApi ? { api: "" } : {}),
+		...(url && keyUrl ? { baseUrl: "" } : {}),
+		movedDown: !!((api && keyApi) || (url && keyUrl)),
+	};
 }
 
 /** Fields only a provider entry of models.json has; a value with none of them is a wrapper around one. */

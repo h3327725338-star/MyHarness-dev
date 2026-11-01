@@ -112,6 +112,50 @@ describe("sessions-index.json persistent session list index", () => {
 		resetSessionsIndexStatsForTests();
 	}
 
+	it("knows a chat a scheduled task started, also from the sidecar, and not a chat continued from it", async () => {
+		const run = JSON.stringify({
+			type: "custom",
+			id: "run1",
+			parentId: null,
+			timestamp: new Date(1500).toISOString(),
+			customType: "scheduled-run",
+			data: { scheduleId: "s1", title: "Morning" },
+		});
+		const task = writeSession("sched001", "check the mail", 1000);
+		writeFileSync(task, `${run}\n`, { flag: "a" });
+		writeSession("plain002", "a chat of the user", 2000);
+		const continued = writeSession("cont0003", "go on", 3000);
+		const lines = readFileSync(continued, "utf8").split("\n");
+		const header = { ...JSON.parse(lines[0]!), parentSession: task };
+		writeFileSync(continued, `${JSON.stringify(header)}\n${lines[1]}\n${run}\n`);
+
+		const scheduledIds = (list: { id: string; scheduled?: boolean }[]) =>
+			list.filter((info) => info.scheduled).map((info) => info.id);
+		expect(scheduledIds(await SessionManager.listAll())).toEqual(["sched001"]);
+		flushAllWorkspaceIndexes();
+		coldStart();
+		expect(scheduledIds(await SessionManager.listAll())).toEqual(["sched001"]);
+		expect(getSessionsIndexStatsForTests().misses).toBe(0);
+	});
+
+	it("reads the chat files again when the sidecar is of the version before scheduled chats were known", async () => {
+		const task = writeSession("sched001", "check the mail", 1000);
+		writeFileSync(
+			task,
+			`${JSON.stringify({ type: "custom", id: "run1", parentId: null, timestamp: new Date(1500).toISOString(), customType: "scheduled-run", data: {} })}\n`,
+			{ flag: "a" },
+		);
+		await SessionManager.listAll();
+		const old = readIndexJson();
+		old.version = 1;
+		for (const row of Object.values(old.entries)) delete (row as { scheduled?: boolean }).scheduled;
+		writeFileSync(getSessionsIndexPath(sessionsDir), JSON.stringify(old));
+		coldStart();
+		const [info] = await SessionManager.listAll();
+		expect(info?.scheduled).toBe(true);
+		expect(readIndexJson().version).toBe(2);
+	});
+
 	it("builds the sidecar on listing and serves unchanged files with zero parsing", async () => {
 		const fileA = writeSession("saaa0001", "alpha question", 1000);
 		writeSession("sbbb0002", "beta question", 2000);
@@ -119,7 +163,7 @@ describe("sessions-index.json persistent session list index", () => {
 		const first = await SessionManager.listAll();
 		expect(first).toHaveLength(2);
 		const indexJson = readIndexJson();
-		expect(indexJson.version).toBe(1);
+		expect(indexJson.version).toBe(2);
 		expect(Object.keys(indexJson.entries)).toHaveLength(2);
 		const row = indexJson.entries[rowKey("saaa0001")];
 		expect(row).toMatchObject({ sessionId: "saaa0001", msgCount: 1, preview: "alpha question" });
@@ -305,7 +349,7 @@ describe("sessions-index.json persistent session list index", () => {
 		flushAllWorkspaceIndexes();
 		const stray = readdirSync(sessionsDir).filter((name) => name.endsWith(".tmp"));
 		expect(stray).toEqual([]);
-		expect(JSON.parse(readFileSync(getSessionsIndexPath(sessionsDir), "utf8")).version).toBe(1);
+		expect(JSON.parse(readFileSync(getSessionsIndexPath(sessionsDir), "utf8")).version).toBe(2);
 	});
 
 	it("keeps list shape unchanged without pagination and pages with total when asked", () => {

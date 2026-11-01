@@ -1,11 +1,11 @@
 // User-level operations. Each maps to a real backend endpoint; nothing here fakes Agent behaviour.
-import { addPendingMessage, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
+import { addPendingMessage, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadScheduled, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
 import { chatModeOf, expandedKey } from "./chat-modes.js";
 import { BUILTIN_COMMAND_KINDS } from "./builtin-commands.js";
 import { commitChanges, pushChanges } from "./git-flow.js";
 import { loadPrefs, normPath } from "./util.js";
 import { REVEAL_ENTRY_EVENT } from "./message-nav.js";
-import { serverText, t } from "./i18n.js";
+import { count, serverText, t } from "./i18n.js";
 import { getFetch } from "./export-mode.js";
 import { COMPOSER_QUEUE_DEBOUNCE_MS } from "./run-modes.js";
 import { browserTabId, normalizeWorkspaceTab, PANEL_TAB_TYPES, workspaceTabSection } from "./workspace-model.js";
@@ -33,11 +33,11 @@ function releasePendingDialog(fallback) {
 }
 
 /** Promise-based confirmation modal (rendered by overlays.js). */
-export function confirmDialog({ title, message, confirmLabel = t("Confirm"), cancelLabel, danger = false, detail, artifactChoice = false }) {
+export function confirmDialog({ title, message, confirmLabel = t("Confirm"), cancelLabel, danger = false, detail }) {
 	return new Promise((resolve) => {
 		releasePendingDialog(false);
 		dialogResolver = resolve;
-		setView({ dialog: { type: "confirm", title, message, confirmLabel, cancelLabel, danger, detail, artifactChoice } });
+		setView({ dialog: { type: "confirm", title, message, confirmLabel, cancelLabel, danger, detail } });
 	});
 }
 /**
@@ -49,6 +49,17 @@ export function deleteChatDialog({ path, title }) {
 		releasePendingDialog(false);
 		dialogResolver = resolve;
 		setView({ dialog: { type: "delete-chat", path, title } });
+	});
+}
+/**
+ * "Remove workspace?" with the parts the user may delete as well, each with its count (rendered by app.js).
+ * Resolves `{ deleteChats, deleteArtifacts, deleteMemory }`, or false when cancelled.
+ */
+export function removeWorkspaceDialog({ id, name, mode }) {
+	return new Promise((resolve) => {
+		releasePendingDialog(false);
+		dialogResolver = resolve;
+		setView({ dialog: { type: "remove-workspace", id, name, mode } });
 	});
 }
 /**
@@ -69,6 +80,11 @@ export function inputDialog({ title, label, initial = "", confirmLabel = t("Save
 		dialogResolver = resolve;
 		setView({ dialog: { type: "input", title, label, initial, confirmLabel, placeholder } });
 	});
+}
+/** The project files of a deleted chat that could not go to the Recycle Bin are still safe where they are: say so. */
+function reportFilesKept(result) {
+	const kept = result?.filesKept?.length;
+	if (kept) toast(t("{files} could not go to the Recycle Bin and stayed where they are.", { files: count(kept, "file") }), "warning", 9000);
 }
 export function resolveConfirm(value) {
 	releasePendingDialog(value);
@@ -634,12 +650,13 @@ export const actions = {
 		// The group the sidebar lists it in from the click on, when the page knows it (otherwise the service decides).
 		const group = unbound ? GENERAL_KEY : rootPath || workspace?.rootPath || null;
 		if (keepsNewChat({ rootPath, unbound, mode, group })) {
-			// No switch, but the click still shows the chat as a switch would: the Project sources page over it (bound to
-			// the chat on screen, so a switch closes it) closes, and its group opens.
+			// No switch, but the click still shows the chat as a switch would: a page over it (Project sources, Scheduled
+			// tasks; bound to the chat on screen, so a switch closes it) closes, and its group opens.
 			const expandKey = expandedKey(mode);
 			const shown = {};
 			if (group && state.view[expandKey]?.[group] !== true) shown[expandKey] = { ...state.view[expandKey], [group]: true };
 			if (state.view.sourcesPage) shown.sourcesPage = null;
+			if (state.view.schedulesPage) shown.schedulesPage = null;
 			if (Object.keys(shown).length) setView(shown);
 			setTimeout(() => {
 				if (!composerCovered()) document.querySelector(".composer-input")?.focus();
@@ -796,10 +813,11 @@ export const actions = {
 		const result = await attempt(() => post("/api/sessions/delete", { path, deleteArtifacts: ok.deleteArtifacts === true, deleteMemory: ok.deleteMemory === true }));
 		unhide();
 		if (!result) {
-			state.workspaces = { ...state.workspaces, sessions: lists.sessions, unbound: lists.unbound, archived: lists.archived };
+			state.workspaces = { ...state.workspaces, sessions: lists.sessions, unbound: lists.unbound, archived: lists.archived, scheduled: lists.scheduled };
 			emit();
 			return;
 		}
+		reportFilesKept(result);
 		await refreshAll();
 	},
 
@@ -813,7 +831,7 @@ export const actions = {
 		moveListed(path, archived, info);
 		const result = await attempt(() => post("/api/sessions/archive", { path, archived }));
 		if (!result) {
-			state.workspaces = { ...state.workspaces, sessions: lists.sessions, unbound: lists.unbound, archived: lists.archived };
+			state.workspaces = { ...state.workspaces, sessions: lists.sessions, unbound: lists.unbound, archived: lists.archived, scheduled: lists.scheduled };
 			emit();
 			return result;
 		}
@@ -878,16 +896,20 @@ export const actions = {
 	},
 
 	/**
-	 * Un-register a Workspace. The row leaves the sidebar at once (with the group's own fold motion), while the server
-	 * removes the registration; a refusal puts the row back where it was. Waiting for the answer first left the row on
-	 * screen — and the whole sidebar looking unresponsive — for as long as the removal took.
+	 * Un-register a Workspace, and delete what the user switched on. The row leaves the sidebar at once (with the group's
+	 * own fold motion), while the server does the work; a refusal puts the row back where it was. Waiting for the answer
+	 * first left the row on screen — and the whole sidebar looking unresponsive — for as long as the removal took.
 	 */
 	async removeWorkspace(id, name) {
-		const ok = await confirmDialog({ title: t("Remove workspace?"), message: t("“{name}” is removed from the list. Its folder, project files and chats are not deleted; its chats stay available without a workspace.", { name }), confirmLabel: t("Remove"), artifactChoice: true });
-		if (!ok) return;
 		const mode = uiMode();
+		const ok = await removeWorkspaceDialog({ id, name, mode });
+		if (!ok) return;
 		const before = state.workspaces;
 		const row = before.list.find((workspace) => workspace.id === id);
+		// The chat on screen leaves first when it goes with the Workspace, so that the removal can close it. An empty one
+		// goes either way: it must not keep working in a folder that has left the list.
+		const shown = uiMode() === mode && state.snap?.workspace?.id === id ? state.activeSlot : undefined;
+		const leaves = shown && (ok.deleteChats === true || !state.slots.find((slot) => slot.slot === shown)?.hasContent);
 		// The sidebar may be showing another mode by now: then its list is not the one to touch.
 		const showList = (list) => {
 			if (uiMode() !== mode) return;
@@ -895,9 +917,17 @@ export const actions = {
 			emit();
 		};
 		if (row) showList(before.list.filter((workspace) => workspace.id !== id));
-		const result = await attempt(() => post("/api/workspaces/remove", { id, deleteArtifacts: ok.deleteArtifacts === true, mode }));
-		if (!result && row) showList(before.list);
-		await loadWorkspaces(mode);
+		if (leaves) await actions.newSession(undefined, { unbound: true });
+		const result = await attempt(() => post("/api/workspaces/remove", { id, deleteChats: ok.deleteChats === true, deleteArtifacts: ok.deleteArtifacts === true, deleteMemory: ok.deleteMemory === true, mode }));
+		if (!result) {
+			if (row) showList(before.list);
+			// Refused: nothing happened to that chat, so the screen goes back to it.
+			if (leaves) await attempt(() => showSlot(shown));
+		}
+		reportFilesKept(result);
+		// Chats may have gone from the screen as well as from the list.
+		if (result && ok.deleteChats === true) await refreshAll();
+		else await loadWorkspaces(mode);
 	},
 
 	/** The dialog that turns Git integration on for the workspace (identity, repository, first version). */
@@ -981,10 +1011,10 @@ async function showSlot(slot, seq) {
 	await activateSlot(slot, seq);
 }
 
-/** A chat as the sidebar lists it (in a workspace, in No Folder or in the Archive). */
+/** A chat as the sidebar lists it (in a workspace, in No Folder, in Scheduled tasks or in the Archive). */
 function findListed(path) {
 	const lists = state.workspaces;
-	for (const list of [...Object.values(lists.sessions), lists.unbound || [], lists.archived || []]) {
+	for (const list of [...Object.values(lists.sessions), lists.unbound || [], lists.scheduled || [], lists.archived || []]) {
 		const info = list.find((item) => samePath(item.path, path));
 		if (info) return info;
 	}
@@ -996,7 +1026,7 @@ function updateListed(path, patch) {
 	const lists = state.workspaces;
 	const update = (list) => (list && list.some((item) => samePath(item.path, path)) ? list.map((item) => (samePath(item.path, path) ? { ...item, ...patch } : item)) : list);
 	const sessions = Object.fromEntries(Object.entries(lists.sessions).map(([root, list]) => [root, update(list)]));
-	state.workspaces = { ...lists, sessions, unbound: update(lists.unbound), archived: update(lists.archived) };
+	state.workspaces = { ...lists, sessions, unbound: update(lists.unbound), scheduled: update(lists.scheduled), archived: update(lists.archived) };
 	emit();
 }
 
@@ -1010,7 +1040,7 @@ function moveListed(path, archived, info) {
 	if (archived) {
 		const sessions = Object.fromEntries(Object.entries(lists.sessions).map(([root, list]) => [root, without(list)]));
 		const archivedList = info ? [info, ...(without(lists.archived) || [])] : lists.archived;
-		state.workspaces = { ...lists, sessions, unbound: without(lists.unbound), archived: archivedList };
+		state.workspaces = { ...lists, sessions, unbound: without(lists.unbound), scheduled: without(lists.scheduled), archived: archivedList };
 	} else {
 		state.workspaces = { ...lists, archived: without(lists.archived) };
 	}
@@ -1022,7 +1052,7 @@ function removeListed(path) {
 	const lists = state.workspaces;
 	const without = (list) => (list && list.some((item) => samePath(item.path, path)) ? list.filter((item) => !samePath(item.path, path)) : list);
 	const sessions = Object.fromEntries(Object.entries(lists.sessions).map(([root, list]) => [root, without(list)]));
-	state.workspaces = { ...lists, sessions, unbound: without(lists.unbound), archived: without(lists.archived) };
+	state.workspaces = { ...lists, sessions, unbound: without(lists.unbound), scheduled: without(lists.scheduled), archived: without(lists.archived) };
 	emit();
 }
 
@@ -1056,13 +1086,13 @@ const samePath = (a, b) => normPath(a).toLowerCase() === normPath(b).toLowerCase
  */
 function composerCovered() {
 	const view = state.view;
-	if (view.settingsOpen || view.providerEditor || view.palette || view.dialog || view.sourcesPage) return true;
+	if (view.settingsOpen || view.providerEditor || view.palette || view.dialog || view.sourcesPage || view.schedulesPage) return true;
 	return !!document.querySelector(".overlay-host:not(.closing), .lightbox-scrim");
 }
 
-/** Read the chat lists the sidebar shows again (each workspace's that was loaded, No Folder and the Archive). */
+/** Read the chat lists the sidebar shows again (each workspace's that was loaded, No Folder, Scheduled tasks and the Archive). */
 async function refreshSessionLists() {
-	await Promise.all([...Object.keys(state.workspaces.sessions).map((root) => loadSessions(root)), loadUnbound(), loadArchived()]);
+	await Promise.all([...Object.keys(state.workspaces.sessions).map((root) => loadSessions(root)), loadUnbound(), loadScheduled(), loadArchived()]);
 }
 
 export { api, loadGitStatus };
