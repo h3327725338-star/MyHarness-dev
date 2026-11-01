@@ -107,6 +107,7 @@ cp permission-gate.ts ~/.myharness/agent/extensions/
 |-----------|-------------|
 | `custom-provider-anthropic/` | Custom Anthropic provider with OAuth support and custom streaming implementation |
 | `custom-provider-gitlab-duo/` | GitLab Duo provider using myharness-ai's built-in Anthropic/OpenAI streaming via proxy |
+| `claude-code-shell.ts` | Runs the installed, signed-in `claude` program as a provider, with MyHarness as the interface. Needs a build with `managesOwnContext`; runs with `bypassPermissions` |
 
 ### External Dependencies
 
