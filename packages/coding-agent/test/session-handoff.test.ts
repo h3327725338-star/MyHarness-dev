@@ -11,6 +11,7 @@ import {
 } from "../src/agent/runtime/session-handoff.ts";
 import { getSessionConversationPath } from "../src/config/paths/index.ts";
 import { SettingsManager } from "../src/config/settings/index.ts";
+import { describeLocalTime, localStamp, localTimeZone } from "../src/schedules/timing.ts";
 import { readHandoff, writeHandoff } from "../src/session/history/handoff-store.ts";
 import { resetHistoryIndexForTests } from "../src/session/history/index-store.ts";
 import { clearParseCache } from "../src/session/storage/jsonl/parse-cache.ts";
@@ -190,10 +191,14 @@ describe("SessionHandoff", () => {
 		});
 		const work = handoffWork(file)!;
 		expect(work.incremental).toBe(false);
-		const task = buildHandoffTask(work, "饮水");
+		const task = buildHandoffTask(work, "饮水", Date.UTC(2026, 9, 28, 22, 30));
 		expect(task).toContain("not usable");
 		expect(task).toContain("Assistant (interrupted)");
 		expect(task).not.toContain("<existing-note>");
+		// Times are this computer's wall clock, the same clock the chat's current-time note uses.
+		const tz = localTimeZone();
+		expect(task).toContain(`Current local time: ${describeLocalTime(Date.UTC(2026, 9, 28, 22, 30), tz)}`);
+		expect(task).toContain(`[Assistant (interrupted) · ${localStamp(clock, tz)} · entry a2]`);
 	});
 });
 

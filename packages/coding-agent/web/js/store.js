@@ -64,6 +64,9 @@ const SLOT_DEFAULTS = () => ({
 	subAgents: {},
 	// The sub-agents' light state (activity bar, live cards): the server's sub_agent_state / snapshot `subAgents`.
 	subAgentState: { items: [], running: 0 },
+	// The chat's background shell jobs (bash/pwsh run_in_background) for the Background panel: the server's
+	// background_jobs / snapshot `backgroundJobs`, complete each time.
+	backgroundJobs: [],
 	resources: null,
 	gitStatus: undefined,
 	currentRunId: undefined,
@@ -270,6 +273,8 @@ export const state = {
 	modeState: null,
 	/** Changes when either global personal prompt was saved somewhere (`mode_preferences_changed`). */
 	modePreferencesNonce: 0,
+	/** Changes when a model prompt was saved somewhere (`model_prompts_changed`). */
+	modelPromptsNonce: 0,
 	models: null,
 	settings: null,
 	providers: null,
@@ -635,7 +640,11 @@ export function setView(patch) {
 	if (Object.hasOwn(patch, "colorTheme")) colorThemes[mode] = colorThemeOf(patch.colorTheme);
 	state.view = { ...state.view, ...patch, colorThemes, colorTheme: colorThemes[mode] };
 	// A width the user dragged is the chat's own, and also where the panel of a chat that has none of its own yet starts.
-	for (const key of ["panelW", "chatW"]) if (patch[key] !== undefined) panelDefaults[key] = ownWidth(patch[key]) ?? panelDefaults[key];
+	// The conversation column that collaboration mode starts a website with (actions.js enterWorkspaceMax) is not one.
+	for (const key of ["panelW", "chatW"]) {
+		if (patch[key] === undefined || (key === "chatW" && patch.wsMax === true)) continue;
+		panelDefaults[key] = ownWidth(patch[key]) ?? panelDefaults[key];
+	}
 	// Each section of the panel remembers its own last tab: the navigation row goes back to it.
 	if (patch.wsActive !== undefined || patch.wsTabs !== undefined) {
 		const recent = recentSectionTabs(state.view.wsRecent, state.view.wsTabs, state.view.wsActive);
@@ -685,6 +694,15 @@ export function applyAppearance() {
 	setDataset(root, "chatMode", state.view.chatMode);
 	setCssVar(root, "--read-w", state.view.readWidth === "auto" ? "clamp(720px, 82%, 1060px)" : `${state.view.readWidth}px`);
 	applyColumnWidths();
+}
+
+/**
+ * Narrowest chat column in collaboration mode. On the frameless desktop window the column's header also holds the
+ * window buttons, so it keeps their width plus its own icon row (the `--chat-min-ws` floor in layout.css).
+ */
+export function chatColumnMin() {
+	const controls = typeof document === "undefined" ? null : document.querySelector(".window-controls");
+	return controls ? Math.max(320, controls.offsetWidth + 6 + 268) : 320;
 }
 
 /** `.app` as App last mounted it: the element that carries the column widths. */
@@ -881,6 +899,7 @@ export async function loadSnapshot(slot = targetSlot ?? activeSlot) {
 		state.completion = snap.flags.completion ? (snap.flags.completionStatus ?? { startedAt: Date.now() }) : false;
 	state.memoryMaintenance = snap.memoryMaintenance ?? null;
 		applySubAgentState(snap.subAgents);
+		state.backgroundJobs = Array.isArray(snap.backgroundJobs) ? snap.backgroundJobs : [];
 		emit();
 	});
 	return snap;
@@ -941,16 +960,29 @@ export async function chooseThinkingLevel(level) {
 }
 
 const transcriptSent = new Map();
-// The server stamps a message when it takes it, after the page drew it; this only absorbs clock rounding.
+// The server stamps a message when it takes it, after the page drew it, and saves a reply just before it reports the
+// reply's end; this only absorbs clock rounding and that short gap.
 const PENDING_LANDED_SLACK_MS = 2000;
 /**
  * Whether a persisted assistant entry is the same message as a live one. The two carry different timestamps (the
  * persisted one is stamped when it was saved), so the content decides: the same blocks in order, a tool call by its id.
+ * A reply with no content (stopped or failed before any output) has nothing to compare: it is the same message when it
+ * ended the same way and was saved when the live one ended (the server saves a reply just before it reports the end).
+ * Without this the live copy of a stopped reply was carried across every transcript read and drawn at the tail, so
+ * the previous turn showed "Cancelled" under its complete answer once the next message was sent.
  */
 function sameAssistantMessage(persisted, live) {
 	const a = persisted.blocks || [];
 	const b = live.blocks || [];
-	if (a.length === 0 || a.length !== b.length) return false;
+	if (a.length !== b.length) return false;
+	if (a.length === 0)
+		return (
+			!!persisted.id &&
+			persisted.stopReason === live.stopReason &&
+			typeof persisted.ts === "number" &&
+			typeof live.endedAt === "number" &&
+			Math.abs(persisted.ts - live.endedAt) <= PENDING_LANDED_SLACK_MS
+		);
 	return a.every((block, i) => block.type === b[i].type && (block.type === "toolCall" ? block.id === b[i].id : block.text === b[i].text));
 }
 export async function loadTranscript(slot = targetSlot ?? activeSlot, { limit } = {}) {
@@ -2237,8 +2269,8 @@ function connectEvents() {
 			}
 			// Missed from its start (see message_update): show the finished reply, unless a transcript read already
 			// brought the saved copy of it.
-			if (d.item?.kind === "assistant" && !state.items.some((entry) => entry.kind === "assistant" && sameAssistantMessage(entry, d.item)))
-				appendStreamedItem({ ...d.item, liveId: d.liveId, final: true, endedAt: d.endedAt });
+			const ended = d.item?.kind === "assistant" ? { ...d.item, liveId: d.liveId, final: true, endedAt: d.endedAt } : undefined;
+			if (ended && !state.items.some((entry) => entry.kind === "assistant" && sameAssistantMessage(entry, ended))) appendStreamedItem(ended);
 			return;
 		}
 		// A user/custom message that was already appended at message_start is replaced by its final form.
@@ -2267,6 +2299,10 @@ function connectEvents() {
 	});
 	on("sub_agent_state", (d) => {
 		applySubAgentState(d);
+		emit();
+	});
+	on("background_jobs", (d) => {
+		state.backgroundJobs = Array.isArray(d.jobs) ? d.jobs : [];
 		emit();
 	});
 
@@ -2352,6 +2388,7 @@ function connectEvents() {
 		state.userBashOrder = [];
 		state.subAgents = {};
 		state.subAgentState = { items: [], running: 0 };
+		state.backgroundJobs = [];
 		state.compaction = null;
 		state.retry = null;
 		state.resources = null;
@@ -2411,6 +2448,10 @@ function connectEvents() {
 	});
 	on("mode_preferences_changed", () => {
 		state.modePreferencesNonce += 1;
+		emit(true);
+	});
+	on("model_prompts_changed", () => {
+		state.modelPromptsNonce += 1;
 		emit(true);
 	});
 	on("login_event", (d) => set({ loginEvent: d.type === "done" ? null : d }));
@@ -2474,6 +2515,9 @@ function attachEntryId(d) {
 		else if (item.kind === "assistant") match = candidate.kind === "assistant" && Math.abs(candidate.ts - item.ts) < 60_000;
 		// A user row by its time, or by its text within a minute (a server that sent the time the entry was written).
 		else if (item.kind === "user") match = candidate.kind === "user" && !candidate.pending && (candidate.ts === item.ts || (typeof item.text === "string" && candidate.text === item.text && Math.abs(candidate.ts - item.ts) < 60_000));
+		// A message the session sent itself (a background command's report starts a turn with one) by its type and text: its
+		// entry is written a moment after the message's own time, and the turn it heads is keyed by its id once it has one.
+		else if (item.kind === "custom") match = candidate.kind === "custom" && candidate.customType === item.customType && (candidate.ts === item.ts || (typeof item.text === "string" && candidate.text === item.text && Math.abs(candidate.ts - item.ts) < 60_000));
 		else match = candidate.kind === item.kind && candidate.ts === item.ts;
 		if (match) {
 			const next = items.slice();

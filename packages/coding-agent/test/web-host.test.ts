@@ -34,6 +34,7 @@ import { ModelRuntime } from "../src/providers/runtime/index.ts";
 import { SessionManager } from "../src/session/manager/index.ts";
 import { flushSessionWrites } from "../src/session/storage/jsonl/write-batch.ts";
 import { SCHEDULED_RUN_ENTRY } from "../src/session/types.ts";
+import { backgroundJobManager } from "../src/tools/shell/job-manager.ts";
 import { showPopupNotification } from "../src/utils/popup-notification.ts";
 import { startBackgroundBatch } from "./suite/background-batch.ts";
 import { getMessageText, type Harness } from "./suite/harness.ts";
@@ -645,7 +646,88 @@ describe("Web host (real runtime with a faux provider)", () => {
 		await expect(fx.get("/api/translate/voice?text=problem&accent=au")).rejects.toThrow(/^400:/);
 	});
 
-	async function start(options: { authFile?: boolean; nebiusBaseUrl?: string } = {}): Promise<Fixture> {
+	it("lists the chat's background commands, reads the end of their output and stops one, telling the page each time", async () => {
+		const fx = await start();
+		cleanups.push(async () => {
+			await backgroundJobManager.cancelAll();
+			backgroundJobManager.clearRecords();
+		});
+		// The event stream is open once the hub has sent it the slots.
+		await fx.waitFor("slots");
+		// A command that writes two lines and runs until it is stopped.
+		const running =
+			(text: string) =>
+			({ onData, signal }: { onData: (data: Buffer) => void; signal: AbortSignal }) =>
+				new Promise<{ exitCode: number | null }>((resolve) => {
+					onData(Buffer.from(text, "utf8"));
+					signal.addEventListener("abort", () => resolve({ exitCode: null }), { once: true });
+				});
+		const sessionKey = `session:${fx.hub.host.session.sessionId}`;
+		const mine = backgroundJobManager.start({
+			sessionKey,
+			toolName: "bash",
+			command: "npm run dev",
+			cwd: fx.project,
+			run: running("ready on 5173\nGET /\n"),
+		});
+		const other = backgroundJobManager.start({
+			sessionKey: "session:another-chat",
+			toolName: "pwsh",
+			command: "another chat's command",
+			cwd: fx.project,
+			run: running("not yours\n"),
+		});
+
+		const started = await fx.waitFor("background_jobs", (data) =>
+			data.jobs.some((job: any) => job.id === mine.taskId),
+		);
+		expect(started.jobs).toEqual([
+			expect.objectContaining({
+				id: mine.taskId,
+				tool: "bash",
+				command: "npm run dev",
+				cwd: fx.project,
+				status: "running",
+			}),
+		]);
+		expect((await fx.get("/api/state")).backgroundJobs.map((job: any) => job.id)).toEqual([mine.taskId]);
+		expect((await fx.get("/api/background")).jobs.map((job: any) => job.id)).toEqual([mine.taskId]);
+
+		let output: any;
+		for (let tries = 0; tries < 100; tries += 1) {
+			output = await fx.get(`/api/background/output?id=${mine.taskId}`);
+			if (output.text === "ready on 5173\nGET /\n") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		expect(output).toMatchObject({
+			text: "ready on 5173\nGET /\n",
+			status: "running",
+			skipped: 0,
+			logTruncated: false,
+		});
+
+		// Another chat's command is neither readable nor stoppable from here.
+		await expect(fx.get(`/api/background/output?id=${other.taskId}`)).rejects.toThrow(/^404:/);
+		await expect(fx.post("/api/background/stop", { id: other.taskId })).rejects.toThrow(/^404:/);
+		expect(backgroundJobManager.get(other.taskId)?.status).toBe("running");
+
+		const stopped = await fx.post("/api/background/stop", { id: mine.taskId });
+		expect(stopped).toMatchObject({ ok: true, job: { id: mine.taskId, status: "killed" } });
+		expect(stopped.jobs).toEqual([expect.objectContaining({ id: mine.taskId, status: "killed" })]);
+		const ended = await fx.waitFor("background_jobs", (data) =>
+			data.jobs.some((job: any) => job.id === mine.taskId && job.status === "killed"),
+		);
+		expect(ended.jobs).toHaveLength(1);
+		expect(
+			fx.events.some(
+				(entry) => entry.event === "background_jobs" && entry.data.jobs.some((job: any) => job.id === other.taskId),
+			),
+		).toBe(false);
+	});
+
+	async function start(
+		options: { authFile?: boolean; nebiusBaseUrl?: string; runtimePerChat?: boolean } = {},
+	): Promise<Fixture> {
 		const project = tempDir("myharness-web-project");
 		const dataRoot = tempDir("myharness-web-data");
 		const agentDir = tempDir("myharness-web-agent");
@@ -658,28 +740,32 @@ describe("Web host (real runtime with a faux provider)", () => {
 		// authFile: credentials live in the agent dir's auth.json, so another runtime can write to them as a session does.
 		const authStorage = options.authFile ? AuthStorage.create(join(agentDir, "auth.json")) : AuthStorage.inMemory();
 		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
-		const modelRuntime = await ModelRuntime.create({
-			credentials: authStorage,
-			modelsPath: join(agentDir, "models.json"),
-		});
 		const model = faux.getModel();
-		modelRuntime.registerProvider(model.provider, {
-			baseUrl: model.baseUrl,
-			api: model.api,
-			models: [
-				{
-					id: model.id,
-					name: model.name,
-					api: model.api,
-					reasoning: model.reasoning,
-					input: model.input,
-					cost: model.cost,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-					baseUrl: model.baseUrl,
-				},
-			],
-		});
+		const newModelRuntime = async () => {
+			const runtime = await ModelRuntime.create({
+				credentials: authStorage,
+				modelsPath: join(agentDir, "models.json"),
+			});
+			runtime.registerProvider(model.provider, {
+				baseUrl: model.baseUrl,
+				api: model.api,
+				models: [
+					{
+						id: model.id,
+						name: model.name,
+						api: model.api,
+						reasoning: model.reasoning,
+						input: model.input,
+						cost: model.cost,
+						contextWindow: model.contextWindow,
+						maxTokens: model.maxTokens,
+						baseUrl: model.baseUrl,
+					},
+				],
+			});
+			return runtime;
+		};
+		const modelRuntime = await newModelRuntime();
 		const runtimeOptions = {
 			agentDir,
 			modelRuntime,
@@ -690,7 +776,12 @@ describe("Web host (real runtime with a faux provider)", () => {
 		// directories are removed; a later write put the agent directory back, or held its lock while it was removed.
 		const settingsManagers: SettingsManager[] = [];
 		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({ ...runtimeOptions, cwd });
+			// runtimePerChat: each chat gets its own ModelRuntime, as chats in different folders have in the app.
+			const services = await createAgentSessionServices({
+				...runtimeOptions,
+				...(options.runtimePerChat ? { modelRuntime: await newModelRuntime() } : {}),
+				cwd,
+			});
 			// Other tests queue faux responses for foreground tasks only; the memory tests turn Auto Memory back on.
 			services.settingsManager.setConversationNamingSettings({ enabled: false });
 			services.settingsManager.setAutoMemorySettings({ enabled: false });
@@ -1561,6 +1652,96 @@ describe("Web host (real runtime with a faux provider)", () => {
 		await fx.post("/api/git/undo/restore");
 		expect(readFileSync(join(fx.project, "notes.txt"), "utf8").replace(/\r\n/g, "\n")).toBe("alpha\nbeta\n");
 	}, 90_000);
+
+	it("keeps only what the task can account for on its card and lists what changed elsewhere meanwhile", async () => {
+		const fx = await start();
+		writeFileSync(join(fx.project, "notes.txt"), "alpha\n");
+		writeFileSync(join(fx.project, "other.txt"), "other\n");
+		expect(initializeGitRepository(fx.project).ok).toBe(true);
+		expect(setLocalGitIdentity(fx.project, { name: "Web test", email: "web@example.invalid" }).ok).toBe(true);
+		expect(createInitialGitBaseline(fx.project).ok).toBe(true);
+		const owner = fx.hub.get((await fx.get("/api/state")).slot)!;
+		owner.session.settingsManager.setGitIntegrationEnabled(true);
+		await owner.session.settingsManager.flush();
+
+		fx.faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "notes.txt", content: "alpha\nbeta\n" })], {
+				stopReason: "toolUse",
+			}),
+			async () => {
+				// Another program changes the folder while the task runs, more than the 2 s slack before its own command.
+				writeFileSync(join(fx.project, "other.txt"), "other\nchanged by another program\n");
+				writeFileSync(join(fx.project, "outside.txt"), "made by another program\n");
+				await new Promise((resolve) => setTimeout(resolve, 2_600));
+				return fauxAssistantMessage(
+					[fauxToolCall("bash", { command: `node -e "require('fs').writeFileSync('mine.txt', 'mine')"` })],
+					{ stopReason: "toolUse" },
+				);
+			},
+			fauxAssistantMessage([fauxText("Done.")]),
+		]);
+		await fx.post("/api/prompt", { text: "append beta, then make mine.txt" });
+		const finished = await fx.waitFor("run_finished", () => true, 30_000);
+		expect(readFileSync(join(fx.project, "mine.txt"), "utf8")).toBe("mine");
+
+		// The task's own write and its own command count; the other program's two files do not.
+		expect(finished.changeCount).toBe(2);
+		const card = (await fx.get("/api/transcript")).items.filter((item: any) => item.kind === "runChanges").at(-1);
+		expect(card.files.map((file: any) => file.path).sort()).toEqual(["mine.txt", "notes.txt"]);
+		const byPath = (files: any[]) => [...files].sort((a, b) => a.path.localeCompare(b.path));
+		const elsewhere = [
+			{ path: "other.txt", status: "modified", by: "outside" },
+			{ path: "outside.txt", status: "added", by: "outside" },
+		];
+		expect(byPath(card.elsewhere)).toEqual(elsewhere);
+		// The list is saved with the card, so a reload or a restart shows the same row under it.
+		const saved = owner.session.sessionManager
+			.getEntries()
+			.filter((entry: any) => entry.type === "custom" && entry.customType === "web-run-changes")
+			.at(-1) as any;
+		expect(byPath(saved.data.elsewhere)).toEqual(elsewhere);
+	}, 60_000);
+
+	for (const gitIntegration of [false, true]) {
+		it(`shows what the task's own commands changed in a folder without Git (Git integration ${gitIntegration ? "on" : "off"})`, async () => {
+			const fx = await start();
+			writeFileSync(join(fx.project, "notes.txt"), "alpha\n");
+			const owner = fx.hub.get((await fx.get("/api/state")).slot)!;
+			if (gitIntegration) {
+				// On, but the folder is no repository: there is no checkpoint, so the folder is compared with a baseline.
+				owner.session.settingsManager.setGitIntegrationEnabled(true);
+				await owner.session.settingsManager.flush();
+			}
+			fx.faux.setResponses([
+				async () => {
+					// The folder's baseline is taken in the background when the task starts; a real model's first answer
+					// takes longer than this small folder needs.
+					await new Promise((resolve) => setTimeout(resolve, 1_000));
+					// Another program adds a file, more than the 2 s slack before the task's own command.
+					writeFileSync(join(fx.project, "outside.txt"), "made by another program\n");
+					await new Promise((resolve) => setTimeout(resolve, 2_600));
+					const script = `const fs = require('fs'); fs.writeFileSync('made.txt', 'one\\ntwo\\n'); fs.appendFileSync('notes.txt', 'beta\\n');`;
+					return fauxAssistantMessage([fauxToolCall("bash", { command: `node -e "${script}"` })], {
+						stopReason: "toolUse",
+					});
+				},
+				fauxAssistantMessage([fauxText("Done.")]),
+			]);
+			await fx.post("/api/prompt", { text: "make made.txt and add a line to notes.txt" });
+			const finished = await fx.waitFor("run_finished", () => true, 30_000);
+			expect(readFileSync(join(fx.project, "notes.txt"), "utf8").replace(/\r\n/g, "\n")).toBe("alpha\nbeta\n");
+
+			expect(finished.changeCount).toBe(2);
+			const card = (await fx.get("/api/transcript")).items.filter((item: any) => item.kind === "runChanges").at(-1);
+			const files = [...card.files].sort((a: any, b: any) => a.path.localeCompare(b.path));
+			// A new file has all its lines; a changed one has no content from before the task to count against.
+			expect(files[0]).toMatchObject({ path: "made.txt", status: "added", additions: 2, deletions: 0 });
+			expect(files[1]).toMatchObject({ path: "notes.txt", status: "modified" });
+			expect(files).toHaveLength(2);
+			expect(card.elsewhere).toEqual([{ path: "outside.txt", status: "added", by: "outside" }]);
+		}, 60_000);
+	}
 
 	it("marks a run whose provider fails as failed and keeps the error", async () => {
 		const fx = await start();
@@ -2512,6 +2693,44 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(
 			(await fx.get("/api/models", first.slot)).providers.some((provider: any) => provider.id === "selection-test"),
 		).toBe(false);
+	});
+
+	it("offers a provider enabled in another chat in this chat's model list too, and drops it when disabled there", async () => {
+		const fx = await start({ runtimePerChat: true });
+		const first = await fx.get("/api/state");
+		const config = {
+			baseUrl: "http://127.0.0.1:9/v1",
+			api: "openai-completions",
+			apiKey: "local",
+			models: [{ id: "deepseek-v4.1-flash-1017" }],
+		};
+		await fx.post("/api/providers/custom/save", { id: "kedaya-test", config }, first.slot);
+		await fx.post("/api/providers/enabled", { id: "kedaya-test", enabled: false }, first.slot);
+		const offered = async () =>
+			(await fx.get("/api/models", first.slot)).providers.some((provider: any) => provider.id === "kedaya-test");
+		expect(await offered()).toBe(false);
+		// A chat in another folder: in the app it has a ModelRuntime of its own.
+		const other = await fx.post(
+			"/api/sessions/new",
+			{ rootPath: tempDir("myharness-web-other-project") },
+			first.slot,
+		);
+		expect(other.slot).not.toBe(first.slot);
+		const reconciled = async (enabled: boolean) => {
+			const startAt = fx.events.length;
+			await fx.post("/api/providers/enabled", { id: "kedaya-test", enabled }, other.slot);
+			await vi.waitFor(() => {
+				expect(
+					fx.events
+						.slice(startAt)
+						.some((event) => event.event === "models_changed" && event.data.slot === first.slot),
+				).toBe(true);
+			});
+		};
+		await reconciled(true);
+		expect(await offered()).toBe(true);
+		await reconciled(false);
+		expect(await offered()).toBe(false);
 	});
 
 	it("shows a renamed model under its new name in every open chat, also one that was running at the time", async () => {

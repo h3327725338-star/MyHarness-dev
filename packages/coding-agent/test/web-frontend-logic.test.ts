@@ -420,6 +420,59 @@ describe("Web UI: Commit repair containment", () => {
 	});
 });
 
+describe("Web UI: a background command's report", () => {
+	const user = { kind: "user", id: "u1", ts: 1, text: "run the tests in the background", images: [] };
+	const started = assistant([{ type: "text", text: "Started; it reports back when it ends." }], { ts: 2 });
+	const report = {
+		kind: "custom",
+		id: "r1",
+		ts: 10,
+		customType: "background-job-complete",
+		display: true,
+		text: "This message is from MyHarness, not from the user: …",
+		details: {
+			jobs: [
+				{
+					id: "job-1",
+					tool: "bash",
+					command: "npm test",
+					status: "failed",
+					exitCode: 1,
+					startedAt: 3,
+					endedAt: 9,
+					tail: "1 failed",
+				},
+			],
+		},
+	};
+	const answer = assistant([{ type: "text", text: "1 test failed." }], { ts: 11 });
+
+	it("opens a round of its own, so the answer before it stays the final answer of its turn", () => {
+		const turns = buildTurns([user, started, report, answer], { toolRuns: {} });
+		expect(turns).toHaveLength(2);
+		expect(turns[0].final.text).toBe("Started; it reports back when it ends.");
+		expect(turns[0].steps).toHaveLength(0);
+		expect(turns[1].user).toBeNull();
+		expect(turns[1].jobReport).toBe(report);
+		expect(turns[1].startedAt).toBe(10);
+		expect(turns[1].final.text).toBe("1 test failed.");
+		expect(turns[1].key).toBe("t-r1");
+		// Folded, the earlier turn still shows its answer as the answer, not as a step.
+		expect(turnSegments(turns[0], { fold: true })).toHaveLength(0);
+	});
+
+	it("stands alone when no turn was started for it (the user had stopped the task)", () => {
+		const held = { ...report, details: { ...report.details, held: true } };
+		const next = { kind: "user", id: "u2", ts: 20, text: "what happened?", images: [] };
+		const turns = buildTurns([user, started, held, next], { toolRuns: {} });
+		expect(turns).toHaveLength(3);
+		expect(turns[1].jobReport).toBe(held);
+		expect(turns[1].final).toBeNull();
+		expect(turnOutcome(turns[1], {})).toBe("completed");
+		expect(turns[2].user).toBe(next);
+	});
+});
+
 describe("Web UI: permanent Git records and unknown pricing", () => {
 	it("keeps consecutive Git outcomes as independent transcript entries", () => {
 		const result = { tone: "ok", title: "Commit succeeded", hash: "abc1234" };
@@ -663,6 +716,32 @@ describe("Web UI: a run ended by an interrupting message", () => {
 		expect(interruptedByNext(stopped, { user: { ts: 75_000 } })).toBe(false);
 		expect(interruptedByNext(stopped, undefined)).toBe(false);
 		expect(interruptedByNext(stopped, { standalone: { kind: "bash" } })).toBe(false);
+	});
+
+	it("does not time chats saved since the server marks interrupts: a quick message after Stop is a stop", async () => {
+		const { interruptedByNext } = await import(new URL("turns.js", webDir).href);
+		// The chat of 2026-11-04: Stop at 04:25:08, the next message sent 1.9 s later and saved 3.2 s later (memories were
+		// being picked). The page showed the copy it sent (1.9 s: "interrupted", no card) until a reload brought the saved
+		// one (3.2 s: "Cancelled").
+		const stoppedAt = Date.parse("2026-11-03T20:25:08.000Z");
+		const stopped = {
+			startedAt: stoppedAt - 20_000,
+			endedAt: stoppedAt,
+			items: [{ kind: "assistant", id: "a1", ts: stoppedAt }],
+		};
+		expect(interruptedByNext(stopped, { user: { ts: stoppedAt + 1_900 } })).toBe(false);
+		expect(interruptedByNext(stopped, { user: { ts: stoppedAt + 1_900, pending: true } })).toBe(false);
+		expect(interruptedByNext(stopped, { user: { ts: stoppedAt + 3_200 } })).toBe(false);
+		// The marker still decides it.
+		expect(interruptedByNext({ ...stopped, interrupted: true }, { user: { ts: stoppedAt + 400 } })).toBe(true);
+		// A chat saved before the marker existed is still timed.
+		const old = Date.parse("2026-10-25T03:38:04.312Z");
+		expect(
+			interruptedByNext(
+				{ startedAt: old - 60_000, endedAt: old, items: [{ kind: "assistant", id: "a0", ts: old }] },
+				{ user: { ts: old + 211 } },
+			),
+		).toBe(true);
 	});
 
 	it("trusts the server's marker, and never times a reply still on the page from when it started", async () => {

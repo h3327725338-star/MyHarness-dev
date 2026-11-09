@@ -92,7 +92,7 @@ try {
  check(emptyHint()?.textContent.includes('还没有模型'),'the empty list does not show the default hint: '+emptyHint()?.textContent);
 
  // Adding by hand after that is unaffected, and the notice of the old detection stays gone.
- [...document.querySelectorAll('.set-card-head button')].find(el=>el.textContent.includes('手动添加')).click();await wait(80);
+ [...document.querySelectorAll('.pf-models-head button')].find(el=>el.textContent.includes('手动添加')).click();await wait(80);
  check(cards().length===1&&!notice(),'a manually added model shows a stale detection notice');
  document.body.insertAdjacentHTML('beforeend','<p id="ready">passed</p>');
 } catch(error){document.body.insertAdjacentHTML('beforeend','<p id="ready">'+error.stack+'</p>');}

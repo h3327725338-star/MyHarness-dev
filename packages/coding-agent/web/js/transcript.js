@@ -784,8 +784,14 @@ function FinalMessage({ final }) {
 	</div>`;
 }
 
-/** Added / removed lines of one file, or nothing when the diff could not be counted (binary, too large, no baseline). */
-const lineCounts = (file) => (file.binary || file.unavailable ? null : html`<${Counts} additions=${file.additions} deletions=${file.deletions} />`);
+/**
+ * Added / removed lines of one file, or nothing when the diff could not be counted (binary, too large, no baseline). A
+ * file whose text stayed the same apart from its line endings (CRLF / LF) says so instead of "+0 −0".
+ */
+const lineCounts = (file) => {
+	if (file.lineEndingsOnly) return html`<span class="dim change-eol">${t("Line endings only")}</span>`;
+	return file.binary || file.unavailable ? null : html`<${Counts} additions=${file.additions} deletions=${file.deletions} />`;
+};
 
 /** A Markdown file's diff as formatted text: each run of unchanged, removed and added lines is rendered as Markdown. */
 function MarkdownDiff({ patch }) {
@@ -832,6 +838,7 @@ function ChangeDiff({ card, file }) {
 	if (!data) return html`<div class="change-note"><${Spinner} /></div>`;
 	if (data.summary.binary) return html`<div class="change-note dim">${t("Binary file — no text diff.")}</div>`;
 	if (data.summary.unavailable) return html`<div class="change-note dim">${serverText(data.summary.unavailable)}</div>`;
+	if (data.summary.lineEndingsOnly) return html`<div class="change-note dim">${t("Only the line endings changed (CRLF / LF); the text is the same.")}</div>`;
 	if (!data.patch) return html`<div class="change-note dim">${t("No content changes.")}</div>`;
 	return html`<div class="change-diff">
 		${markdown ? html`<${MarkdownDiff} patch=${data.patch} />` : html`<${DiffView} patch=${data.patch} language=${languageFor(file.path)} />`}
@@ -873,6 +880,32 @@ function ChangeCard({ card }) {
 			${counted ? html`<${Counts} additions=${files.reduce((n, f) => n + f.additions, 0)} deletions=${files.reduce((n, f) => n + f.deletions, 0)} />` : null}
 		</div>
 		${files.map((file) => html`<${ChangeFile} key=${file.path} card=${card} file=${file} />`)}
+		${card.elsewhere?.length ? html`<${ChangedElsewhere} files=${card.elsewhere} total=${card.elsewhereTotal} />` : null}
+	</div>`;
+}
+
+const ELSEWHERE_BY = { chat: N_("Another conversation"), outside: N_("Another program") };
+
+/**
+ * Files that changed in the folder while the task ran, but not by it (another chat, or a program outside this app):
+ * one quiet row at the bottom of the card that opens the list. They are never counted in the card or the task's totals.
+ */
+function ChangedElsewhere({ files, total }) {
+	const [open, setOpen] = useState(false);
+	const count = Math.max(files.length, Number(total) || 0);
+	const more = count - files.length;
+	return html`<div class="change-elsewhere">
+		<button class="change-file change-elsewhere-head" aria-expanded=${open} title=${t("Changed in this folder while the task ran, but not by it: another chat or another program changed these files. They are not counted.")} onClick=${() => setOpen(!open)}>
+			<${Icon} name="chevronRight" size=${13} class="disclose" />
+			<span class="truncate">${t("{files} changed elsewhere meanwhile, not counted", { files: plural(count, "file") })}</span>
+		</button>
+		<${Collapse} open=${open}>${open ? html`<div class="change-elsewhere-list">
+			${files.map((file) => html`<div class="change-elsewhere-row" key=${file.path} title=${file.path}>
+				<span class="change-path truncate">${dirname(file.path) ? html`<span class="dim">${dirname(file.path)}/</span>` : null}${basename(file.path)}${file.status === "deleted" ? html` <span class="dim">${t("(deleted)")}</span>` : null}</span>
+				<span class="dim change-elsewhere-by">${t(ELSEWHERE_BY[file.by] || ELSEWHERE_BY.outside)}</span>
+			</div>`)}
+			${more > 0 ? html`<div class="change-elsewhere-row dim">${t("…and {n} more", { n: more })}</div>` : null}
+		</div>` : null}<//>
 	</div>`;
 }
 
@@ -921,6 +954,57 @@ function ScheduledRunMarker({ item, details }) {
 	</div>`;
 }
 
+/** How a background command in a report ended. A command MyHarness stopped never reports, so "killed" came from outside. */
+const JOB_REPORT_STATUS = { completed: N_("Done"), failed: N_("Failed"), killed: N_("Killed"), timed_out: N_("Timed out") };
+const firstCommandLine = (command) => String(command || "").split("\n")[0];
+
+function jobReportEnding(job) {
+	const status =
+		job.status === "failed" && job.exitCode !== undefined && job.exitCode !== null
+			? t("exit {exitCode}", { exitCode: job.exitCode })
+			: t(JOB_REPORT_STATUS[job.status] || job.status || "");
+	const ran = job.endedAt && job.startedAt ? job.endedAt - job.startedAt : 0;
+	return ran >= 1000 ? `${status} · ${fmtDuration(ran)}` : status;
+}
+
+/** One command of a report: its own line when the report has several, then the end of its output and the whole log's path. */
+function JobReportOutput({ job, several }) {
+	const text = typeof job.tail === "string" ? job.tail : "";
+	return html`<div class="job-report-job">
+		${several ? html`<div class="job-report-line"><span class="mono truncate" title=${job.command}>${clip(firstCommandLine(job.command), 80)}</span><span class="dim">· ${jobReportEnding(job)}</span></div>` : null}
+		<pre class="job-report-out">${text ? html`<${Ansi} text=${text} />` : html`<span class="dim">${t("(no output)")}</span>`}</pre>
+		${job.logTruncated ? html`<div class="dim job-report-note">${t("The output grew past the size a background command may write; what came after that was not saved.")}</div>` : null}
+		${job.logPath ? html`<div class="dim job-report-note"><span>${job.tailCut ? t("The end of the output; the whole log:") : t("The whole log:")}</span> <code class="job-report-log">${job.logPath}</code><${CopyButton} text=${job.logPath} label=${t("Copy path")} size=${13} /></div>` : null}
+	</div>`;
+}
+
+/**
+ * The message MyHarness sends when background commands of this chat end (turns.js gives the turn it starts a round of
+ * its own): a line naming the command, how it ended and how long it ran, like the chat's other markers, with the end of
+ * its output behind "Show output". A report held back because the user had stopped the task says it waits for the next
+ * message.
+ */
+function JobReportMarker({ item }) {
+	const [open, setOpen] = useState(false);
+	const details = item.details && typeof item.details === "object" ? item.details : {};
+	const jobs = Array.isArray(details.jobs) ? details.jobs : [];
+	const one = jobs.length === 1 ? jobs[0] : undefined;
+	return html`<div class="marker job-report-marker">
+		<div class="marker-head">
+			<span class="marker-line" />
+			<span class="marker-text continuation-text">
+				<${Icon} name="pulse" size=${13} />
+				<span>${jobs.length > 1 ? t("{n} background commands ended", { n: jobs.length }) : t("Background command ended")}</span>
+				${one ? html`<span class="mono truncate" title=${one.command}>${clip(firstCommandLine(one.command), 60)}</span><span class="dim">· ${jobReportEnding(one)}</span>` : null}
+				${details.held ? html`<span class="dim" title=${t("You had stopped the task, so no turn was started for it. The agent reads it with your next message.")}>· ${t("Held for your next message")}</span>` : null}
+				${jobs.length ? html`<button class="link-btn" aria-expanded=${open} onClick=${() => setOpen(!open)}>${open ? t("Hide output") : t("Show output")}</button>` : null}
+			</span>
+			<span class="marker-line" />
+		</div>
+		<${Collapse} open=${open}><div class="marker-body job-report-body">${jobs.map((job) => html`<${JobReportOutput} key=${job.id} job=${job} several=${jobs.length > 1} />`)}</div><//>
+	</div>`;
+}
+
 function ContinuationMarker({ item }) {
 	const [open, setOpen] = useState(false);
 	const started = useStore((s) => s.items.some((other) => other.kind === "user"));
@@ -965,7 +1049,7 @@ const TurnView = memo(function TurnView({ turn, isLast, live, waiting, run, cwd,
 	// Folding rebuilds the blocks (texts and later blocks go into the first one): glide to the new height instead of jumping.
 	const processRef = useSwapGlide(fold);
 	return html`<section class=${`turn ${live ? "live" : ""}`} data-turn-key=${turn.user ? turn.key : undefined} data-last-turn=${isLast ? "" : undefined}>
-		${turn.user ? (turn.scheduled ? html`<${ScheduledRunMarker} item=${turn.user} details=${turn.scheduled} />` : html`<${UserMessage} item=${turn.user} turn=${turn} />`) : null}
+		${turn.user ? (turn.scheduled ? html`<${ScheduledRunMarker} item=${turn.user} details=${turn.scheduled} />` : html`<${UserMessage} item=${turn.user} turn=${turn} />`) : turn.jobReport ? html`<${JobReportMarker} item=${turn.jobReport} />` : null}
 		<div class="turn-process" ref=${processRef}>
 		${segments.map((segment) =>
 			segment.type === "text"

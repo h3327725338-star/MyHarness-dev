@@ -15,6 +15,7 @@ import { explainProviderError } from "../../providers/recovery/error-explanation
 import { imageBase64Length, imageForDisplay, imageHasData } from "../../session/storage/jsonl/image-files.ts";
 import { SCHEDULED_RUN_ENTRY, type SessionEntry, type SessionMessageTiming } from "../../session/types.ts";
 import { parseExpandedBuiltinPromptCommand } from "../../startup/slash-commands.ts";
+import type { BackgroundJobInfo } from "../../tools/shell/job-manager.ts";
 
 /** Tool result details larger than this are replaced by a marker to keep payloads bounded. */
 const MAX_DETAILS_JSON_CHARS = 400_000;
@@ -53,6 +54,15 @@ export interface WireChangeFile {
 	deletions: number;
 	binary: boolean;
 	unavailable?: string;
+	/** Only the line endings changed (CRLF / LF); the text lines are the same. */
+	lineEndingsOnly?: boolean;
+}
+
+/** A file a task's card leaves out: another chat ("chat") or something outside this app ("outside") changed it meanwhile. */
+export interface WireElsewhereFile {
+	path: string;
+	status: string;
+	by: "chat" | "outside";
 }
 
 export interface WireImage {
@@ -194,7 +204,17 @@ export interface WireUsage {
 
 export type WireItem =
 	| { kind: "gitStatus"; id: string; ts: number; result: Record<string, unknown> }
-	| { kind: "runChanges"; id: string; ts: number; runId: number; files: WireChangeFile[] }
+	| {
+			kind: "runChanges";
+			id: string;
+			ts: number;
+			runId: number;
+			files: WireChangeFile[];
+			/** Files changed elsewhere while the task ran, listed under the card (not counted). */
+			elsewhere?: WireElsewhereFile[];
+			/** How many files were changed elsewhere when that is more than `elsewhere` lists. */
+			elsewhereTotal?: number;
+	  }
 	| {
 			kind: "user";
 			id?: string;
@@ -424,6 +444,37 @@ export function subAgentStateToWire(state: { items: Array<{ details?: unknown }>
 	return { ...state, items: state.items.map((item) => ({ ...item, details: sanitizeDetails(item.details) })) };
 }
 
+/** A background shell job (bash/pwsh `run_in_background`) as the Background panel lists it. */
+export interface WireBackgroundJob {
+	id: string;
+	tool: BackgroundJobInfo["toolName"];
+	command: string;
+	cwd: string;
+	status: BackgroundJobInfo["status"];
+	exitCode?: number | null;
+	startedAt: number;
+	endedAt?: number;
+	logTruncated?: boolean;
+}
+
+/** A very long command (a heredoc) is cut for the list; the panel shows the start of it. */
+const MAX_WIRE_COMMAND_CHARS = 20_000;
+
+export function backgroundJobToWire(job: BackgroundJobInfo): WireBackgroundJob {
+	return {
+		id: job.taskId,
+		tool: job.toolName,
+		command:
+			job.command.length > MAX_WIRE_COMMAND_CHARS ? `${job.command.slice(0, MAX_WIRE_COMMAND_CHARS)}…` : job.command,
+		cwd: job.cwd,
+		status: job.status,
+		...(job.status === "running" ? {} : { exitCode: job.exitCode ?? null }),
+		startedAt: job.startedAt,
+		...(job.endedAt ? { endedAt: job.endedAt } : {}),
+		...(job.logTruncated ? { logTruncated: true } : {}),
+	};
+}
+
 function wireUsage(usage: {
 	input: number;
 	output: number;
@@ -586,7 +637,10 @@ export function messageToWire(
 
 /** The change card kept in a RUN_CHANGES_ENTRY, without the diffs; undefined when the data is not a card with files. */
 export function runChangesToWire(id: string, ts: number, data: unknown): WireItem | undefined {
-	const card = data as { runId?: unknown; files?: unknown } | null | undefined;
+	const card = data as
+		| { runId?: unknown; files?: unknown; elsewhere?: unknown; elsewhereTotal?: unknown }
+		| null
+		| undefined;
 	if (!card || !Array.isArray(card.files)) return undefined;
 	const files: WireChangeFile[] = [];
 	for (const file of card.files as Array<Record<string, unknown> | null>) {
@@ -599,10 +653,33 @@ export function runChangesToWire(id: string, ts: number, data: unknown): WireIte
 			deletions: Number(file.deletions) || 0,
 			binary: file.binary === true,
 			...(typeof file.unavailable === "string" ? { unavailable: file.unavailable } : {}),
+			...(file.lineEndingsOnly === true ? { lineEndingsOnly: true } : {}),
 		});
 	}
 	if (files.length === 0) return undefined;
-	return { kind: "runChanges", id, ts, runId: Number(card.runId) || 0, files };
+	const elsewhere: WireElsewhereFile[] = [];
+	if (Array.isArray(card.elsewhere)) {
+		for (const file of card.elsewhere as Array<Record<string, unknown> | null>) {
+			if (!file || typeof file.path !== "string") continue;
+			elsewhere.push({
+				path: file.path,
+				status: typeof file.status === "string" ? file.status : "modified",
+				by: file.by === "chat" ? "chat" : "outside",
+			});
+		}
+	}
+	const elsewhereTotal = Number(card.elsewhereTotal);
+	return {
+		kind: "runChanges",
+		id,
+		ts,
+		runId: Number(card.runId) || 0,
+		files,
+		...(elsewhere.length > 0 ? { elsewhere } : {}),
+		...(elsewhere.length > 0 && Number.isFinite(elsewhereTotal) && elsewhereTotal > elsewhere.length
+			? { elsewhereTotal }
+			: {}),
+	};
 }
 
 export interface EntriesToWireOptions {

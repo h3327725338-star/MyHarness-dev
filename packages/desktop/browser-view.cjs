@@ -8,12 +8,13 @@ const { createPasswordStore, attachPasswordManager } = require(require('node:pat
 const { createPermissionStore } = require(require('node:path').join(__dirname, 'browser-permissions.cjs'));
 const { createDownloadHistory } = require(require('node:path').join(__dirname, 'browser-downloads.cjs'));
 const page = require(require('node:path').join(__dirname, 'browser-page-helpers.cjs'));
+const { uploadFiles, createFileChoosers } = require(require('node:path').join(__dirname, 'browser-file-chooser.cjs'));
 const { attachZoom, cleanZoom, createSiteZoomStore, stepZoom } = require(require('node:path').join(__dirname, 'zoom.cjs'));
 const dark = require(require('node:path').join(__dirname, 'browser-dark.cjs'));
 const { acceptLanguage, createLanguageStore, languageList } = require(require('node:path').join(__dirname, 'browser-language.cjs'));
 const { createBrowserSync } = require(require('node:path').join(__dirname, 'browser-sync.cjs'));
 const { createWebMailState } = require(require('node:path').join(__dirname, 'browser-web-mail.cjs'));
-const { sendThroughPage, bareAddress } = require(require('node:path').join(__dirname, 'browser-web-mail-send.cjs'));
+const { sendThroughPage, bareAddress, attachmentFiles } = require(require('node:path').join(__dirname, 'browser-web-mail-send.cjs'));
 const { createHelpDesk, signInAddress } = require(require('node:path').join(__dirname, 'browser-help.cjs'));
 const { translator } = require(require('node:path').join(__dirname, 'ui-language.cjs'));
 const { INTERACTIVE_QUERY } = page;
@@ -53,9 +54,6 @@ exports.wantsChromeAgent = (url) => {
 const PARTITION = 'persist:myharness-third-party';
 const MAX_TABS = 40;
 const DEFAULT_TAB = 'main';
-// Agent-driven file uploads may only pick files inside the current workspace and only up to this size. The page's own
-// file picker is the normal path; this limit is for the programmatic `upload` command and never exposes other files.
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 // A bookmark keeps its site icon inline; a bigger icon falls back to the bookmark's first letter.
 const MAX_ICON_BYTES = 64 * 1024;
 // Titles that a bot check (Cloudflare's interstitial, its "verification failed" page and their kin) shows. Such a page
@@ -69,9 +67,17 @@ const CURSOR_WORLD = 1207;
 // A hidden page is throttled by Chromium and then ignores input events (a wheel event never even completes). While the
 // Agent acts on a tab it is kept awake, and throttled again after this long without an Agent action.
 const AGENT_AWAKE_MS = 20000;
+// A page dialog (alert, confirm, prompt) in a tab the Agent acted on within this long waits for the Agent's answer
+// instead of opening the engine's box over the app; one nobody answers is dismissed after DIALOG_WAIT_MS.
+const AGENT_DIALOG_MS = 120000;
+const DIALOG_WAIT_MS = 120000;
+// An upload: at most this many files (a folder counts its files), together at most this many bytes.
+const MAX_UPLOAD_FILES = 500;
+const MAX_UPLOAD_TOTAL_BYTES = 300 * 1024 * 1024;
 // A background tab is laid out at least this large, so sites give the Agent their desktop layout there. So is the tab
-// on screen while the Agent works on it in a smaller panel: the page gets this size and the panel shows the part of it
-// that fits (never a scaled-down picture), so the Agent sees the whole page while the user keeps a narrow panel.
+// on screen while the Agent works on it in a smaller side panel: the page gets this size and the panel shows the part of
+// it that fits (never a scaled-down picture), so the Agent sees the whole page while the user keeps a narrow panel. Never
+// where the user watches the page (collaboration mode, browser fullscreen): there it has exactly its box (`fit`).
 const AGENT_VIEWPORT = { width: 1280, height: 800 };
 // The tab on screen goes back to the panel's size this long after the Agent's last action on it, or at once when a
 // person clicks or types in it.
@@ -83,6 +89,8 @@ const AGENT_TAB_ACTIONS = new Set(['snapshot', 'read', 'mouse', 'keys', 'insertT
 // Agent commands that answer a page. On a human check (a `challenge` page) none of them runs: the check is the user's,
 // and the Agent asks for it with `handoff` instead of pressing, typing or scripting its way past it.
 const CHALLENGE_REFUSED = new Set(['mouse', 'keys', 'insertText', 'exec', 'click', 'type', 'upload', 'login']);
+// Agent commands that may make a page open its file chooser; it is taken over first (browser-file-chooser.cjs).
+const CHOOSER_GUARDED = new Set(['mouse', 'keys', 'insertText', 'exec', 'click', 'type', 'upload']);
 
 /** Whether `candidate` is the same as, or inside, `root` (Windows paths are case-insensitive). */
 const insideRoot = (root, candidate) => {
@@ -124,6 +132,10 @@ exports.createBrowser = (window, log, options = {}) => {
   const tabs = new Map();
   let activeTabId = null;
   let rectangle = null;
+  // The page asks for the active tab to be laid out at exactly its box (`fit`): the box is collaboration mode's workspace
+  // or browser fullscreen, where the user watches the page, so the Agent's desktop size (widenForAgent) never makes it
+  // larger than what shows there (the user saw its right or bottom part cut off).
+  let rectangleFits = false;
   // The part of the active tab's box that the page leaves uncovered (a sidebar floated over its left side), or null when
   // the whole box is. The view keeps its full size and is cut at the edge, so a playing video stays live beside it.
   let clipRectangle = null;
@@ -744,6 +756,8 @@ exports.createBrowser = (window, log, options = {}) => {
       signIn: !!tab.passwordVisible || signInAddress(tab.url),
       // The Agent's open request for the user's help on this tab (browser-help.cjs), or null.
       help: tab.help || null,
+      // A page dialog (alert, confirm, prompt) waiting for the Agent's answer (holdDialog), or null.
+      dialog: tab.dialog ? { type: tab.dialog.type, message: tab.dialog.message } : null,
       // The page's zoom (1 = 100 %), shown on the toolbar while it is not 100 %.
       zoom: tab.zoom ?? 1,
       // Dark mode: whether the page is recolored now, the general mode and this site's own choice (null: follows it).
@@ -901,9 +915,10 @@ exports.createBrowser = (window, log, options = {}) => {
           stage.setBounds(shown);
           stageOrigin = { x: shown.x, y: shown.y };
           // While the Agent works on the tab in a panel smaller than its desktop size, the page is laid out at that size
-          // and the stage shows the part of it that fits the panel (widenForAgent).
-          const width = tab.agentWide ? Math.max(bounds.width, AGENT_VIEWPORT.width) : bounds.width;
-          const height = tab.agentWide ? Math.max(bounds.height, AGENT_VIEWPORT.height) : bounds.height;
+          // and the stage shows the part of it that fits the panel (widenForAgent); never in a box the user watches.
+          const wide = tab.agentWide && !rectangleFits;
+          const width = wide ? Math.max(bounds.width, AGENT_VIEWPORT.width) : bounds.width;
+          const height = wide ? Math.max(bounds.height, AGENT_VIEWPORT.height) : bounds.height;
           tab.view.setBounds({ x: bounds.x - shown.x, y: bounds.y - shown.y, width, height });
         } catch { /* view is going away */ }
         try { tab.view.setVisible(true); } catch { /* view is going away */ }
@@ -941,6 +956,7 @@ exports.createBrowser = (window, log, options = {}) => {
   /** Hide every view and forget the rectangle: the next activation always starts from a fresh measurement. */
   const hideAll = () => {
     rectangle = null;
+    rectangleFits = false;
     clipRectangle = null;
     stopFrames();
     for (const tab of tabs.values()) {
@@ -1027,6 +1043,37 @@ exports.createBrowser = (window, log, options = {}) => {
     contents.on('dom-ready', () => { if (live()) void syncDark(tab); });
     // So does a frame of the same site that commits or loads later (darkFramesSoon).
     contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => { if (!isMainFrame && live()) darkFramesSoon(tab); });
+    // A new document gets a page widget of its own, which starts hidden: a tab the Agent keeps awake wakes it at once
+    // (keepAwake), or the Agent's clicks after a navigation went nowhere and its screenshots timed out.
+    contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
+      if (isMainFrame && tab.awake && live()) { try { contents.setBackgroundThrottling(false); } catch { /* view is going away */ } }
+    });
+    // Page dialogs (alert, confirm, prompt) of a tab the Agent works in wait for the Agent's answer (holdDialog): the
+    // engine's own box sat over the app where the Agent could not see it, and the page and every command on it froze
+    // until a person clicked it. A dialog after a person's own input keeps the engine's handling.
+    const engineDialog = contents.listeners('-run-dialog');
+    contents.removeAllListeners('-run-dialog');
+    contents.on('-run-dialog', (info, callback) => {
+      const agentAt = tab.agentAt || 0;
+      if (live() && Date.now() - agentAt < AGENT_DIALOG_MS && agentAt >= (tab.personAt || 0)) {
+        holdDialog(tab, info, callback);
+        return;
+      }
+      if (!engineDialog.length) { callback(false, ''); return; }
+      for (const listener of engineDialog) listener.call(contents, info, callback);
+    });
+    // The engine closes a page's open dialog itself when the page goes away (a navigation, a reload).
+    contents.on('-cancel-dialogs', () => { if (tab.dialog) tab.dialog.finish(false, '', 'cancelled'); });
+    // A page that asks before it is left ("changes you made may not be saved"): when the Agent itself moved it on (its
+    // navigation, or its input that started one, a moment ago), the page is left as the Agent asked. Without an answer
+    // the engine cancels the move without a word, and the Agent waited for a page that never came.
+    contents.on('will-prevent-unload', (event) => {
+      const by = Math.max(tab.agentNavigateAt || 0, tab.agentInputAt || 0);
+      if (!live() || Date.now() - by > 15000 || (tab.personAt || 0) > by) return;
+      event.preventDefault();
+      tab.lastDialog = { type: 'beforeunload', message: '', url: tab.url, answered: 'left', accepted: true, at: Date.now() };
+      log(`网页离开前的确认已按 Agent 的操作离开：${tab.url}`);
+    });
     contents.on('did-frame-finish-load', (_event, isMainFrame) => { if (!isMainFrame && live()) darkFramesSoon(tab); });
     contents.on('did-start-loading', () => {
       if (!live()) return;
@@ -1120,9 +1167,12 @@ exports.createBrowser = (window, log, options = {}) => {
     // A person clicking or typing in a page laid out for the Agent takes it back at the panel's size (widenForAgent). The
     // Agent's own input passes here too: input right after one of its actions is the Agent's.
     contents.on('input-event', (_event, input) => {
-      if (!tab.agentWide || !live()) return;
       if (input.type !== 'mouseDown' && input.type !== 'keyDown' && input.type !== 'rawKeyDown') return;
       if (Date.now() - (tab.agentInputAt || 0) < 1500) return;
+      // A person's own input: a dialog it opens is theirs (the engine's box), not the Agent's, and so is a file chooser.
+      tab.personAt = Date.now();
+      fileChoosers.disarm(tab);
+      if (!tab.agentWide || !live()) return;
       narrowAfterAgent(tab);
     });
     // A site that goes full screen itself (a video's fullscreen button) takes the workspace into browser fullscreen with it.
@@ -1194,7 +1244,7 @@ exports.createBrowser = (window, log, options = {}) => {
     const view = adopted
       ? new WebContentsView({ webContents: adopted })
       : new WebContentsView({ webPreferences: { session: partition, contextIsolation: true, nodeIntegration: false, sandbox: true, preload, disableHtmlFullscreenWindowResize: true } });
-    const tab = { id, view, url: initialUrl || '', title: '', loading: false, error: '', challenge: false, timer: undefined, pictures: undefined, timers: new Set(), downloads: new Map(), findPending: new Map(), destroyed: false };
+    const tab = { id, view, url: initialUrl || '', title: '', loading: false, error: '', challenge: false, timer: undefined, pictures: undefined, timers: new Set(), downloads: new Map(), findPending: new Map(), dialog: null, dialogWaiters: new Set(), destroyed: false };
     tabs.set(id, tab);
     // A hidden view keeps a real viewport: background tabs lay out, take input and can be captured like the visible one.
     // The size must be set before the view is hidden: Electron does not pass bounds set on a hidden view to its page.
@@ -1226,6 +1276,7 @@ exports.createBrowser = (window, log, options = {}) => {
   const destroyTab = (tab) => {
     if (!tab || tab.destroyed) return;
     tab.destroyed = true;
+    fileChoosers.disarm(tab, { detached: true });
     clearTimeout(tab.timer);
     for (const timer of tab.timers) clearTimeout(timer);
     tab.timers.clear();
@@ -1242,11 +1293,13 @@ exports.createBrowser = (window, log, options = {}) => {
       entry.resolve({ activeMatch: 0, matches: 0, closed: true });
     }
     tab.findPending.clear();
+    // A dialog waiting for the Agent goes with its page.
+    if (tab.dialog) tab.dialog.finish(false, '', 'cancelled');
     // An Agent waiting for the user on this tab hears that the tab is gone.
     helpDesk.closed(tab);
     tabs.delete(tab.id);
     passwordManager?.forget(tab);
-    if (activeTabId === tab.id) { activeTabId = null; rectangle = null; }
+    if (activeTabId === tab.id) { activeTabId = null; rectangle = null; rectangleFits = false; }
     for (let index = networkLog.length - 1; index >= 0; index--) if (networkLog[index].tabId === tab.id) networkLog.splice(index, 1);
     const downloadsBefore = downloadLog.length;
     for (let index = downloadLog.length - 1; index >= 0; index--) if (downloadLog[index].tabId === tab.id && downloadLog[index].state !== 'completed') downloadLog.splice(index, 1);
@@ -1292,17 +1345,43 @@ exports.createBrowser = (window, log, options = {}) => {
   const snapshot = async (tab) => {
     if (tab.destroyed) throw new Error(`浏览器标签 ${tab.id} 已关闭`);
     keepAwake(tab);
-    const viewport = await viewportOf(tab).catch(() => null);
+    const contents = contentsOf(tab);
+    // While a page dialog waits for an answer the page runs no script: its last frame is taken as it is.
+    const blocked = !!tab.dialog;
+    // The view's own box in CSS pixels, for a page that cannot answer for its viewport.
+    const boxViewport = () => { try { const box = tab.view.getBounds(); const zoom = tab.zoom ?? 1; return box.width > 0 ? { width: Math.round(box.width / zoom), height: Math.round(box.height / zoom) } : null; } catch { return null; } };
+    const viewport = blocked ? boxViewport() : await withTimeout(viewportOf(tab), 3000, 'viewport').catch(() => boxViewport());
+    // Two animation frames first, so what the last action changed is drawn (a page drawing none is not waited for).
+    if (!blocked) await withTimeout(runInPage(tab, 'new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done(true))))'), 1000, 'frame').catch(() => undefined);
     let buffer;
+    const failures = [];
+    // 1. The page's latest frame copied as it is. This works while the app window is covered by another window,
+    // minimized or hidden in the tray: the DevTools capture waits for a new frame to reach the screen, which never
+    // happens then, and timed out after 15 s.
     try {
-      const shot = await withDebugger(tab, (debuggerApi) => withTimeout(debuggerApi.sendCommand('Page.captureScreenshot', { format: 'png', fromSurface: true }), 15000, '页面没有在 15 秒内完成截图'));
-      buffer = Buffer.from(String(shot?.data || ''), 'base64');
+      const image = await withTimeout(contents.capturePage({ x: 0, y: 0, width: 0, height: 0 }, { stayHidden: true, stayAwake: true }), 6000, '复制页面画面超时');
+      if (image && !image.isEmpty()) buffer = image.toPNG();
+      else failures.push('页面还没有画面');
     } catch (error) {
-      // A page whose debugger is taken (its own DevTools open) can still be captured while it is on screen.
-      if (!tab.view.getVisible()) throw error;
-      buffer = (await contentsOf(tab).capturePage()).toPNG();
+      failures.push(error.message);
     }
-    if (!buffer.length) throw new Error('截图没有返回图像');
+    // 2. The DevTools capture of a new frame, for a page whose last frame could not be copied.
+    if (!buffer) {
+      try {
+        const shot = await withDebugger(tab, (debuggerApi) => withTimeout(debuggerApi.sendCommand('Page.captureScreenshot', { format: 'png', fromSurface: true }), 8000, '页面 8 秒内没有画出新画面'));
+        buffer = Buffer.from(String(shot?.data || ''), 'base64');
+      } catch (error) {
+        failures.push(error.message);
+      }
+    }
+    if (!buffer?.length) {
+      let where = '';
+      try {
+        if (!window.isDestroyed() && !window.isVisible()) where = 'MyHarness 窗口隐藏在托盘里，窗口隐藏期间打开或跳转的网页可能画不出画面；';
+        else if (!window.isDestroyed() && window.isMinimized()) where = 'MyHarness 窗口最小化了，网页可能暂时不出画面；';
+      } catch { /* window going away */ }
+      throw new Error(`截图失败：${where}${failures.join('；')}。文字类操作（read、text、find、interactive）和点击不受影响，可以先用它们；需要看画面时请用户打开 MyHarness 窗口`);
+    }
     let image = nativeImage?.createFromBuffer ? nativeImage.createFromBuffer(buffer) : undefined;
     if (image && !image.isEmpty() && viewport?.width > 0 && viewport?.height > 0) {
       const size = image.getSize();
@@ -1312,7 +1391,7 @@ exports.createBrowser = (window, log, options = {}) => {
       }
     }
     const size = image && !image.isEmpty() ? image.getSize() : viewport || { width: 0, height: 0 };
-    return { snapshot: `data:image/png;base64,${buffer.toString('base64')}`, width: size.width, height: size.height };
+    return { snapshot: `data:image/png;base64,${buffer.toString('base64')}`, width: size.width, height: size.height, ...(tab.dialog ? { dialog: publicDialog(tab.dialog) } : {}) };
   };
 
   const withTimeout = (promise, ms, message) => new Promise((resolve, reject) => {
@@ -1330,18 +1409,89 @@ exports.createBrowser = (window, log, options = {}) => {
 
   const viewportOf = (tab) => runInPage(tab, '({ width: innerWidth, height: innerHeight })');
 
-  /** Keep a tab's page running at full speed for a while, so a background tab takes the Agent's input and paints. */
+  // ---- Page dialogs (alert, confirm, prompt) answered by the Agent ------------------------------------------------
+  let dialogSeq = 0;
+  /** What the Agent is told of a held dialog. */
+  const publicDialog = (entry) => (entry ? { type: entry.type, message: entry.message, ...(entry.type === 'prompt' ? { defaultText: entry.defaultPrompt } : {}), url: entry.url, waitingMs: Date.now() - entry.at } : null);
+  const dialogMessage = (entry) => `网页弹出了${{ alert: '提示', confirm: '确认', prompt: '输入' }[entry.type] || ''}对话框（${entry.type}）「${entry.message.slice(0, 200)}」，回答之前页面不会响应；请用 workspace 的 dialog 操作回答（accept: true 确定，false 取消${entry.type === 'prompt' ? '；text 是要填的内容' : ''}）`;
+  /**
+   * A page dialog of a tab the Agent acts in, held for the Agent instead of the engine's box over the app (which the
+   * Agent could not see, and which froze the page and every command on it until a person clicked it). The page waits,
+   * as it does for a person, until the `dialog` command answers it; one nobody answers is dismissed after
+   * DIALOG_WAIT_MS. Commands that were waiting on the page (a click whose handler opened it) end at once and report it.
+   */
+  const holdDialog = (tab, info, callback) => {
+    if (tab.dialog) tab.dialog.finish(false, '', 'replaced');
+    const type = ['alert', 'confirm', 'prompt'].includes(info?.dialogType) ? info.dialogType : 'alert';
+    let url = tab.url;
+    try { url = info?.frame?.url || tab.url; } catch { /* frame gone */ }
+    const entry = { id: ++dialogSeq, type, message: String(info?.messageText ?? '').slice(0, 1000), defaultPrompt: String(info?.defaultPromptText ?? '').slice(0, 500), url, at: Date.now() };
+    let done = false;
+    entry.finish = (accept, text, how) => {
+      if (done) return;
+      done = true;
+      clearTimeout(entry.timer);
+      if (tab.dialog === entry) tab.dialog = null;
+      const answer = type === 'prompt' && accept ? String(text ?? entry.defaultPrompt ?? '') : '';
+      tab.lastDialog = { ...publicDialog(entry), answered: how, accepted: !!accept, ...(type === 'prompt' && accept ? { text: answer } : {}), at: Date.now() };
+      // A dialog the engine cancelled itself (the page navigated away) has nobody left to answer.
+      if (how !== 'cancelled') { try { callback(!!accept, answer); } catch { /* page gone */ } }
+      if (!tab.destroyed && tabs.get(tab.id) === tab) commit(tab, {});
+    };
+    entry.timer = later(tab, () => {
+      log(`网页对话框 ${Math.round(DIALOG_WAIT_MS / 1000)} 秒无人回答，已取消：${entry.message.slice(0, 80)}`);
+      entry.finish(false, '', 'timeout');
+    }, DIALOG_WAIT_MS);
+    tab.dialog = entry;
+    for (const waiter of [...tab.dialogWaiters]) waiter();
+    commit(tab, {});
+  };
+  const DIALOG_OPENED = Symbol('dialog');
+  /** A page dialog opened while a command waited on the page; the command reports it instead of hanging. */
+  class DialogOpened extends Error {
+    constructor(tab) {
+      super(tab.dialog ? dialogMessage(tab.dialog) : '网页弹出的对话框已经关闭，请重试');
+      this.dialog = publicDialog(tab.dialog);
+    }
+  }
+  /** A page command a page dialog may interrupt: its answer, or DIALOG_OPENED as soon as a dialog is held instead. */
+  const untilDialog = (tab, promise) => {
+    if (!tab.dialogWaiters) return promise;
+    if (tab.dialog) {
+      promise.catch(() => undefined);
+      return Promise.resolve(DIALOG_OPENED);
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = () => {
+        tab.dialogWaiters.delete(waiter);
+        promise.catch(() => undefined);
+        resolve(DIALOG_OPENED);
+      };
+      tab.dialogWaiters.add(waiter);
+      promise.then((value) => { tab.dialogWaiters.delete(waiter); resolve(value); }, (error) => { tab.dialogWaiters.delete(waiter); reject(error); });
+    });
+  };
+
+  /**
+   * Keep a tab's page running at full speed for a while, so a background tab takes the Agent's input and paints. Every
+   * call sets it again, not only the first: each new document of the page (a navigation, a reload, a send that moves the
+   * page on) gets a widget of its own that starts hidden, which the earlier call never reached. That widget dropped the
+   * Agent's clicks and never drew a frame to capture ("页面没有在 15 秒内完成截图", again and again after the page moved).
+   */
   const keepAwake = (tab) => {
     const contents = contentsOf(tab);
     tab.agentInputAt = Date.now();
+    tab.agentAt = Date.now();
+    try { contents.setBackgroundThrottling(false); } catch { /* older engine: input may wait for the tab to show */ }
     if (!tab.awake) {
-      try { contents.setBackgroundThrottling(false); } catch { /* older engine: input may wait for the tab to show */ }
       tab.awake = true;
     }
     clearTimeout(tab.awakeTimer);
     tab.awakeTimer = later(tab, () => {
       tab.awake = false;
       try { contentsOf(tab).setBackgroundThrottling(true); } catch { /* view is going away */ }
+      // The page's upload buttons open the system window again (browser-file-chooser.cjs).
+      fileChoosers.disarm(tab);
     }, AGENT_AWAKE_MS);
   };
 
@@ -1351,11 +1501,12 @@ exports.createBrowser = (window, log, options = {}) => {
    * clicks the whole page the site gives a desktop (a chat's full conversation, not the narrow layout of the panel).
    * The panel's size comes back AGENT_WIDE_IDLE_MS after the Agent's last action or when a person clicks or types in the
    * page (narrowAfterAgent). Resolves once the page has its new size, so the Agent's next look sees the new layout.
+   * A box the user watches (`fit`: collaboration mode, browser fullscreen) keeps the page at its own size.
    */
   const widenForAgent = async (tab) => {
     clearTimeout(tab.agentWideTimer);
     tab.agentWideTimer = later(tab, () => narrowAfterAgent(tab), AGENT_WIDE_IDLE_MS);
-    if (tab.agentWide || tab.id !== activeTabId || !tab.view?.getVisible()) return;
+    if (tab.agentWide || rectangleFits || tab.id !== activeTabId || !tab.view?.getVisible()) return;
     const bounds = boundsForRectangle();
     if (!bounds || (bounds.width >= AGENT_VIEWPORT.width && bounds.height >= AGENT_VIEWPORT.height)) return;
     tab.agentWide = true;
@@ -1463,6 +1614,7 @@ exports.createBrowser = (window, log, options = {}) => {
     const kind = String(value.kind || 'click');
     keepAwake(tab);
     const downloadsBefore = downloadSeq;
+    const choosersBefore = fileChoosers.seq(tab);
     let x = Number(value.x);
     let y = Number(value.y);
     // No point given: aim at an element (selector, index or visible label) like the click command does.
@@ -1477,7 +1629,9 @@ exports.createBrowser = (window, log, options = {}) => {
     const button = ['left', 'right', 'middle'].includes(value.button) ? value.button : kind === 'right_click' ? 'right' : 'left';
     const modifiers = modifierBits(value.modifiers);
     const target = kind === 'move' || kind === 'wheel' || kind === 'up' ? undefined : await describePoint(tab, x, y);
-    await withDebugger(tab, async (debuggerApi) => {
+    // A press whose handler opens a page dialog does not finish until the dialog is answered: the answer then says so at
+    // once (the page waits for the `dialog` command) instead of hanging until the call timed out.
+    const sent = await untilDialog(tab, withDebugger(tab, async (debuggerApi) => {
       const send = (params) => {
         tab.agentInputAt = Date.now();
         return debuggerApi.sendCommand('Input.dispatchMouseEvent', { modifiers, pointerType: 'mouse', ...params });
@@ -1501,9 +1655,10 @@ exports.createBrowser = (window, log, options = {}) => {
       } else if (kind === 'wheel') {
         await send({ type: 'mouseWheel', x, y, button: 'none', buttons: 0, deltaX: Number(value.deltaX) || 0, deltaY: Number(value.deltaY) || 0 });
       } else if (kind !== 'move') throw new Error(`未知的鼠标操作：${kind}`);
-    });
+    }));
     const endX = kind === 'drag' ? toX : x;
     const endY = kind === 'drag' ? toY : y;
+    if (sent === DIALOG_OPENED) return { ok: true, kind, x, y, ...(kind === 'drag' ? { toX, toY } : {}), viewport, target: target || undefined, dialog: publicDialog(tab.dialog) };
     showCursor(tab, endX, endY, kind !== 'move' && kind !== 'wheel');
     // A click may start a download: report it (and wait for it) right here, so the Agent learns where the file went
     // without searching for it. A control that names a download or a file is given longer to start one.
@@ -1512,7 +1667,9 @@ exports.createBrowser = (window, log, options = {}) => {
       const looksLikeFile = DOWNLOAD_HINT.test(`${target?.text || ''} ${target?.href || ''}`);
       downloads = await awaitDownloads(tab, downloadsBefore, looksLikeFile ? 6000 : 400, 30000);
     }
-    return { ok: true, kind, x, y, ...(kind === 'drag' ? { toX, toY } : {}), viewport, target: target || undefined, ...(downloads.length ? { downloads } : {}) };
+    // A press that opened the page's file chooser: no window was shown (browser-file-chooser.cjs); the answer says so.
+    const fileChooser = fileChoosers.chooserNote(tab, choosersBefore);
+    return { ok: true, kind, x, y, ...(kind === 'drag' ? { toX, toY } : {}), viewport, target: target || undefined, ...(downloads.length ? { downloads } : {}), ...(fileChooser ? { fileChooser } : {}) };
   };
 
   /**
@@ -1542,12 +1699,16 @@ exports.createBrowser = (window, log, options = {}) => {
     const repeat = Math.max(1, Math.min(50, Number.isInteger(value.repeat) ? value.repeat : 1));
     const events = list.map((combo) => keyEvents(combo));
     keepAwake(tab);
-    await withDebugger(tab, async (debuggerApi) => {
+    const choosersBefore = fileChoosers.seq(tab);
+    const sent = await untilDialog(tab, withDebugger(tab, async (debuggerApi) => {
       for (let round = 0; round < repeat; round++) {
         for (const sequence of events) for (const event of sequence) { tab.agentInputAt = Date.now(); await debuggerApi.sendCommand('Input.dispatchKeyEvent', event); }
       }
-    });
-    return { ok: true, keys: list, repeat, focused: await focusedElement(tab) };
+    }));
+    if (sent === DIALOG_OPENED) return { ok: true, keys: list, repeat, focused: null, dialog: publicDialog(tab.dialog) };
+    const focused = await focusedElement(tab);
+    const fileChooser = fileChoosers.chooserNote(tab, choosersBefore);
+    return { ok: true, keys: list, repeat, focused, ...(fileChooser ? { fileChooser } : {}) };
   };
 
   /** Type text into whatever has the keyboard focus, as an input method would (any language, no per-key mapping). */
@@ -1558,62 +1719,62 @@ exports.createBrowser = (window, log, options = {}) => {
   const insertText = async (tab, text, options = {}) => {
     keepAwake(tab);
     if (options.replace) await runInPage(tab, page.inPage(page.pageSelectFocused, { richToo: options.replace === true }));
-    await withDebugger(tab, async (debuggerApi) => {
+    const sent = await untilDialog(tab, withDebugger(tab, async (debuggerApi) => {
       if (text) await debuggerApi.sendCommand('Input.insertText', { text });
       else if (options.replace) for (const event of keyEvents('Delete')) await debuggerApi.sendCommand('Input.dispatchKeyEvent', event);
-    });
+    }));
+    if (sent === DIALOG_OPENED) return { ok: true, focused: null, dialog: publicDialog(tab.dialog) };
     return { ok: true, focused: await focusedElement(tab) };
   };
 
-  const accessibilityTree = async (tab) => {
-    const contents = contentsOf(tab);
-    const debuggerApi = contents.debugger;
-    let attached = false;
-    try {
-      if (!debuggerApi.isAttached()) { debuggerApi.attach('1.3'); attached = true; }
-    } catch (error) { throw new Error(`无法附加可访问性调试器：${error.message}`); }
-    try {
-      await debuggerApi.sendCommand('Accessibility.enable');
-      const result = await debuggerApi.sendCommand('Accessibility.getFullAXTree');
-      const nodes = Array.isArray(result?.nodes) ? result.nodes : [];
-      const pick = (node) => {
-        const properties = Object.fromEntries((node.properties || []).map((property) => [property.name, property.value?.value]));
-        return {
-          id: node.nodeId,
-          role: node.role?.value,
-          name: typeof node.name?.value === 'string' ? node.name.value.slice(0, 200) : '',
-          description: typeof node.description?.value === 'string' ? node.description.value.slice(0, 200) : '',
-          value: node.value?.value === undefined ? undefined : String(node.value.value).slice(0, 200),
-          ignored: node.ignored === true,
-          properties,
-          children: (node.childIds || []).slice(0, 80),
-        };
+  const accessibilityTree = (tab) => withDebugger(tab, async (debuggerApi) => {
+    await debuggerApi.sendCommand('Accessibility.enable');
+    const result = await debuggerApi.sendCommand('Accessibility.getFullAXTree');
+    const nodes = Array.isArray(result?.nodes) ? result.nodes : [];
+    const pick = (node) => {
+      const properties = Object.fromEntries((node.properties || []).map((property) => [property.name, property.value?.value]));
+      return {
+        id: node.nodeId,
+        role: node.role?.value,
+        name: typeof node.name?.value === 'string' ? node.name.value.slice(0, 200) : '',
+        description: typeof node.description?.value === 'string' ? node.description.value.slice(0, 200) : '',
+        value: node.value?.value === undefined ? undefined : String(node.value.value).slice(0, 200),
+        ignored: node.ignored === true,
+        properties,
+        children: (node.childIds || []).slice(0, 80),
       };
-      return nodes.map(pick);
-    } finally {
-      if (attached) { try { debuggerApi.detach(); } catch { /* already gone */ } }
-    }
-  };
+    };
+    return nodes.map(pick);
+  });
 
   const runInPage = async (tab, expression) => {
-    const value = await contentsOf(tab).executeJavaScript(expression, true);
+    const value = await untilDialog(tab, contentsOf(tab).executeJavaScript(expression, true));
+    if (value === DIALOG_OPENED) throw new DialogOpened(tab);
     return value === undefined ? null : value;
   };
 
-  /** Run `fn` with the page's debugger attached; detach again when this call attached it (an AX read may already hold it). */
+  /**
+   * Run `fn` with the page's debugger attached. Calls may overlap (a click held up by a page dialog still holds it while
+   * the dialog is answered), so the debugger is detached only when the last call that uses it is done, and only when
+   * these calls attached it.
+   */
   const withDebugger = async (tab, fn) => {
     const contents = contentsOf(tab);
     const debuggerApi = contents.debugger;
-    let attached = false;
     try {
-      if (!debuggerApi.isAttached()) { debuggerApi.attach('1.3'); attached = true; }
+      if (!debuggerApi.isAttached()) { debuggerApi.attach('1.3'); tab.debuggerOwned = true; }
     } catch (error) {
       throw new Error(`无法附加网页调试器：${error.message}`);
     }
+    tab.debuggerUsers = (tab.debuggerUsers || 0) + 1;
     try {
       return await fn(debuggerApi);
     } finally {
-      if (attached) { try { debuggerApi.detach(); } catch { /* already gone */ } }
+      tab.debuggerUsers -= 1;
+      if (tab.debuggerUsers === 0 && tab.debuggerOwned) {
+        tab.debuggerOwned = false;
+        try { debuggerApi.detach(); } catch { /* already gone */ }
+      }
     }
   };
 
@@ -1659,70 +1820,39 @@ exports.createBrowser = (window, log, options = {}) => {
     return { ok: true };
   };
 
-  /** A workspace file that the Agent may hand to a page's file input; anything outside the workspace is refused. */
-  const workspaceUploadFile = (value) => {
-    if (!workspaceRoot) throw new Error('当前桌面宿主没有工作区根目录，不能上传文件');
-    if (typeof value !== 'string' || !value) throw new Error('upload 需要工作区内的文件路径');
-    const path = require('node:path');
-    const fs = require('node:fs');
-    let root;
-    try { root = fs.realpathSync(workspaceRoot); } catch (error) { throw new Error(`无法读取工作区目录：${error.message}`); }
-    let file;
-    try { file = fs.realpathSync(path.resolve(root, value)); } catch { throw new Error(`上传文件不存在：${value}`); }
-    if (!insideRoot(root, file)) throw new Error('只能上传当前工作区内的文件');
-    const stat = fs.statSync(file);
-    if (!stat.isFile()) throw new Error('只能上传普通文件，不能上传目录或设备');
-    if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`上传文件超过 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MiB 上限`);
-    return { absolute: file, name: path.basename(file), size: stat.size, relative: path.relative(root, file).replace(/\\/g, '/') };
-  };
-
   /**
-   * Put one workspace file into a page's `<input type="file">` without opening the system picker. The element is found by
-   * CSS selector or by the index from `interactive`; a missing or non-file element is an error, and the page receives the
-   * same input/change events a person's choice would produce.
+   * Keep the tab's debugger attached for a caller that listens to it over time (the file chooser takeover), counted
+   * like withDebugger's calls so neither detaches it under the other.
    */
-  const uploadFile = async (tab, info, selector, index) => {
-    return withDebugger(tab, async (debuggerApi) => {
-      const expression = Number.isInteger(index)
-        ? `(${page.pageHelpers})(${JSON.stringify(INTERACTIVE_QUERY)}).all(${JSON.stringify(INTERACTIVE_QUERY)})[${index}]`
-        : `document.querySelector(${JSON.stringify(selector)})`;
-      const found = await debuggerApi.sendCommand('Runtime.evaluate', { expression, objectGroup: 'myharness-upload' });
-      const objectId = found?.result?.objectId;
-      if (!objectId) {
-        throw new Error(Number.isInteger(index) ? `没有索引为 ${index} 的可交互元素` : `没有匹配 ${selector} 的元素`);
-      }
-      try {
-        const described = await debuggerApi.sendCommand('Runtime.callFunctionOn', {
-          objectId,
-          returnByValue: true,
-          functionDeclaration: 'function(){ return { tag: this.tagName, type: this.type || "", disabled: !!this.disabled, multiple: !!this.multiple }; }',
-        });
-        const element = described?.result?.value || {};
-        if (element.tag !== 'INPUT' || element.type !== 'file') throw new Error('目标元素不是 <input type="file">');
-        if (element.disabled) throw new Error('目标文件输入框已禁用');
-        try { await debuggerApi.sendCommand('DOM.enable'); } catch { /* older Electron may not need it */ }
-        // DOM.setFileInputFiles fires input and change itself, as a person's choice does. What the input holds is noted
-        // when its change event starts (capture on its root, before the page's handlers): pages often empty the input in
-        // their handler so the same file can be chosen again, which read as "no file", and the change sent here on top
-        // made them take the file twice. Only when no change came are the events sent here.
-        await debuggerApi.sendCommand('Runtime.callFunctionOn', {
-          objectId,
-          functionDeclaration: 'function(){ const input = this; const root = input.getRootNode(); const note = (event) => { if (event.target !== input) return; input.__myharnessUpload = { count: input.files ? input.files.length : 0, name: input.files && input.files[0] ? input.files[0].name : "" }; }; input.__myharnessUpload = null; input.__myharnessUploadStop = () => root.removeEventListener("change", note, true); root.addEventListener("change", note, true); }',
-        });
-        await debuggerApi.sendCommand('DOM.setFileInputFiles', { files: [info.absolute], objectId });
-        const after = await debuggerApi.sendCommand('Runtime.callFunctionOn', {
-          objectId,
-          returnByValue: true,
-          functionDeclaration: 'function(){ if (!this.__myharnessUpload) { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); } const seen = this.__myharnessUpload || { count: this.files ? this.files.length : 0, name: this.files && this.files[0] ? this.files[0].name : "" }; if (this.__myharnessUploadStop) this.__myharnessUploadStop(); delete this.__myharnessUpload; delete this.__myharnessUploadStop; return seen; }',
-        });
-        const files = after?.result?.value || {};
-        if (!files.count) throw new Error('文件输入框没有接收到文件');
-        return { ok: true, name: files.name || info.name, size: info.size, path: info.relative, count: files.count };
-      } finally {
-        try { await debuggerApi.sendCommand('Runtime.releaseObjectGroup', { objectGroup: 'myharness-upload' }); } catch { /* debugger may be gone */ }
-      }
-    });
+  const holdDebugger = (tab) => {
+    const debuggerApi = contentsOf(tab).debugger;
+    if (!debuggerApi.isAttached()) { debuggerApi.attach('1.3'); tab.debuggerOwned = true; }
+    tab.debuggerUsers = (tab.debuggerUsers || 0) + 1;
+    let released = false;
+    return {
+      api: debuggerApi,
+      release: () => {
+        if (released) return;
+        released = true;
+        tab.debuggerUsers -= 1;
+        if (tab.debuggerUsers === 0 && tab.debuggerOwned && !tab.destroyed) {
+          tab.debuggerOwned = false;
+          try { debuggerApi.detach(); } catch { /* already gone */ }
+        }
+      },
+    };
   };
+  // Files for pages, and the page's file chooser while the Agent works on a tab (browser-file-chooser.cjs).
+  const fileChoosers = createFileChoosers({
+    hold: holdDebugger,
+    mouse: (tab, value) => mouse(tab, value),
+    click: (tab, value) => click(tab, value),
+    inPage: page.inPage,
+    pageLocate: page.pageLocate,
+    pageHelpers: page.pageHelpers,
+    interactiveQuery: INTERACTIVE_QUERY,
+    log,
+  });
 
   /**
    * Find one element the way a person would point at it: by the index from `interactive`, a CSS selector, or its visible
@@ -1752,10 +1882,13 @@ exports.createBrowser = (window, log, options = {}) => {
     const base = { ok: true, tag: found.tag, text: found.text || '', x: found.x, y: found.y };
     if (found.inView && !found.covered) {
       const pressed = await mouse(tab, { kind: value.double ? 'double_click' : 'click', x: found.x, y: found.y, button: value.button, modifiers: value.modifiers });
-      return { ...base, how: 'mouse', ...(pressed.downloads ? { downloads: pressed.downloads } : {}) };
+      return { ...base, how: 'mouse', ...(pressed.downloads ? { downloads: pressed.downloads } : {}), ...(pressed.fileChooser ? { fileChooser: pressed.fileChooser } : {}) };
     }
+    const choosersBefore = fileChoosers.seq(tab);
     await runInPage(tab, 'window.__myharnessTarget && window.__myharnessTarget.click()');
-    return { ...base, how: 'script', ...(found.covered ? { covered: found.covered } : { offscreen: true }) };
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const fileChooser = fileChoosers.chooserNote(tab, choosersBefore);
+    return { ...base, how: 'script', ...(found.covered ? { covered: found.covered } : { offscreen: true }), ...(fileChooser ? { fileChooser } : {}) };
   };
 
   /**
@@ -2044,7 +2177,10 @@ exports.createBrowser = (window, log, options = {}) => {
       if (!provider) throw new Error('内置浏览器里没有登录 Gmail 或 Outlook 网页版：请先在内置浏览器登录，或在 设置 → 连接 里连接邮箱');
     }
     const strings = (list) => (Array.isArray(list) ? list.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim()).slice(0, 50) : []);
-    const message = { to: strings(value.to), cc: strings(value.cc), bcc: strings(value.bcc), subject: String(value.subject || ''), text: String(value.text || '') };
+    const message = { to: strings(value.to), cc: strings(value.cc), bcc: strings(value.bcc), subject: String(value.subject || ''), text: String(value.text || ''), attachments: strings(value.attachments) };
+    // Attachments are files of this computer named by their full path; they are checked before a page opens.
+    for (const file of message.attachments) if (!require('node:path').isAbsolute(file)) throw new Error(`附件需要完整路径：${file}`);
+    attachmentFiles(message.attachments);
     const sender = new BrowserWindow({
       show: false,
       width: AGENT_VIEWPORT.width,
@@ -2056,7 +2192,7 @@ exports.createBrowser = (window, log, options = {}) => {
       contents.setAudioMuted(true);
       contents.setWindowOpenHandler(() => ({ action: 'deny' }));
       setAgent(contents, provider === 'google' ? 'https://mail.google.com/' : 'https://outlook.live.com/');
-      const sent = await sendThroughPage(contents, { provider, message, account, timeoutMs: bounded(value.timeoutMs, 10000, 120000, 60000), log });
+      const sent = await sendThroughPage(contents, { provider, message, account, timeoutMs: bounded(value.timeoutMs, 10000, 300000, 60000), log });
       log(`已通过 ${provider === 'google' ? 'Gmail' : 'Outlook'} 网页发出邮件（${sent.ms} ms）`);
       const from = signedIn[provider]?.account;
       return { ...sent, ...(from ? { account: from } : {}) };
@@ -2089,6 +2225,9 @@ exports.createBrowser = (window, log, options = {}) => {
       if (tab && !tab.destroyed) {
         keepAwake(tab);
         await widenForAgent(tab);
+        // What the Agent presses may open the page's file chooser: no system window may open for it; in the background
+        // nobody could answer it and every later command waited behind it.
+        if (CHOOSER_GUARDED.has(action)) await fileChoosers.arm(tab);
       }
     }
     if (context.agent === true && CHALLENGE_REFUSED.has(action)) {
@@ -2119,6 +2258,7 @@ exports.createBrowser = (window, log, options = {}) => {
         activeTabId = target.id;
         // A new tab starts hidden until the page reports where its box is; an old rectangle must not place it.
         rectangle = cleanRect(value.rect);
+        rectangleFits = !!rectangle && value.fit === true;
         placeActive();
         if (existing && value.url) {
           const next = exports.httpUrl(value.url);
@@ -2141,6 +2281,7 @@ exports.createBrowser = (window, log, options = {}) => {
         activeTabId = target.id;
         // Never reuse the previous tab's or the previous activation's rectangle: the page measures and sends a fresh one.
         rectangle = cleanRect(value.rect);
+        rectangleFits = !!rectangle && value.fit === true;
         clipRectangle = null;
         stopFrames();
         placeActive();
@@ -2163,8 +2304,10 @@ exports.createBrowser = (window, log, options = {}) => {
           if (order !== boundsOrder) return { ok: true, superseded: true };
         }
         rectangle = next;
-        // `clip`: the part of the box the page leaves uncovered. `live`: the view is hidden for an animation over its
-        // place, and the page shows moving frames of it there until the next rectangle.
+        // `fit`: the user watches the page in this box (collaboration mode, browser fullscreen), so it is laid out at
+        // exactly its size. `clip`: the part of the box the page leaves uncovered. `live`: the view is hidden for an
+        // animation over its place, and the page shows moving frames of it there until the next rectangle.
+        rectangleFits = !!next && value.fit === true;
         clipRectangle = next ? cleanRect(value.clip) : null;
         placeActive();
         if (!next && value.live === true) startFrames(tabs.get(activeTabId));
@@ -2372,10 +2515,18 @@ exports.createBrowser = (window, log, options = {}) => {
       case 'wait':
         return waitFor(requireTab(value.tabId), value);
       case 'upload': {
-        const index = Number.isInteger(value.index) ? value.index : undefined;
-        if (index === undefined && (typeof value.selector !== 'string' || !value.selector)) throw new Error('upload 需要 selector 或 index');
-        const info = workspaceUploadFile(value.path);
-        return uploadFile(requireTab(value.tabId), info, value.selector, index);
+        // The chat names its folders (`roots`: its own, then its artifacts); without them, the folder the host started in.
+        const roots = Array.isArray(value.roots) && value.roots.length ? value.roots : workspaceRoot ? [workspaceRoot] : [];
+        const files = uploadFiles(Array.isArray(value.paths) && value.paths.length ? value.paths : value.path, { roots });
+        const tab = requireTab(value.tabId);
+        keepAwake(tab);
+        return fileChoosers.upload(tab, files, {
+          selector: typeof value.selector === 'string' && value.selector ? value.selector : undefined,
+          index: Number.isInteger(value.index) ? value.index : undefined,
+          label: typeof value.label === 'string' && value.label.trim() ? value.label : undefined,
+          x: Number.isFinite(value.x) ? value.x : undefined,
+          y: Number.isFinite(value.y) ? value.y : undefined,
+        });
       }
       case 'text': {
         const target = requireTab(value.tabId);
@@ -2517,6 +2668,7 @@ exports.createBrowser = (window, log, options = {}) => {
     },
     bounds: (rect) => {
       rectangle = cleanRect(rect);
+      rectangleFits = false;
       clipRectangle = null;
       if (rectangle && !tabs.has(activeTabId || DEFAULT_TAB)) {
         const tab = createTab(undefined);
@@ -2532,6 +2684,7 @@ exports.createBrowser = (window, log, options = {}) => {
       for (const tab of [...tabs.values()]) destroyTab(tab);
       activeTabId = null;
       rectangle = null;
+      rectangleFits = false;
     },
     snapshot: () => {
       const tab = tabs.get(activeTabId);

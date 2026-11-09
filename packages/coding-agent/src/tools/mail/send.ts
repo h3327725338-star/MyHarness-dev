@@ -2,11 +2,14 @@
  * One email sent, for the `mail` tool (a message without an API path) and for scheduled emails (schedules/): through the
  * mailbox connected to the mail tool by its API when there is one (Gmail API messages/send, Microsoft Graph sendMail),
  * else through the Gmail or Outlook website the user is signed in to in the built-in browser (the desktop host's
- * `webMailSend`, packages/desktop/browser-web-mail-send.cjs: the website's compose page opens already filled in and its
- * Send button is pressed). Either way no model works a compose form, so the email leaves within seconds. An Agent that
- * filled Gmail's form itself took minutes for one email.
+ * `webMailSend`, packages/desktop/browser-web-mail-send.cjs: the website's compose page opens with the recipients and
+ * subject, the text is typed in, attachments go to the page's own file chooser, and its Send button is pressed). Either
+ * way no model works a compose form, so the email leaves within seconds. An Agent that filled Gmail's form itself took
+ * minutes for one email.
  */
+import { stat } from "node:fs/promises";
 import type { MailAccount, MailConnections } from "../../providers/credentials/mail-connections.ts";
+import { resolveReadPath } from "../path-utils.ts";
 import type { DesktopWorkspaceChannel } from "../workspace.ts";
 import { applyMessage, type MailMessageInput } from "./message.ts";
 
@@ -21,6 +24,8 @@ export interface MailSent {
 	provider: "google" | "microsoft";
 	/** The address it was sent from, when known. */
 	account?: string;
+	/** The file names the website showed attached (website sends with attachments). */
+	attached?: string[];
 	ms: number;
 }
 
@@ -35,6 +40,10 @@ export interface SendMailOptions {
 
 const SEND_PATH = { google: "/gmail/v1/users/me/messages/send", microsoft: "/v1.0/me/sendMail" } as const;
 const WEB_SEND_TIMEOUT_MS = 60_000;
+/** The longest a website send may take with attachments being uploaded (the desktop host allows the same). */
+const WEB_SEND_TIMEOUT_MAX_MS = 300_000;
+/** What Gmail and Outlook on the web take as attachments of one message. */
+const WEB_ATTACHMENT_LIMIT_BYTES = 25 * 1024 * 1024;
 
 const label = (provider: MailAccount["provider"]) => (provider === "google" ? "Gmail" : "Outlook");
 
@@ -84,11 +93,39 @@ export async function sendMail(mail: OutgoingMail, options: SendMailOptions): Pr
 		throw new Error(
 			"没有可以发信的邮箱：设置 → 连接 里没有连接邮箱 API，这里也没有内置浏览器可用（需要 MyHarness 桌面版）。",
 		);
-	if (mail.attachments?.length || mail.html)
+	if (mail.html)
 		throw new Error(
-			"通过 Gmail/Outlook 网页发信只支持纯文本，不能带附件或 HTML；请在 设置 → 连接 里连接邮箱 API 后再发。",
+			"通过 Gmail/Outlook 网页发信只支持纯文本正文（message.text），不能用 HTML；需要 HTML 正文请在 设置 → 连接 里连接邮箱 API。",
 		);
 	if (!mail.subject?.trim()) throw new Error("通过 Gmail/Outlook 网页发信需要主题（message.subject）。");
+	// Attachments go to the website's own file chooser by their full path; each is checked here first, and the time
+	// allowed grows with their size (the website uploads them before Send is pressed).
+	const attachments: string[] = [];
+	let attachmentBytes = 0;
+	for (const path of mail.attachments ?? []) {
+		const resolved = resolveReadPath(path, options.cwd);
+		let info: Awaited<ReturnType<typeof stat>>;
+		try {
+			info = await stat(resolved);
+		} catch {
+			throw new Error(`无法读取附件：${path}`);
+		}
+		if (!info.isFile()) throw new Error(`附件只能是文件，不能是目录：${path}`);
+		attachmentBytes += info.size;
+		attachments.push(resolved);
+	}
+	if (attachmentBytes > WEB_ATTACHMENT_LIMIT_BYTES)
+		throw new Error(
+			`附件一共 ${(attachmentBytes / 1048576).toFixed(1)} MB，超过 Gmail/Outlook 网页的 25 MB 上限；请改为发送网盘链接。`,
+		);
+	// A form that has to be loaded a second time (see browser-web-mail-send.cjs) and a long text get a little more time.
+	const textLength = (mail.text ?? "").length;
+	const timeoutMs = Math.min(
+		WEB_SEND_TIMEOUT_MAX_MS,
+		WEB_SEND_TIMEOUT_MS +
+			Math.ceil(textLength / 5_000) * 5_000 +
+			(attachments.length ? 30_000 + Math.ceil(attachmentBytes / 1048576) * 4_000 : 0),
+	);
 	const value = (await options.channel.request(
 		{
 			action: "webMailSend",
@@ -97,17 +134,19 @@ export async function sendMail(mail: OutgoingMail, options: SendMailOptions): Pr
 			bcc: mail.bcc ?? [],
 			subject: mail.subject,
 			text: mail.text ?? "",
+			...(attachments.length ? { attachments } : {}),
 			...(mail.account ? { account: mail.account } : {}),
-			timeoutMs: WEB_SEND_TIMEOUT_MS,
+			timeoutMs,
 		},
-		WEB_SEND_TIMEOUT_MS + 15_000,
-	)) as { ok?: boolean; provider?: string; account?: string } | null;
+		timeoutMs + 15_000,
+	)) as { ok?: boolean; provider?: string; account?: string; attached?: string[] } | null;
 	const provider = value?.provider === "microsoft" ? "microsoft" : "google";
 	if (!value?.ok) throw new Error(`${label(provider)} 网页没有确认发出这封邮件。`);
 	return {
 		via: "web",
 		provider,
 		...(value.account ? { account: value.account } : {}),
+		...(Array.isArray(value.attached) && value.attached.length ? { attached: value.attached.map(String) } : {}),
 		ms: now() - started,
 	};
 }
@@ -118,5 +157,8 @@ export function describeMailSent(sent: MailSent, to: readonly string[]): string 
 		sent.via === "api"
 			? `${label(sent.provider)} API${sent.account ? ` (${sent.account})` : ""}`
 			: `${label(sent.provider)} website in the built-in browser${sent.account ? ` (${sent.account})` : ""}`;
-	return `sent to ${to.join(", ")} through the ${how} in ${(sent.ms / 1000).toFixed(1)} s`;
+	const files = sent.attached?.length
+		? ` with ${sent.attached.length} attachment(s): ${sent.attached.join(", ")}`
+		: "";
+	return `sent to ${to.join(", ")} through the ${how}${files} in ${(sent.ms / 1000).toFixed(1)} s`;
 }

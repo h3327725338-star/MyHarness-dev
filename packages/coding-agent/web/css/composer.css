@@ -451,7 +451,9 @@ button.env-chip:hover { color: var(--text); background: var(--surface-hover); }
 .popover.set-multiselect-pop { width: 320px; max-width: min(420px, calc(100vw - 16px)); padding: 4px; }
 .set-multiselect-menu { display: flex; flex-direction: column; min-width: 0; width: 100%; }
 .set-multiselect-list { max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
-.set-multiselect-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 28px; padding: 4px 8px; border-radius: var(--r-xs); border: 0; background: none; color: var(--text); font-size: var(--fs-code); text-align: left; cursor: pointer; transition: background var(--t-fast); }
+/* `flex: none`: the list is a height-capped flex column, which would otherwise squeeze every row down to its 28px minimum
+   and let a wrapped name run into the rows below. */
+.set-multiselect-item { flex: none; display: flex; align-items: center; gap: 8px; width: 100%; min-height: 28px; padding: 4px 8px; border-radius: var(--r-xs); border: 0; background: none; color: var(--text); font-size: var(--fs-code); text-align: left; cursor: pointer; transition: background var(--t-fast); }
 .set-multiselect-item:hover:not(:disabled), .set-multiselect-item.hi { background: var(--surface-hover); color: var(--text); }
 .set-multiselect-item.active { background: var(--surface-select); }
 .set-multiselect-item.locked { cursor: default; }
@@ -462,9 +464,13 @@ button.env-chip:hover { color: var(--text); background: var(--surface-hover); }
 .set-multiselect-option-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .set-multiselect-option-hint { flex: none; font-size: var(--fs-xs); color: var(--text-3); margin-left: auto; max-width: 120px; }
 .set-multiselect-unknown-hint { flex: none; font-size: var(--fs-mini); color: var(--text-3); margin-left: auto; }
-.set-multiselect-full .set-multiselect-item { flex-wrap: wrap; }
-.set-multiselect-full .set-multiselect-option-label { white-space: normal; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; }
-.set-multiselect-full .set-multiselect-unknown-hint { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+/* Full names: a long name wraps inside its own column (basis 0, so it never drops below the checkbox); the checkbox and the
+   short hint stay on its first line, and the "not in the list" note takes a line of its own under the name. */
+.set-multiselect-full .set-multiselect-item { flex-wrap: wrap; align-items: flex-start; row-gap: 2px; }
+.set-multiselect-full .set-multiselect-item .multi-box { margin-top: 2px; }
+.set-multiselect-full .set-multiselect-option-label { flex: 1 1 0; white-space: normal; overflow-wrap: anywhere; overflow: visible; text-overflow: clip; }
+.set-multiselect-full .set-multiselect-option-hint { margin-top: 2px; }
+.set-multiselect-full .set-multiselect-unknown-hint { flex: 1 0 100%; padding-left: 22px; margin-left: 0; white-space: normal; overflow-wrap: anywhere; }
 .model-menu .pop-scroll { max-height: 300px; }
 .model-menu .empty { padding: 14px 10px; font-size: var(--fs-sm); }
 .model-row.hi { background: var(--surface-hover); color: var(--text); }

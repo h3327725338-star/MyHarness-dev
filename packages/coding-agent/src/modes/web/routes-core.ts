@@ -9,6 +9,7 @@ import { buildContextBreakdown } from "../../context/context-breakdown.ts";
 import { WorktreeMergedRecords } from "../../git/worktrees/merged-records.ts";
 import { readImageBytes, storedSessionImage } from "../../session/storage/jsonl/image-files.ts";
 import { formatSkillsForPrompt } from "../../skills/loader/index.ts";
+import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { resizeImage } from "../../utils/image-resize.ts";
 import { collectInputImageAttachments } from "../../utils/input-image-attachments.ts";
 import type { WebHost } from "./host.ts";
@@ -16,6 +17,7 @@ import type { WebHttpServer } from "./http-server.ts";
 import { HttpError } from "./http-server.ts";
 import { pagePresence } from "./page-presence.ts";
 import {
+	backgroundJobToWire,
 	entryImages,
 	subAgentStateToWire,
 	TRANSCRIPT_IMAGE_TYPES,
@@ -174,6 +176,31 @@ export function registerCoreRoutes(server: WebHttpServer, host: WebHost): void {
 		if (report.unconfirmed > 0)
 			throw new HttpError(500, "Some sub-agents did not confirm the stop in time and may still be running.");
 		return { ok: true, stopped, errors: report.errors, state: subAgentStateToWire(session.subAgentState) };
+	});
+	/** The Background panel: the chat's background shell jobs (bash/pwsh `run_in_background`), oldest first. */
+	server.route("GET", "/api/background", () => ({ jobs: host.backgroundJobs() }));
+	/** The end of one job's output for the panel. Reading it here leaves the agent's job_output cursor where it is. */
+	server.route("GET", "/api/background/output", async ({ url }) => {
+		const id = url.searchParams.get("id");
+		if (!id) throw new HttpError(400, "Missing id");
+		const bytes = Number(url.searchParams.get("bytes"));
+		const tail = await backgroundJobManager.readTail(
+			id,
+			Number.isFinite(bytes) && bytes > 0 ? bytes : undefined,
+			host.backgroundJobKey(),
+		);
+		if (!tail)
+			throw new HttpError(404, "This background job is no longer known here (MyHarness may have restarted since).");
+		return tail;
+	});
+	/** Stop one background job from the panel: its whole process tree ends, the agent sees it as killed. */
+	server.route("POST", "/api/background/stop", async ({ body }) => {
+		const id = asString(asObject(body).id, "id");
+		const { job, confirmed } = await backgroundJobManager.kill(id, host.backgroundJobKey());
+		if (!job)
+			throw new HttpError(404, "This background job is no longer known here (MyHarness may have restarted since).");
+		if (!confirmed) throw new HttpError(500, "The process did not confirm that it ended; it may still be running.");
+		return { ok: true, job: backgroundJobToWire(job), jobs: host.backgroundJobs() };
 	});
 	server.route("POST", "/api/abort-compaction", () => {
 		host.session.abortCompaction();

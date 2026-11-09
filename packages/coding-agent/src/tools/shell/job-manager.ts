@@ -9,12 +9,14 @@
  *
  * Output is streamed to a per-job log file in the temp directory so unbounded
  * background output never lives in memory. `job_output` reads incrementally
- * from that file with a per-job byte cursor.
+ * from that file with a byte cursor per job and reading session.
  *
  * Bounds (all process-local, all deliberate):
  * - ownership: every job carries a session scope key (see `session-scope.ts`),
- *   so two sessions opened on the same directory never see or kill each other's
- *   jobs;
+ *   so two sessions opened on the same directory never list or kill each other's
+ *   jobs. Another session that has a job's taskId may read its output
+ *   (`readOutputAs`) from a read position of its own, so a chat started later (a
+ *   scheduled task) can check the job without hiding output from its owner;
  * - disk: one job may write at most {@link BACKGROUND_JOB_MAX_LOG_BYTES} to its
  *   log; after that the writes stop and `logTruncated` is reported;
  * - concurrency: one session may run at most {@link BACKGROUND_JOB_MAX_CONCURRENT}
@@ -26,6 +28,12 @@
  * status and log remain queryable after the process ends. When a job record
  * leaves the store (eviction or `clearRecords()`), its log file is deleted —
  * the log lives exactly as long as the record that points at it.
+ *
+ * Listeners (`subscribe`) hear about every start and end. The owning chat's
+ * AgentSession reports an ended job back to the model in a new turn
+ * (agent/runtime/background-job-reports.ts), except when MyHarness stopped it
+ * itself (`stopRequested`) or the owner's job_output already returned its end
+ * (`endRead`).
  */
 
 import { spawnSync } from "node:child_process";
@@ -86,10 +94,20 @@ export interface BackgroundJobInfo extends Record<string, unknown> {
 	startedAt: number;
 	endedAt?: number;
 	logPath: string;
-	/** Bytes consumed so far by job_output cursor. */
+	/** Bytes the owning session's job_output calls have read so far (other sessions keep their own position). */
 	consumedBytes: number;
 	/** True once the job produced more than BACKGROUND_JOB_MAX_LOG_BYTES of output. */
 	logTruncated?: boolean;
+	/**
+	 * MyHarness stopped the job itself (job_kill, the Web UI's Background panel, shutdown), not the job ending or
+	 * something outside MyHarness killing it. Its end is not reported back to the chat.
+	 */
+	stopRequested?: boolean;
+	/**
+	 * The owning session's job_output already returned how the job ended, with nothing left to read: the chat has seen
+	 * its end and gets no report of it (agent/runtime/background-job-reports.ts).
+	 */
+	endRead?: boolean;
 }
 
 export interface JobOutputRead {
@@ -106,8 +124,31 @@ export interface JobOutputRead {
 	logTruncated: boolean;
 }
 
+/** The end of a job's log as a viewer (the Web UI's Background panel) reads it. */
+export interface JobLogTail {
+	taskId: string;
+	status: BackgroundJobStatus;
+	exitCode?: number | null;
+	/** The last bytes of the log, starting on a whole line when the log is longer than the window. */
+	text: string;
+	/** Bytes in the log file when it was read. */
+	size: number;
+	/** Bytes before `text` that were left out (0 when the whole log is in `text`). */
+	skipped: number;
+	logTruncated: boolean;
+	/** The whole log on disk, for output longer than the panel reads. */
+	logPath: string;
+}
+
+/** Told about a job when it starts and once it has ended and its log is complete. Gets a copy of the record. */
+export type BackgroundJobListener = (job: BackgroundJobInfo) => void;
+
 /** Global hard cap for any background job regardless of per-call timeout. */
 export const BACKGROUND_JOB_MAX_RUNTIME_MS = 24 * 60 * 60 * 1000;
+/** Default window a viewer reads from the end of a job's log. */
+export const JOB_LOG_TAIL_BYTES = 64 * 1024;
+/** Largest window a viewer may ask for. */
+export const JOB_LOG_TAIL_MAX_BYTES = 1024 * 1024;
 /** Maximum finished jobs kept in the store per process (oldest pruned first). */
 export const MAX_RETAINED_JOBS = 100;
 /** Default byte window returned by one job_output call. */
@@ -160,6 +201,13 @@ function getIncompleteUtf8TrailingBytes(buf: Buffer): number {
 	return 0;
 }
 
+/** Number of leading bytes of `buf` that continue a character started before it (at most 3). */
+function getLeadingUtf8ContinuationBytes(buf: Buffer): number {
+	let count = 0;
+	while (count < Math.min(3, buf.length) && (buf[count] & 0xc0) === 0x80) count += 1;
+	return count;
+}
+
 interface JobState {
 	info: BackgroundJobInfo;
 	controller: AbortController;
@@ -170,6 +218,10 @@ interface JobState {
 	/** Bytes handed to the log stream, including the ones dropped after the cap. */
 	logBytesSeen: number;
 	logCapBytes: number;
+	/** Read positions of the other sessions that read this job by its taskId; the owner's is `info.consumedBytes`. */
+	readers: Map<string, number>;
+	/** The job has ended and its log is complete (set just before `settled` resolves). */
+	ended: boolean;
 	closeLog: () => Promise<void>;
 	removeLog: () => Promise<void>;
 }
@@ -185,6 +237,25 @@ function newTaskId(): string {
  */
 export class BackgroundJobManager {
 	private jobs = new Map<string, JobState>();
+	private listeners = new Set<BackgroundJobListener>();
+
+	/** Hear about every job's start and end (the Web UI shows them). Returns the function that stops listening. */
+	subscribe(listener: BackgroundJobListener): () => void {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	}
+
+	private notify(info: BackgroundJobInfo): void {
+		for (const listener of [...this.listeners]) {
+			try {
+				listener({ ...info });
+			} catch {
+				// A viewer must never break a job.
+			}
+		}
+	}
 
 	/** Launch a background job and return its record immediately (non-blocking). */
 	start(options: StartBackgroundJobOptions): BackgroundJobInfo {
@@ -260,6 +331,8 @@ export class BackgroundJobManager {
 			removeLog,
 			logBytesSeen: 0,
 			logCapBytes: resolveLogCapBytes(),
+			readers: new Map(),
+			ended: false,
 		};
 		this.pruneFinishedJobs();
 		this.jobs.set(taskId, state);
@@ -308,9 +381,15 @@ export class BackgroundJobManager {
 				},
 			)
 			.finally(() => {
-				void closeLog().finally(() => resolveSettled());
+				void closeLog().finally(() => {
+					state.ended = true;
+					resolveSettled();
+					// Told once the log is complete, so a viewer that reads it now gets the last lines too.
+					this.notify(info);
+				});
 			});
 
+		this.notify(info);
 		return { ...info };
 	}
 
@@ -355,7 +434,7 @@ export class BackgroundJobManager {
 		return { ...state.info };
 	}
 
-	/** Read the output produced since the previous job_output call. */
+	/** Read the output produced since the owning session's previous job_output call (`sessionKey`: only for that session). */
 	async readOutput(
 		taskId: string,
 		maxBytes = JOB_OUTPUT_MAX_BYTES_PER_READ,
@@ -364,7 +443,27 @@ export class BackgroundJobManager {
 		const state = this.jobs.get(taskId);
 		if (!state) return undefined;
 		if (sessionKey !== undefined && state.info.sessionKey !== sessionKey) return undefined;
+		return this.readFrom(state, state.info.sessionKey, maxBytes);
+	}
+
+	/**
+	 * Read a job's output as the session `reader` (its scope key). Any session that has the taskId may read any job of
+	 * this process: that is how a chat started later (a scheduled task) checks a job another chat started. The owning
+	 * session moves the job's own cursor (`consumedBytes`); every other session has a cursor of its own, so a read from
+	 * elsewhere never hides output from the owner.
+	 */
+	async readOutputAs(
+		reader: string,
+		taskId: string,
+		maxBytes = JOB_OUTPUT_MAX_BYTES_PER_READ,
+	): Promise<JobOutputRead | undefined> {
+		const state = this.jobs.get(taskId);
+		return state ? this.readFrom(state, reader, maxBytes) : undefined;
+	}
+
+	private async readFrom(state: JobState, reader: string, maxBytes: number): Promise<JobOutputRead> {
 		const info = state.info;
+		const owner = reader === info.sessionKey;
 		const base = (): JobOutputRead => ({
 			taskId: info.taskId,
 			sessionKey: info.sessionKey,
@@ -375,16 +474,21 @@ export class BackgroundJobManager {
 			hasMore: false,
 			logTruncated: info.logTruncated === true,
 		});
+		// The owner now knows how the job ended and has nothing left to read: its end needs no report.
+		const seen = (read: JobOutputRead): JobOutputRead => {
+			if (owner && state.ended && !read.hasMore) info.endRead = true;
+			return read;
+		};
 		let size = 0;
 		try {
 			size = (await stat(info.logPath)).size;
 		} catch {
 			// Log file missing (write failure or external deletion): return empty increment.
-			return base();
+			return seen(base());
 		}
 
-		const start = info.consumedBytes;
-		if (size <= start) return base();
+		const start = owner ? info.consumedBytes : (state.readers.get(reader) ?? 0);
+		if (size <= start) return seen(base());
 
 		const length = Math.min(Math.max(1, maxBytes), size - start);
 		let buffer = Buffer.allocUnsafe(length);
@@ -411,12 +515,65 @@ export class BackgroundJobManager {
 		// If the window holds nothing else, return it whole so the cursor always moves.
 		const partialBytes = getIncompleteUtf8TrailingBytes(buffer.subarray(0, cut));
 		if (partialBytes > 0 && partialBytes < cut) cut -= partialBytes;
-		info.consumedBytes = start + cut;
-		return {
+		if (owner) info.consumedBytes = start + cut;
+		else state.readers.set(reader, start + cut);
+		return seen({
 			...base(),
 			increment: buffer.subarray(0, cut).toString("utf8").replace(/\r\n/g, "\n"),
 			hasMore: start + cut < size,
+		});
+	}
+
+	/**
+	 * The end of a job's log for a viewer (the Web UI's Background panel). Unlike readOutput it leaves job_output's
+	 * cursor where it is, so looking at a job never hides output from the agent.
+	 */
+	async readTail(taskId: string, maxBytes = JOB_LOG_TAIL_BYTES, sessionKey?: string): Promise<JobLogTail | undefined> {
+		const state = this.jobs.get(taskId);
+		if (!state) return undefined;
+		if (sessionKey !== undefined && state.info.sessionKey !== sessionKey) return undefined;
+		const info = state.info;
+		const tail: JobLogTail = {
+			taskId: info.taskId,
+			status: info.status,
+			exitCode: info.exitCode,
+			text: "",
+			size: 0,
+			skipped: 0,
+			logTruncated: info.logTruncated === true,
+			logPath: info.logPath,
 		};
+		let size = 0;
+		try {
+			size = (await stat(info.logPath)).size;
+		} catch {
+			return tail;
+		}
+		tail.size = size;
+		if (size === 0) return tail;
+		const window = Math.min(Math.max(1, Math.floor(maxBytes) || JOB_LOG_TAIL_BYTES), JOB_LOG_TAIL_MAX_BYTES);
+		const start = Math.max(0, size - window);
+		let buffer = Buffer.allocUnsafe(size - start);
+		const handle = await open(info.logPath, "r");
+		try {
+			const result = await handle.read(buffer, 0, buffer.length, start);
+			buffer = result.buffer.subarray(0, result.bytesRead);
+		} finally {
+			await handle.close();
+		}
+		let cut = 0;
+		if (start > 0) {
+			// A window that starts inside the log starts on its next whole line, or at least on a whole character.
+			const newline = buffer.indexOf(0x0a);
+			cut = newline !== -1 && newline < buffer.length - 1 ? newline + 1 : getLeadingUtf8ContinuationBytes(buffer);
+		}
+		let end = buffer.length;
+		// The job may be writing a character right now: its first bytes wait for the next read.
+		const partial = getIncompleteUtf8TrailingBytes(buffer.subarray(cut));
+		if (partial > 0 && partial < end - cut) end -= partial;
+		tail.text = buffer.subarray(cut, end).toString("utf8").replace(/\r\n/g, "\n");
+		tail.skipped = start + cut;
+		return tail;
 	}
 
 	/**
@@ -436,6 +593,7 @@ export class BackgroundJobManager {
 		const state = this.jobs.get(taskId);
 		if (!state || state.info.status !== "running") return false;
 		state.terminateRequested = reason;
+		if (reason === "killed") state.info.stopRequested = true;
 		let confirmed = true;
 		if (state.info.pid) {
 			confirmed = await killProcessTreeAndWait(state.info.pid).catch(() => false);
@@ -480,6 +638,7 @@ export class BackgroundJobManager {
 		for (const state of this.jobs.values()) {
 			if (state.info.status !== "running") continue;
 			state.terminateRequested = "killed";
+			state.info.stopRequested = true;
 			const pid = state.info.pid;
 			if (!pid) continue;
 			try {

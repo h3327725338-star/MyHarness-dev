@@ -83,13 +83,33 @@ function offsetAt(ms: number, tz: string): number {
 	);
 }
 
+const pad = (value: number) => String(value).padStart(2, "0");
+
+/** The zone of `tz` at `ms` for people and models: "Asia/Kuala_Lumpur, UTC+08:00". */
+export function describeZone(ms: number, tz: string): string {
+	const offset = Math.round(offsetAt(ms, tz) / 60_000);
+	return `${tz}, UTC${offset < 0 ? "-" : "+"}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
+}
+
+/** The wall clock in `tz` at `ms`, short, for lists that name the zone once: "2026-10-29 19:58". */
+export function localStamp(ms: number, tz: string): string {
+	const clock = wallClock(ms, tz);
+	return `${clock.year}-${pad(clock.month)}-${pad(clock.day)} ${pad(clock.hour)}:${pad(clock.minute)}`;
+}
+
 /** The wall clock in `tz` at `ms` for people and models: "2026-10-29 19:58, Thursday (Asia/Kuala_Lumpur, UTC+08:00)". */
 export function describeLocalTime(ms: number, tz: string): string {
-	const clock = wallClock(ms, tz);
-	const pad = (value: number) => String(value).padStart(2, "0");
-	const offset = Math.round(offsetAt(ms, tz) / 60_000);
-	const zone = `UTC${offset < 0 ? "-" : "+"}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
-	return `${clock.year}-${pad(clock.month)}-${pad(clock.day)} ${pad(clock.hour)}:${pad(clock.minute)}, ${WEEKDAY_NAMES[clock.weekday]} (${tz}, ${zone})`;
+	return `${localStamp(ms, tz)}, ${WEEKDAY_NAMES[wallClock(ms, tz).weekday]} (${describeZone(ms, tz)})`;
+}
+
+/**
+ * A stored time (ISO text in UTC, or milliseconds) as this computer's wall clock, the way the current time reaches
+ * models. A model shown the raw UTC text reads its date as local: here, 06:27 in the morning shows as the day before.
+ * A missing or broken time (a missing `updatedAt` reads as 1970) is "unknown", never a made-up date.
+ */
+export function describeStoredTime(value: string | number | undefined, tz = localTimeZone()): string {
+	const ms = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
+	return Number.isFinite(ms) && ms > 0 ? describeLocalTime(ms, tz) : "unknown";
 }
 
 /** The moment the wall clock in `tz` shows the given date and time. */

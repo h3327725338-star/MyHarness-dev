@@ -263,6 +263,62 @@ describe("Google Drive sync engine", () => {
 		expect(restoredMode.get("general").drafts.s1?.text).toBe("unfinished");
 	});
 
+	it("syncs the General chats of the default group (no Workspace) both ways, but not its Coding chats", async () => {
+		const drive = new FakeDrive();
+		const a = device(drive, "desktop", "device-a");
+		const b = device(drive, "laptop", "device-b");
+		const chat = (sessionId: string, mode: "general" | "coding") => {
+			const folder = join(a.dataRoot, "workspaces", "unbound", "sessions", sessionId);
+			mkdirSync(join(folder, "conversation"), { recursive: true });
+			mkdirSync(join(folder, "artifacts"), { recursive: true });
+			writeFileSync(join(folder, "artifacts", "notes.md"), `notes of ${sessionId}`);
+			const header = {
+				type: "session",
+				version: 3,
+				id: sessionId,
+				mode,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: join(a.agentDir, "default-workspace"),
+			};
+			const entry = {
+				type: "message",
+				id: "e1",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: [{ type: "text", text: `hello from ${sessionId}` }] },
+			};
+			const file = join(folder, "conversation", `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
+			writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+			return file;
+		};
+		const general = chat("plain", "general");
+		chat("repo", "coding");
+
+		await sync(a, b);
+		const arrived = join(b.dataRoot, "workspaces", "unbound", "sessions", "plain");
+		const conversation = join(arrived, "conversation", basename(general));
+		expect(readFileSync(conversation, "utf8")).toContain("hello from plain");
+		expect(readFileSync(join(arrived, "artifacts", "notes.md"), "utf8")).toBe("notes of plain");
+		expect(existsSync(join(b.dataRoot, "workspaces", "unbound", "sessions", "repo"))).toBe(false);
+		// The group is not a Workspace on either computer.
+		expect(
+			WorkspaceStore.create(b.agentDir, b.dataRoot)
+				.list()
+				.some((item) => item.workspaceId === "unbound"),
+		).toBe(false);
+
+		// A reply written on the second computer comes back to the first.
+		appendEntry(conversation, {
+			type: "message",
+			id: "e2",
+			parentId: "e1",
+			timestamp: "2026-01-01T00:00:02.000Z",
+			message: { role: "user", content: [{ type: "text", text: "written on the laptop" }] },
+		});
+		await sync(b, a);
+		expect(readFileSync(general, "utf8")).toContain("written on the laptop");
+	});
+
 	it("propagates an explicit memory deletion without resurrecting it later", async () => {
 		const drive = new FakeDrive();
 		const a = device(drive, "desktop", "device-a");

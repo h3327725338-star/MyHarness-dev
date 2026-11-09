@@ -80,12 +80,13 @@ export const toolDescription = (tool) => {
 	return Object.hasOwn(TOOL_DESCRIPTIONS, tool.name) && !tool.extension ? t(TOOL_DESCRIPTIONS[tool.name]) : firstSentence(tool.description);
 };
 
-function Section({ title, count, children, defaultOpen = true }) {
+/** A foldable section of a panel (Session, Background); `actions` sit at the end of its head and keep their own clicks. */
+export function Section({ title, count, children, defaultOpen = true, actions = null }) {
 	const [open, setOpen] = useState(defaultOpen);
 	const toggle = () => setOpen(!open);
 	return html`<section class="ctx-section">
-		<div class="ctx-head" onClick=${toggle} role="button" tabindex="0" aria-expanded=${open} onKeyDown=${(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle())}>
-			<${Icon} name="chevronRight" size=${13} class="disclose" /><span class="grow">${title}${count != null ? html` <span class="dim">${count}</span>` : null}</span>
+		<div class="ctx-head" onClick=${toggle} role="button" tabindex="0" aria-expanded=${open} onKeyDown=${(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle())}>
+			<${Icon} name="chevronRight" size=${13} class="disclose" /><span class="grow">${title}${count != null ? html` <span class="dim">${count}</span>` : null}</span>${actions}
 		</div>
 		<${Collapse} open=${open}><div class="ctx-body">${children}</div><//>
 	</section>`;

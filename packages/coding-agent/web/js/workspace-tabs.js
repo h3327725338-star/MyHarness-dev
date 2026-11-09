@@ -1,9 +1,9 @@
-// The right-hand workspace keeps several things open at once: the changes/files/terminal/session panels, any number of
+// The right-hand workspace keeps several things open at once: the changes/files/terminal/background/session panels, any number of
 // files (text, code, PDF, image, media, Office) and any number of website tabs (each backed by a real browser view in
 // the desktop host). Every tab keeps its own state; opening something new activates or adds a tab instead of replacing
 // what is already there. The strip scrolls when the tabs do not fit, can be reordered by dragging, and remembers the
 // open tabs in the page preferences. The panel's first row (`PanelNav`) holds every section: Changes, Files, Terminal,
-// Session and, set apart, the browser. A strip of tabs is the second row and lists only the tabs of the section on
+// Background, Session and, set apart, the browser. A strip of tabs is the second row and lists only the tabs of the section on
 // screen (website tabs, or the file list and the open files), so the browser never mixes with the files and panels.
 import { COLLAPSE_MS, html, Icon, Menu, MenuItem, MenuSep, motionEnabled, useEffect, useLayoutEffect, useRef, useState } from "./ui.js";
 import { t } from "./i18n.js";
@@ -23,6 +23,7 @@ const TYPE_ICONS = {
 	changes: "fileDiff",
 	files: "folder",
 	terminal: "terminal",
+	background: "pulse",
 	context: "layers",
 	browser: "globe",
 	file: "file",
@@ -32,6 +33,7 @@ const NAV_SECTIONS = [
 	["changes", "fileDiff", "Changes"],
 	["files", "folder", "Files"],
 	["terminal", "terminal", "Terminal"],
+	["background", "pulse", "Background"],
 	["context", "layers", "Session"],
 ];
 

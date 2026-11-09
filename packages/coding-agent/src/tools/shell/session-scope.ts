@@ -3,8 +3,9 @@
  *
  * Both features keep per-session records in process-local maps, so the key must
  * identify the *session*, not the directory: two sessions that open the same
- * working directory must not see (or kill) each other's jobs and must not share
- * preserved cwd/env. The tool execution contract hands every tool the same
+ * working directory must not list (or kill) each other's jobs and must not share
+ * preserved cwd/env. (Reading a job's output by its taskId is open to every
+ * session, from a read position of its own: see job-manager.ts.) The tool execution contract hands every tool the same
  * context object extensions get (`ctx.sessionManager`), which is the only place
  * a Session id is readable from inside a tool. Reading it must never throw: a
  * missing or broken context falls back to the tool's creation cwd, which is the

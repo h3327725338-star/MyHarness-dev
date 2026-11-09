@@ -114,16 +114,17 @@ export interface ScheduleToolDetails {
 	count?: number;
 }
 
-function repeatLine(repeat: ScheduleRepeat): string {
+/** In the task's own time zone, like its next run, not the stored UTC text. */
+function repeatLine(repeat: ScheduleRepeat, tz: string): string {
 	switch (repeat.type) {
 		case "once":
-			return `once at ${repeat.at}`;
+			return `once at ${describeDue(repeat.at, tz)}`;
 		case "daily":
 			return `every day at ${repeat.time}`;
 		case "weekly":
 			return `every week on days ${repeat.days.join(",")} (0 = Sunday) at ${repeat.time}`;
 		case "interval":
-			return `every ${repeat.minutes} min from ${repeat.from}`;
+			return `every ${repeat.minutes} min from ${describeDue(repeat.from, tz)}`;
 	}
 }
 
@@ -134,7 +135,7 @@ function describe(schedule: ScheduleView, snapshot: ScheduleSnapshot): string {
 			: (snapshot.devices.find((entry) => entry.id === id)?.name ?? "another computer");
 	const parts = [
 		`${schedule.id} · ${schedule.kind} · "${schedule.title}"`,
-		repeatLine(schedule.repeat),
+		repeatLine(schedule.repeat, schedule.tz),
 		schedule.enabled
 			? `next ${describeDue(schedule.next, schedule.tz)}`
 			: schedule.repeat.type === "once" && Date.parse(schedule.repeat.at) <= Date.now()

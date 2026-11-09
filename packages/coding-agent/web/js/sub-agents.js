@@ -101,7 +101,7 @@ export async function stopSubAgents(body) {
  * The one stop of the bar: a quiet square icon (the player's stop) that only this small
  * button answers. It never takes the click or the keys of the row it sits in, and a stop that failed says why.
  */
-function StopButton({ label, title, onStop, disabled }) {
+export function StopButton({ label, title, onStop, disabled }) {
 	const [busy, setBusy] = useState(false);
 	const run = async (event) => {
 		event.stopPropagation();
@@ -279,6 +279,20 @@ function SubAgentList({ items, subAgents, now, cwd, unknown, rows, traces }) {
 	return html`<div class="sa-list">
 		${items.map((item) => html`<${DispatchRows} key=${item.id} item=${item} details=${subAgents[item.id] ?? item.details} now=${now} cwd=${cwd} unknown=${unknown} rows=${rows} traces=${traces} />`)}
 	</div>`;
+}
+
+/**
+ * Sub-agent rows outside the bar (the Background panel lists the chat's background dispatches): the bar's rows, each
+ * opening in place to what the sub-agent did, with an open state of their own.
+ */
+export function SubAgentRows({ items }) {
+	const state = useSubAgents();
+	const subAgents = useStore((s) => s.subAgents);
+	const cwd = useStore((s) => s.snap?.cwd || "");
+	const rows = useOpenSet();
+	const traces = useOpenSet();
+	const now = useNow(!state.unknown && items.some((item) => item.tasks.some(isRunning)));
+	return html`<${SubAgentList} items=${items} subAgents=${subAgents} now=${now} cwd=${cwd} unknown=${state.unknown} rows=${rows} traces=${traces} />`;
 }
 
 function failedCount(items) {

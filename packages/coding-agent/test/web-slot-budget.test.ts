@@ -95,6 +95,8 @@ interface StubSpec {
 	touchedAt: number;
 	startedAt?: number;
 	busy?: boolean;
+	/** A background command still runs, or its report has not gone out yet. */
+	backgroundJobsPending?: boolean;
 }
 
 function stubHost(slotId: string, spec: StubSpec, disposed: string[]): WebHost {
@@ -109,6 +111,7 @@ function stubHost(slotId: string, spec: StubSpec, disposed: string[]): WebHost {
 		gitTask: null,
 		backgroundGit: new Set(),
 		unread: false,
+		backgroundJobsPending: spec.backgroundJobsPending ?? false,
 		status: { slot: slotId },
 		transcriptCacheBytes: 0,
 		tracker: { listRuns: () => [] },
@@ -187,6 +190,38 @@ describe("WebHostHub.pruneIdle wiring", () => {
 		expect(internals.slots.has("s-old")).toBe(false);
 		expect(internals.slots.has("s-mid")).toBe(true);
 		expect(internals.slots.has("s-new")).toBe(true);
+		await server.close();
+	});
+
+	it("keeps an idle chat whose background command still runs or has not reported yet", async () => {
+		const disposed: string[] = [];
+		const server = new WebHttpServer();
+		const hub = new WebHostHub({
+			server,
+			version: "test",
+			onShutdown: () => {},
+			idleBudgetBytes: 0, // nothing idle fits: every slot the hub may release goes
+			maxIdleSlots: 100,
+			estimateSlotBytes: () => 10,
+		});
+		const internals = hub as unknown as { slots: Map<string, WebHost>; primary: WebHost | undefined };
+		const primary = stubHost("s-primary", { touchedAt: 0 }, disposed);
+		internals.slots.set(primary.slotId, primary);
+		internals.primary = primary;
+		const keep = stubHost("s-keep", { touchedAt: 100 }, disposed);
+		internals.slots.set(keep.slotId, keep);
+		// The newest idle slot always stays; the older ones go unless something keeps them.
+		internals.slots.set("s-newest", stubHost("s-newest", { touchedAt: 20 }, disposed));
+		internals.slots.set("s-plain", stubHost("s-plain", { touchedAt: 10 }, disposed));
+		internals.slots.set("s-job", stubHost("s-job", { touchedAt: 5, backgroundJobsPending: true }, disposed));
+
+		(hub as unknown as { pruneIdle: (keep: WebHost) => void }).pruneIdle(keep);
+		await tick();
+
+		// Released, the chat's command would report back to a session that no longer exists.
+		expect(disposed).toEqual(["s-plain"]);
+		expect(internals.slots.has("s-job")).toBe(true);
+		expect(internals.slots.has("s-newest")).toBe(true);
 		await server.close();
 	});
 });

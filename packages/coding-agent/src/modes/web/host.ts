@@ -28,6 +28,7 @@ import { getDataDir } from "../../config.ts";
 import type { ProjectTrustContext } from "../../extensions/compat/types.ts";
 import type { GitCheckpoint } from "../../git/checkpoints/checkpoint.ts";
 import { hasGitCheckpointTaskChangesAsync, listGitCheckpoints } from "../../git/checkpoints/checkpoint.ts";
+import { getCachedGitInspect } from "../../git/repository/read-cache.ts";
 import {
 	bashCommandMayMoveGitHead,
 	type ChangeDetectionResult,
@@ -42,6 +43,7 @@ import type { SessionEntry } from "../../session/types.ts";
 import { getRenamePlanPaths } from "../../symbols/workflow/rename-plans.ts";
 import { applyPatchPaths } from "../../tools/files/apply-patch-parser.ts";
 import { resolveToCwd } from "../../tools/path-utils.ts";
+import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
 import {
 	describeTaskNotification,
@@ -50,7 +52,7 @@ import {
 	summarizeRunWork,
 } from "../../utils/popup-notification.ts";
 import type { ChangeClaimRegistry } from "./change-claims.ts";
-import { ChangeTracker, type RunChangeRecord } from "./changes.ts";
+import { ChangeTracker, type RunChangeRecord, toolCallMayWriteFiles } from "./changes.ts";
 import type { WebDialogBridge } from "./dialogs.ts";
 import { GenerationSpeedMeter } from "./generation-speed.ts";
 import type { WebHttpServer } from "./http-server.ts";
@@ -58,6 +60,7 @@ import { pagePresence } from "./page-presence.ts";
 import { RequestCacheMeter } from "./request-cache.ts";
 import { TranscriptCache } from "./transcript-cache.ts";
 import {
+	backgroundJobToWire,
 	entriesToWire,
 	entryProjectsToWire,
 	INTERRUPT_ENTRY,
@@ -68,6 +71,7 @@ import {
 	sanitizeDetails,
 	subAgentStateToWire,
 	toWireModel,
+	type WireBackgroundJob,
 	type WireItem,
 } from "./wire.ts";
 
@@ -353,6 +357,10 @@ export class WebHost {
 	}
 
 	private unsubscribe: (() => void) | undefined;
+	/** Stops forwarding background shell jobs to the page (`background_jobs`). */
+	private stopWatchingJobs: (() => void) | undefined;
+	/** submit() calls in progress: a background job's report waits for them (setBackgroundJobReportGate). */
+	private submitting = 0;
 	private generation = 0;
 	private liveMessageSeq = 0;
 	private liveAssistantId: string | undefined;
@@ -500,6 +508,8 @@ export class WebHost {
 			const task = data as Record<string, unknown>;
 			this.gitTask = task.active ? task : null;
 			if (task.active) this.operationStarted = true;
+			// A background job's report waits for a Git task; it may go now.
+			else this.session.pokeBackgroundJobReports();
 		}
 		if (ACTIVITY_EVENTS.has(event)) this.lastActivityAt = Date.now();
 		const payload = data !== null && typeof data === "object" ? { ...(data as object), slot: this.slotId } : data;
@@ -615,7 +625,33 @@ export class WebHost {
 			await this.bindSession();
 			this.broadcast("session_replaced", { at: Date.now() });
 		});
+		// The chat's background shell jobs go to the page when one starts and when one ends (the Background panel).
+		this.stopWatchingJobs ??= backgroundJobManager.subscribe((job) => {
+			if (job.sessionKey === this.backgroundJobKey())
+				this.broadcast("background_jobs", { jobs: this.backgroundJobs() });
+		});
 		await this.bindSession();
+	}
+
+	/** The key the shell tools file this chat's background jobs under (tools/shell/session-scope.ts). */
+	backgroundJobKey(): string {
+		return `session:${this.session.sessionId}`;
+	}
+
+	/** This chat's background shell jobs, oldest first. Another process's chat (a mirror) has none here. */
+	backgroundJobs(): WireBackgroundJob[] {
+		return backgroundJobManager.list(this.backgroundJobKey()).map(backgroundJobToWire);
+	}
+
+	/**
+	 * A background shell job of this chat still runs, or ended and has not reported back yet. Its report needs this
+	 * chat's session to be open, so the hub does not release the slot meanwhile.
+	 */
+	get backgroundJobsPending(): boolean {
+		return (
+			backgroundJobManager.runningCountFor(this.backgroundJobKey()) > 0 ||
+			this.session.pendingBackgroundJobReports > 0
+		);
 	}
 
 	private stopBackgroundGit(): void {
@@ -633,6 +669,8 @@ export class WebHost {
 		this.unsubscribe?.();
 		this.generation += 1;
 		this.resetLiveState();
+		// The previous session's calls still open in the shared registry end here; the new tracker starts empty.
+		this.tracker.dispose();
 		this.tracker = new ChangeTracker(this.cwd, {
 			changeClaims: this.changeClaims,
 			sessionKey: () => this.session.sessionId,
@@ -650,6 +688,9 @@ export class WebHost {
 			(status) => this.broadcast("session_handoff", status ?? {}),
 		);
 		this.sessionHandoff.adopt(owedHandoffs);
+		// A background job that ended reports in a turn of its own, but not while this host finishes the previous run
+		// (its change card, checkpoint and memories), runs a Git task or is sending a message.
+		session.setBackgroundJobReportGate(() => !this.completionActive && !this.gitTask && this.submitting === 0);
 		await session.bindExtensions({
 			uiContext: this.dialogs.createExtensionUiContext({
 				getAllThemes: () => [],
@@ -850,7 +891,10 @@ export class WebHost {
 		this.generation += 1;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.stopWatchingJobs?.();
+		this.stopWatchingJobs = undefined;
 		this.resetLiveState();
+		this.tracker.dispose();
 		this.dialogs.dismissAll();
 		this.dialogs.resetSurface();
 		await this.runtimeHost.dispose();
@@ -1170,6 +1214,8 @@ export class WebHost {
 				});
 				return;
 			case "sub_agent_state":
+				// A background sub-agent keeps writing after its tool call returned: its window lasts until it ends.
+				this.tracker.recordDispatches(event.state.items);
 				this.broadcast("sub_agent_state", subAgentStateToWire(event.state));
 				return;
 			case "auto_memory_status":
@@ -1401,7 +1447,18 @@ export class WebHost {
 		this.baselineFailureReason = undefined;
 		if (!this.session.settingsManager.getGitIntegrationSettings().enabled) {
 			void this.ensureBaseline().catch(() => {});
+			return;
 		}
+		// Git integration is on, but a folder outside any repository gets no checkpoint: what shell commands change there
+		// is found the way it is with Git integration off, against a content baseline taken now.
+		const runId = this.currentRunId;
+		const cwd = this.cwd;
+		void getCachedGitInspect(cwd)
+			.then((state) => {
+				const sameRun = this.currentRunId === runId && this.cwd === cwd && this.lastAgentEnd === undefined;
+				if (sameRun && !state.isRepository) void this.ensureBaseline().catch(() => {});
+			})
+			.catch(() => {});
 	}
 
 	private ensureBaseline(): Promise<WorkspaceBaseline | undefined> {
@@ -1447,6 +1504,10 @@ export class WebHost {
 			this.tracker.recordShellStart(runId, toolCallId);
 			const command = (args as { command?: unknown } | null | undefined)?.command;
 			if (bashCommandMayMoveGitHead(command)) this.tracker.recordGitHeadOp(runId);
+		} else if (toolCallMayWriteFiles(toolName)) {
+			// A sub-agent batch, an MCP tool or another tool that may write files without naming them: the time it runs
+			// is a window in which this chat may have changed any file (change-claims.ts).
+			this.tracker.recordToolStart(runId, toolCallId, toolName === "agent" ? "agent" : "tool");
 		}
 	}
 
@@ -1458,6 +1519,8 @@ export class WebHost {
 		} else if (toolName === "bash" || toolName === "pwsh") {
 			// The window is recorded regardless of the exit code: a failed command may still have written files.
 			this.tracker.recordShellEnd(runId, toolCallId);
+		} else if (toolCallMayWriteFiles(toolName)) {
+			this.tracker.recordToolEnd(runId, toolCallId);
 		}
 	}
 
@@ -1486,6 +1549,7 @@ export class WebHost {
 			this.broadcast("completion", { active: false, runId });
 			this.refreshConversationNaming();
 			this.refreshSessionHandoff();
+			this.session.pokeBackgroundJobReports();
 		});
 	}
 
@@ -1505,7 +1569,15 @@ export class WebHost {
 		const succeeded = end?.succeeded === true;
 		const gitEnabled = session.settingsManager.getGitIntegrationSettings().enabled;
 		const checkpoint = session.getGitCheckpoint();
-		const turnHadBash = session.bashExecutionCount > this.bashCountAtRunStart;
+		// Something ran that may write files without naming them: the user's own `!` commands, or the agent's shell
+		// commands, sub-agents, other write-capable tools and this chat's background jobs. Only then is the whole folder
+		// compared with the baseline taken when the run started (edit/write are known from their own snapshots).
+		const turnHadBash =
+			session.bashExecutionCount > this.bashCountAtRunStart ||
+			(runId !== undefined && this.tracker.runHadOpaqueActivity(runId));
+		// The baseline of this run, if one was taken when it started (Git integration off, or a folder outside any
+		// repository). None is taken now: at the end it would already hold the run's own changes.
+		const runBaseline = this.baselinePromise;
 		// 本轮没跑过会动 HEAD 的 git 命令时，HEAD 前进视为窗口外他人提交：不计入本轮卡片，只横幅提示。
 		const excludeExternalCommits = runId === undefined ? false : (this.tracker.getRun(runId)?.gitHeadOps ?? 0) === 0;
 
@@ -1514,8 +1586,8 @@ export class WebHost {
 			detection = await collectFinalWorkspaceChanges({
 				cwd: this.cwd,
 				checkpoint,
-				baseline: gitEnabled || !turnHadBash ? undefined : await this.ensureBaseline(),
-				baselineFailureReason: turnHadBash ? this.baselineFailureReason : undefined,
+				baseline: turnHadBash && runBaseline ? await runBaseline : undefined,
+				baselineFailureReason: turnHadBash && runBaseline ? this.baselineFailureReason : undefined,
 				excludeExternalCommits,
 			});
 		} catch (error) {
@@ -1595,7 +1667,12 @@ export class WebHost {
 	 */
 	private recordRunChanges(runId: number, checkpoint: GitCheckpoint | undefined): void {
 		try {
-			const data = { runId, files: this.tracker.runChangeCard(runId, checkpoint) };
+			// Files another chat or another program changed while the run went on are listed with the card, never counted.
+			const data = {
+				runId,
+				files: this.tracker.runChangeCard(runId, checkpoint),
+				...this.tracker.runChangeCardElsewhere(runId),
+			};
 			if (data.files.length === 0) return;
 			const id = this.session.isMirror
 				? `run-changes-${runId}`
@@ -1847,6 +1924,7 @@ export class WebHost {
 				background: session.backgroundTaskCount,
 			},
 			subAgents: subAgentStateToWire(session.subAgentState),
+			backgroundJobs: this.backgroundJobs(),
 			queue: { steering: [...session.getSteeringMessages()], followUp: [...session.getFollowUpMessages()] },
 			queueModes: { steering: session.steeringMode, followUp: session.followUpMode },
 			context: this.contextState(),
@@ -1896,6 +1974,23 @@ export class WebHost {
 			mode?: "auto" | "steer" | "followUp" | "interrupt";
 			clientMessageId?: string;
 		} = {},
+	): Promise<void> {
+		this.submitting += 1;
+		try {
+			await this.submitMessage(text, options);
+		} finally {
+			this.submitting -= 1;
+			this.session.pokeBackgroundJobReports();
+		}
+	}
+
+	private async submitMessage(
+		text: string,
+		options: {
+			images?: ImageContent[];
+			mode?: "auto" | "steer" | "followUp" | "interrupt";
+			clientMessageId?: string;
+		},
 	): Promise<void> {
 		try {
 			if (!existsSync(this.cwd)) {

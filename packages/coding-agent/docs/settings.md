@@ -146,7 +146,7 @@ Vision Assistant 接受声明支持 image input 的 models，以及通过 MyHarn
 
 一个中转站可以放多把密钥，每把密钥下面有自己的模型，每个模型可以有自己的格式。层数固定三层：
 
-- **Provider**：页面上的“全局设置”，可以填名称、API 格式、Base URL 和 API Key。
+- **Provider**：页面上 Provider 卡片里的“Provider 设置”，可以填名称、API 格式、Base URL 和 API Key。
 - **密钥**：一个 `models.json` 条目，名称、API 格式、Base URL 和 API Key 都可以单独设置。
 - **模型**：可以单独设置名称、API 格式、Base URL 和 API Key。
 
@@ -154,9 +154,9 @@ Vision Assistant 接受声明支持 image input 的 models，以及通过 MyHarn
 
 - 名字都由你自己设置，MyHarness 不加后缀；模型没有名字时显示 Model ID。
 - 如果中转站不同格式要用不同地址（带 `/v1` 和不带），不要在上层填 Base URL，分别填在下面。
-- 旧配置原样可用：每个旧条目显示成一个 Provider 下的一把密钥，全局设置为空。打开页面不写文件，保存或合并时才写，每个模型实际用的地址、格式和密钥不变，旧对话也继续能用。
+- 旧配置原样可用：每个旧条目显示成只有一把密钥的 Provider，Provider 设置为空，页面上不显示密钥这一层，加了第二把密钥才分成两层。打开页面不写文件，保存或合并时才写，每个模型实际用的地址、格式和密钥不变，旧对话也继续能用。
 - 页面按 Base URL 的域名（不看名字）在顶部给出合并建议：主机名相同的默认勾上；主机名不同但主域名相同或 Key 相同的标“可能是同一家”，由你决定。不点不影响使用；确认合并前会先把 `models.json` 备份成 `models.json.before-merge.bak`。
-- 登录型 Provider、覆盖已注册 Provider 的条目和 Nebius 不进入三层，保持原来的页面。
+- 登录型 Provider、覆盖已注册 Provider 的条目和 Nebius 不进入三层，只有一张表单。
 
 文件格式和 Key 的保存位置见 [models.md](models.md#provider-layers)。
 
@@ -178,6 +178,16 @@ Custom Providers 会出现在与其他 configured/extension services 相同的 *
 保存时会将 Provider 和 model metadata 写入 `~/.myharness/agent/models.json`，reload 正在运行的 model catalog，并将 API key 保存到 Provider credential collection。它不会把 API-key values 写入 `models.json`。如果写入、reload 或 credential storage 失败，MyHarness 会恢复之前的 configuration。GUI 会将 `models.json` 规范化重写为 JSON，因此 active file 不会保留 comments 和 custom formatting；修改前的 source 会保存为 `~/.myharness/agent/models.json.bak`。
 
 已有的 custom/configured Providers 可以进行 connection test、编辑、添加 models 或删除。Connection test 会发送一个很小的 model request，可能产生少量 Provider 费用。删除只由当前 `models.json` configuration 提供的 Provider 时，会删除其 entry、已保存的 credentials、legacy vision-store copy 和 cached remote model catalog；重新创建相同 Provider ID 时不会带回这些本地 credentials。如果是 extension/native Provider 仍提供同一 ID，删除 models.json overlay 后它仍然可用，environment variables 和 remote accounts 也不会改变。custom headers、详细 compatibility overrides 等 advanced fields 仍可直接编辑 `models.json`。
+
+## 模型专属提示词（Model prompts）
+
+设置 → 个性化 → **模型专属提示词**：先选一个模型，再写只给它的指令，点“保存”生效；清空后保存（或点“删除”）即删除。下面列出所有已设置提示词的模型，点一行打开它的内容；已从模型列表里消失的模型（例如 Provider 被删或停用）仍会列出，可以编辑或删除。
+
+- 保存在 `~/.myharness/agent/model-prompts.json`（全局，只在这台电脑；不进项目配置，不经 Google Drive 同步），格式为 `{ "version": 1, "prompts": { "<Provider ID>": { "<Model ID>": "<提示词>" } } }`，按 Provider ID + Model ID 精确匹配。
+- 优先级最高：作为 system prompt 的最后一块发送，写明与其他内容冲突时以它为准（内置规则、Coding/General 全局个性提示词、工作区说明、`AGENTS.md`/`CLAUDE.md`、`SYSTEM.md`/`APPEND_SYSTEM.md`、技能和召回记忆）。它不改变工具名称、参数和调用格式，也不改变程序要读的输出格式（例如 JSON）。
+- 只要请求用的是这个模型就带上：主聊天、子智能体、上下文压缩、记忆提取与回想、标题生成、交接摘要、只读委派的 shell 审查等都算；其他模型的请求一律不带。所以给辅助任务所用的模型写了强势要求（例如“只用英文回答”）时，压缩摘要和提取出的记忆也会照做。
+- 从下一次请求起生效，不用重启；正在进行的请求不变。聊天中途换模型，从下一轮起用新模型的提示词。
+- 文件损坏时不覆盖它，页面显示错误，请求照常发送但不带提示词（服务日志打印一次 warning）。
 
 ## Project Trust
 
@@ -305,7 +315,7 @@ Recall 搜索三个所属层的全部 active entries，而不是只搜索最近 
 
 Global 层可以有一条固定的常驻画像 `global/用户画像`（`type: user`、`importance: high`，六节：称呼与身份背景、沟通与语言偏好、工作与授权习惯、长期环境与工具事实、正在推进的事、被纠正过的行为与教训）。整理器每轮整篇重写它；它不存在时，第一批整理任务会授权整理器仅凭同一批里的稳定事实创建初版（事实不足就跳过，绝不臆造）；抽取器对它的写入仍被忽略，模型对它的删除操作也被忽略。主对话模型也可以用 `memory_write` 直接创建或整段更新它（用户导入画像、明确要求记住或更正时），写入立即生效；旧版本进 `archive/`。它存在时放在 recall message 的最前面（上下文里已有同样内容时不再重发，见下方增量说明），不参与普通排序，因此不会重复注入；不存在时也不阻止目录与卡片注入。单条记忆正文上限为 10 KB（只算正文，标题摘要等头不计；读取与写入一致），画像整篇也必须在这个上限内，超出部分拆成普通记忆而不丢信息。
 
-主对话模型有五个记忆工具（Coding 与 General 都可用，子智能体不可用；Auto Memory 关闭或会话不持久化时只返回一句说明）。`memory_search` 不带 `query` 时列出记忆目录（`id | name | description | importance | type | scope | updatedAt | origin`，本轮可见在前、跨项目/待认领在后，按更新时间倒序，超出 16 KB 时截断并标注），带 `query` 时用与 Recall 相同的排序返回摘要（含跨项目与待认领命中，标来源），不含全文；`memory_get` 按 id 取全文（一次最多 5 个，跨项目与 `pending/` 按需可取并标来源），未找到的 id 返回说明而不报错，不返回 `archive/` 下的归档版本。`memory_delete` 按 id 彻底删除（本轮三层＋待认领区，其他项目的不许删；正文连带归档一起清除，不可恢复；一次最多 5 个，只用于用户明确说要忘记时）。`memory_claim` 把一条 `pending/` 记忆认领为当前工作区记忆（一次一条）。`memory_write` 只用在用户明确要求记住、导入、更正或更新时：一次最多 10 条，省略 `id` 新建，带已存在的 `id` 更新并把旧版收进 `archive/`，只有 `global/用户画像` 允许带 `id` 首次创建；正文超 10 KB 拒绝写入而不截断；忘记仍走 `memory_delete`；写入会记一笔待整理变化，让后台整理随后接手。Recall message 只补发模型上下文里还没有的部分（details 带版本号 `v: 2`）：规矩头只发一次，画像内容变了才重发，目录第一次整份发、之后只发新增或改动的行和已移除的 id（变化超过目录位一半时整份重发），上下文里已有且内容没变的卡片不再发，什么都没变的一轮不发 recall。这样以前轮次的 recall 一直留在上下文里、字节不变，下一轮能命中供应商的提示缓存；卡片额度仍按整份画像和目录计算，每轮新发的量不比以前多。没有版本号的旧 recall 仍只在它那一轮发送；压缩后上下文里不再有的部分，下一轮会重新发出。磁盘对话历史不改写。更新使用乐观冲突检测，已有内容变化后重新提取；相同内容不重复归档。新记忆记录提取来源的 Workspace、Session 和末条 Entry ID。这是批次来源，不是逐句证据标注；记忆工具只查长期记忆，不查历史对话——查找和读取之前的聊天由 `session_search` / `session_get` 负责（见下方 [sessionContinuity](#sessioncontinuity)），与 Auto Memory 开关互相独立。Automatic memory 只适用于 persisted sessions；`--no-session` 不读写 long-term memory。
+主对话模型有五个记忆工具（Coding 与 General 都可用，子智能体不可用；Auto Memory 关闭或会话不持久化时只返回一句说明）。`memory_search` 不带 `query` 时列出记忆目录（`id | name | description | importance | type | scope | updatedAt | origin`，本轮可见在前、跨项目/待认领在后，按更新时间倒序，超出 16 KB 时截断并标注），带 `query` 时用与 Recall 相同的排序返回摘要（含跨项目与待认领命中，标来源），不含全文；`memory_get` 按 id 取全文（一次最多 5 个，跨项目与 `pending/` 按需可取并标来源），未找到的 id 返回说明而不报错，不返回 `archive/` 下的归档版本。`memory_delete` 按 id 彻底删除（本轮三层＋待认领区，其他项目的不许删；正文连带归档一起清除，不可恢复；一次最多 5 个，只用于用户明确说要忘记时）。`memory_claim` 把一条 `pending/` 记忆认领为当前工作区记忆（一次一条）。`memory_write` 由主对话模型主动使用：用户说出的偏好、习惯、规矩、纠正和关于自己的稳定事实直接记，不先询问，记完用一句话告知；用户要求记住、导入、更正或更新时也用它。只是观察到的习惯要反复出现才记，并注明是观察所得；不记密钥、只和这次对话有关的细节和未核实的猜测。写之前先查已有条目，有就更新、不重复新建；用户说哪条记错了就立即更新。常驻画像只在用户导入或要求修改时直接写，平时写普通记忆，由后台整理更新画像。一次最多 10 条，省略 `id` 新建，带已存在的 `id` 更新并把旧版收进 `archive/`，只有 `global/用户画像` 允许带 `id` 首次创建；正文超 10 KB 拒绝写入而不截断；忘记仍走 `memory_delete`；写入会记一笔待整理变化，让后台整理随后接手。Recall message 只补发模型上下文里还没有的部分（details 带版本号 `v: 2`）：规矩头只发一次，画像内容变了才重发，目录第一次整份发、之后只发新增或改动的行和已移除的 id（变化超过目录位一半时整份重发），上下文里已有且内容没变的卡片不再发，什么都没变的一轮不发 recall。这样以前轮次的 recall 一直留在上下文里、字节不变，下一轮能命中供应商的提示缓存；卡片额度仍按整份画像和目录计算，每轮新发的量不比以前多。没有版本号的旧 recall 仍只在它那一轮发送；压缩后上下文里不再有的部分，下一轮会重新发出。磁盘对话历史不改写。更新使用乐观冲突检测，已有内容变化后重新提取；相同内容不重复归档。新记忆记录提取来源的 Workspace、Session 和末条 Entry ID。这是批次来源，不是逐句证据标注；记忆工具只查长期记忆，不查历史对话——查找和读取之前的聊天由 `session_search` / `session_get` 负责（见下方 [sessionContinuity](#sessioncontinuity)），与 Auto Memory 开关互相独立。Automatic memory 只适用于 persisted sessions；`--no-session` 不读写 long-term memory。
 
 Memory Markdown files 是 source of truth：
 
@@ -561,7 +571,7 @@ Global 设置。定时的 Agent 任务到点时在新对话里运行，用这里
 
 task 修改 files 后，MyHarness 会发布已验证的结果，然后提供 `Save` 或 `Later`。`Save` 只会 preview 并 commit 当前 task 通过 `edit` 和 `write` calls 修改过的 paths。项目 repository 之外的 files（例如 desktop 上的 paths）不在 checkpoints 覆盖范围内：写入这些 files 不会 snapshot，restore 也不会触碰它们。Git integration 的 checkpoint/save 流程不会自动 push、pull、fetch、clone、创建 remote 或上传 commit；只有用户明确执行 `/push` 时，MyHarness 才会对当前 branch 的真实 upstream 执行受限 Push，并在支持的 GitHub Actions 连接可用时验证远端 SHA 与当前 commit 的 branch-push CI。无法验证 CI 时会保留真实未确认状态。关闭此 setting 只会停止 MyHarness 自动使用 Git，不会删除 `.git`、commits 或 file changes。
 
-启用 Git 后，task changes 会通过 repository 的 task checkpoint 进行跟踪。
+启用 Git 后，task changes 会通过 repository 的 task checkpoint 进行跟踪。当前 directory 不在任何 repository 里时没有 checkpoint，Web UI 的改动卡片按 Git 关闭时的方式检测（每轮开始时的内容基线，见 `web-ui.md` 的“文件变更摘要卡片”）。
 
 任务出错、被中断或 Provider/Tool 失败后，MyHarness 只显示真实错误并原样保留工作区，不会自动弹出恢复选择，也不会拦截下一条消息；checkpoint 仍有未处理的修改时，可以随时输入 `/undo` 选择保留或只撤销这次任务的修改；输入 `/restore` 则丢弃所有未提交内容并退回最新提交。如果 Git 无法创建 checkpoint（例如仓库里有 Windows 保留名文件 `nul`、没有提交的嵌套仓库或权限问题），MyHarness 会显示 Git 原始错误和涉及的路径，本轮不再重复尝试，Agent 继续读写文件、运行命令和接收消息，只是本轮修改无法通过 `/undo` 撤销。MyHarness 不会自动删除或清理这些文件。
 
@@ -787,8 +797,9 @@ Agent-level retry 覆盖的临时故障包括：过载和限流（429、529）�
 - **后台运行与作业管理**：
   - `bash` / `pwsh` 传入 `run_in_background: true` 时，命令在后台异步执行并立即返回分配的 `taskId`（形如 `job-xxxxxxxx`）。
   - `job_list`：列出当前会话的所有后台作业及其运行状态（`running`、`completed`、`failed`、`killed`、`timed_out`）、退出码与命令。
-  - `job_output`：只接收 `taskId`，返回指定后台作业自上次调用以来的增量输出，每次调用最多返回 50KB（未读完时会提示再次调用以继续获取后续内容）。无 `tail` 或 `follow` 参数。
-  - `job_kill`：接收 `taskId`，终止后台作业及其完整子进程树（Windows 上结束该命令的作业对象，没有作业对象时用 `taskkill /F /T /PID`；POSIX 上利用进程组 `SIGKILL`），并确认进程已终结。
+  - `job_output`：只接收 `taskId`，返回指定后台作业自本会话上次调用以来的增量输出，每次调用最多返回 50KB（未读完时会提示再次调用以继续获取后续内容）。无 `tail` 或 `follow` 参数。别的会话启动的作业，只要有 `taskId` 也能读（只读），比如定时任务开出的新对话检查原对话的后台命令；每个会话各记自己的读取位置，不会吃掉所属会话还没读的输出。
+  - `job_kill`：接收 `taskId`，终止本会话启动的后台作业及其完整子进程树（Windows 上结束该命令的作业对象，没有作业对象时用 `taskkill /F /T /PID`；POSIX 上利用进程组 `SIGKILL`），并确认进程已终结。别的会话的作业只能读，不能终止。
+  - 结束后自动回报：主会话启动的后台作业结束时，MyHarness 往该会话追加一条 `background-job-complete` 消息（命令、目录、状态、退出码、用时、输出末尾最多 50 行 / 8KB、日志路径），并开新一轮让 Agent 读结果、告诉用户。被 `job_kill`、Web UI 后台面板停止或随进程退出终止的作业不回报；本会话 `job_output` 已读到结束、输出也读完的作业不回报。回报不插进正在进行的一轮，等运行、正在发送的消息和收尾结束后再开始；1 秒内结束的合成一轮；用户按停止时排队中的回报不开新一轮，直接加进对话，随下一条消息交给模型。没有次数上限，也没有开关。
   - **保护策略与生命周期**：
     - 单会话并发上限：每会话最多同时运行 8 个后台作业，超出时拒绝启动；历史完成作业保留最多 100 条记录，超限时自动淘汰并物理删除最早终结作业的日志。
     - 运行时间上限：后台任务不受前台单次调用的超时限制，但受全局 24 小时硬上限约束，超时后状态变为 `timed_out`。

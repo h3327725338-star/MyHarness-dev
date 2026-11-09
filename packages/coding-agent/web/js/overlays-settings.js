@@ -1,7 +1,7 @@
 // Settings: Web UI appearance (browser-local) plus the same agent settings the terminal /settings menu edits. Every page uses
 // the same pieces: cards for groups, one compact line per setting with the name and (in a weaker colour) its description
 // on the left and the control on the right.
-import { html, useEffect, useMemo, useRef, useState, Collapse, Icon, Modal, Segmented, Spinner, Toggle, UnitGroup, useDelayedBusy, motionEnabled, usePresence } from "./ui.js";
+import { html, useEffect, useMemo, useRef, useState, Chevron, Collapse, Icon, Modal, Popover, Segmented, Spinner, Toggle, UnitGroup, useDelayedBusy, motionEnabled, usePresence } from "./ui.js";
 import { builtinBrowserAvailable, linkTargetOf } from "./link-target.js";
 import { api, attempt, loadModels, loadSettings, loadSnapshot, post, readWidthValue, setView, state, toast, useStore } from "./store.js";
 import { actions, confirmDialog, inputDialog } from "./actions.js";
@@ -10,7 +10,7 @@ import { clip, storedToUnitValue, tokensToUnit, unitToTokens, unitValueToStored 
 import { N_, serverText, t } from "./i18n.js";
 import { LANGUAGES, getLang } from "./lang.js";
 import { COLOR_THEMES } from "./appearance-themes.js";
-import { ModelRefPicker } from "./model-menu.js";
+import { ModelMenu, ModelRefPicker, findModel } from "./model-menu.js";
 import { playNotificationSound } from "./notification-sounds.js";
 import { notificationPermission } from "./notifications.js";
 import { ProvidersPage } from "./providers-page.js";
@@ -1058,6 +1058,7 @@ function Personalization() {
 			${dirty ? html`<button class="btn" disabled=${busy} onClick=${() => setValue(saved)}>${t("Discard changes")}</button>` : null}
 			<button class="btn primary" disabled=${busy || !dirty} onClick=${save}>${t("Save")}</button>
 		</div>
+		<${ModelPrompts} />
 		<${PersonalFullscreen}
 			open=${fullscreen !== null}
 			title=${t(fullscreen === "general" ? "General mode global personal prompt" : "Coding mode global personal prompt")}
@@ -1069,6 +1070,162 @@ function Personalization() {
 				if (fullscreen !== null) setValue({ ...value, [fullscreen]: text });
 			}}
 			onClose=${() => setFullscreen(null)}
+		/>`;
+}
+
+/**
+ * Settings → Personalization → Model prompts (`/api/model-prompts`): the user's own prompt for one model, sent as the
+ * last block of the system prompt of every request that model receives (main chat, sub-agents and helper requests
+ * alike) and never to another model. One model is edited at a time and saved on its own; a box saved empty removes the
+ * prompt. The models that have one are listed below the editor; picking one opens its text.
+ */
+function ModelPrompts() {
+	const models = useStore((s) => s.models);
+	const nonce = useStore((s) => s.modelPromptsNonce);
+	const [saved, setSaved] = useState(null); // [{ provider, model, prompt }]
+	const [selected, setSelected] = useState(null); // { provider, model }
+	const [text, setText] = useState("");
+	const [error, setError] = useState("");
+	const [busy, setBusy] = useState(false);
+	const [picking, setPicking] = useState(false);
+	const [fullscreen, setFullscreen] = useState(false);
+	const anchor = useRef(null);
+	const box = useRef(null);
+	const expander = useRef(null);
+	const caret = useRef({ start: 0, end: 0 });
+	const promptOf = (list, ref) => (ref && list?.find((entry) => entry.provider === ref.provider && entry.model === ref.model)?.prompt) || "";
+	const edits = useRef({ saved: null, selected: null, text: "" });
+	edits.current = { saved, selected, text };
+	useEffect(() => {
+		if (!models) loadModels();
+	}, [models]);
+	// Like the composer's model menu: the list is read again each time it opens, so a model just added shows up.
+	useEffect(() => {
+		if (picking) loadModels();
+	}, [picking]);
+	useEffect(() => {
+		let cancelled = false;
+		api("/api/model-prompts")
+			.then((data) => {
+				if (cancelled) return;
+				const { saved: before, selected: current, text: draft } = edits.current;
+				setSaved(data.prompts);
+				// Saved elsewhere: the open box follows unless it holds unsaved edits.
+				if (current && draft === promptOf(before, current)) setText(promptOf(data.prompts, current));
+				setError("");
+			})
+			.catch((e) => !cancelled && setError(serverText(e.message, t("The operation failed."))));
+		return () => {
+			cancelled = true;
+		};
+	}, [nonce]);
+	const savedText = promptOf(saved, selected);
+	const dirty = !!selected && saved !== null && text !== savedText;
+	const nameOf = (ref) => findModel(models, ref.provider, ref.model)?.name || ref.model;
+	const choose = async (ref) => {
+		setPicking(false);
+		if (selected && ref.provider === selected.provider && ref.model === selected.model) return;
+		if (dirty && !(await confirmDialog({ title: t("Discard unsaved changes?"), message: t("The prompt for {model} has changes that are not saved.", { model: nameOf(selected) }), confirmLabel: t("Discard changes"), danger: true }))) return;
+		setSelected(ref);
+		setText(promptOf(saved, ref));
+	};
+	const store = async (prompt, success) => {
+		setBusy(true);
+		const result = await attempt(() => post("/api/model-prompts", { provider: selected.provider, model: selected.model, prompt }), { success });
+		setBusy(false);
+		if (result?.prompts) {
+			setSaved(result.prompts);
+			setText(promptOf(result.prompts, selected));
+		}
+	};
+	const save = () => store(text, text.trim() ? t("Model prompt saved.") : t("Model prompt removed."));
+	const remove = async () => {
+		if (!(await confirmDialog({ title: t("Remove this model's prompt?"), message: t("Requests to {model} no longer carry it.", { model: nameOf(selected) }), confirmLabel: t("Remove"), danger: true }))) return;
+		await store("", t("Model prompt removed."));
+	};
+	const title = selected ? t("Prompt for {model}", { model: nameOf(selected) }) : t("Model prompts");
+	const placeholder = t("For example: answer in English only, or keep replies short.");
+	return html`<${Card} title=${t("Model prompts")} collapsible>
+		<div class="personal-body">
+			<div class="set-desc">${t("Your own instructions for one model, with the highest priority: every request that model receives carries them, including sub-agents, compaction, memory and titles. Other models never see them.")}</div>
+			${error ? html`<div class="notice danger">${error}</div>` : null}
+			${saved === null && !error
+				? html`<${Spinner} />`
+				: html`
+					<div class="row model-prompt-pick">
+						<span class="set-label">${t("Model")}</span>
+						<span ref=${anchor} class="picker-anchor grow">
+							<button class="select model-ref-btn" aria-haspopup="listbox" aria-expanded=${picking} aria-label=${t("Choose a model")} title=${selected ? `${selected.provider}/${selected.model}` : ""} onClick=${() => setPicking(!picking)}>
+								<span class="model-ref-text">${selected ? nameOf(selected) : t("Choose a model")}</span>
+								<${Chevron} />
+							</button>
+							<${Popover} anchor=${anchor} open=${picking} onClose=${() => setPicking(false)} placement="bottom" align="end" width=${360} maxHeight=${360} class="model-pop model-ref-pop">
+								<${ModelMenu} models=${models} selected=${selected ? { provider: selected.provider, model: selected.model } : null} fullText onPick=${choose} />
+							<//>
+						</span>
+					</div>
+					${selected
+						? html`<div class="personal-expand">
+								<textarea
+									class="field personal-prompt"
+									rows="8"
+									ref=${box}
+									value=${text}
+									disabled=${busy}
+									placeholder=${placeholder}
+									aria-label=${title}
+									onInput=${(e) => setText(e.target.value)}
+								/>
+								<button
+									type="button"
+									class="icon-btn sm personal-expand-btn"
+									title=${t("Edit fullscreen")}
+									aria-label=${t("Edit fullscreen")}
+									ref=${expander}
+									onClick=${() => {
+										caret.current = { start: box.current?.selectionStart ?? 0, end: box.current?.selectionEnd ?? box.current?.selectionStart ?? 0 };
+										setFullscreen(true);
+									}}
+								>
+									<${Icon} name="maximize" size=${14} />
+								</button>
+							</div>
+							<div class="row">
+								<span class="dim grow">${t("Applies from the next request on. A box saved empty removes the prompt.")}</span>
+								${savedText ? html`<button class="btn danger" disabled=${busy} onClick=${remove}>${t("Remove")}</button>` : null}
+								${dirty ? html`<button class="btn" disabled=${busy} onClick=${() => setText(savedText)}>${t("Discard changes")}</button>` : null}
+								<button class="btn primary" disabled=${busy || !dirty} onClick=${save}>${t("Save")}</button>
+							</div>`
+						: null}
+					${saved?.length
+						? html`<div class="col model-prompt-list">
+								<span class="set-label">${t("Models with a prompt")}</span>
+								${saved.map(
+									(entry) => html`<button
+										key=${`${entry.provider}/${entry.model}`}
+										type="button"
+										class=${`model-prompt-item ${selected && selected.provider === entry.provider && selected.model === entry.model ? "on" : ""}`}
+										title=${`${entry.provider}/${entry.model}`}
+										onClick=${() => choose({ provider: entry.provider, model: entry.model })}
+									>
+										<span class="model-prompt-name">${nameOf(entry)}</span>
+										<span class="dim model-prompt-sub">${findModel(models, entry.provider, entry.model) ? entry.provider : t("{provider} · not in the model list", { provider: entry.provider })}</span>
+										<span class="dim model-prompt-snippet">${clip(entry.prompt.split(/\s+/).join(" ").trim(), 80)}</span>
+									</button>`,
+								)}
+							</div>`
+						: html`<span class="dim">${t("No model has a prompt yet.")}</span>`}`}
+		</div>
+	<//>
+	<${PersonalFullscreen}
+			open=${fullscreen && !!selected}
+			title=${title}
+			value=${text}
+			caret=${caret.current}
+			anchor=${expander.current}
+			placeholder=${placeholder}
+			onInput=${(value) => setText(value)}
+			onClose=${() => setFullscreen(false)}
 		/>`;
 }
 
@@ -1244,6 +1401,7 @@ const SEARCH_ROWS = [
 	["conversation", N_("Run steps"), N_("Default state after a reply.")],
 	["personal", N_("Coding mode global personal prompt"), N_("Injected into the next requests of Coding chats only, ahead of the built-in system prompt.")],
 	["personal", N_("General mode global personal prompt"), N_("Injected into the next requests of General chats only, ahead of the built-in system prompt.")],
+	["personal", N_("Model prompts"), N_("Your own instructions for one model, with the highest priority: every request that model receives carries them, including sub-agents, compaction, memory and titles. Other models never see them.")],
 	["git", N_("Commit"), N_("Checks the changes and writes the description as your instructions ask; repairs failed pre-commit checks.")],
 	["git", N_("Push"), N_("Checks the commits as your instructions ask and pushes; CI is followed in the background and repaired when they ask for it.")],
 	["git", N_("Skip Git hooks"), N_("Direct mode only: commit with --no-verify, so pre-commit checks do not run.")],
@@ -1348,7 +1506,8 @@ export function SettingsModal() {
 		setQuery("");
 		setView({ settingsSection: id });
 	};
-	return html`<${Modal} title=${t("Settings")} onClose=${close} width=${900} class="settings-modal" focusInput=${false}>
+	// The provider page edits a tree (provider → key → model): it gets a wider dialog.
+	return html`<${Modal} title=${t("Settings")} onClose=${close} width=${section === "providers" && !searching ? 1180 : 900} class="settings-modal" focusInput=${false}>
 		<div class="settings">
 			<nav class="settings-nav" aria-label=${t("Settings sections")}>
 				<label class="settings-search">

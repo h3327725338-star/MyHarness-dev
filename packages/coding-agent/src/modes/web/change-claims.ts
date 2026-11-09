@@ -2,21 +2,24 @@
  * Cross-session attribution for workspace changes.
  *
  * Several conversations can be open on the same workspace at the same time, and
- * they share one filesystem and one Git state. A run's final change detection
- * compares the workspace against its baseline, so it sees "what changed", not
- * "who changed it": without a record of what each conversation did itself, a
- * change card picks up files another conversation wrote in the same window.
+ * they share one filesystem and one Git state - with each other and with every
+ * other program on the machine (another MyHarness process, an editor, another
+ * coding agent). A run's final change detection compares the workspace against
+ * its baseline, so it sees "what changed", not "who changed it".
  *
- * Every session records here what it changed itself - direct file operations
- * (edit / write / apply_patch) and the windows during which it ran shell
- * commands, which change files opaquely. A finished run then drops the files
- * another session's record explains, an undo lists the files it would roll
- * back that another conversation changed, and the Changes panel asks who changed
- * an uncommitted file last (see session-ownership.ts).
+ * Every session records here what it did itself: direct file operations
+ * (edit / write / apply_patch / apply_rename) with their paths, and the windows
+ * during which it ran something that writes files without naming them - shell
+ * commands, background jobs (until the job really ends), sub-agents and other
+ * tools that may write. A finished run keeps only the detected changes it can
+ * explain itself (see attributeRunChanges); the rest is listed as changed
+ * elsewhere. An undo lists the files it would roll back that another
+ * conversation changed, and the Changes panel asks who changed an uncommitted
+ * file last (see session-ownership.ts).
  *
  * The registry is process-local: it knows the sessions of this app instance.
- * Another MyHarness process, or any unrelated program, on the same workspace
- * leaves no record; its changes stay in the change list as unattributed ones.
+ * Another MyHarness process or any unrelated program leaves no record here,
+ * which is why a run keeps a change only on evidence of its own.
  */
 
 import { resolve } from "node:path";
@@ -32,11 +35,27 @@ export interface ChangeClaim {
 	tool: string;
 }
 
+/** What a window covers, for diagnostics and tests only. */
+export type ActivityKind = "shell" | "job" | "agent" | "tool";
+
+/**
+ * A stretch of time during which a session ran something that may write files without naming them. The name is kept
+ * from the time only shell commands were recorded.
+ */
 export interface ShellWindow {
 	sessionKey: string;
 	runId: number;
 	startedAt: number;
-	endedAt: number;
+	/** Undefined while the work still runs (a background job, a sub-agent or a tool call that has not ended). */
+	endedAt?: number;
+	kind?: ActivityKind;
+}
+
+/** Windows the registry does not store itself, read when needed (the background jobs of this process). */
+export type WindowSource = () => Iterable<ShellWindow>;
+
+export interface ChangeClaimRegistryOptions {
+	windowSource?: WindowSource;
 }
 
 /** Records stay long enough to explain an old checkpoint's undo; the age window bounds memory. */
@@ -44,11 +63,32 @@ const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 const PRUNE_CLAIM_COUNT = 50_000;
 
+/**
+ * Slack around a window when a file's last write time is placed in it: file system time stamps are coarser than the
+ * clock on some drives, and a command's last write can land just after the tool call reported its end.
+ */
+export const ATTRIBUTION_SLACK_MS = 2_000;
+
+function covers(window: ShellWindow, at: number, slack: number): boolean {
+	return window.startedAt - slack <= at && at <= (window.endedAt ?? Number.POSITIVE_INFINITY) + slack;
+}
+
+function overlaps(window: ShellWindow, from: number, to: number): boolean {
+	return window.startedAt <= to && (window.endedAt ?? Number.POSITIVE_INFINITY) >= from;
+}
+
 export class ChangeClaimRegistry {
 	private readonly claims = new Map<string, ChangeClaim[]>();
 	private shellWindows: ShellWindow[] = [];
+	/** Windows whose work has not ended yet, by the id their owner closes them with. */
+	private readonly openWindows = new Map<string, ShellWindow>();
+	private readonly windowSource: WindowSource | undefined;
 	private claimCount = 0;
 	private lastPruneAt = 0;
+
+	constructor(options: ChangeClaimRegistryOptions = {}) {
+		this.windowSource = options.windowSource;
+	}
 
 	record(claim: ChangeClaim): void {
 		const key = pathIdentityKey(claim.path);
@@ -59,9 +99,42 @@ export class ChangeClaimRegistry {
 		this.maybePrune();
 	}
 
+	/** A finished window (its end is known). */
 	recordShell(window: ShellWindow): void {
-		this.shellWindows.push(window);
+		this.shellWindows.push({ ...window, endedAt: Math.max(window.startedAt, window.endedAt ?? window.startedAt) });
 		this.maybePrune();
+	}
+
+	/** A window that starts now and stays open until `closeWindow(id)`: other sessions see it while the work runs. */
+	openWindow(id: string, window: Omit<ShellWindow, "endedAt">): void {
+		this.openWindows.set(id, { ...window });
+		this.maybePrune();
+	}
+
+	/** Ends an open window; an unknown id (never opened, or already closed) is ignored. */
+	closeWindow(id: string, endedAt: number): void {
+		const window = this.openWindows.get(id);
+		if (!window) return;
+		this.openWindows.delete(id);
+		this.shellWindows.push({ ...window, endedAt: Math.max(window.startedAt, endedAt) });
+	}
+
+	/** Whether `id` names a window that is still open. */
+	isWindowOpen(id: string): boolean {
+		return this.openWindows.has(id);
+	}
+
+	/** Every window on record: finished, still open and the ones the source reports. */
+	windows(): ShellWindow[] {
+		const all = [...this.shellWindows, ...this.openWindows.values()];
+		if (this.windowSource) {
+			try {
+				for (const window of this.windowSource()) all.push(window);
+			} catch {
+				// A failing source only loses its windows; the recorded ones still count.
+			}
+		}
+		return all;
 	}
 
 	/** The newest direct change of `path` on record, whoever made it, or undefined when nobody recorded one. */
@@ -73,9 +146,9 @@ export class ChangeClaimRegistry {
 		return latest;
 	}
 
-	/** The shell windows of any session that cover `at`; a command run then may have written the file. */
-	windowsCovering(at: number): ShellWindow[] {
-		return this.shellWindows.filter((window) => window.startedAt <= at && at <= window.endedAt);
+	/** The windows of any session that cover `at`; something that session ran then may have written the file. */
+	windowsCovering(at: number, slack = 0): ShellWindow[] {
+		return this.windows().filter((window) => covers(window, at, slack));
 	}
 
 	/** Whether a session other than `sessionKey` claimed `path` at a time inside [from, to]. */
@@ -88,38 +161,41 @@ export class ChangeClaimRegistry {
 		return false;
 	}
 
-	/** Whether a shell window of another session covers `at`. */
-	foreignShellCovers(at: number, sessionKey: string): boolean {
-		return this.shellWindows.some(
-			(window) => window.sessionKey !== sessionKey && window.startedAt <= at && at <= window.endedAt,
-		);
+	/** Whether a window of another session covers `at`. */
+	foreignShellCovers(at: number, sessionKey: string, slack = 0): boolean {
+		return this.windows().some((window) => window.sessionKey !== sessionKey && covers(window, at, slack));
 	}
 
-	/** Whether a shell window of this session covers `at`. */
-	ownShellCovers(sessionKey: string, at: number): boolean {
-		return this.shellWindows.some(
-			(window) => window.sessionKey === sessionKey && window.startedAt <= at && at <= window.endedAt,
-		);
+	/** Whether a window of this session covers `at`. */
+	ownShellCovers(sessionKey: string, at: number, slack = 0): boolean {
+		return this.windows().some((window) => window.sessionKey === sessionKey && covers(window, at, slack));
 	}
 
 	/**
 	 * The candidates another session changed at or after `since` - by a direct
-	 * file operation or inside one of its shell windows. Used before an undo:
+	 * file operation or inside one of its windows. Used before an undo:
 	 * rolling the workspace back to an old checkpoint takes these changes with it.
 	 */
+	/** Whether `sessionKey` had a window (a call, a background job, a sub-agent dispatch) overlapping [from, to]. */
+	hasWindowDuring(sessionKey: string, from: number, to: number): boolean {
+		return this.windows().some((window) => window.sessionKey === sessionKey && overlaps(window, from, to));
+	}
+
 	foreignChangedSince<T extends { path: string; modifiedAt?: number }>(
 		candidates: readonly T[],
 		sessionKey: string,
 		since: number,
 	): T[] {
 		const foreign: T[] = [];
+		const windows = this.windows().filter((window) => window.sessionKey !== sessionKey);
 		for (const candidate of candidates) {
 			if (this.foreignClaim(candidate.path, sessionKey, since, Number.POSITIVE_INFINITY)) {
 				foreign.push(candidate);
 				continue;
 			}
 			const at = candidate.modifiedAt;
-			if (at !== undefined && at >= since && this.foreignShellCovers(at, sessionKey)) foreign.push(candidate);
+			if (at !== undefined && at >= since && windows.some((window) => covers(window, at, 0)))
+				foreign.push(candidate);
 		}
 		return foreign;
 	}
@@ -136,7 +212,7 @@ export class ChangeClaimRegistry {
 		this.prune(now);
 	}
 
-	/** Drop records older than the retention window. */
+	/** Drop records older than the retention window. Open windows stay until they are closed. */
 	prune(now = Date.now()): void {
 		this.lastPruneAt = now;
 		const floor = now - RETENTION_MS;
@@ -148,7 +224,7 @@ export class ChangeClaimRegistry {
 			else if (kept.length !== list.length) this.claims.set(key, kept);
 		}
 		this.claimCount = count;
-		this.shellWindows = this.shellWindows.filter((window) => window.endedAt >= floor);
+		this.shellWindows = this.shellWindows.filter((window) => (window.endedAt ?? now) >= floor);
 	}
 }
 
@@ -157,7 +233,17 @@ export interface AttributableChange {
 	status: string;
 }
 
-export interface ForeignChangeSelection {
+/** Who made a change a run leaves out: another conversation of this app, or something outside it. */
+export type ChangedElsewhereBy = "chat" | "outside";
+
+/** A detected change that is not the run's own: shown under its card, never counted. */
+export interface ChangedElsewhere {
+	path: string;
+	status: string;
+	by: ChangedElsewhereBy;
+}
+
+export interface RunAttributionInput {
 	registry: ChangeClaimRegistry;
 	/** Identity of the session whose run is being attributed. */
 	sessionKey: string;
@@ -173,35 +259,56 @@ export interface ForeignChangeSelection {
 }
 
 /**
- * Which of a run's detected changes another session explains: a direct file
- * operation it recorded inside the run's window, or - for a change no session
- * recorded directly - a file whose last write falls inside another session's
- * shell window and outside every shell window of this session. Files this run
- * changed itself are never dropped, and a change with no explanation stays.
+ * Splits a run's detected changes into the ones the run can explain and the ones changed elsewhere.
+ *
+ * A change stays with the run when the run changed the file through its own file tools, or when the file's last write
+ * falls inside one of this session's windows (a command, a background job, a sub-agent, another tool that may write).
+ * Ambiguity keeps it: windows of two sessions that overlap, and a write time outside the run (a command that copies or
+ * unpacks files keeps their old times) while the run had a window of its own. A deleted file has no write time, so it
+ * stays when the run had any window. Everything else - another conversation's direct operation inside the run, or a
+ * write inside the run while this session was not running anything that writes - was made elsewhere.
  */
-export function selectForeignChanges(
-	changes: readonly AttributableChange[],
-	selection: ForeignChangeSelection,
-): string[] {
-	const dropped: string[] = [];
+export function attributeRunChanges<T extends AttributableChange>(
+	changes: readonly T[],
+	input: RunAttributionInput,
+): { kept: T[]; elsewhere: ChangedElsewhere[] } {
+	const { registry, sessionKey, ownPaths, from, to, baseDir, modifiedAt } = input;
+	const slack = ATTRIBUTION_SLACK_MS;
+	const windows = registry.windows();
+	const own = windows.filter((window) => window.sessionKey === sessionKey);
+	const foreign = windows.filter((window) => window.sessionKey !== sessionKey);
+	const ownActive = own.some((window) => overlaps(window, from - slack, to + slack));
+	const foreignActive = foreign.some((window) => overlaps(window, from - slack, to + slack));
+	const kept: T[] = [];
+	const elsewhere: ChangedElsewhere[] = [];
+	const leave = (change: T, by: ChangedElsewhereBy) =>
+		elsewhere.push({ path: change.path, status: change.status, by });
 	for (const change of changes) {
-		const absolute = resolve(selection.baseDir, change.path);
-		if (selection.ownPaths.has(pathIdentityKey(absolute))) continue;
-		if (selection.registry.foreignClaim(absolute, selection.sessionKey, selection.from, selection.to)) {
-			dropped.push(change.path);
+		const absolute = resolve(baseDir, change.path);
+		if (ownPaths.has(pathIdentityKey(absolute))) {
+			kept.push(change);
 			continue;
 		}
-		if (change.status === "deleted") continue;
-		const at = selection.modifiedAt(absolute);
-		if (
-			at !== undefined &&
-			at >= selection.from &&
-			at <= selection.to &&
-			selection.registry.foreignShellCovers(at, selection.sessionKey) &&
-			!selection.registry.ownShellCovers(selection.sessionKey, at)
-		) {
-			dropped.push(change.path);
+		if (registry.foreignClaim(absolute, sessionKey, from, to)) {
+			leave(change, "chat");
+			continue;
 		}
+		if (change.status === "deleted") {
+			if (ownActive) kept.push(change);
+			else leave(change, foreignActive ? "chat" : "outside");
+			continue;
+		}
+		const at = modifiedAt(absolute);
+		if (at !== undefined && own.some((window) => covers(window, at, slack))) {
+			kept.push(change);
+			continue;
+		}
+		if (at !== undefined && at >= from - slack && at <= to + slack) {
+			leave(change, foreign.some((window) => covers(window, at, slack)) ? "chat" : "outside");
+			continue;
+		}
+		if (ownActive) kept.push(change);
+		else leave(change, "outside");
 	}
-	return dropped;
+	return { kept, elsewhere };
 }

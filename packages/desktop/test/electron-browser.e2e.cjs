@@ -137,6 +137,13 @@ async function main() {
   writeFileSync(join(workspaceRoot, 'upload-source.txt'), 'upload me\n');
   mkdirSync(join(workspaceRoot, 'folder'), { recursive: true });
   writeFileSync(outsideFile, 'not allowed\n');
+  // A chat's own folders, which it names with each upload; the app's start folder (workspaceRoot) is not one of them.
+  const chatFolder = join(profile, 'chat');
+  const artifactsFolder = join(profile, 'artifacts');
+  mkdirSync(chatFolder, { recursive: true });
+  mkdirSync(artifactsFolder, { recursive: true });
+  writeFileSync(join(chatFolder, 'from-chat.txt'), 'chat file\n');
+  writeFileSync(join(artifactsFolder, 'report.pdf'), '%PDF-1.4 e2e\n');
   const browser = createBrowser(window, (message) => report.events.push(`log:${message}`), { workspaceRoot });
 
   // --- permission + page commands ---------------------------------------------------------------
@@ -180,10 +187,21 @@ async function main() {
   check(intoClearing.ok === true && intoClearing.count === 1, 'an upload counts although the page empties its input on change', intoClearing);
   const handled = await browser.command({ action: 'exec', tabId: id, code: 'window.__uploads' });
   check(JSON.stringify(handled.result) === '["upload-source.txt"]', 'the page handled the chosen file once, not twice', handled.result);
-  await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#file', path: outsideFile }), /只能上传当前工作区内的文件/, 'a file outside the workspace is refused');
+  // Files come from the chat's folders or from the user's own folder; anything else is refused (system files, other users).
+  const systemFile = join(process.env.SystemRoot || 'C:\\Windows', 'win.ini');
+  await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#file', path: systemFile }), /只能上传你用户文件夹/, "a file outside the user's folder is refused");
+  // A chat names its own folders (its folder, then its artifacts folder); they replace the app's start folder.
+  const named = { roots: [chatFolder, artifactsFolder] };
+  const fromArtifacts = await browser.command({ action: 'upload', tabId: id, selector: '#file', path: join(artifactsFolder, 'report.pdf'), ...named });
+  check(fromArtifacts.ok === true && fromArtifacts.name === 'report.pdf', "a file in the chat's artifacts folder is uploaded", fromArtifacts);
+  const fromChat = await browser.command({ action: 'upload', tabId: id, selector: '#file', path: 'from-chat.txt', ...named });
+  check(fromChat.ok === true && fromChat.name === 'from-chat.txt', "a relative path is read from the chat's folder", fromChat);
+  await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#file', path: 'upload-source.txt', ...named }), /不存在/, "a relative path is not read from the app's start folder when the chat names its folders");
+  const outside = await browser.command({ action: 'upload', tabId: id, selector: '#file', path: outsideFile, ...named });
+  check(outside.ok === true && outside.name === 'outside.txt', "a file elsewhere in the user's folder is uploaded by its full path", outside);
   await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#file', path: 'folder' }), /普通文件/, 'a directory is refused');
   await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#file', path: 'missing.txt' }), /不存在/, 'a missing file is refused');
-  await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#name', path: 'upload-source.txt' }), /input type="file"/, 'a non-file input is refused');
+  await assertRejects(() => browser.command({ action: 'upload', tabId: id, selector: '#name', path: 'upload-source.txt' }), /没有打开选择文件的窗口/, 'a control that opens no file chooser is an error that says so');
   // The Agent tool, end to end: real IPC to this Electron main process, real WebContentsView commands, faux model turn.
   const toolRun = await runWorkspaceTool(browser, origin, id, workspaceRoot);
   const toolText = Array.isArray(toolRun.report.results) ? toolRun.report.results.join('\n') : '';

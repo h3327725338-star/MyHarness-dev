@@ -16,7 +16,7 @@ reading the 5,660 change lists. Since then the maintainer has run sync for real 
 | --- | --- |
 | Global, Workspace and Session memories, including archives, pending quarantine and the user profile | Yes |
 | General-mode Workspaces: identity, name, instructions, memory/library switches | Yes |
-| General-mode chats: conversation JSONL (branches merged by entry id), handoff metadata, session metadata (without this computer's paths) | Yes |
+| General-mode chats, including the default group of chats that belong to no Workspace: conversation JSONL (branches merged by entry id), handoff metadata, session metadata (without this computer's paths) | Yes |
 | A chat's search index (`metadata/history-index.json`) | No, it describes the chat file on the computer that built it |
 | Session attachments (`uploads/`), artifacts, notes, tool results and other session files | Yes |
 | Workspace library sources and workspace artifacts | Yes |
@@ -25,6 +25,7 @@ reading the 5,660 change lists. Since then the maintainer has run sync for real 
 | Coding-mode repository files, worktrees and build output | No |
 | General-mode drafts and the General personal prompt | Yes |
 | Saved prompts of the Web UI (Session panel → My prompts) | Yes, only that list; other Web UI preferences stay on each device |
+| Model prompts (Settings → Personalization, `model-prompts.json`) | No, they stay on each device like the other settings |
 | Built-in browser (desktop app): bookmarks, new-tab shortcuts, site zoom, dark mode, website language, site permissions | Yes, as the desktop profile's own files |
 | Built-in browser: sign-ins (persistent cookies) and saved passwords | Only after the user sets a sync passphrase; sealed on the computer before upload |
 | Coding-mode chats, repositories, worktrees | No |
@@ -228,6 +229,9 @@ A Workspace is identified by its stable `workspaceId`. Its root folder is bound 
 - a chat synced from another device stores that device's folder in its header; when that folder does not exist here
   (or the chat still sits in the managed placeholder after the real folder was bound) it opens in its Workspace's folder
   on this device. Other chats, such as a worktree or a sub-folder that exists, keep their own folder.
+- a chat of the default group (no Workspace) stores the other device's default working folder; when that folder
+  does not exist here it opens in this device's own default working folder, like a new chat of that group. The
+  group itself is never published as a Workspace.
 
 Coding-mode registrations are not copied when a General workspace is removed; removing a workspace in General leaves the
 physical directory in place. A Workspace the user removed from every list keeps its files here, is not published again,

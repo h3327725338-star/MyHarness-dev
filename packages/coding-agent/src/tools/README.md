@@ -56,9 +56,9 @@
 | `pwsh.ts` | `pwsh` 工具（Windows PowerShell） |
 | `executor.ts` | `executeBashWithOperations()`：用户直接执行命令（`!命令`）时用的流式执行 |
 | `session-bash.ts` | `SessionBashRunner`：一个会话里用户直接执行的命令。同一时间只跑一条，完整输出落盘，结果写入会话；Agent 正在运行时先排队，等本轮结束再写入 |
-| `job-manager.ts` | `BackgroundJobManager`：后台 shell 任务表、日志写临时文件、增量字节游标读取、进程树终止、单任务日志上限（64MB）、会话并发上限（8 个）、最近 100 个任务淘汰并清理对应日志文件 |
-| `job-tools.ts` | `job_list`、`job_output`、`job_kill` 三个内置工具的定义与创建 |
-| `session-scope.ts` | 会话所有权作用域解析：优先读取 `ctx.sessionManager.getSessionId()`，退回 cwd，隔离不同会话的任务和状态 |
+| `job-manager.ts` | `BackgroundJobManager`：后台 shell 任务表、日志写临时文件、增量字节游标读取（所属会话一个游标；别的会话按 taskId 读时用 `readOutputAs`，各记自己的游标，不动所属会话的）、进程树终止、单任务日志上限（64MB）、会话并发上限（8 个）、最近 100 个任务淘汰并清理对应日志文件；`subscribe` 在任务启动和结束（日志写完后）时通知 Web 宿主和结束回报（`agent/runtime/background-job-reports.ts`），`readTail` 给后台面板和结束回报读日志末尾（不动 `job_output` 的游标）；任务信息里的 `stopRequested`（被 `job_kill`、面板或进程退出停止）和 `endRead`（所属会话的 `job_output` 已读到结束、没有剩余输出）决定结束时是否回报 |
+| `job-tools.ts` | `job_list`、`job_output`、`job_kill` 三个内置工具的定义与创建。`job_list`、`job_kill` 只管本会话的任务；`job_output` 有 taskId 就能读本进程里任何会话的任务（只读），比如定时任务开出的新对话检查原对话的后台命令 |
+| `session-scope.ts` | 会话所有权作用域解析：优先读取 `ctx.sessionManager.getSessionId()`，退回 cwd，隔离不同会话的任务列表、终止和状态 |
 | `shell-session.ts` | `preserve_state` 状态保持机制：尾部探针构建、探针解析与输出剥离、环境变量差分、跨进程调用状态注入 |
 | `delegated-write-guard.ts` | 读写型子智能体的落笔边界：文件/Glob 参数与 shell（可执行文件、内联代码、`cd`、重定向、变量路径）必须留在任务 worktree 内；`agent`/`workflow`/`ultracode` 及同类派发工具一律拦截，标记 `[delegated-write-guard]` |
 | `null-redirect-guard.ts` | `findBashNullDeviceRedirect()`：bash 里 `>nul` 会建出真文件并破坏 Git，属引号感知的纯扫描，不执行命令 |
@@ -70,7 +70,7 @@
 
 ### memory/ — 记忆工具
 
-`search.ts`：`memory_search`（无 `query` 列记忆目录，有 `query` 用 `agent/runtime/auto-memory.ts` 的 `selectMemoriesForQuery()` 返回摘要）和 `memory_get`（按 id 取全文，未找到只返回说明）。两个工具只读、`executionMode: "parallel"`；读取通过可注入的 `MemoryToolOperations`，`createSessionMemoryOperations()` 按会话的 Data root / Workspace / Conversation 读取，Auto Memory 关闭或会话不持久化时返回“未启用”说明。`write.ts`：`memory_write`（用户明确要求记住、导入、更正或更新时，一次最多 10 条地创建/更新本轮三层的记忆与常驻画像；省略 `id` 新建，只有 `global/用户画像` 允许带 `id` 首次创建；超 10 KB 拒绝而不截断；`executionMode: "sequential"`，经 `session/memory/store.ts` 的锁写盘并刷新索引、记一笔待整理变化）。`manage.ts`：`memory_delete` 彻底删除、`memory_claim` 认领 `pending/`。子智能体按 `agent/runtime/role.ts` 白名单不会拿到这些工具（写入类同样不给）。
+`search.ts`：`memory_search`（无 `query` 列记忆目录，有 `query` 用 `agent/runtime/auto-memory.ts` 的 `selectMemoriesForQuery()` 返回摘要）和 `memory_get`（按 id 取全文，未找到只返回说明）。两个工具只读、`executionMode: "parallel"`；读取通过可注入的 `MemoryToolOperations`，`createSessionMemoryOperations()` 按会话的 Data root / Workspace / Conversation 读取，Auto Memory 关闭或会话不持久化时返回“未启用”说明。`write.ts`：`memory_write`（主对话模型主动记下用户说出的偏好、习惯、规矩、纠正和稳定事实，用户要求记住、导入、更正或更新时也用；常驻画像只在用户导入或要求修改时写；一次最多 10 条地创建/更新本轮三层的记忆与常驻画像；省略 `id` 新建，只有 `global/用户画像` 允许带 `id` 首次创建；超 10 KB 拒绝而不截断；`executionMode: "sequential"`，经 `session/memory/store.ts` 的锁写盘并刷新索引、记一笔待整理变化）。`manage.ts`：`memory_delete` 彻底删除、`memory_claim` 认领 `pending/`。子智能体按 `agent/runtime/role.ts` 白名单不会拿到这些工具（写入类同样不给）。
 
 ### interaction/ — 交互工具
 
@@ -85,7 +85,7 @@
 
 ### mail/
 
-`tool.ts`：`mail` 工具，使用已连接的 Gmail / Outlook 邮箱（`providers/credentials/mail-connections.ts`）调用 Gmail API 或 Microsoft Graph，并处理附件保存。`message.ts`：把纯字段写成的邮件编码为 Gmail 的 RFC 5322 `raw` 或 Graph message（含附件）。`route-context.ts`：同时有 `mail` 和 `workspace`（桌面端内置浏览器）的对话，每轮把邮件走哪条路作为提醒加入上下文（路线没变不重发）：有通过 API 连接的邮箱时用 `mail` 工具；一个都没有时告诉 Agent 不要调用 `mail`，改用内置浏览器里已登录的网页邮箱（宿主的 `webMail` 回答哪个已登录，1.5 秒内没答复就列出 Gmail 和 Outlook 两个网址，回答缓存 10 分钟）。以前没有 API 连接时 Agent 也先调用 `mail`，报错后才转去浏览器。`send.ts`：发一封新邮件的唯一入口 `sendMail`，`mail` 工具只给 `message` 不给 `path` 时和定时邮件（`schedules/` 的 `kind: "mail"`）都用它：有合适的 API 邮箱就用 API；没有时经桌面宿主的 `webMailSend` 命令，在内置浏览器已登录的 Gmail / Outlook 网页里一次填好并发出（纯文本、要有主题、不能带附件），不再让 Agent 一格一格填写信表单。
+`tool.ts`：`mail` 工具，使用已连接的 Gmail / Outlook 邮箱（`providers/credentials/mail-connections.ts`）调用 Gmail API 或 Microsoft Graph，并处理附件保存。`message.ts`：把纯字段写成的邮件编码为 Gmail 的 RFC 5322 `raw` 或 Graph message（含附件）。`route-context.ts`：同时有 `mail` 和 `workspace`（桌面端内置浏览器）的对话，每轮把邮件走哪条路作为提醒加入上下文（路线没变不重发）：有通过 API 连接的邮箱时用 `mail` 工具；一个都没有时告诉 Agent 不要调用 `mail`，改用内置浏览器里已登录的网页邮箱（宿主的 `webMail` 回答哪个已登录，1.5 秒内没答复就列出 Gmail 和 Outlook 两个网址，回答缓存 10 分钟）。以前没有 API 连接时 Agent 也先调用 `mail`，报错后才转去浏览器。`send.ts`：发一封新邮件的唯一入口 `sendMail`，`mail` 工具只给 `message` 不给 `path` 时和定时邮件（`schedules/` 的 `kind: "mail"`）都用它：有合适的 API 邮箱就用 API；没有时经桌面宿主的 `webMailSend` 命令，在内置浏览器已登录的 Gmail / Outlook 网页里发出：写信页地址只带收件人和主题，正文在页面打开后直接输入（以前正文放在地址里，长正文让地址过长、写信页打不开），附件交给网页自己的文件选择框上传并等上传完（合计不超过 25 MB，等待时间按大小加长；正文每 5000 字也多给 5 秒）；纯文本正文、要有主题，不再让 Agent 一格一格填写信表单。写信页 20 秒还没出现会重新打开一次；到时间仍没出现时，报错写明页面停在哪个标题和地址、缺正文框还是主题框（也写进桌面日志），写信页已出现但没填好时报出缺哪一项，不再一律说“没有打开”。
 
 ### web-search/ — 联网搜索与读网页
 

@@ -38,7 +38,7 @@ it.skipIf(!installed.length)(
 				join(root, "test.js"),
 				`
 import {h,render} from '/vendor/preact.js';
-import {activateSlot,chatTucked,panelInstance,setView,state} from '/js/store.js';
+import {activateSlot,chatColumnMin,chatTucked,panelInstance,setView,state} from '/js/store.js';
 import {actions} from '/js/actions.js';
 import {ChangesPanel} from '/js/panel-changes.js';
 import {BranchChip} from '/js/branch-menu.js';
@@ -164,7 +164,9 @@ try{
  const saved=JSON.parse(localStorage.getItem('myharness.web.prefs')||'{}');
  must(saved.wsPanels&&saved.wsPanels.a&&saved.wsPanels.b,'the per-conversation panels were not saved: '+JSON.stringify(saved.wsPanels));
  must(JSON.stringify(saved.wsPanels.a.wsTabs.map(tab=>tab.id))===JSON.stringify(inA),'the saved panel of A is wrong');
- must(saved.wsPanels.a.panelW===640&&saved.wsPanels.a.chatW===500&&saved.wsPanels.b.panelW===700,'the widths of each chat were not saved: '+JSON.stringify(saved.wsPanels));
+ // A shows a website: collaboration mode started it with the conversation column at its narrowest (actions.js
+ // enterWorkspaceMax), so that is A's width now; B keeps the one it had.
+ must(saved.wsPanels.a.panelW===640&&saved.wsPanels.a.chatW===chatColumnMin()&&saved.wsPanels.b.panelW===700&&saved.wsPanels.b.chatW===380,'the widths of each chat were not saved: '+JSON.stringify(saved.wsPanels));
  must(saved.panelW===700&&saved.chatW===380,'the widths a new chat starts with were not saved: '+JSON.stringify({panelW:saved.panelW,chatW:saved.chatW}));
  must(!('wsMax' in saved.wsPanels.a)&&!('wsSidebar' in saved.wsPanels.a)&&!('wsChatHidden' in saved.wsPanels.a),'collaboration mode was saved: '+JSON.stringify(saved.wsPanels.a));
  must(saved.sidebarOpen===true,'the sidebar hidden by collaboration mode was saved as hidden');

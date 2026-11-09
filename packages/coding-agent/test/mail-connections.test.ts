@@ -494,10 +494,26 @@ describe("mail tool: a new email without an API path", () => {
 			expect.any(Number),
 		);
 		expect(result.content[0]!.text).toContain("Gmail website in the built-in browser (me@gmail.com)");
-		// The website takes plain text with a subject only; without a desktop host there is no website at all.
+		// The website takes plain text with a subject; attachments go to it by their full path, each checked first, with
+		// more time for the upload. Without a desktop host there is no website at all.
+		writeFileSync(join(dir, "a.txt"), "hello");
+		await run(
+			connections,
+			{ message: { to: ["me@gmail.com"], subject: "x", text: "y", attachments: ["a.txt"] } },
+			host,
+		);
+		const [command, timeout] = host.request.mock.calls.at(-1) as unknown as [Record<string, unknown>, number];
+		expect(command).toEqual(
+			expect.objectContaining({ action: "webMailSend", attachments: [join(dir, "a.txt")], text: "y" }),
+		);
+		expect(Number(command.timeoutMs)).toBeGreaterThan(60_000);
+		expect(timeout).toBe(Number(command.timeoutMs) + 15_000);
 		await expect(
-			run(connections, { message: { to: ["me@gmail.com"], subject: "x", attachments: ["a.txt"] } }, host),
-		).rejects.toThrow("不能带附件");
+			run(connections, { message: { to: ["me@gmail.com"], subject: "x", attachments: ["missing.pdf"] } }, host),
+		).rejects.toThrow("无法读取附件");
+		await expect(
+			run(connections, { message: { to: ["me@gmail.com"], subject: "x", html: "<b>x</b>" } }, host),
+		).rejects.toThrow("不能用 HTML");
 		await expect(run(connections, { message: { to: ["me@gmail.com"], text: "x" } }, host)).rejects.toThrow(
 			"需要主题",
 		);

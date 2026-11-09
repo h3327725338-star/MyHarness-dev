@@ -2,14 +2,14 @@
 import { t } from "./i18n.js";
 import { basename, uid } from "./util.js";
 
-export const PANEL_TAB_TYPES = ["changes", "files", "terminal", "context"];
+export const PANEL_TAB_TYPES = ["changes", "files", "terminal", "background", "context"];
 
 function panelTitle(type) {
-	return { changes: t("Changes"), files: t("Files"), terminal: t("Terminal"), context: t("Session") }[type] || type;
+	return { changes: t("Changes"), files: t("Files"), terminal: t("Terminal"), background: t("Background"), context: t("Session") }[type] || type;
 }
 
 /**
- * The section of the panel a tab belongs to, as named by the panel's own navigation row: the four panels are their own
+ * The section of the panel a tab belongs to, as named by the panel's own navigation row: the five panels are their own
  * sections, a file tab belongs to Files (next to the file list) and a website tab to the browser.
  */
 export function workspaceTabSection(tab) {

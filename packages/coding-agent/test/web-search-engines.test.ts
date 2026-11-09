@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { WebSearchEngineId } from "../src/config/settings/types.ts";
+import { localStamp, localTimeZone } from "../src/schedules/timing.ts";
 import { EngineRunner } from "../src/tools/web-search/engine-runner.ts";
 import { bing, decodeBingHref, parseBingHtml } from "../src/tools/web-search/engines/bing.ts";
 import { findMissingQueryTerm, splitLeadingDate } from "../src/tools/web-search/engines/common.ts";
@@ -23,6 +24,8 @@ import {
 } from "../src/tools/web-search/transport.ts";
 
 const NOW = Date.UTC(2026, 8, 26);
+/** The day a relative date ("3 hours ago") lands on, on this computer's clock. */
+const localDay = (ms: number) => localStamp(ms, localTimeZone()).slice(0, 10);
 
 function page(
 	text: string,
@@ -89,7 +92,7 @@ describe("Google engine", () => {
 				title: "Introducing GPT-6",
 				url: "https://openai.com/gpt-6/",
 				snippet: "Meet GPT-6",
-				publishedAt: "2026-09-24",
+				publishedAt: localDay(NOW - 2 * 86_400_000),
 				rank: 1,
 			},
 			{ title: "ChatGPT", url: "https://chatgpt.com/", snippet: "Use ChatGPT", publishedAt: undefined, rank: 2 },
@@ -324,7 +327,12 @@ describe("result helpers", () => {
 			publishedAt: "2025-01-22",
 		});
 		expect(splitLeadingDate("2026年9月1日 · 新闻", NOW)).toEqual({ snippet: "新闻", publishedAt: "2026-09-01" });
-		expect(splitLeadingDate("3 hours ago · Now", NOW)).toEqual({ snippet: "Now", publishedAt: "2026-09-25" });
+		expect(splitLeadingDate("3 hours ago · Now", NOW)).toEqual({
+			snippet: "Now",
+			publishedAt: localDay(NOW - 3 * 3_600_000),
+		});
+		// 21:00 UTC is already the next morning in Kuala Lumpur.
+		expect(localStamp(NOW - 3 * 3_600_000, "Asia/Kuala_Lumpur").slice(0, 10)).toBe("2026-09-26");
 		expect(splitLeadingDate("No date here", NOW)).toEqual({ snippet: "No date here" });
 	});
 

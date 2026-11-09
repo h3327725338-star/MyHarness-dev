@@ -9,11 +9,14 @@
  * Auto Review 已不使用任何 AI 安全判决。
  */
 
+import { appendModelInstructions, readModelPrompt } from "../../providers/models/model-prompts.ts";
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
 
 export interface ReadOnlyGuardAiAdjudicatorOptions {
 	provider: string;
 	model: string;
+	/** Where the user's own prompt for this model is read (model-prompts.ts); without it the request carries none. */
+	agentDir?: string;
 	timeoutMs?: number;
 	maxCalls?: number;
 }
@@ -894,6 +897,13 @@ export function createReadOnlyGuardExtensionSource(
 				maxCalls: options.adjudicator.maxCalls ?? 4,
 			}
 		: undefined;
+	// This request goes to the model directly instead of through ModelRuntime, so the model's own prompt is added here.
+	const adjudicatorModelPrompt = options.adjudicator
+		? readModelPrompt(options.adjudicator.agentDir, options.adjudicator.provider, options.adjudicator.model)
+		: "";
+	const adjudicatorSystemPrompt = adjudicatorModelPrompt
+		? appendModelInstructions(loadSystemPrompt("tasks/shell-adjudicator.md"), adjudicatorModelPrompt)
+		: loadSystemPrompt("tasks/shell-adjudicator.md");
 	return `const patterns = ${JSON.stringify(BLOCKED_BASH_PATTERNS)}.map(([source, flags]) => new RegExp(source, flags));
 const hasUnsafeAutoReviewOutputRedirection = ${hasUnsafeAutoReviewOutputRedirection.toString()};
 const hasUnsafeOutputRedirection = hasUnsafeAutoReviewOutputRedirection;
@@ -964,7 +974,7 @@ async function askAiToAdjudicateReadonly(command, ctx) {
               {
                 role: "system",
                 content:
-                  ${JSON.stringify(loadSystemPrompt("tasks/shell-adjudicator.md"))},
+                  ${JSON.stringify(adjudicatorSystemPrompt)},
               },
               {
                 role: "user",

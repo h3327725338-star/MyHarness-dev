@@ -9,7 +9,7 @@ import { detectInstalledBrowsers, LocalBrowser } from "../src/tools/web-search/b
 // in the middle of a run (a reconnect, the send check's recovery, a chat deleted elsewhere) used to wipe the live reply,
 // and every later update of it was dropped because its live entry was gone: the answer stayed blank until a reload.
 it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1")(
-	"keeps a streaming reply through a transcript reload and shows a reply whose start was missed",
+	"keeps a streaming reply through a transcript reload, shows a reply whose start was missed, keeps a stopped reply in its turn",
 	async () => {
 		const installed = detectInstalledBrowsers();
 		expect(installed.length).toBeGreaterThan(0);
@@ -117,6 +117,34 @@ try {
  await emit([{event:'message_end',data:{slot:'test',liveId:'live-3',item:reply('third-done')}}]);
  await wait(300);
  if(shown('third-done')!==1) throw Error('late message_end duplicated a saved reply');
+ // 4. A reply stopped before any output has no content to match its saved copy by. Its live copy was carried across
+ // every read and drawn at the tail, so the next turn showed "Cancelled" under its complete answer.
+ await emit([], reply('second-done','a-2'));
+ const empty=(ts,extra)=>({kind:'assistant',ts,blocks:[],stopReason:'aborted',...extra});
+ const emptyCount=()=>state.items.filter(i=>i.kind==='assistant'&&!(i.blocks||[]).length).length;
+ const cancelledIn=text=>[...document.querySelectorAll('.transcript section.turn')].filter(s=>(s.querySelector('.user-bubble')?.textContent||'').includes(text)).reduce((n,s)=>n+s.querySelectorAll('.banner.o-cancelled').length,0);
+ const stopUser={kind:'user',text:'stop-me',id:'u-4',ts:Date.now()};
+ await emit([{event:'message_start',data:{slot:'test',item:stopUser}}],stopUser);
+ await emit([{event:'message_start',data:{slot:'test',liveId:'live-4',item:{kind:'assistant',ts:stopUser.ts+10,blocks:[]}}}]);
+ const stoppedAt=Date.now();
+ // Saved first, then reported, the way the server does it.
+ await emit([{event:'message_end',data:{slot:'test',liveId:'live-4',item:empty(stopUser.ts+10),endedAt:stoppedAt}}],empty(stoppedAt+5,{id:'a-4'}));
+ await check('stopped turn shows no Cancelled card',()=>cancelledIn('stop-me')===1);
+ await emit([], {kind:'user',text:'next-question',id:'u-5',ts:stoppedAt+10000});
+ await emit([], {...reply('next-answer','a-5'),ts:stoppedAt+11000});
+ await refreshAll();
+ await check('next turn not drawn',()=>shown('next-answer')===1);
+ await wait(300);
+ if(cancelledIn('stop-me')!==1||cancelledIn('next-question')!==0) throw Error('stopped reply moved on a reload: Cancelled cards '+cancelledIn('stop-me')+' / '+cancelledIn('next-question'));
+ if(emptyCount()!==1) throw Error('stopped reply kept twice: '+emptyCount());
+ // A late message_end of an empty reply whose saved copy a read already brought adds no second copy.
+ const failedAt=Date.now();
+ await emit([], empty(failedAt,{id:'a-6',stopReason:'error'}));
+ await refreshAll();
+ await check('saved empty reply not loaded',()=>emptyCount()===2);
+ await emit([{event:'message_end',data:{slot:'test',liveId:'live-6',item:empty(failedAt-50,{stopReason:'error'}),endedAt:failedAt-3}}]);
+ await wait(300);
+ if(emptyCount()!==2) throw Error('late message_end duplicated a saved empty reply: '+emptyCount());
  document.body.insertAdjacentHTML('beforeend','<pre id="ready">passed</pre>');
 }catch(e){document.body.insertAdjacentHTML('beforeend','<pre id="ready">'+e.message+'</pre>');}
 `,

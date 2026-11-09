@@ -36,6 +36,9 @@ const CHAT_PEEK = ".app.chat-tucked > .main";
 const MIN_SHOWN = 48;
 // The gutter between a peeking card and the website, as around a docked card: the card's ring and shadow lie in it.
 const PEEK_GAP = 6;
+// Collaboration mode and browser fullscreen: the user watches the page there, so the host lays it out at exactly its box
+// (`fit`) instead of the larger size it gives the Agent in the side panel, which would cut off its right or bottom part.
+const WATCHED = ".app.ws-max";
 
 /**
  * An animation is moving, resizing or fading the box: "screen" for a View Transition over the whole screen (the mode
@@ -230,7 +233,8 @@ export function createBrowserViewSync({ host, tabId, element, onError }) {
 			}
 		}
 		shown = true;
-		send(rect, part === rect ? undefined : { clip: part });
+		const fit = !!node.closest?.(WATCHED);
+		send(rect, part === rect && !fit ? undefined : { ...(part === rect ? {} : { clip: part }), ...(fit ? { fit: true } : {}) });
 	};
 	const tick = (now) => {
 		if (stopped) return;

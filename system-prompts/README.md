@@ -14,19 +14,20 @@
 | --- | --- |
 | `global/core.md` | 编程会话的通用行为、证据、工作方式和沟通规则 |
 | `global/output-language.md` | 编程会话的用户回复语言策略 |
-| `roles/main.md` | Main 授权边界；保留现有 `reviewer` 同样使用此文本的行为 |
+| `roles/main.md` | Main 授权边界，以及“回复结束即停止工作”：除非自己启动的东西真的会把它带回来（后台 shell 命令或后台子智能体派发结束时回报、定时 Agent 任务），不承诺稍后回来查看或汇报；保留现有 `reviewer` 同样使用此文本的行为 |
 | `roles/delegated.md` | 只读委派会话的执行边界 |
 | `roles/delegated-write.md` | 读写模式（Sub Agent 设置为「读写」）委派会话的执行边界，仅限自身 worktree、永不 commit/push |
 | `roles/explore.md` | Explore 子进程通过 `--append-system-prompt` 追加的专用职责 |
 | `roles/explore-write.md` | 读写模式 Explore 子进程追加的专用职责，含 worktree 边界与末尾 `## Worktree result` 返回格式 |
 | `session/commit-authorization.md` | 当前不存在；显式 `/commit` 的授权和 Git 事务边界由 Coding Agent 源码处理，不会从本目录加载 |
-| `session/handoff.md` | 后台交接摘要请求的职责与输出格式（话题、当前焦点、必要背景、结论与纠正、未完成事项、来源；区分已确认与未验证，中断回复不写成完成；提示词文件本身不含非英文字符） |
+| `session/handoff.md` | 后台交接摘要请求的职责与输出格式（话题、当前焦点、必要背景、结论与纠正、未完成事项、来源；区分已确认与未验证，中断回复不写成完成；“今天”等日期按任务给出的当前本机时间和每条消息的发送时间推算，推不出就不写；提示词文件本身不含非英文字符） |
 | `session/auto-memory.md` | 仅 Auto Memory 完整启用时追加的记忆优先级约束 |
 | `session/project-context.md` | 有项目上下文时使用，变量 `projectContext` |
 | `session/artifacts.md` | 持久化结构化 Session 的临时产出存放规则，变量 `artifactsDir`；由 `_getTurnSystemPrompt` 追加实际对话路径，不适用于正式源码或用户指定路径 |
 | `session/working-directory.md` | 当前工作目录，变量 `cwd` |
 | `session/workspace-instructions.md` | 仅 General 模式且工作区设置了说明时，放在 `<workspace_context>` 内说明前：工作区说明与 `<user_personalization>` 同时生效，冲突时以工作区说明为准；由 `_getTurnSystemPrompt` 追加 |
 | `session/model-identity.md` | 当前模型已知时使用，变量 `name`、`provider` |
+| `session/model-instructions.md` | 用户给某个模型写了专属提示词（设置 → 个性化 → 模型专属提示词，`<agentDir>/model-prompts.json`）时，放在 `<model_instructions priority="highest">` 内、用户原文之前：这段指令高于本请求里的其他一切（内置规则、`<user_personalization>`、工作区说明、项目上下文、自定义 Prompt、技能、召回记忆），但不改变工具名称、参数、调用格式和程序要读的输出格式；由 `ModelRuntime.stream` / `streamSimple` 追加在 system prompt 最后，只发给那一个模型 |
 | `skills/coding-agent.md` | 编程会话的技能读取规则；仅启用 read 且存在可见技能时有正文 |
 | `skills/harness.md` | 通用 AgentHarness 的技能说明；原文不同，独立维护 |
 | `harness/default.md` | 通用 AgentHarness 未提供自定义 systemPrompt 时的默认身份 |
@@ -41,7 +42,7 @@
 | `compaction/coding-agent/checkpoint.md` | 上下文压缩检查点的摘要要求（作为最后一条用户消息发出，前面是聊天自己的请求，便于命中提示缓存） |
 | `compaction/coding-agent/recovery.md` | 检查点里“之前的消息怎么读回”的说明，变量 `session`；其后由代码列出用户消息的 entry id |
 | `compaction/harness/system.md` | 通用 AgentHarness 压缩及分支摘要的系统职责；与编程版不同，不能直接合并 |
-| `memory/extractor.md`、`consolidator.md` | 后台独立记忆提取、合并请求的职责；优先更新、区分已确认事实与建议、保留适用条件；归档被替代内容；可选的 `importance` / `triggers` 标注及更新时保留原值；整理器仅在事实充分时可创建常驻用户画像初版、之后整篇重写（条目 ID 由任务文本给出，提示词文件本身不含非英文字符） |
+| `memory/extractor.md`、`consolidator.md` | 后台独立记忆提取、合并请求的职责；优先更新、区分已确认事实与建议、保留适用条件；归档被替代内容；可选的 `importance` / `triggers` 标注及更新时保留原值；日期只按任务给出的当前时间和消息时间确定，确定不了就不写或注明未确认；整理器仅在事实充分时可创建常驻用户画像初版、之后整篇重写（条目 ID 由任务文本给出，提示词文件本身不含非英文字符） |
 | `memory/recalled-context.md` | 召回记忆消息的说明；此项属于消息正文，和记忆系统约束配套管理 |
 | `memory/picker.md` | Memory picker 的职责：根据用户消息从记忆目录里挑选，只用 JSON 回答序号，最多 5 个，可以不选 |
 | `tasks/conversation-title.md` | 独立会话标题生成请求；新标题用核心对象＋主要目的，中文目标 6–10 字、最多 12 字，英文 2–4 词，保留必要技术名称；主题未变时保留已有标题，不为缩短旧标题增加请求 |
@@ -76,6 +77,8 @@ Extension Prompt 由 Coding Agent 的 ResourceLoader/context loader 独立处理
 唯一文本入口：`packages/ai/src/api/system-prompt-loader.ts` 的 `loadSystemPrompt` / `loadSystemPromptLines`。编程会话的组合入口是 `packages/coding-agent/src/system-prompts/composer/index.ts`，本地 loader 边界是 `packages/coding-agent/src/system-prompts/loader/index.ts`；各独立任务只加载自己的文件，不遍历目录或按字母序自动注入。
 
 主聊天稳定顺序为：用户个性化内容（有配置时）→ 当前模式身份 → 共用核心 → 当前工具说明 → 工具路由 → slash 命令 → 当前工具规则 → 自定义 Prompt → append Prompt → 项目上下文 → 技能 → 回复语言 → 角色边界（顺序冻结；工具按名确定性排序，缺 snippet 时行内占位不断条目）。工作目录与当前模型不再进 system，改走 messages 提醒：插在最后一条 user 之前、时间戳为 0 的 transient user 消息，不写盘、不占缓存前缀，内容不变；压缩 fork 原样复用父 system/tools 引用。
+
+模型专属提示词不属于上面的组合顺序：它在请求真正发出前，由 `packages/coding-agent/src/providers/models/model-prompts.ts` 经 `ModelRuntime.stream` / `streamSimple` 追加为 system prompt 的最后一块（扩展变换和角色边界之后），按 Provider ID + Model ID 精确匹配。凡是经过 ModelRuntime、用的是这个模型的请求都带上：主聊天、子智能体（子进程读同一个 agent 目录）、压缩、记忆、标题、交接摘要等辅助请求；其他模型的请求一律不带。不走 ModelRuntime 的只读委派 shell 审查请求（`tools/shell/read-only-guard.ts`）在生成时单独追加。`claude-code-shell` 扩展收到的就是带着这一块的完整 system prompt，原样交给 `claude`。文件每次请求按大小和修改时间判断是否重读，保存后从下一次请求起生效；文件损坏时打印一次 warning、不发送提示词，不让请求失败。
 
 扩展按原注册顺序变换 Prompt；随后按原条件追加 Auto Memory 规则，在持久化结构化 Session 中追加对话产出规则和实际目录，再去除旧角色块并重新追加当前角色边界。这保留了原来的角色块去重逻辑。Anthropic OAuth 身份由 adapter 单独放在以上文本前面。显式 `/commit` 的授权、失败恢复和 Git 事务由 `packages/coding-agent/src/agent/runtime/agent-session.ts`、`modes/web/` 等源码处理，不对应一个本目录中的静态 Prompt 文件。
 

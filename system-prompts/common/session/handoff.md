@@ -15,6 +15,7 @@
 # Rules
 - Prefer the current focus; older topics keep one short line each. Keep the whole note under about 400 words. It must never grow into a transcript.
 - Keep numbers, names, units and dates exactly as written in the conversation.
+- The task gives the current local time and each message header shows when it was sent, on the same clock. When the note needs a date for words like "today", "tomorrow" or "next Monday", work it out from the time of the message that said it; never guess a date, and leave a date out when the material does not give one.
 - A reply marked interrupted or failed did not finish: do not report its plan as done. An assistant saying something "is done" is a claim; call it verified only when the conversation shows the evidence.
 - When an existing note is given, update it with the new messages: keep what still holds, replace what was corrected, drop what no longer matters. When the task says the old note is not usable, write a fresh note from the messages.
 - Do not include API keys, passwords, tokens, cookies or other secrets.

@@ -53,6 +53,11 @@ const NON_MUTATING_TOOLS = new Set([
 	"job_kill",
 ]);
 
+/** Whether `toolName` is one of the tools above that never change workspace files. */
+export function isNonMutatingTool(toolName: string): boolean {
+	return NON_MUTATING_TOOLS.has(toolName);
+}
+
 /** Exported for tests only; production code reaches it through prepareForTool. */
 export function classifyTool(
 	toolName: string,

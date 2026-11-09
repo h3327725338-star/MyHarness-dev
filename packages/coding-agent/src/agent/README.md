@@ -23,6 +23,7 @@
 | `assistant-model.ts` | 辅助模型（Auto Memory、Sub-agent、Vision）“跟随主模型”的解析 |
 | `session-handoff.ts` | `SessionHandoff`：后台交接摘要（只在空闲时跑、45 秒合并连续轮次、有限退避重试；只写会话 `metadata/handoff.json`，不改对话历史，不是压缩）；`handoffWork()` 决定是否有未覆盖的消息，`resolveHandoffModel()` 按“单独设置 → 压缩模型 → 主模型”选模型 |
 | `conversation-naming.ts` | `ConversationNaming`：后台按节流命名的调度（只在空闲时跑，写 `conversation-naming` 自定义条目），`conversationNamingWork()` 决定是否需要命名 |
+| `background-job-reports.ts` | `BackgroundJobReports`：主会话的后台 shell 命令结束时写 `background-job-complete` 消息并开新一轮回报（被停止的、`job_output` 已读到结束的不报；等运行、正在发送的消息和宿主收尾都结束才开始，1 秒内结束的合成一轮；用户按停止后排队的回报只追加、不开新一轮）；`backgroundJobReportText()` 是模型读到的文字 |
 | `role.ts` | `AgentRole`（main / delegated / reviewer）、角色提示和按角色限制工具名 |
 | `prompt-correlation.ts` | `correlatePrompt()` / `promptCorrelation()`：prompt 与客户端消息 ID 的关联 |
 | `defaults.ts` | `DEFAULT_THINKING_LEVEL` |

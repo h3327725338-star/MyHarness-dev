@@ -3,7 +3,7 @@
 // state it actually reached, so the Agent can verify a command instead of assuming it worked. Nothing here creates a
 // new capability: every command is the same action a person triggers from the header, the tab strip or the viewer.
 import { actions, closeAppDialog } from "./actions.js";
-import { panelSessionId, saveStoredPanel, state, storedPanel } from "./store.js";
+import { chatColumnMin, panelSessionId, saveStoredPanel, state, storedPanel } from "./store.js";
 import { browserTabId, normalizeWorkspaceTab, PANEL_TAB_TYPES } from "./workspace-model.js";
 import { externalWebUrl, linkTargetOf } from "./link-target.js";
 import { forgetBrowserHelp, noteBrowserHelp } from "./attention-cards.js";
@@ -96,6 +96,25 @@ async function shownOnScreen(tabId, limitMs = 800) {
 
 
 /**
+ * A website tab the Agent brings to the front is there for the user to watch it work or to act in it (sign in, a human
+ * check), so it opens in collaboration mode, straight from where the layout is (actions.openWorkspace `wide`): the page
+ * gets the room of the sidebar and the conversation, which becomes the narrowest column beside it. The narrow side
+ * panel showed too little of the page to follow, and browser fullscreen hides the conversation, so neither is used. The
+ * Agent's background tabs never open the panel at all (`background`).
+ */
+const showsWide = (tab) => tab?.type === "browser";
+
+/**
+ * Collaboration mode comes in through a layout morph, whose single update runs a frame or two after the command
+ * (layout-morph.js): the answer waits for it, so the state it reports is the one on screen. Timers, not animation frames,
+ * which stop while the window is hidden (the morph then runs at once anyway).
+ */
+async function untilActive(tabId, limitMs = 1500) {
+	const started = Date.now();
+	while (state.view.wsActive !== tabId && Date.now() - started < limitMs) await new Promise((resolve) => setTimeout(resolve, 16));
+}
+
+/**
  * A command from the Agent of a chat that is not on screen (another chat, or the other mode) changes that chat's saved
  * panel only. Rendering it here would put that chat's file or website into the panel of the chat the user is working
  * in; the user finds the tab when they open that chat again.
@@ -111,10 +130,17 @@ function runStoredPanelCommand(sessionId, value, action) {
 		onScreen: false,
 	});
 	const save = () => saveStoredPanel(sessionId, panel);
-	const activate = (tab) => {
+	const activate = (tab, shown = false) => {
 		panel.wsActive = tab.id;
 		panel.panelOpen = true;
 		if (PANEL_TAB_TYPES.includes(tab.type)) panel.panelTab = tab.type;
+		// A website the Agent shows waits in collaboration mode for when the user opens this chat, beside the conversation
+		// column at its narrowest (showsWide).
+		if (shown && showsWide(tab)) {
+			panel.wsMax = true;
+			panel.wsChatHidden = false;
+			panel.chatW = chatColumnMin();
+		}
 	};
 	const closeHostView = (tab) => {
 		const desktop = window.myHarnessDesktop;
@@ -133,12 +159,17 @@ function runStoredPanelCommand(sessionId, value, action) {
 		}
 		if (panel.wsTabs.length === 0) panel.panelOpen = false;
 	};
-	const open = (descriptor, background = false) => {
+	const open = (descriptor, { background = false, shown = false } = {}) => {
 		const wanted = descriptor?.type === "browser" && !descriptor.id && typeof descriptor.url === "string" ? { ...descriptor, id: browserTabId(panel.wsTabs, descriptor.url) } : descriptor;
 		const tab = normalizeWorkspaceTab(wanted);
 		if (!tab) return null;
 		if (!panel.wsTabs.some((item) => item.id === tab.id)) panel.wsTabs.push(tab);
-		if (!background || !panel.wsActive) activate(tab);
+		if (!background) activate(tab, shown);
+		else if (!panel.wsActive) {
+			// A tab the Agent works in behind the user's back never opens the panel (actions.openWorkspace).
+			panel.wsActive = tab.id;
+			if (PANEL_TAB_TYPES.includes(tab.type)) panel.panelTab = tab.type;
+		}
 		return tab.id;
 	};
 	switch (action) {
@@ -146,7 +177,8 @@ function runStoredPanelCommand(sessionId, value, action) {
 			return report();
 		case "open": {
 			const tab = value.tab || {};
-			if (!open(openedTab(tab), value.background === true))
+			const background = value.background === true;
+			if (!open(openedTab(tab), { background, shown: !background && value.link !== true }))
 				throw new Error("workspace: this tab needs type=browser with a url, or type=file with a path");
 			save();
 			return report();
@@ -157,7 +189,7 @@ function runStoredPanelCommand(sessionId, value, action) {
 			return report();
 		case "activate": {
 			const tab = panel.wsTabs.find((item) => item.id === String(value.tabId || ""));
-			if (tab) activate(tab);
+			if (tab) activate(tab, true);
 			save();
 			return report();
 		}
@@ -219,20 +251,28 @@ export async function runWorkspaceCommand(command) {
 				await window.myHarnessDesktop.external(url);
 				return workspaceState();
 			}
-			const id = actions.openWorkspace(openedTab(tab), { background: value.background === true });
+			// A link the user clicked is theirs to place; a website the Agent shows opens wide (showsWide).
+			const wide = value.background !== true && value.link !== true && showsWide(tab);
+			const id = actions.openWorkspace(openedTab(tab), { background: value.background === true, wide });
 			if (!id)
 				throw new Error("workspace: this tab needs type=browser with a url, or type=file with a path");
 			// A tab opened in the background is not meant to be shown; only the one that comes to the front is checked.
-			if (value.background === true && state.view.wsActive !== id) return workspaceState();
+			if (value.background === true && (state.view.wsActive !== id || !state.view.panelOpen)) return workspaceState();
+			await untilActive(id);
 			const shown = await shownOnScreen(id);
 			return { ...workspaceState(), shown };
 		}
 		case "close":
 			actions.closeWorkspaceTab(String(value.tabId || ""));
 			return workspaceState();
-		case "activate":
-			actions.activateWorkspaceTab(String(value.tabId || ""));
+		case "activate": {
+			const id = String(value.tabId || "");
+			const tab = state.view.wsTabs.find((item) => item.id === id);
+			// The Agent bringing its website to the front (also for a `handoff`) opens it wide, as `open` does.
+			actions.activateWorkspaceTab(id, { wide: showsWide(tab) });
+			if (tab) await untilActive(id);
 			return workspaceState();
+		}
 		case "closeOthers":
 			actions.closeOtherWorkspaceTabs(String(value.tabId || ""));
 			return workspaceState();

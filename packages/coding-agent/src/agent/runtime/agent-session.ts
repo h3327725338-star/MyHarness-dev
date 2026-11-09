@@ -123,6 +123,7 @@ import { MAIL_ROUTE_CONTEXT_TYPE, mailRouteContext } from "../../tools/mail/rout
 import { SessionToolRegistry } from "../../tools/session-tool-registry.ts";
 import type { BashOperations } from "../../tools/shell/bash.ts";
 import type { BashResult } from "../../tools/shell/executor.ts";
+import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { SessionBashRunner } from "../../tools/shell/session-bash.ts";
 import type { SubAgentBackgroundProgress, SubAgentBackgroundTask } from "../../tools/sub-agent.ts";
 import type { SymbolsCodeIntelligenceServices } from "../../tools/symbols-runtime.ts";
@@ -151,6 +152,7 @@ import {
 	isIncrementalRecall,
 	type MemoryMaintenanceStatus,
 } from "./auto-memory.ts";
+import { type BackgroundJobReportMessage, BackgroundJobReports } from "./background-job-reports.ts";
 import { currentTimeContext } from "./current-time.ts";
 import type { CustomMessage } from "./messages.ts";
 import { correlatePrompt } from "./prompt-correlation.ts";
@@ -474,6 +476,12 @@ export class AgentSession {
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	private readonly _backgroundWork: SessionBackgroundWork;
+	/** The chat's background shell jobs report back when they end (main agent only; see background-job-reports.ts). */
+	private readonly _jobReports: BackgroundJobReports | undefined;
+	/** The host's own reasons a report may not start a turn yet (the Web UI finishing a run, a Git task). */
+	private _jobReportGate: (() => boolean) | undefined;
+	/** prompt() calls still preparing their message: a report must not take the run they are about to start. */
+	private _promptsPreparing = 0;
 	private _disposed = false;
 	private _disposePromise: Promise<void> | undefined;
 	private _sidecarCleanupPromise: Promise<void> | undefined;
@@ -667,6 +675,18 @@ export class AgentSession {
 			currentRun: () => (this._isAgentRunActive ? this._runSequence : -1),
 			deliverResult: (message, options) => this._deliverBackgroundResult(message, options.sameRun),
 		});
+		// Delegated sub-agents never get turns of their own: only the main agent's chat hears from its jobs.
+		this._jobReports =
+			this._agentRole === "main"
+				? new BackgroundJobReports(
+						{
+							sessionKey: () => `session:${this.sessionManager.getSessionId()}`,
+							canStartTurn: () => this._canStartJobReportTurn(),
+							deliver: (message, options) => this._deliverJobReport(message, options.startTurn),
+						},
+						backgroundJobManager,
+					)
+				: undefined;
 		const workflowToolOptions = {
 			getSettings: () => this._subAgentSettings(),
 			trace: this._traceCoordinator.writer,
@@ -1206,6 +1226,8 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
+		// A run, an operation or a dispatch just ended: a background job's report may now start its turn.
+		this._jobReports?.poke();
 		if (this._foregroundIdleWaiters.size > 0 && this.isForegroundIdle) {
 			const waiters = [...this._foregroundIdleWaiters];
 			this._foregroundIdleWaiters.clear();
@@ -1584,6 +1606,7 @@ export class AgentSession {
 		this._runtimeGeneration += 1;
 		this._requestTiming.reset();
 		this._backgroundWork.dispose();
+		this._jobReports?.dispose();
 		this._signalBackgroundWait();
 		try {
 			this.abortRetry();
@@ -2434,6 +2457,28 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// While the message is being prepared (commands, extensions, auth, context), a background job's report must not
+		// start a turn: the run this prompt is about to start would then be refused as already processing.
+		this._promptsPreparing += 1;
+		let preparing = true;
+		const donePreparing = () => {
+			if (!preparing) return;
+			preparing = false;
+			this._promptsPreparing -= 1;
+			this._jobReports?.poke();
+		};
+		try {
+			await this._preparePromptAndRun(text, options, donePreparing);
+		} finally {
+			donePreparing();
+		}
+	}
+
+	private async _preparePromptAndRun(
+		text: string,
+		options: PromptOptions | undefined,
+		donePreparing: () => void,
+	): Promise<void> {
 		const clientMessageId = (options as InternalPromptOptions | undefined)?.clientMessageId;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -2650,6 +2695,8 @@ export class AgentSession {
 			const pending = new Set(pendingNextTurnMessages);
 			this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter((message) => !pending.has(message));
 		};
+		// _runAgentPrompt takes prompt admission in the same synchronous step, so no report can come in between.
+		donePreparing();
 		await this._runAgentPrompt(
 			messages,
 			() => {
@@ -2856,6 +2903,70 @@ export class AgentSession {
 	}
 
 	/**
+	 * Whether a background job's report may start a turn now: nothing runs or is being sent in this chat, no operation
+	 * (compaction, retry, a ! command) is open, and the host has no reason of its own to wait (setBackgroundJobReportGate).
+	 */
+	private _canStartJobReportTurn(): boolean {
+		return (
+			!this._disposed &&
+			!this.isMirror &&
+			!this._isAgentRunActive &&
+			!this._promptAdmissionPromise &&
+			this._promptsPreparing === 0 &&
+			this.isForegroundIdle &&
+			(this._jobReportGate?.() ?? true)
+		);
+	}
+
+	/**
+	 * A background job's report goes into the chat: as a new turn, or, for one held back because the user stopped the
+	 * task, as a message the model reads with the next prompt. Called only when _canStartJobReportTurn() just said yes.
+	 */
+	private _deliverJobReport(message: BackgroundJobReportMessage, startTurn: boolean): void {
+		if (this._disposed) return;
+		if (!startTurn) {
+			this.sendCustomMessage(message).catch((error: unknown) => {
+				console.warn(
+					"[background jobs] A held background job report could not be saved:",
+					error instanceof Error ? error.message : String(error),
+				);
+			});
+			return;
+		}
+		// The same system prompt a message from the user gets (prompt()), so the provider's prompt cache still matches.
+		if (this._autoMemory.isEnabled()) {
+			this._systemPromptOverride = this._getTurnSystemPrompt(
+				`${this._baseSystemPrompt}\n\n${AUTO_MEMORY_SYSTEM_PROMPT}`,
+			);
+		}
+		this.sendCustomMessage(message, { triggerTurn: true }).catch((error: unknown) => {
+			console.warn(
+				"[background jobs] The turn on a finished background job failed:",
+				error instanceof Error ? error.message : String(error),
+			);
+		});
+	}
+
+	/**
+	 * A host's own reasons a background job's report must wait before it starts a turn (the Web UI finishing the previous
+	 * run, a Git task). When those reasons go away, the host calls pokeBackgroundJobReports().
+	 */
+	setBackgroundJobReportGate(gate: (() => boolean) | undefined): void {
+		this._jobReportGate = gate;
+		this._jobReports?.poke();
+	}
+
+	/** Look again whether a waiting background job report can start its turn. */
+	pokeBackgroundJobReports(): void {
+		this._jobReports?.poke();
+	}
+
+	/** Background jobs of this chat that ended and whose report has not gone out yet. */
+	get pendingBackgroundJobReports(): number {
+		return this._jobReports?.pendingCount ?? 0;
+	}
+
+	/**
 	 * The main agent has given its answer and only waits for background Explore batches to report back. There is no
 	 * model run to interrupt: a new message must be queued (steer), because abort() would cancel those batches.
 	 */
@@ -3047,7 +3158,11 @@ export class AgentSession {
 		// An interruption (a new message) keeps the sub-agents: dispatches running inside a tool call move to the
 		// background and the tool call returns at once. The stop button ends everything.
 		if (options?.keepBackground) this._backgroundWork.detachForeground();
-		else this._backgroundWork.cancel();
+		else {
+			this._backgroundWork.cancel();
+			// Stopped by the user: the background jobs that ended meanwhile start no turn of their own.
+			this._jobReports?.holdPending();
+		}
 		this._signalBackgroundWait();
 		this.abortRetry();
 		this.abortCompaction();

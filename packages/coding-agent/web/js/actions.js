@@ -1,5 +1,5 @@
 // User-level operations. Each maps to a real backend endpoint; nothing here fakes Agent behaviour.
-import { addPendingMessage, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadScheduled, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
+import { addPendingMessage, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, chatColumnMin, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadScheduled, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
 import { chatModeOf, expandedKey } from "./chat-modes.js";
 import { BUILTIN_COMMAND_KINDS } from "./builtin-commands.js";
 import { commitChanges, pushChanges } from "./git-flow.js";
@@ -166,6 +166,28 @@ function leaveWorkspaceMax() {
 	return { wsMax: false, wsMaxSidebar: null, wsChatHidden: false, sidebarOpen: plainSidebar() };
 }
 
+/** The workspace tab on screen, if one is active. */
+function activeTab() {
+	return state.view.wsTabs.find((tab) => tab.id === state.view.wsActive);
+}
+
+/**
+ * The view patch that starts collaboration mode with `tab` on screen. The sidebar of the plain layout is kept to give
+ * back on exit. A website starts with the conversation column at its narrowest, so the page gets all the room there is
+ * and shows whole (the column can still be dragged wider); the chat's other tabs keep the column as wide as it was. The
+ * store does not take that width for one the user dragged (store.js setView).
+ */
+function enterWorkspaceMax(tab) {
+	return {
+		wsMax: true,
+		wsChatHidden: false,
+		panelOpen: true,
+		wsMaxSidebar: state.view.sidebarOpen,
+		sidebarOpen: false,
+		...(tab?.type === "browser" ? { chatW: chatColumnMin() } : {}),
+	};
+}
+
 /**
  * Close the panel with `patch`. Out of collaboration mode the panel slides out on its own; in it the columns change
  * places, so the change runs as a layout morph: the workspace fades where it is while the conversation grows over the
@@ -214,10 +236,18 @@ export const actions = {
 		if (next === state.view.wsMax) return;
 		if (next && !state.view.wsActive && !state.view.wsTabs.length) return;
 		// The columns swap places: layout-morph.js moves each one from its old box to its new one.
-		morphLayout(
-			() => setView(next ? { wsMax: true, wsChatHidden: false, panelOpen: true, wsMaxSidebar: state.view.sidebarOpen, sidebarOpen: false } : leaveWorkspaceMax()),
-			{ beforeCapture: hideBrowserViews },
-		);
+		morphLayout(() => setView(next ? enterWorkspaceMax(activeTab()) : leaveWorkspaceMax()), { beforeCapture: hideBrowserViews });
+	},
+
+	/**
+	 * Collaboration mode's own button pressed again, or Esc in it. On a website the whole panel closes: the side panel
+	 * shows too little of a page to go back to, so a page is either expanded or put away. Any other tab goes back to the
+	 * side panel.
+	 */
+	restoreWorkspace() {
+		if (!state.view.wsMax) return;
+		if (activeTab()?.type === "browser") actions.closePanel();
+		else actions.toggleWorkspaceMax(false);
 	},
 
 	/**
@@ -236,7 +266,9 @@ export const actions = {
 	 * itself keeps its size and buttons and never covers the taskbar (that would be a video's full screen, not this).
 	 * It is the collaboration layout with the sidebar and the conversation tucked away: each peeks in from its edge
 	 * (sidebar-peek.js, chat-peek.js) and its button keeps it open. The tab's toolbar, sign-in pages and downloads work as
-	 * before. F11, Esc or the toolbar button ends it, and so does closing the panel or leaving the website tab (app.js).
+	 * before. F11, Esc or a button ends it and steps down to collaboration mode, never to the side panel; closing the
+	 * panel or leaving the website tab ends it where the layout goes (app.js), and a site's own full screen ending goes
+	 * back to where it started.
 	 */
 	toggleBrowserFull(force, { bySite = false } = {}) {
 		const next = typeof force === "boolean" ? force : !state.view.browserFull;
@@ -251,12 +283,26 @@ export const actions = {
 		}
 		const prev = state.view.browserFullPrev;
 		// The sidebar comes back as it was, or stays if the user kept it open meanwhile.
-		setView({ browserFull: false, browserFullChat: false, browserFullPrev: null, sidebarOpen: state.view.sidebarOpen || !!prev?.sidebarOpen });
+		const sidebarOpen = state.view.sidebarOpen || !!prev?.sidebarOpen;
+		const leave = { browserFull: false, browserFullChat: false, browserFullPrev: null };
+		const active = activeTab();
+		// The user ending fullscreen on a website lands in collaboration mode: the page stays where it is and the
+		// conversation comes back as the column on its right, at its narrowest (enterWorkspaceMax). The sidebar of the plain
+		// layout waits for the end of that mode.
+		if (!bySite && state.view.panelOpen && active?.type === "browser") {
+			if (state.view.wsMax) setView({ ...leave, wsMax: true, sidebarOpen, chatW: chatColumnMin() });
+			else setView({ ...leave, ...enterWorkspaceMax(active), wsMaxSidebar: sidebarOpen, sidebarOpen: state.view.sidebarOpen });
+			return;
+		}
+		setView({ ...leave, sidebarOpen });
 	},
 
 	/**
 	 * Open (or focus) one workspace tab: a panel, a file, or a browser page. Never replaces an open tab. With
-	 * `{ background: true }` the tab is only added (the Agent works in it while the user keeps looking at theirs).
+	 * `{ background: true }` the tab is only added (the Agent works in it while the user keeps looking at theirs): the
+	 * panel never opens for it, and it becomes the active tab only when there is none. With `{ wide: true }` the tab comes
+	 * to the front in collaboration mode (a website the Agent shows the user, workspace-host.js) in one update, so the
+	 * side panel is never drawn on the way; the caller waits for that update (layout-morph.js runs it a frame later).
 	 */
 	openWorkspace(descriptor, options) {
 		const tabs = state.view.wsTabs;
@@ -269,24 +315,45 @@ export const actions = {
 		const tab = normalizeWorkspaceTab(wanted);
 		if (!tab) return null;
 		const existing = tabs.find((item) => item.id === tab.id);
-		if (options?.background === true && state.view.wsActive) {
-			if (!existing) setView({ wsTabs: [...tabs, tab] });
+		if (options?.background === true) {
+			const patch = existing ? {} : { wsTabs: [...tabs, tab] };
+			if (!state.view.wsActive) {
+				patch.wsActive = tab.id;
+				if (PANEL_TAB_TYPES.includes(tab.type)) patch.panelTab = tab.type;
+			}
+			if (Object.keys(patch).length > 0) setView(patch);
 			return tab.id;
 		}
 		// The native view of the tab that is on screen right now must disappear before another tab is rendered.
 		if (state.view.panelOpen && state.view.wsActive && state.view.wsActive !== tab.id) hideBrowserViews();
 		const patch = { panelOpen: true, wsActive: tab.id };
 		if (PANEL_TAB_TYPES.includes(tab.type)) patch.panelTab = tab.type;
+		if (options?.wide === true && !state.view.wsMax && !state.view.browserFull) {
+			morphLayout(
+				() => {
+					const now = state.view.wsTabs;
+					setView({ ...patch, ...(now.some((item) => item.id === tab.id) ? {} : { wsTabs: [...now, tab] }), ...enterWorkspaceMax(tab) });
+				},
+				{ beforeCapture: hideBrowserViews },
+			);
+			return tab.id;
+		}
 		if (!existing) patch.wsTabs = [...tabs, tab];
 		setView(patch);
 		return tab.id;
 	},
 
-	activateWorkspaceTab(id) {
+	/** Bring an open tab to the front; `{ wide: true }` as in openWorkspace. */
+	activateWorkspaceTab(id, options) {
 		const tab = state.view.wsTabs.find((item) => item.id === id);
 		if (!tab) return;
 		if (state.view.wsActive !== id) hideBrowserViews();
-		setView({ panelOpen: true, wsActive: id, ...(PANEL_TAB_TYPES.includes(tab.type) ? { panelTab: tab.type } : {}) });
+		const patch = { panelOpen: true, wsActive: id, ...(PANEL_TAB_TYPES.includes(tab.type) ? { panelTab: tab.type } : {}) };
+		if (options?.wide === true && !state.view.wsMax && !state.view.browserFull) {
+			morphLayout(() => setView({ ...patch, ...enterWorkspaceMax(tab) }), { beforeCapture: hideBrowserViews });
+			return;
+		}
+		setView(patch);
 	},
 
 	closeWorkspaceTab(id) {
@@ -467,7 +534,7 @@ export const actions = {
 	},
 
 	/**
-	 * The panel's navigation row: Changes, Files, Terminal, Session and the browser. Files and the browser come back on
+	 * The panel's navigation row: Changes, Files, Terminal, Background, Session and the browser. Files and the browser come back on
 	 * the tab they showed last (a file or the file list; a website tab); the other sections are one panel each.
 	 */
 	showWorkspaceSection(section) {

@@ -18,6 +18,8 @@
 - An upsert with an existing ID replaces that entry's whole content. The existing memory list shows each entry's current content: keep every fact in it that is still true and add the new information.
 - Distinguish explicitly user-approved decisions from proposals and assistant inferences. Do not record assistant plans as completed facts.
 - Preserve necessary workspace/conversation scope, time conditions, and evidence sources when compressing content. Do not lose constraints merely to be brief.
+- The task gives the current local time and each message shows when it was sent. Date what someone said or did by the time of that message, and resolve words like today or tomorrow from it.
+- Never take a date from other memories or from the conversation text as the date something was said or done. A date later than the current time is valid only for something scheduled, such as an exam or a deadline. When the real date cannot be established, leave it out or say it is unconfirmed.
 - content must be short, self-contained, and explain how it applies or why it matters.
 - Return as many operations as needed; do not truncate the list. Return an empty array if nothing is worth retaining.
 

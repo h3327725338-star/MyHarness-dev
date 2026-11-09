@@ -9,6 +9,7 @@ import {
 	createAgentSessionRuntime,
 	createAgentSessionServices,
 } from "../src/agent/runtime/session-runtime.ts";
+import { getDefaultWorkingDir, getSessionDir, UNBOUND_WORKSPACE_ID } from "../src/config/paths/index.ts";
 import { WorkspaceStore } from "../src/data/workspace-store.ts";
 import { WebDialogBridge } from "../src/modes/web/dialogs.ts";
 import { WebHttpServer } from "../src/modes/web/http-server.ts";
@@ -358,6 +359,36 @@ describe("General quick-create workspace (real folders, isolated temp dirs)", ()
 		await fx.hub.reloadWorkspaces();
 		expect(fx.hub.get(result.slot)!.cwd).toBe(chosen);
 		expect(fx.hub.get(result.slot)!.workspace?.rootPath).toBe(chosen);
+	});
+
+	it("opens a default-group chat synced from another device in this device's default folder", async () => {
+		const fx = await start();
+		const opened = await fx.post("/api/sessions/new", { unbound: true, mode: "general" });
+		const owner = fx.hub.get(opened.slot)!;
+		fx.faux.setResponses([fauxAssistantMessage([fauxText("done")])]);
+		await owner.submit("hello");
+		await owner.session.waitForForegroundIdle();
+		const [headerLine, ...rest] = readFileSync(owner.session.sessionFile!, "utf8").split("\n");
+		// A chat of the default group (no Workspace) as another device wrote it, and one whose folder exists here.
+		const write = (sessionId: string, cwd: string) => {
+			const file = join(
+				getSessionDir(process.env.MYHARNESS_DATA_ROOT!, UNBOUND_WORKSPACE_ID, sessionId),
+				"conversation",
+				`2026-01-01T00-00-00-000Z_${sessionId}.jsonl`,
+			);
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, [JSON.stringify({ ...JSON.parse(headerLine), id: sessionId, cwd }), ...rest].join("\n"));
+			return file;
+		};
+		const away = write("synced-default", join(tempDir("other-device"), "agent", "default-workspace"));
+		const kept = tempDir("existing-folder");
+		const here = write("kept-default", kept);
+
+		const result = await fx.hub.openSession(fx.hub.host, away);
+		expect(result.cwdMissing).toBeUndefined();
+		expect(fx.hub.get(result.slot)!.cwd).toBe(getDefaultWorkingDir(fx.agentDir));
+		const stays = await fx.hub.openSession(fx.hub.host, here);
+		expect(fx.hub.get(stays.slot)!.cwd).toBe(kept);
 	});
 
 	it("rejects blank, illegal and duplicate names without touching disk", async () => {

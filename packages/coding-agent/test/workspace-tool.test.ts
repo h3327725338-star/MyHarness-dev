@@ -1,7 +1,7 @@
 import { readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createWorkspaceToolDefinition,
@@ -26,6 +26,7 @@ const NO_ANSWER = Symbol("no answer");
 function fakeHost(
 	respond: (channel: string, command: Record<string, unknown>) => unknown,
 	sessionId?: () => string | undefined,
+	uploadRoots?: () => string[],
 ) {
 	const sent: SentCommand[] = [];
 	let deliver: ((message: unknown) => void) | undefined;
@@ -57,7 +58,11 @@ function fakeHost(
 			deliver = listen;
 		},
 	);
-	const tool = createWorkspaceToolDefinition({ channel: () => channel, ...(sessionId ? { sessionId } : {}) });
+	const tool = createWorkspaceToolDefinition({
+		channel: () => channel,
+		...(sessionId ? { sessionId } : {}),
+		...(uploadRoots ? { uploadRoots } : {}),
+	});
 	return { channel, tool, sent };
 }
 
@@ -292,14 +297,100 @@ describe("workspace tool: browser page control", () => {
 			if (channel === "workspace") return pageState([{ id: browserTabId, type: "browser" }], browserTabId);
 			if (command.action === "list") return [{ tabId: browserTabId }];
 			if (command.action === "upload") {
-				expect(command).toMatchObject({ tabId: browserTabId, path: "docs/report.pdf", selector: "#file" });
+				expect(command).toMatchObject({ tabId: browserTabId, paths: ["docs/report.pdf"], selector: "#file" });
 				return { ok: true, name: "report.pdf", size: 1024, count: 1, path: "docs/report.pdf" };
 			}
 			throw new Error("unexpected");
 		});
 		const result = await call(tool, { operation: "upload", path: "docs/report.pdf", selector: "#file" });
-		expect(result.content[0]!.text).toContain("uploaded report.pdf (1024 bytes)");
+		expect(result.content[0]!.text).toContain("uploaded report.pdf (1024 bytes, docs/report.pdf)");
 		expect(result.details.result).toMatchObject({ count: 1, name: "report.pdf" });
+	});
+
+	it("names the chat's own folders for an upload and reads a relative path from the chat's folder", async () => {
+		const browserTabId = "browser:https://example.com/";
+		const chat = join(tmpdir(), "chat-folder");
+		const artifacts = join(tmpdir(), "chat-artifacts");
+		let seen: Record<string, unknown> | undefined;
+		const { tool } = fakeHost(
+			(channel, command) => {
+				if (channel === "workspace") return pageState([{ id: browserTabId, type: "browser" }], browserTabId);
+				if (command.action === "list") return [{ tabId: browserTabId }];
+				if (command.action === "upload") {
+					seen = command;
+					return { ok: true, name: "report.pdf", size: 1024, count: 1, path: "docs/report.pdf" };
+				}
+				throw new Error("unexpected");
+			},
+			undefined,
+			// The desktop host only allows these folders; the app's own start folder is not one of them.
+			() => [chat, artifacts, "relative/ignored"],
+		);
+		await call(tool, { operation: "upload", path: "docs/report.pdf", selector: "#file" });
+		expect(seen).toMatchObject({ paths: [resolve(chat, "docs/report.pdf")], roots: [chat, artifacts] });
+	});
+
+	it("presses an upload button by its words, answers the picker it opened and gives several files", async () => {
+		const browserTabId = "browser:https://teams.example/";
+		let seen: Record<string, unknown> | undefined;
+		const { tool } = fakeHost((channel, command) => {
+			if (channel === "workspace") return pageState([{ id: browserTabId, type: "browser" }], browserTabId);
+			if (command.action === "list") return [{ tabId: browserTabId }];
+			if (command.action === "upload") {
+				seen = command;
+				return {
+					ok: true,
+					how: "chooser",
+					count: 2,
+					files: [
+						{ name: "a.pdf", size: 10, path: "a.pdf" },
+						{ name: "b.png", size: 20, path: "~/Downloads/b.png" },
+					],
+					frame: "https://assignments.example/",
+					pressed: { tag: "button", text: "Upload from this device" },
+				};
+			}
+			throw new Error("unexpected");
+		});
+		const result = await call(tool, {
+			operation: "upload",
+			label: "Upload from this device",
+			paths: ["a.pdf", "C:/Users/user/Downloads/b.png"],
+		});
+		expect(seen).toMatchObject({
+			label: "Upload from this device",
+			paths: ["a.pdf", "C:/Users/user/Downloads/b.png"],
+		});
+		const text = result.content[0]!.text;
+		expect(text).toContain("uploaded a.pdf (10 bytes, a.pdf); b.png (20 bytes, ~/Downloads/b.png)");
+		expect(text).toContain(
+			'how=answered the page\'s file picker opened by button "Upload from this device" (no window was shown)',
+		);
+		expect(text).toContain("frame=https://assignments.example/");
+		await expect(call(tool, { operation: "upload", label: "Attach" })).rejects.toThrow(/needs path/);
+		await expect(call(tool, { operation: "upload", path: "a.pdf", x: 10 })).rejects.toThrow(/both x and y/);
+	});
+
+	it("tells the model when a click opened the page's file picker and how to answer it", async () => {
+		const browserTabId = "browser:https://example.com/";
+		const { tool } = fakeHost((channel, command) => {
+			if (channel === "workspace") return pageState([{ id: browserTabId, type: "browser" }], browserTabId);
+			if (command.action === "list") return [{ tabId: browserTabId }];
+			if (command.action === "click")
+				return {
+					ok: true,
+					tag: "button",
+					text: "Attach",
+					how: "mouse",
+					x: 5,
+					y: 5,
+					fileChooser: { mode: "selectSingle", multiple: false },
+				};
+			throw new Error("unexpected");
+		});
+		const result = await call(tool, { operation: "click", label: "Attach" });
+		expect(result.content[0]!.text).toContain("file_picker: this opened the page's file picker; no window was shown");
+		expect(result.content[0]!.text).toContain("operation upload and path (one file)");
 	});
 
 	it("finds in the page, moves to the next match and stops the find", async () => {

@@ -342,17 +342,19 @@ setInterval(()=>{}, 1000);
 		expect(listB.details?.jobs?.some((job) => job.taskId === taskId)).toBe(false);
 	});
 
-	it("enforces session isolation: Session B job_output and job_kill reject Session A jobs", async () => {
+	it("lets Session B read Session A's job by taskId from its own read position, but not kill it", async () => {
 		const bashDef = createBashToolDefinition(testDir);
 		const jobOutputDef = createJobOutputToolDefinition(testDir);
 		const jobKillDef = createJobKillToolDefinition(testDir);
 		const ctxA = makeSessionCtx("session-ALPHA-2");
 		const ctxB = makeSessionCtx("session-BETA-2");
+		const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+			result.content.map((part) => part.text ?? "").join("");
 
 		const result = await bashDef.execute(
 			"call-1",
 			{
-				command: 'node -e "setInterval(()=>{}, 1000)"',
+				command: `node -e "console.log('alpha output'); setInterval(()=>{}, 1000)"`,
 				run_in_background: true,
 			},
 			undefined,
@@ -360,14 +362,38 @@ setInterval(()=>{}, 1000);
 			ctxA,
 		);
 		const taskId = result.details?.taskId as string;
+		expect(
+			await waitForCondition(
+				async () => (await backgroundJobManager.readTail(taskId))?.text.includes("alpha output") ?? false,
+			),
+		).toBe(true);
 
-		await expect(jobOutputDef.execute("call-2", { taskId }, undefined, undefined, ctxB)).rejects.toThrow(
-			`Unknown background job: ${taskId}`,
+		// A chat started later (a scheduled task) reads the job, and says whose it is.
+		const readB = textOf(await jobOutputDef.execute("call-2", { taskId }, undefined, undefined, ctxB));
+		expect(readB).toContain(`Job ${taskId} (started by another session; read-only here) — Status: running`);
+		expect(readB).toContain("alpha output");
+		// Its next read goes on from where it stopped.
+		expect(textOf(await jobOutputDef.execute("call-3", { taskId }, undefined, undefined, ctxB))).toContain(
+			"(no new output)",
 		);
+		// The owner still gets the output: another session's reads never move its read position.
+		const readA = textOf(await jobOutputDef.execute("call-4", { taskId }, undefined, undefined, ctxA));
+		expect(readA).toContain(`Job ${taskId} — Status: running`);
+		expect(readA).toContain("alpha output");
+		expect(backgroundJobManager.get(taskId)?.consumedBytes).toBeGreaterThan(0);
 
-		await expect(jobKillDef.execute("call-3", { taskId }, undefined, undefined, ctxB)).rejects.toThrow(
-			`Unknown background job: ${taskId}`,
+		await expect(jobKillDef.execute("call-5", { taskId }, undefined, undefined, ctxB)).rejects.toThrow(
+			`Background job ${taskId} was started by another session`,
 		);
+		expect(backgroundJobManager.get(taskId)?.status).toBe("running");
+
+		// An id that no job in this process has says why that can happen.
+		await expect(
+			jobOutputDef.execute("call-6", { taskId: "job-00000000" }, undefined, undefined, ctxB),
+		).rejects.toThrow(/^Unknown background job: job-00000000\. .*ends and its log is deleted when MyHarness exits/);
+		await expect(
+			jobKillDef.execute("call-7", { taskId: "job-00000000" }, undefined, undefined, ctxB),
+		).rejects.toThrow("Unknown background job: job-00000000");
 	});
 
 	it("enforces maximum 8 concurrent running jobs per session and allows new job when one exits", async () => {
@@ -868,5 +894,104 @@ setInterval(()=>{}, 1000);
 
 		const runningDead = await waitForCondition(() => !isProcessAlive(runningPid), 5000);
 		expect(runningDead).toBe(true);
+	});
+
+	it("tells subscribers when a job starts and once it has ended with its whole log written", async () => {
+		const ctx = makeSessionCtx("sess-subscribe");
+		const sessionKey = resolveSessionScope(ctx, testDir);
+		const seen: string[] = [];
+		const endTails: Array<Promise<string | undefined>> = [];
+		let release: (() => void) | undefined;
+		const unsubscribe = backgroundJobManager.subscribe((job) => {
+			seen.push(`${job.taskId}:${job.status}`);
+			if (job.status !== "running")
+				endTails.push(backgroundJobManager.readTail(job.taskId, undefined, sessionKey).then((tail) => tail?.text));
+		});
+		// A listener that throws is skipped; the job and the other listeners go on.
+		const unsubscribeBroken = backgroundJobManager.subscribe(() => {
+			throw new Error("listener failed");
+		});
+		try {
+			const job = backgroundJobManager.start({
+				sessionKey,
+				toolName: "bash",
+				command: "subscribe_test",
+				cwd: testDir,
+				run: async ({ onData }) => {
+					await new Promise<void>((resolve) => {
+						release = resolve;
+					});
+					onData(Buffer.from("first line\n", "utf8"));
+					onData(Buffer.from("last line\n", "utf8"));
+					return { exitCode: 0 };
+				},
+			});
+			expect(seen).toEqual([`${job.taskId}:running`]);
+			await waitForCondition(() => release !== undefined);
+			release?.();
+			await backgroundJobManager.waitUntilSettled(job.taskId);
+			expect(await waitForCondition(() => seen.length === 2)).toBe(true);
+			expect(seen[1]).toBe(`${job.taskId}:completed`);
+			expect(await Promise.all(endTails)).toEqual(["first line\nlast line\n"]);
+		} finally {
+			unsubscribe();
+			unsubscribeBroken();
+		}
+		const later = backgroundJobManager.start({
+			sessionKey,
+			toolName: "bash",
+			command: "after_unsubscribe",
+			cwd: testDir,
+			run: async () => ({ exitCode: 0 }),
+		});
+		await backgroundJobManager.waitUntilSettled(later.taskId);
+		await sleep(50);
+		expect(seen).toHaveLength(2);
+	});
+
+	it("reads the end of a long log from a whole line without moving job_output's cursor", async () => {
+		const ctx = makeSessionCtx("sess-tail");
+		const sessionKey = resolveSessionScope(ctx, testDir);
+		const lines = Array.from(
+			{ length: 4000 },
+			(_, index) => `第 ${String(index + 1).padStart(5, "0")} 行：中文输出\n`,
+		).join("");
+		const size = Buffer.byteLength(lines, "utf8");
+		const job = backgroundJobManager.start({
+			sessionKey,
+			toolName: "bash",
+			command: "tail_test",
+			cwd: testDir,
+			run: async ({ onData }) => {
+				onData(Buffer.from(lines, "utf8"));
+				return { exitCode: 0 };
+			},
+		});
+		await backgroundJobManager.waitUntilSettled(job.taskId);
+
+		const tail = await backgroundJobManager.readTail(job.taskId, 1000, sessionKey);
+		expect(tail).toMatchObject({
+			taskId: job.taskId,
+			status: "completed",
+			exitCode: 0,
+			size,
+			logTruncated: false,
+			logPath: job.logPath,
+		});
+		expect(tail!.text.startsWith("第 ")).toBe(true);
+		expect(tail!.text.endsWith("第 04000 行：中文输出\n")).toBe(true);
+		expect(tail!.text).not.toContain("\uFFFD");
+		expect(Buffer.byteLength(tail!.text, "utf8")).toBeLessThanOrEqual(1000);
+		expect(tail!.skipped + Buffer.byteLength(tail!.text, "utf8")).toBe(size);
+
+		const whole = await backgroundJobManager.readTail(job.taskId, 1024 * 1024, sessionKey);
+		expect(whole).toMatchObject({ skipped: 0, text: lines });
+
+		// The agent's own reading still starts at the beginning of the log.
+		const read = await backgroundJobManager.readOutput(job.taskId, undefined, sessionKey);
+		expect(read!.increment.startsWith("第 00001 行")).toBe(true);
+
+		expect(await backgroundJobManager.readTail(job.taskId, 1000, "session:someone-else")).toBeUndefined();
+		expect(await backgroundJobManager.readTail("job-unknown")).toBeUndefined();
 	});
 });

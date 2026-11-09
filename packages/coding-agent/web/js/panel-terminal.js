@@ -77,7 +77,8 @@ export function terminalEntries(items, toolRuns, userBash, userBashOrder, cwd) {
 
 const STATUS_BADGE = { running: ["accent", N_("Running")], done: ["ok", N_("Done")], failed: ["danger", N_("Failed")], error: ["danger", N_("Could not start")], cancelled: ["", N_("Cancelled")], timeout: ["danger", N_("Timed out")], pending: ["", N_("Queued")] };
 
-function Output({ text, wrap, follow }) {
+/** A command's output with its colours, kept scrolled to the end while `follow` and the reader is at the end. */
+export function Output({ text, wrap, follow }) {
 	const ref = useRef(null);
 	const stick = useRef(true);
 	const segments = useMemo(() => ansiSegments(text), [text]);

@@ -10,12 +10,18 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { createTwoFilesPatch } from "diff";
 import type { GitCheckpoint } from "../../git/checkpoints/checkpoint.ts";
+import { isNonMutatingTool } from "../../git/checkpoints/coordinator.ts";
 import { runGit, runGitSync } from "../../git/repository/command.ts";
 import { getCachedGitInspect } from "../../git/repository/read-cache.ts";
 import type { ReviewChange, ReviewChangeStatus } from "../../git/repository/review-types.ts";
 import type { ChangeDetectionResult, GitTaskChangeSummary } from "../../git/repository/workspace-changes.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
-import { type ChangeClaimRegistry, selectForeignChanges } from "./change-claims.ts";
+import {
+	type ActivityKind,
+	attributeRunChanges,
+	type ChangeClaimRegistry,
+	type ChangedElsewhere,
+} from "./change-claims.ts";
 import {
 	batchWorktreeStats,
 	coalescedWorktreeListFetch,
@@ -31,6 +37,8 @@ const MAX_FILES_WITH_STATS = 300;
 /** Diffs kept with a task's change card in the session: larger ones (per file, or all together) are left out. */
 const MAX_CARD_PATCH_CHARS = 200_000;
 const MAX_CARD_PATCH_CHARS_PER_RUN = 1_000_000;
+/** Files changed elsewhere that a card lists by name; the count beyond it is kept as a number. */
+export const MAX_CARD_ELSEWHERE_FILES = 200;
 
 /** Tools whose file changes are observed from their own calls: the before/after content of each file they name. */
 export type FileMutationTool = "edit" | "write" | "apply_patch" | "apply_rename";
@@ -44,6 +52,8 @@ export interface FileChangeSummary {
 	binary: boolean;
 	/** Why the content diff cannot be shown (status is still real). */
 	unavailable?: string;
+	/** The text is the same once CRLF and LF count as one line ending: only the line endings changed. */
+	lineEndingsOnly?: boolean;
 	/** Another conversation changed this file more recently: that conversation commits it, this one keeps its history only. */
 	lastChangeElsewhere?: boolean;
 }
@@ -69,8 +79,12 @@ export interface RunChangeRecord {
 	/** Tool-level file operations observed during the run (edit/write/apply_patch/apply_rename), regardless of detection. */
 	toolFileOps: Array<{ path: string; tool: FileMutationTool; ok: boolean }>;
 	bashRuns: number;
+	/** Calls of the run that may write files without naming them: shell commands, sub-agent batches, other tools. */
+	opaqueCalls: number;
 	/** Shell calls that may have moved Git HEAD (git commit/merge/switch/...): HEAD progress is then treated as possibly own. */
 	gitHeadOps: number;
+	/** Detected changes the run cannot explain: another conversation or another program changed them meanwhile. */
+	elsewhere?: ChangedElsewhere[];
 }
 
 interface Snapshot {
@@ -92,6 +106,60 @@ export function statModifiedAt(absolutePath: string): number | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Text with CRLF line endings written as LF, the way Git compares text files: the content before a task often comes
+ * from Git (LF) while the file on disk has CRLF (a .ps1/.cmd/.bat file, or any text file with core.autocrlf), and
+ * without this every line would count as changed.
+ */
+function withLfLineEndings(text: string | null): string | null {
+	return text === null ? null : text.replace(/\r\n/g, "\n");
+}
+
+/** Builds a file's summary diff with line endings compared the way Git compares text. */
+function textDiff(
+	summary: FileChangeSummary,
+	before: string | null,
+	after: string | null,
+	oldPathName: string,
+): { summary: FileChangeSummary; patch?: string } {
+	const beforeText = withLfLineEndings(before);
+	const afterText = withLfLineEndings(after);
+	if (before !== null && after !== null && before !== after && beforeText === afterText) {
+		summary.lineEndingsOnly = true;
+		return { summary };
+	}
+	const patch = makePatch(summary.path, beforeText, afterText, oldPathName);
+	const counts = countPatchLines(patch);
+	summary.additions = counts.additions;
+	summary.deletions = counts.deletions;
+	return { summary, patch };
+}
+
+/**
+ * Tools that write nothing in the workspace beyond the checkpoint list's read-only tools: web pages and memories are
+ * saved in the data folder, and stopping a sub-agent writes nothing. Their calls are no window of their own, so a run
+ * that only searched the web does not claim what other programs changed meanwhile.
+ */
+const NO_WORKSPACE_WRITE_TOOLS = new Set([
+	"web_search",
+	"web_fetch",
+	"memory_write",
+	"memory_delete",
+	"memory_claim",
+	"agent_tasks",
+]);
+
+/**
+ * Whether a call of `toolName` may write files without naming them, so the time it runs counts as a window in which
+ * the session may have changed any file. File tools name their files and are recorded by path instead.
+ */
+export function toolCallMayWriteFiles(toolName: string): boolean {
+	if (toolName === "edit" || toolName === "write" || toolName === "apply_patch" || toolName === "apply_rename") {
+		return false;
+	}
+	return !isNonMutatingTool(toolName) && !NO_WORKSPACE_WRITE_TOOLS.has(toolName);
 }
 
 function looksBinary(buffer: Buffer): boolean {
@@ -187,8 +255,15 @@ export class ChangeTracker {
 	private readonly snapshotBytes = new Map<number, number>();
 	private readonly checkpoints = new Map<number, GitCheckpoint>();
 	private readonly pendingBefore = new Map<string, { runId: number; rels: string[] }>();
-	/** Shell calls (bash / pwsh) that started but have not reported an end yet. */
-	private readonly openShells = new Map<string, { runId: number; startedAt: number }>();
+	/**
+	 * Calls that may write files without naming them (shell commands, sub-agent batches, other tools) and have not
+	 * reported an end yet, by tool call id. Each is an open window in the shared registry while it runs.
+	 */
+	private readonly openActivities = new Map<string, { runId: number; startedAt: number; windowId?: string }>();
+	/** Sub-agent dispatches seen running, by dispatch id, with the registry window that stays open until they end. */
+	private readonly openDispatches = new Map<string, string>();
+	/** Dispatches whose window is already recorded as ended. */
+	private readonly endedDispatches = new Set<string>();
 
 	constructor(cwd: string, options: ChangeTrackerOptions = {}) {
 		this.cwd = cwd;
@@ -201,12 +276,26 @@ export class ChangeTracker {
 	}
 
 	reset(): void {
+		this.dispose();
 		this.runs.clear();
 		this.snapshots.clear();
 		this.snapshotBytes.clear();
 		this.pendingBefore.clear();
 		this.checkpoints.clear();
-		this.openShells.clear();
+	}
+
+	/**
+	 * The tracker is being replaced (another session bound to the slot, or the slot closed): the windows it still holds
+	 * open in the shared registry end now, so they do not cover time this tracker no longer watches.
+	 */
+	dispose(): void {
+		const now = Date.now();
+		for (const activity of this.openActivities.values()) {
+			if (activity.windowId) this.changeClaims?.closeWindow(activity.windowId, now);
+		}
+		this.openActivities.clear();
+		for (const windowId of this.openDispatches.values()) this.changeClaims?.closeWindow(windowId, now);
+		this.openDispatches.clear();
 	}
 
 	beginRun(runId: number): RunChangeRecord {
@@ -217,15 +306,17 @@ export class ChangeTracker {
 			changes: [],
 			toolFileOps: [],
 			bashRuns: 0,
+			opaqueCalls: 0,
 			gitHeadOps: 0,
 		};
 		this.runs.set(runId, record);
 		this.snapshots.set(runId, new Map());
 		this.snapshotBytes.set(runId, 0);
-		// A shell call from an earlier run never reported its end; an unclosed window cannot be trusted to bound
-		// anything, so it is dropped instead of being stretched over the new run.
-		for (const [toolCallId, shell] of this.openShells) {
-			if (shell.runId !== runId) this.openShells.delete(toolCallId);
+		// A call from an earlier run never reported its end: its window ends where that run ended (or now, when the
+		// run never finished) instead of being stretched over the new run.
+		for (const [toolCallId, activity] of this.openActivities) {
+			if (activity.runId === runId) continue;
+			this.endActivity(toolCallId, this.runs.get(activity.runId)?.endedAt ?? Date.now());
 		}
 		// Keep memory bounded: only the most recent runs retain snapshots.
 		const ids = [...this.runs.keys()].sort((a, b) => a - b);
@@ -300,29 +391,118 @@ export class ChangeTracker {
 		}
 	}
 
-	/** A shell call started: remember when, so the files it writes can be attributed to this session. */
+	/** A shell call started: the files written while it runs can be this session's. */
 	recordShellStart(runId: number, toolCallId: string): void {
-		this.openShells.set(toolCallId, { runId, startedAt: Date.now() });
+		this.recordToolStart(runId, toolCallId, "shell");
 	}
 
 	/** A shell call ended: its window is what file writes inside it are attributed to. */
 	recordShellEnd(runId: number, toolCallId: string): void {
-		const shell = this.openShells.get(toolCallId);
-		this.openShells.delete(toolCallId);
-		if (!shell) return;
-		this.publishShellWindow(runId, shell.startedAt, Date.now());
+		this.recordToolEnd(runId, toolCallId);
+	}
+
+	/**
+	 * A call that may write files without naming them started (a shell command, a sub-agent batch, another tool). Its
+	 * window opens in the shared registry right away, so other sessions see it while it runs.
+	 */
+	recordToolStart(runId: number, toolCallId: string, kind: ActivityKind): void {
+		const startedAt = Date.now();
+		const record = this.runs.get(runId);
+		if (record) record.opaqueCalls += 1;
+		const sessionKey = this.sessionKeyProvider?.();
+		let windowId: string | undefined;
+		if (this.changeClaims && sessionKey) {
+			windowId = `${sessionKey}\u0000call\u0000${toolCallId}`;
+			this.changeClaims.openWindow(windowId, { sessionKey, runId, startedAt, kind });
+		}
+		this.openActivities.set(toolCallId, { runId, startedAt, ...(windowId ? { windowId } : {}) });
+	}
+
+	/**
+	 * Whether something of this session ran during the run that may write files without naming them: a shell command or
+	 * another write-capable call of the run, a sub-agent dispatch, or a background job still running from an earlier
+	 * task. Final detection then has to compare the whole folder: the Git checkpoint, or the content baseline taken
+	 * when the run started.
+	 */
+	runHadOpaqueActivity(runId: number): boolean {
+		const record = this.runs.get(runId);
+		if (!record) return false;
+		if (record.opaqueCalls > 0) return true;
+		const sessionKey = this.sessionKeyProvider?.();
+		if (!this.changeClaims || !sessionKey) return false;
+		return this.changeClaims.hasWindowDuring(sessionKey, record.startedAt, record.endedAt ?? Date.now());
+	}
+
+	/** The call ended, whatever its result: a failed command may still have written files. */
+	recordToolEnd(_runId: number, toolCallId: string): void {
+		this.endActivity(toolCallId, Date.now());
+	}
+
+	private endActivity(toolCallId: string, endedAt: number): void {
+		const activity = this.openActivities.get(toolCallId);
+		this.openActivities.delete(toolCallId);
+		if (activity?.windowId) this.changeClaims?.closeWindow(activity.windowId, endedAt);
+	}
+
+	/**
+	 * The session's sub-agent dispatches as the session reports them. A dispatch that runs in the background outlives
+	 * the tool call that started it: its window stays open until it ends, so the files its sub-agents write count as
+	 * this session's. A dispatch that is no longer reported has ended.
+	 */
+	recordDispatches(
+		dispatches: ReadonlyArray<{ id: string; startedAt: number; endedAt?: number; status: string }>,
+	): void {
+		const registry = this.changeClaims;
+		const sessionKey = this.sessionKeyProvider?.();
+		if (!registry || !sessionKey) return;
+		const now = Date.now();
+		const runId = this.latestRunId() ?? 0;
+		const reported = new Set<string>();
+		for (const dispatch of dispatches) {
+			reported.add(dispatch.id);
+			if (this.endedDispatches.has(dispatch.id)) continue;
+			const ended = dispatch.endedAt !== undefined || dispatch.status !== "running";
+			const windowId = this.openDispatches.get(dispatch.id);
+			if (!ended) {
+				if (windowId) continue;
+				const id = `${sessionKey}\u0000dispatch\u0000${dispatch.id}`;
+				registry.openWindow(id, { sessionKey, runId, startedAt: dispatch.startedAt, kind: "agent" });
+				this.openDispatches.set(dispatch.id, id);
+				continue;
+			}
+			if (windowId) registry.closeWindow(windowId, dispatch.endedAt ?? now);
+			// First seen already finished (it started and ended between two reports): its whole run is one window.
+			else
+				registry.recordShell({
+					sessionKey,
+					runId,
+					startedAt: dispatch.startedAt,
+					endedAt: dispatch.endedAt ?? now,
+					kind: "agent",
+				});
+			this.markDispatchEnded(dispatch.id);
+		}
+		for (const [id, windowId] of this.openDispatches) {
+			if (reported.has(id)) continue;
+			registry.closeWindow(windowId, now);
+			this.markDispatchEnded(id);
+		}
+	}
+
+	private markDispatchEnded(id: string): void {
+		this.openDispatches.delete(id);
+		this.endedDispatches.add(id);
+		// Dispatch ids never repeat; the set only stops the final report of a wave from being recorded twice.
+		if (this.endedDispatches.size > 500) {
+			const oldest = this.endedDispatches.values().next().value;
+			if (oldest !== undefined) this.endedDispatches.delete(oldest);
+		}
 	}
 
 	private publishClaim(runId: number, rel: string, tool: FileMutationTool, at: number): void {
 		const sessionKey = this.sessionKeyProvider?.();
 		if (!this.changeClaims || !sessionKey) return;
 		this.changeClaims.record({ sessionKey, runId, path: path.resolve(this.cwd, rel), at, tool });
-	}
-
-	private publishShellWindow(runId: number, startedAt: number, endedAt: number): void {
-		const sessionKey = this.sessionKeyProvider?.();
-		if (!this.changeClaims || !sessionKey) return;
-		this.changeClaims.recordShell({ sessionKey, runId, startedAt, endedAt: Math.max(startedAt, endedAt) });
 	}
 
 	recordBash(runId: number): void {
@@ -355,8 +535,8 @@ export class ChangeTracker {
 			record.reason = "Final change detection was unavailable; showing files touched by edit/write only.";
 			this.mergeToolChanges(runId, record);
 		}
-		this.closeOpenShells(runId, record.endedAt ?? Date.now());
-		this.dropForeignChanges(record);
+		this.closeOpenActivities(runId, record.endedAt ?? Date.now());
+		this.attributeChanges(record);
 		if (checkpoint) {
 			this.checkpoints.set(runId, checkpoint);
 			record.checkpointId = checkpoint.id;
@@ -394,35 +574,33 @@ export class ChangeTracker {
 	}
 
 	/**
-	 * Remove the changes another open conversation explains (see change-claims.ts): a file operation it recorded
-	 * inside this run's window, or a file whose last write falls inside one of its shell windows and outside every
-	 * shell window of this session. The run's own file operations are never removed.
+	 * Keep only the changes this run can explain (see attributeRunChanges in change-claims.ts): its own file
+	 * operations, and files last written inside one of this session's windows. The others were changed by another
+	 * conversation or another program while the run went on; they leave the card and are listed under it.
 	 */
-	private dropForeignChanges(record: RunChangeRecord): void {
+	private attributeChanges(record: RunChangeRecord): void {
 		const sessionKey = this.sessionKeyProvider?.();
 		if (!this.changeClaims || !sessionKey || record.changes.length === 0) return;
 		const ownPaths = new Set(
 			record.toolFileOps.filter((op) => op.ok).map((op) => pathIdentityKey(path.resolve(this.cwd, op.path))),
 		);
-		const dropped = new Set(
-			selectForeignChanges(record.changes, {
-				registry: this.changeClaims,
-				sessionKey,
-				ownPaths,
-				from: record.startedAt,
-				to: record.endedAt ?? Date.now(),
-				baseDir: this.cwd,
-				modifiedAt: statModifiedAt,
-			}),
-		);
-		if (dropped.size > 0) record.changes = record.changes.filter((change) => !dropped.has(change.path));
+		const { kept, elsewhere } = attributeRunChanges(record.changes, {
+			registry: this.changeClaims,
+			sessionKey,
+			ownPaths,
+			from: record.startedAt,
+			to: record.endedAt ?? Date.now(),
+			baseDir: this.cwd,
+			modifiedAt: statModifiedAt,
+		});
+		record.changes = kept;
+		if (elsewhere.length > 0) record.elsewhere = elsewhere;
 	}
 
-	private closeOpenShells(runId: number, endedAt: number): void {
-		for (const [toolCallId, shell] of this.openShells) {
-			if (shell.runId !== runId) continue;
-			this.openShells.delete(toolCallId);
-			this.publishShellWindow(runId, shell.startedAt, endedAt);
+	/** The calls of this run that never reported an end: their windows end with the run. */
+	private closeOpenActivities(runId: number, endedAt: number): void {
+		for (const [toolCallId, activity] of this.openActivities) {
+			if (activity.runId === runId) this.endActivity(toolCallId, endedAt);
 		}
 	}
 
@@ -486,11 +664,7 @@ export class ChangeTracker {
 					: "No Git checkpoint: the pre-task content of files changed by shell commands is not recorded.";
 			return { summary };
 		}
-		const patch = makePatch(change.path, before.text, after.text, change.oldPath ?? change.path);
-		const counts = countPatchLines(patch);
-		summary.additions = counts.additions;
-		summary.deletions = counts.deletions;
-		return { summary, patch };
+		return textDiff(summary, before.text, after.text, change.oldPath ?? change.path);
 	}
 
 	summariseRun(runId: number, checkpoint: GitCheckpoint | undefined): FileChangeSummary[] {
@@ -529,6 +703,19 @@ export class ChangeTracker {
 			kept += diff.patch.length;
 			return { ...diff.summary, patch: diff.patch };
 		});
+	}
+
+	/**
+	 * The files a finished run left out because they were changed elsewhere, as its card keeps them: names and
+	 * statuses only (never counted, no diffs), at most MAX_CARD_ELSEWHERE_FILES by name plus the full count.
+	 */
+	runChangeCardElsewhere(runId: number): { elsewhere?: ChangedElsewhere[]; elsewhereTotal?: number } {
+		const elsewhere = this.runs.get(runId)?.elsewhere;
+		if (!elsewhere?.length) return {};
+		return {
+			elsewhere: elsewhere.slice(0, MAX_CARD_ELSEWHERE_FILES),
+			...(elsewhere.length > MAX_CARD_ELSEWHERE_FILES ? { elsewhereTotal: elsewhere.length } : {}),
+		};
 	}
 
 	// ---------------------------------------------------------------------
@@ -638,10 +825,6 @@ export class ChangeTracker {
 			summary.unavailable = "File is larger than 2 MB; content diff skipped.";
 			return { summary };
 		}
-		const patch = makePatch(change.path, before.text, after.text, change.oldPath ?? change.path);
-		const counts = countPatchLines(patch);
-		summary.additions = counts.additions;
-		summary.deletions = counts.deletions;
-		return { summary, patch };
+		return textDiff(summary, before.text, after.text, change.oldPath ?? change.path);
 	}
 }

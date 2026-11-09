@@ -1787,6 +1787,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 							adjudicator: {
 								provider: options.settings.provider,
 								model: options.settings.model,
+								agentDir: getAgentDir(),
 							},
 						}),
 				{ encoding: "utf8", mode: 0o600 },

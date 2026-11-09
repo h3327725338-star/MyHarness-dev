@@ -7,6 +7,8 @@
 - delete archives an old entry rather than permanently deleting it; the old version is also archived before an update. Before archiving, ensure useful information survives in retained or updated entries.
 - Do not change global/workspace/session ownership or automatically promote conversation information to another scope.
 - Do not save or generate secrets.
+- The task gives the current local time and each memory shows when it was last updated. Keep dates as written and do not invent or estimate new ones; when a memory gives no date, its last update time is only the latest it can have happened.
+- A date later than the current time is valid only for something scheduled, such as an exam or a deadline. If a memory says something was already said or done on such a date, the date is wrong: say it is unconfirmed unless the given memories establish the real date.
 - Return at most 20 operations; return an empty array if no consolidation is needed.
 
 # Annotations

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+import { ModelPromptStore } from "../../providers/models/model-prompts.ts";
 import { SessionManager } from "../../session/manager/index.ts";
 import { type ChatDraft, ModeStateStore } from "../../session/mode-state.ts";
 import type { ChatMode } from "../../session/types.ts";
@@ -121,5 +122,19 @@ export function registerModeRoutes(server: WebHttpServer, host: WebHost, hub: We
 		for (const selected of Object.keys(updates) as ChatMode[])
 			host.broadcast("mode_preferences_changed", { mode: selected });
 		return modeStore.getPersonalPrompts();
+	});
+	// Settings → Personalization → Model prompts: the user's own prompt per model (providers/models/model-prompts.ts).
+	const modelPrompts = () => new ModelPromptStore(host.runtimeHost.services.agentDir);
+	server.route("GET", "/api/model-prompts", () => ({ prompts: modelPrompts().list() }));
+	server.route("POST", "/api/model-prompts", ({ body }) => {
+		const input = object(body);
+		const { provider, model, prompt } = input;
+		if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "A Provider ID is required");
+		if (typeof model !== "string" || !model.trim()) throw new HttpError(400, "A Model ID is required");
+		if (typeof prompt !== "string" || prompt.includes("\u0000")) throw new HttpError(400, "Invalid model prompt");
+		const store = modelPrompts();
+		store.set(provider, model, prompt);
+		host.broadcast("model_prompts_changed", {});
+		return { prompts: store.list() };
 	});
 }

@@ -227,6 +227,33 @@
 .term-input { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px var(--pad-panel); border-top: 1px solid var(--border); }
 .term-note { padding: 4px var(--pad-panel) 8px; font-size: var(--fs-xs); }
 
+/* Background: what keeps running for the chat (panel-background.js). The rows are the sub-agent rows of the bar
+   (composer.css .sa-*) and the sections those of Session (.ctx-*); here the list scrolls with the panel, and the rows
+   reach a little past the text column so their hover sits around the text the way it does in the bar. */
+.bg-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.bg-panel .panel-scroll { padding-bottom: var(--pad-panel); }
+.bg-summary { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin-left: auto; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bg-panel .ctx-head > .sa-icon-btn { margin: -4px -4px -4px 0; }
+.bg-panel .sa-list { max-height: none; overflow: visible; margin: 0 -6px; padding: 0; }
+.bg-job .sa-name { flex: 1 1 auto; max-width: none; }
+.bg-job .sa-activity { flex: none; color: var(--text-2); }
+.bg-job.s-failed .sa-activity, .bg-job.s-timed_out .sa-activity { color: var(--danger); }
+.bg-job.s-killed .bg-cmd, .bg-job.s-unknown .bg-cmd { color: var(--text-3); }
+.bg-cmd { font-size: var(--fs-code); }
+.bg-detail { display: flex; flex-direction: column; gap: 8px; padding: 4px 6px 10px 30px; font-size: var(--fs-sm); }
+.bg-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+.bg-facts > .icon-btn.sm:last-child { margin-right: -4px; }
+.bg-cwd { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+.bg-command { margin: 0; padding: 8px 10px; max-height: 120px; overflow: auto; border-radius: var(--r-sm); background: var(--bg-inset); font-size: var(--fs-code); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bg-notice { margin: 0; }
+.bg-more { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: var(--fs-xs); }
+.bg-log { overflow-wrap: anywhere; }
+.bg-out { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--code-bg); overflow: hidden; }
+.bg-out .term-out { max-height: min(48vh, 360px); }
+.bg-out .term-pre { padding: 8px 10px; }
+.bg-loading { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 8px 10px; font-size: var(--fs-sm); }
+.bg-empty { padding: 0 0 4px; font-size: var(--fs-sm); line-height: 1.5; }
+
 /* Session/context */
 .context-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .context-panel .panel-scroll { padding-bottom: var(--pad-panel); }

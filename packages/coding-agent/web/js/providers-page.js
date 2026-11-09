@@ -1,19 +1,25 @@
-// Settings → Providers: the providers on the left, the chosen one on the right. A provider has three layers: its global
+// Settings → Providers: the providers on the left, the chosen one on the right. A provider has three layers: its own
 // settings, its keys and their models (providers/models/layers.ts); a value set higher up covers the same value below.
-// Each key is edited in one place (connection, current API key, models); managing several API keys of a key is its own
-// sub-view, and deleting sits apart at the bottom. Opening or switching providers only reads what is saved: no endpoint
+// The right side draws them as a tree: the provider's card on top (name, state, its settings folded into one line), its
+// keys one level in, each key's models one level further. One key is open at a time, and one save bar at the bottom
+// saves whatever is changed on the provider; deleting, moving and the JSON view sit in each row's ⋯ menu. A key that
+// stands alone is the provider itself: its connection fills the provider's card and its models hang below it. Managing
+// several API keys of a key is its own sub-view. Opening or switching providers only reads what is saved: no endpoint
 // is contacted.
-import { html, useEffect, useRef, useState, Collapse, Fold, Icon, Spinner, Toggle } from "./ui.js";
+import { html, useEffect, useRef, useState, COLLAPSE_MS, Collapse, Fold, FoldIn, Icon, Menu, MenuItem, MenuSep, Spinner, Toggle } from "./ui.js";
 import { Select } from "./select.js";
 import { api, attempt, loadModels, loadProviders, loadSettings, post, setView, toast, useStore } from "./store.js";
 import { confirmDialog, inputDialog } from "./actions.js";
 import { clip } from "./util.js";
 import { N_, serverText, t, tNodes } from "./i18n.js";
-import { Field, ProviderForm, apiLabel, apiOptions } from "./provider-form.js";
+import { Field, ProviderForm, SaveBar, apiLabel, apiOptions, apiShort, focusField, followIntoView, shortUrl, steadyRow, useUnsaved } from "./provider-form.js";
 import { BASE_URL_EXAMPLE, baseUrlProblem, entryHasSharedKey, findRow, isLayeredMember, memberGapCount, memberValues, providerTree, rowName, uniqueProviderId } from "./provider-models.js";
 import { nebiusSummary, openServicePage, useNebiusInfo } from "./service-keys.js";
 
 const NEW = "\u0000new";
+// The forms of the right side that are not a key: the provider's own settings and the key being added.
+const GLOBAL = "\u0000global";
+const NEW_KEY = "\u0000new-key";
 
 /** One value a provider from an extension stores itself; the provider checks it, and its message says what is wrong. */
 function ProviderSettingField({ providerId, setting, onSaved, onDirty }) {
@@ -118,23 +124,30 @@ const modelCount = (n) => (n === 1 ? t("1 model") : t("{n} models", { n }));
 const modelsOf = ({ provider, entry }) => entry?.config?.models?.length ?? provider.modelCount ?? 0;
 const totalModels = (row) => row.members.reduce((sum, member) => sum + modelsOf(member), 0);
 
-/** The key in use, with the entry to manage all keys of the provider. */
+/** The key in use, with the entry to manage all keys of the provider (the form puts its label beside it). */
 function KeySummary({ provider, onManage, busy }) {
 	const c = provider.credentials;
 	const active = c?.apiKeys.find((k) => k.active);
 	const oauthActive = c?.active?.type === "oauth";
 	const count = c?.apiKeys.length || 0;
-	return html`<div class="col field-label"><span class="field-name">${t("API key")}</span>
-		<div class="key-current">
-			<${Icon} name="key" size=${14} />
-			${active
-				? html`<span class="truncate grow"><span>${serverText(active.label)}</span> <span class="dim mono">${active.suffix ? `••••${active.suffix}` : ""}</span></span><span class="badge ok">${t("in use")}</span>`
-				: oauthActive
-					? html`<span class="grow">${t("OAuth login")}</span><span class="badge ok">${t("in use")}</span>`
-					: html`<span class="grow dim">${provider.configured && provider.authSource ? t("Set outside MyHarness ({source})", { source: serverText(provider.authSource) }) : t("No API key saved")}</span>`}
-			${provider.supportsApiKeyLogin || count || c?.hasOAuth ? html`<button class="btn sm" disabled=${busy} onClick=${onManage}>${count > 1 ? t("Manage API keys ({n})", { n: count }) : count ? t("Manage API keys") : t("Add API key")}</button>` : null}
-		</div>
+	return html`<div class="key-current">
+		<${Icon} name="key" size=${14} />
+		${active
+			? html`<span class="truncate grow"><span>${serverText(active.label)}</span> <span class="dim mono">${active.suffix ? `••••${active.suffix}` : ""}</span></span><span class="badge ok">${t("in use")}</span>`
+			: oauthActive
+				? html`<span class="grow">${t("OAuth login")}</span><span class="badge ok">${t("in use")}</span>`
+				: html`<span class="grow dim">${provider.configured && provider.authSource ? t("Set outside MyHarness ({source})", { source: serverText(provider.authSource) }) : t("No API key saved")}</span>`}
+		${provider.supportsApiKeyLogin || count || c?.hasOAuth ? html`<button class="btn sm" disabled=${busy} onClick=${onManage}>${count > 1 ? t("Manage API keys ({n})", { n: count }) : count ? t("Manage API keys") : t("Add API key")}</button>` : null}
 	</div>`;
+}
+
+/** The ⋯ menu at the end of a row: what is done to the row as a whole (delete, move, the JSON view) lives here, away from Save. */
+function RowMenu({ label, items, disabled }) {
+	const list = items.filter(Boolean);
+	if (!list.some((item) => item !== "-")) return null;
+	return html`<${Menu} align="end" class="prov-menu" trigger=${({ toggle, open }) => html`<button type="button" class=${`icon-btn sm prov-more ${open ? "active" : ""}`} title=${t("More")} aria-label=${label} aria-haspopup="menu" aria-expanded=${open} disabled=${disabled} onClick=${toggle}><${Icon} name="more" size=${15} /></button>`}>
+		${(close) => list.map((item, index) => (item === "-" ? html`<${MenuSep} key=${`sep-${index}`} />` : html`<${MenuItem} key=${item.label} icon=${item.icon} label=${item.label} danger=${item.danger} disabled=${item.disabled} onClick=${() => { close(); item.onClick(); }} />`))}
+	<//>`;
 }
 
 /** Every saved API key of the provider: add, name, switch and delete. Deleting here removes one key, never the provider. */
@@ -218,106 +231,157 @@ function LoginNotice() {
 	return null;
 }
 
+/** What a key uses from the top down, for the one line of its folded row: format, address and the end of its API key. */
+function keyUses(member, group) {
+	const config = member.entry?.config ?? {};
+	return {
+		api: group?.config?.api || config.api || "",
+		url: group?.config?.baseUrl || config.baseUrl || "",
+		suffix: group?.key?.suffix || member.provider.credentials?.apiKeys?.find((key) => key.active)?.suffix || "",
+	};
+}
+
+/** The end of the API key a key's requests use, for the "In effect" line of its models. */
+const activeSuffix = (provider) => provider.credentials?.apiKeys?.find((key) => key.active)?.suffix || "";
+
+/** The parts of a summary line, with a quiet dot between them. */
+const joined = (parts) => parts.filter(Boolean).flatMap((part, index) => (index ? [html`<span class="prov-sep" aria-hidden="true">·</span>`, part] : [part]));
+
 /**
- * The top layer of a provider. What is filled in here applies to every key and model below it; a field left empty lets
- * them decide for themselves. A provider that so far stands alone becomes a group when this is first saved.
+ * The provider's own settings, one foldable line of its card: what is filled in here applies to every key and model
+ * below; a field left empty lets them decide for themselves. Folded, the line says what is set (or that each key
+ * decides). A provider that so far stands alone becomes a group when this is first saved. The page's save bar saves it
+ * through `ctl`; it has no buttons of its own.
  */
-function GlobalSettings({ row, apiTypes, onSaved, onDirty }) {
+function GlobalSettings({ row, apiTypes, open, onToggle, onSaved, onDirty, ctl, onState, onReveal }) {
 	const group = row.group;
 	const fromRow = () => ({ name: group?.config?.name ?? "", baseUrl: group?.config?.baseUrl ?? "", api: group?.config?.api ?? "", apiKey: "", removeKey: false });
 	const [draft, setDraft] = useState(fromRow);
 	const [dirty, setDirty] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState("");
-	const [open, setOpen] = useState(false);
-	useEffect(() => onDirty?.(dirty), [dirty]);
-	useEffect(() => () => onDirty?.(false), []);
+	const nameRef = useRef(null);
+	// "Rename" on a folded line: the name field takes the keyboard once the fold has drawn it.
+	const wantsName = useRef(false);
+	const [nameAsks, setNameAsks] = useState(0);
+	const changed = useUnsaved(draft, dirty);
+	useEffect(() => onDirty?.(changed), [changed]);
+	useEffect(() => onState?.({ dirty: changed, busy }), [changed, busy]);
+	useEffect(() => () => {
+		onDirty?.(false);
+		onState?.({ dirty: false, busy: false });
+	}, []);
+	useEffect(() => {
+		const input = nameRef.current;
+		if (!wantsName.current || !input) return;
+		wantsName.current = false;
+		focusField(input, { scroll: true });
+	}, [nameAsks, open]);
 	const patch = (next) => {
 		setDraft((current) => ({ ...current, ...next }));
 		setDirty(true);
 		setError("");
 	};
+	const fail = (message) => {
+		setError(message);
+		onReveal?.();
+	};
 	const save = async () => {
 		const url = draft.baseUrl.trim();
-		if (url && baseUrlProblem(url)) return setError(t("The Base URL must be a full http:// or https:// address."));
+		if (url && baseUrlProblem(url)) {
+			fail(t("The Base URL must be a full http:// or https:// address."));
+			return false;
+		}
 		setBusy(true);
+		let saved = false;
 		try {
 			await post("/api/providers/group/save", { ...(group ? { id: group.id } : { memberId: row.members[0].provider.id }), name: draft.name, baseUrl: url, api: draft.api, apiKey: draft.apiKey, removeApiKey: draft.removeKey });
+			saved = true;
 			setDirty(false);
-			toast(t("Provider saved"), "info", 2500);
-			await onSaved();
 			setDraft((current) => ({ ...current, baseUrl: url, apiKey: "", removeKey: false }));
+			await onSaved();
 		} catch (failure) {
-			setError(serverText(failure.message, t("The operation failed.")));
+			if (!saved) fail(serverText(failure.message, t("The operation failed.")));
 		}
 		setBusy(false);
+		return saved;
 	};
 	const discard = () => {
 		setDraft(fromRow());
 		setDirty(false);
 		setError("");
 	};
+	if (ctl) ctl.current = { save, discard, focusName: () => ((wantsName.current = true), setNameAsks((n) => n + 1)) };
 	const urls = memberValues(row.members, "baseUrl");
 	const apis = memberValues(row.members, "api");
-	return html`<section class="set-card collapsible prov-global">
-		<div class="set-card-head"><button type="button" class="set-card-toggle grow" aria-expanded=${open} onClick=${() => setOpen(!open)}><${Fold} /><strong>${t("Global settings")}</strong></button></div>
+	const decide = t("Each key decides");
+	const chip = (label, value, mono) => html`<span class="prov-chip"><span>${label}</span><b class=${mono ? "mono" : ""}>${value ?? decide}</b></span>`;
+	return html`<div class=${`prov-group prov-global ${open ? "open" : ""}`}>
+		<button type="button" class="prov-row prov-group-row" aria-expanded=${open} onClick=${onToggle}>
+			<${Fold} />
+			<span class="prov-group-label">${t("Provider settings")}</span>
+			${changed ? html`<span class="dot accent prov-dirty" title=${t("Unsaved changes")} />` : null}
+			<span class="prov-group-sum">
+				<span class="prov-group-chips" aria-hidden=${open ? "true" : undefined}>
+					${chip(t("API format"), group?.config?.api ? apiShort(group.config.api) : null)}
+					${chip(t("Base URL"), group?.config?.baseUrl ? shortUrl(group.config.baseUrl) : null, !!group?.config?.baseUrl)}
+					${chip(t("API key"), group?.key ? (group.key.suffix ? `••••${group.key.suffix}` : t("API key set")) : null, !!group?.key?.suffix)}
+				</span>
+				<span class="dim truncate prov-group-hint" aria-hidden=${open ? undefined : "true"}>${t("Filled in here, it applies to every key and model below; left empty, each key decides.")}</span>
+			</span>
+		</button>
 		<${Collapse} open=${open}>
-		<div class="set-card-body pf-fields prov-global-body">
-			<span class="set-card-desc">${t("What you fill in here applies to every key and model below. Leave a field empty and the layers below decide for themselves.")}</span>
-			${error ? html`<div class="notice danger" role="alert">${error}</div>` : null}
-			<div class="pf-two">
-				<${Field} label=${t("Provider name")}><input class="field" placeholder=${rowName(row)} value=${draft.name} onInput=${(e) => patch({ name: e.target.value })} /><//>
-				<${Field} label=${t("API format")} hint=${dirty && draft.api && apis.differ ? t("Your keys use different formats now. Saved like this, they all use {value}.", { value: apiLabel(draft.api) }) : null}><${Select} value=${draft.api} ariaLabel=${t("API format")} onChange=${(next) => patch({ api: next })} options=${apiOptions(apiTypes, t("Not set here"))} /><//>
+			<div class="prov-group-body">
+				${error ? html`<div class="notice danger pf-error" role="alert">${error}</div>` : null}
+				<div class="pf-two">
+					<${Field} label=${t("Provider name")}><input ref=${nameRef} class="field" placeholder=${rowName(row)} value=${draft.name} onInput=${(e) => patch({ name: e.target.value })} /><//>
+					<${Field} label=${t("API format")} hint=${changed && draft.api && apis.differ ? t("Your keys use different formats now. Saved like this, they all use {value}.", { value: apiLabel(draft.api) }) : null}><${Select} value=${draft.api} ariaLabel=${t("API format")} onChange=${(next) => patch({ api: next })} options=${apiOptions(apiTypes, t("Not set here"))} /><//>
+				</div>
+				<${Field} label=${t("Base URL")} hint=${changed && draft.baseUrl.trim() && urls.differ ? t("Your keys use different addresses now ({values}). Saved like this, they all use this one. A service that needs a different address per format (with /v1 and without) should leave this empty.", { values: urls.values.join(", ") }) : null}><input class="field mono example-placeholder" placeholder=${BASE_URL_EXAMPLE} aria-label=${t("Base URL")} value=${draft.baseUrl} onInput=${(e) => patch({ baseUrl: e.target.value })} /><//>
+				<div class="col field-label"><span class="field-name">${t("API key")}</span>
+					${group?.key && !draft.removeKey
+						? html`<div class="key-current"><${Icon} name="key" size=${14} /><span class="grow dim mono">${group.key.suffix ? `••••${group.key.suffix}` : ""}</span><button type="button" class="btn sm ghost" onClick=${() => patch({ removeKey: true })}>${t("Remove")}</button></div>`
+						: html`<input class="field mono" type="password" autocomplete="off" placeholder=${t("Leave empty when each key has its own")} aria-label=${t("API key")} value=${draft.apiKey} onInput=${(e) => patch({ apiKey: e.target.value })} />`}
+				</div>
 			</div>
-			<${Field} label=${t("Base URL")} hint=${dirty && draft.baseUrl.trim() && urls.differ ? t("Your keys use different addresses now ({values}). Saved like this, they all use this one. A service that needs a different address per format (with /v1 and without) should leave this empty.", { values: urls.values.join(", ") }) : null}><input class="field mono example-placeholder" placeholder=${BASE_URL_EXAMPLE} aria-label=${t("Base URL")} value=${draft.baseUrl} onInput=${(e) => patch({ baseUrl: e.target.value })} /><//>
-			<div class="col field-label"><span class="field-name">${t("API key")}</span>
-				${group?.key && !draft.removeKey
-					? html`<div class="key-current"><${Icon} name="key" size=${14} /><span class="grow dim mono">${group.key.suffix ? `••••${group.key.suffix}` : ""}</span><button class="btn sm ghost" onClick=${() => patch({ removeKey: true })}>${t("Remove")}</button></div>`
-					: html`<input class="field mono" type="password" autocomplete="off" placeholder=${t("Leave empty when each key has its own")} aria-label=${t("Global API key")} value=${draft.apiKey} onInput=${(e) => patch({ apiKey: e.target.value })} />`}
-			</div>
-			${dirty
-				? html`<div class="row prov-global-foot"><span class="grow dim pf-hint">${t("Unsaved changes")}</span><button class="btn" disabled=${busy} onClick=${discard}>${t("Discard")}</button><button class="btn primary" disabled=${busy} onClick=${save}>${busy ? t("Saving…") : t("Save")}</button></div>`
-				: null}
-		</div>
 		<//>
-	</section>`;
+	</div>`;
 }
 
-/** One key of a provider: a summary row that opens into its form. The form stays mounted once opened, so a fold keeps what was typed. */
-function KeyCard({ member, row, upper, open, onToggle, several, busy, apiTypes, defaults, onManage, onSaved, onDirty, onEnabled, onLeave, onDelete }) {
+/**
+ * One key of a provider: a row of the tree (name, what it uses, its models, its state, ⋯) that opens into its form. The
+ * form stays mounted once opened, so folding keeps what was typed; the row then shows a dot until it is saved.
+ */
+function KeyNode({ member, row, upper, open, onToggle, several, busy, dirty, apiTypes, defaults, onManage, onSaved, onDirty, ctl, onState, onReveal, initialView, onEnabled, menu }) {
 	const { provider, entry } = member;
 	const mounted = useRef(open);
 	if (open) mounted.current = true;
-	// The sticky footer of the form needs the fold to stop clipping once it has finished opening.
-	const [settled, setSettled] = useState(open);
-	useEffect(() => {
-		if (!open) return setSettled(false);
-		const timer = setTimeout(() => setSettled(true), 320);
-		return () => clearTimeout(timer);
-	}, [open]);
 	const status = memberStatus(member, row.group);
 	const hasStoredKey = !!provider.credentials?.apiKeys?.length;
 	const name = entry.config.name || provider.id;
-	return html`<section class=${`prov-key ${settled ? "settled" : ""}`} data-key=${provider.id}>
-		<div class="prov-key-head">
-			<button type="button" class="prov-key-toggle grow" aria-expanded=${open} onClick=${onToggle}>
+	const uses = keyUses(member, row.group);
+	return html`<div class=${`prov-node prov-key ${open ? "open" : ""}`} data-key=${provider.id}>
+		<div class="prov-row prov-key-head">
+			<button type="button" class="prov-row-toggle prov-key-toggle grow" aria-expanded=${open} onClick=${onToggle}>
 				<${Fold} />
+				<${Icon} name="key" size=${14} class="prov-ico" />
 				<span class="truncate prov-key-name">${name}</span>
+				<span class="dim truncate prov-key-sum">${joined([uses.api && apiShort(uses.api), uses.url && html`<span class="mono">${shortUrl(uses.url)}</span>`, uses.suffix && html`<span class="mono">••••${uses.suffix}</span>`])}</span>
+				${dirty ? html`<span class="dot accent prov-dirty" title=${t("Unsaved changes")} />` : null}
+				<span class="dim prov-key-count">${modelCount(modelsOf(member))}</span>
+				<span class=${`badge ${status.cls}`}>${status.text}</span>
 			</button>
-			<span class="dim prov-key-count">${modelCount(modelsOf(member))}</span>
-			<span class=${`badge ${status.cls}`}>${status.text}</span>
 			${several ? html`<${Toggle} checked=${provider.enabled} label=${t("Enable {name}", { name })} disabled=${busy || provider.missingBaseUrl} onChange=${(enabled) => onEnabled([member], enabled)} />` : null}
-			${several ? html`<button class="icon-btn sm" disabled=${busy} title=${t("Move out of this provider")} aria-label=${t("Move {name} out of this provider", { name })} onClick=${onLeave}><${Icon} name="fork" size=${13} /></button>` : null}
+			${menu}
 		</div>
 		<${Collapse} open=${open} keepMounted=${mounted.current}>
 			${mounted.current
 				? html`<div class="prov-key-body">
-					<${ProviderForm} key=${provider.id} asKey upper=${upper} modelKeys=${entry.modelKeys} configured=${entryHasSharedKey(provider)} initial=${{ id: entry.id, config: entry.config }} apiTypes=${apiTypes} defaults=${defaults} keyArea=${html`<${KeySummary} provider=${provider} busy=${busy} onManage=${onManage} />`} hasStoredKey=${hasStoredKey} onSaved=${onSaved} onDirty=${onDirty}
-						footerStart=${html`<button class="btn danger" disabled=${busy} onClick=${onDelete}><${Icon} name="trash" size=${13} />${several ? t("Delete this key") : t("Delete provider")}</button>`} />
+					<${ProviderForm} key=${provider.id} asKey upper=${upper} modelKeys=${entry.modelKeys} configured=${entryHasSharedKey(provider)} initial=${{ id: entry.id, config: entry.config }} apiTypes=${apiTypes} defaults=${defaults} keyArea=${html`<${KeySummary} provider=${provider} busy=${busy} onManage=${onManage} />`} hasStoredKey=${hasStoredKey} keySuffix=${upper?.key ? upper.key.suffix : activeSuffix(provider)} onSaved=${onSaved} onDirty=${onDirty} ctl=${ctl} onState=${onState} onReveal=${onReveal} initialView=${initialView} />
 				</div>`
 				: null}
 		<//>
-	</section>`;
+	</div>`;
 }
 
 function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSaved, onDirty, onDeleted, onShow, onMerged, confirmDiscard, reload }) {
@@ -327,22 +391,71 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 	const entry = first.entry;
 	const managed = members.every(isLayeredMember);
 	const several = members.length > 1;
+	// A key that stands alone is the provider itself: no key level, its connection in the provider's card.
+	const single = managed && !row.group && members.length === 1;
 	const [managing, setManaging] = useState(null);
 	const [busy, setBusy] = useState("");
 	const [adding, setAdding] = useState(false);
+	// Every new key gets a fresh form.
+	const [addCount, setAddCount] = useState(0);
+	const [globalOpen, setGlobalOpen] = useState(false);
+	const [merging, setMerging] = useState(false);
+	// The key whose form opens straight in the JSON view (its ⋯ menu, before the form was ever drawn).
+	const [jsonFor, setJsonFor] = useState(null);
+	// What each form of the right side reports: unsaved changes, a save on its way. One bar acts on all of them.
+	const [states, setStates] = useState({});
+	const [saving, setSaving] = useState(false);
+	const [nudge, setNudge] = useState(0);
+	const ctls = useRef({});
+	const ctlOf = (id) => (ctls.current[id] ??= { current: null });
+	const stateOf = (id) => (next) => setStates((current) => (current[id]?.dirty === next.dirty && current[id]?.busy === next.busy ? current : { ...current, [id]: next }));
+	const rootRef = useRef(null);
 	// Every key starts folded; only one asked for by name opens. Asking for a row, even of one key, is not that.
 	const isAskedFor = (id) => !!id && id !== row.id && members.some((member) => member.provider.id === id);
-	const [opened, setOpened] = useState(() => new Set(isAskedFor(focus) ? [focus] : []));
+	const [openKey, setOpenKey] = useState(() => (isAskedFor(focus) ? focus : null));
 	useEffect(() => {
-		if (isAskedFor(focus)) setOpened((current) => (current.has(focus) ? current : new Set(current).add(focus)));
+		if (isAskedFor(focus)) setOpenKey(focus);
 	}, [focus]);
-	const toggle = (id) =>
-		setOpened((current) => {
-			const next = new Set(current);
-			if (next.has(id)) next.delete(id);
-			else next.add(id);
-			return next;
-		});
+	const dirtyIds = Object.keys(states).filter((id) => id !== NEW_KEY && states[id].dirty);
+	const anyBusy = saving || Object.values(states).some((state) => state.busy);
+	/** Something the unsaved changes block: say so, and shake the bar so the eye finds it. */
+	const blocked = (message) => {
+		toast(message, "warning", 4500);
+		setNudge((n) => n + 1);
+	};
+	const toggleKey = (id, event) => {
+		const rowEl = event?.currentTarget?.closest(".prov-row");
+		if (openKey === id) return setOpenKey(null);
+		if (adding) {
+			if (states[NEW_KEY]?.dirty) return blocked(t("Add or cancel the new key first."));
+			setAdding(false);
+		}
+		setOpenKey(id);
+		if (rowEl) steadyRow(rowEl);
+	};
+	const startAdding = () => {
+		if (dirtyIds.length) return blocked(t("Save or discard the changes first, then add a key."));
+		setOpenKey(null);
+		setAddCount((n) => n + 1);
+		setAdding(true);
+	};
+	// The new key unfolds where it is added and comes into view while the others fold; its name already has the keyboard.
+	useEffect(() => {
+		if (!adding) return;
+		ctlOf(NEW_KEY).current?.focusName?.({ scroll: false });
+		const node = rootRef.current?.querySelector(".prov-new");
+		if (node) followIntoView(node, COLLAPSE_MS + 220);
+	}, [adding, addCount]);
+	const editJson = (id) => {
+		const control = ctlOf(id).current;
+		if (control) control.editJson();
+		else setJsonFor(id);
+		if (openKey !== id) {
+			if (adding && states[NEW_KEY]?.dirty) return blocked(t("Add or cancel the new key first."));
+			setAdding(false);
+			setOpenKey(id);
+		}
+	};
 	const setEnabled = async (targets, enabled) => {
 		setBusy("enabled");
 		// A key without an address cannot be switched on; the others still can.
@@ -387,7 +500,7 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 		if (!(await confirmDialog({
 			title: t("Merge {name} into {target}?", { name: rowName(row), target: rowName(target) }),
 			message: covering.length
-				? t("{target} has global settings for: {fields}. They will cover what these keys use now. Clear them there if these keys should keep their own. A backup of models.json is kept first.", { target: rowName(target), fields: covering.join(", ") })
+				? t("{target} has provider settings for: {fields}. They will cover what these keys use now. Clear them there if these keys should keep their own. A backup of models.json is kept first.", { target: rowName(target), fields: covering.join(", ") })
 				: t("Each key keeps its name, its models and what it uses now. A backup of models.json is kept first."),
 			confirmLabel: t("Merge"),
 		}))) return;
@@ -407,6 +520,34 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 			api: !row.group?.config?.api && formats.length === 1 ? formats[0] : "",
 		};
 	};
+	// The forms of the tree, top down: the order the bar saves them in.
+	const formIds = [GLOBAL, ...members.map((member) => member.provider.id)];
+	const nameOf = (id) => (id === GLOBAL ? t("Provider settings") : (members.find((member) => member.provider.id === id)?.entry?.config?.name || rowName(row)));
+	const saveAll = async () => {
+		if (anyBusy) return;
+		setSaving(true);
+		for (const id of [...formIds.filter((id) => states[id]?.dirty), ...(adding ? [NEW_KEY] : [])]) {
+			// A refused save names its problem in its own form; the rest waits for the next click.
+			if (!(await ctlOf(id).current?.save?.())) break;
+		}
+		setSaving(false);
+	};
+	const discardAll = () => {
+		for (const id of dirtyIds) ctlOf(id).current?.discard?.();
+		setAdding(false);
+	};
+	/** A form whose save was refused unfolds, so the notice at its top can be read. */
+	const reveal = (id) => () => {
+		if (id === GLOBAL) setGlobalOpen(true);
+		else if (id !== NEW_KEY && openKey !== id) setOpenKey(id);
+	};
+	/** A key's save stays where it is: the page does not jump to the key just saved. */
+	const keepSaved = (id, info) => onSaved(id, { ...info, keep: true });
+	const rename = () => {
+		if (single || !managed) return ctlOf(provider.id).current?.focusName?.();
+		setGlobalOpen(true);
+		ctlOf(GLOBAL).current?.focusName?.();
+	};
 	const managedMember = managing ? members.find((member) => member.provider.id === managing) : null;
 	const status = rowStatus(row);
 	const anyEnabled = members.some((member) => member.provider.enabled);
@@ -414,57 +555,126 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 	const upper = row.group ? { ...row.group.config, key: row.group.key } : null;
 	const keyArea = html`<${KeySummary} provider=${provider} busy=${!!busy} onManage=${() => setManaging(provider.id)} />`;
 	const hasStoredKey = !!provider.credentials?.apiKeys?.length || provider.credentials?.active?.type === "oauth";
-	return html`<div class="stack">
-		${managedMember ? html`<${KeyManager} provider=${managedMember.provider} onBack=${() => setManaging(null)} />` : null}
-		<div class="stack" style=${managedMember ? "display:none" : undefined}>
-			<div class="prov-head">
-				<div class="col grow"><div class="prov-title truncate">${rowName(row)}</div><div class=${`dim truncate ${row.group ? "" : "mono"}`}>${row.group ? `${keyCount(members.length)} · ${modelCount(totalModels(row))}` : provider.id}</div></div>
-				<span class=${`badge ${status.cls}`}>${status.text}</span>
-				<label class="check-label sm" title=${noneCanRun ? t("Fill in the Base URL and save to turn this provider on.") : undefined}><span class="dim">${t("Enabled")}</span><${Toggle} checked=${anyEnabled} label=${t("Enable {name}", { name: rowName(row) })} disabled=${!!busy || noneCanRun} onChange=${(enabled) => setEnabled(members, enabled)} /></label>
+	const name = rowName(row);
+	const inModelsJson = !!entry;
+	const menuLabel = t("More actions for {name}", { name });
+	const head = html`<div class="prov-head prov-root-head">
+		<div class="col grow">
+			<div class="prov-title truncate">${name}</div>
+			<div class="dim truncate prov-root-sub">${row.group ? `${keyCount(members.length)} · ${modelCount(totalModels(row))}` : html`<span class="mono">${provider.id}</span>${inModelsJson ? ` · ${modelCount(modelsOf(first))}` : ""}`}</div>
+		</div>
+		<span class=${`badge ${status.cls}`}>${status.text}</span>
+		<label class="check-label sm" title=${noneCanRun ? t("Fill in the Base URL and save to turn this provider on.") : undefined}><span class="dim">${t("Enabled")}</span><${Toggle} checked=${anyEnabled} label=${t("Enable {name}", { name })} disabled=${!!busy || noneCanRun} onChange=${(enabled) => setEnabled(members, enabled)} /></label>
+		${inModelsJson
+			? html`<${RowMenu} label=${menuLabel} disabled=${!!busy} items=${[
+				{ icon: "edit", label: t("Rename"), onClick: rename },
+				(single || !managed) && { icon: "wrench", label: t("Edit as JSON (advanced)"), onClick: () => ctlOf(provider.id).current?.editJson?.() },
+				managed && mergeTargets.length && { icon: "gitMerge", label: t("Merge into another provider…"), onClick: () => setMerging(true) },
+				"-",
+				{ icon: "trash", label: t("Delete provider"), danger: true, onClick: removeRow },
+			]} />`
+			: null}
+	</div>`;
+	const mergeRow = html`<${FoldIn} content=${merging && mergeTargets.length
+		? html`<div class="row prov-merge">
+			<${Icon} name="gitMerge" size=${14} class="prov-ico" />
+			<span class="dim">${t("Merge into")}</span>
+			<${Select} size="sm" value="" disabled=${!!busy} placeholder=${t("Merge into another provider…")} ariaLabel=${t("Merge into another provider")} onChange=${(target) => (setMerging(false), mergeInto(target))} options=${mergeTargets.map((other) => ({ value: other.id, label: rowName(other) }))} />
+			<span class="grow" />
+			<button type="button" class="btn sm ghost" onClick=${() => setMerging(false)}>${t("Cancel")}</button>
+		</div>`
+		: null} />`;
+	const addRow = html`<div class="prov-node prov-add-node">
+		<div class="prov-add-row">
+			<button type="button" class="btn sm ghost prov-add-key" disabled=${adding || !!busy} onClick=${startAdding}><${Icon} name="plus" size=${13} />${t("Add key")}</button>
+			${single ? html`<span class="dim pf-hint">${t("With a second key, this splits into provider settings and keys.")}</span>` : null}
+		</div>
+	</div>`;
+	const newKey = html`<${FoldIn} class="prov-node prov-new" content=${adding
+		? html`<div class="prov-row prov-key-head prov-new-head">
+				<${Icon} name="chevronDown" size=${13} class="prov-new-chev" />
+				<${Icon} name="key" size=${14} class="prov-ico" />
+				<span class="truncate prov-key-name">${t("New key")}</span>
+				<span class="dim truncate prov-key-sum">${t("Not added yet")}</span>
 			</div>
+			<div class="prov-key-body">
+				<${ProviderForm} key=${`new-key-${addCount}`} asKey initial=${null} seed=${newKeySeed()} attachTo=${provider.id} takenIds=${takenIds} upper=${upper} apiTypes=${apiTypes} defaults=${defaults} onDirty=${(d) => onDirty("new-key", d)} ctl=${ctlOf(NEW_KEY)} onState=${stateOf(NEW_KEY)}
+					onSaved=${(id, info) => {
+						setAdding(false);
+						setOpenKey(id);
+						return onSaved(id, info);
+					}} />
+			</div>`
+		: null} />`;
+	const shown = adding || dirtyIds.length > 0;
+	const places = dirtyIds.length + (adding ? 1 : 0);
+	const bar = html`<div class="prov-tree-end" />
+		<${SaveBar} show=${shown} nudge=${nudge} busy=${anyBusy}
+			message=${places > 1 ? t("{n} places have unsaved changes", { n: places }) : adding ? t("The new key is not added yet") : t("{name} has unsaved changes", { name: nameOf(dirtyIds[0]) })}
+			cancelLabel=${dirtyIds.length ? t("Discard") : t("Cancel")} onCancel=${discardAll}
+			saveLabel=${adding && !dirtyIds.length ? t("Add key") : t("Save")} onSave=${saveAll} />`;
+	const formProps = (id) => ({ ctl: ctlOf(id), onState: stateOf(id), onReveal: reveal(id), onDirty: (d) => onDirty(id, d) });
+	let body;
+	if (single || (inModelsJson && !managed)) {
+		// One key, or an entry outside the layers: the provider's card holds the connection, its models hang below it.
+		// The bar shares a gapless column with the form, so its coming and going never moves what is above it.
+		body = html`<div class="prov-tree"><${ProviderForm} key=${provider.id} head=${html`${head}${mergeRow}`} tail=${single ? html`${newKey}${addRow}` : null} initial=${{ id: entry.id, config: entry.config }} upper=${null} modelKeys=${entry.modelKeys} configured=${entryHasSharedKey(provider)} apiTypes=${apiTypes} defaults=${defaults} keyArea=${keyArea} hasStoredKey=${hasStoredKey} keySuffix=${activeSuffix(provider)} onSaved=${keepSaved} ...${formProps(provider.id)} />${bar}</div>`;
+	} else if (managed) {
+		body = html`<div class="prov-tree">
+				<section class="prov-root">
+					${head}
+					${mergeRow}
+					<div class="prov-root-body">
+						<${GlobalSettings} row=${row} apiTypes=${apiTypes} open=${globalOpen} onToggle=${() => setGlobalOpen(!globalOpen)} onSaved=${reload} ...${formProps(GLOBAL)} />
+					</div>
+				</section>
+				<div class="prov-branch prov-keys">
+					${members.map((member) => {
+						const id = member.provider.id;
+						return html`<${KeyNode} key=${id} member=${member} row=${row} upper=${upper} open=${openKey === id} onToggle=${(event) => toggleKey(id, event)} several=${several} busy=${!!busy} dirty=${!!states[id]?.dirty} apiTypes=${apiTypes} defaults=${defaults} onManage=${() => setManaging(id)} onSaved=${keepSaved} initialView=${jsonFor === id ? "json" : undefined} onEnabled=${setEnabled} ...${formProps(id)}
+							menu=${html`<${RowMenu} label=${t("More actions for {name}", { name: member.entry.config.name || id })} disabled=${!!busy} items=${[
+								{ icon: "key", label: t("Manage API keys"), onClick: () => setManaging(id) },
+								{ icon: "wrench", label: t("Edit as JSON (advanced)"), onClick: () => editJson(id) },
+								several && { icon: "fork", label: t("Move out of this provider"), onClick: () => leave(member) },
+								"-",
+								{ icon: "trash", label: several ? t("Delete this key") : t("Delete provider"), danger: true, onClick: () => removeKey(member) },
+							]} />`} />`;
+					})}
+					${newKey}
+					${addRow}
+				</div>
+				${bar}
+			</div>`;
+	} else {
+		// A provider from an extension: shown as it is; its address and models are managed there.
+		body = html`<div class="prov-tree">
+			<section class="prov-root">
+				${head}
+				<div class="prov-root-body">
+					<div class="pf-conn"><div class="pf-fields">
+						${provider.baseUrl ? html`<div class="col field-label pf-row"><span class="field-name">${t("Base URL")}</span><span class="mono pf-value">${provider.baseUrl}</span></div>` : null}
+						<div class="col field-label pf-row"><span class="field-name">${t("API key")}</span>${keyArea}</div>
+						<div class="col field-label pf-row"><span class="field-name">${t("Models")}</span><span class="pf-value">${t("{modelCount} models", { modelCount: provider.modelCount })}</span></div>
+						<span class="dim pf-hint">${t("This provider is not defined in models.json (it comes from an extension), so its address and models are managed there.")}</span>
+					</div></div>
+				</div>
+			</section>
+			${provider.settings?.length
+				? html`<section class="set-card prov-ext-settings">
+					<div class="set-card-head"><strong>${t("Provider settings")}</strong></div>
+					<div class="set-card-body pf-fields">
+						${provider.settings.map((setting) => html`<${ProviderSettingField} key=${setting.id} providerId=${provider.id} setting=${setting} onSaved=${reload} onDirty=${(d) => onDirty(`setting:${setting.id}`, d)} />`)}
+					</div>
+				</section>`
+				: null}
+		</div>`;
+	}
+	return html`<div ref=${rootRef} class="stack prov-fill">
+		${managedMember ? html`<${KeyManager} provider=${managedMember.provider} onBack=${() => setManaging(null)} />` : null}
+		<div class="stack prov-fill" style=${managedMember ? "display:none" : undefined}>
 			${!several && provider.missingBaseUrl ? html`<div class="notice danger" role="status">${t("The Base URL is not filled in, so this provider is off. Enter the Base URL and save to use it.")}</div>` : null}
 			<${LoginNotice} />
-			${managed
-				? html`<${GlobalSettings} row=${row} apiTypes=${apiTypes} onSaved=${reload} onDirty=${(d) => onDirty("global", d)} />
-					<div class="prov-keys stack">
-						<div class="row prov-keys-head"><strong class="grow">${t("Keys")} <span class="dim">${members.length}</span></strong><button class="btn sm ghost" disabled=${adding} onClick=${() => setAdding(true)}><${Icon} name="plus" size=${13} />${t("Add key")}</button></div>
-						${members.map((member) => html`<${KeyCard} key=${member.provider.id} member=${member} row=${row} upper=${upper} open=${opened.has(member.provider.id)} onToggle=${() => toggle(member.provider.id)} several=${several} busy=${!!busy} apiTypes=${apiTypes} defaults=${defaults} onManage=${() => setManaging(member.provider.id)} onSaved=${onSaved} onDirty=${(d) => onDirty(member.provider.id, d)} onEnabled=${setEnabled} onLeave=${() => leave(member)} onDelete=${() => removeKey(member)} />`)}
-						${adding
-							? html`<section class="prov-key settled prov-key-new">
-								<div class="prov-key-head"><strong class="grow">${t("New key")}</strong></div>
-								<div class="prov-key-body">
-									<${ProviderForm} key="new-key" asKey initial=${null} seed=${newKeySeed()} attachTo=${provider.id} takenIds=${takenIds} upper=${upper} apiTypes=${apiTypes} defaults=${defaults} onDirty=${(d) => onDirty("new-key", d)}
-										onSaved=${(id, info) => { setAdding(false); setOpened((current) => new Set(current).add(id)); return onSaved(id, info); }}
-										footerStart=${html`<button class="btn" onClick=${() => setAdding(false)}>${t("Cancel")}</button>`} />
-								</div>
-							</section>`
-							: null}
-					</div>
-					<div class="row prov-actions">
-						${mergeTargets.length ? html`<${Select} size="sm" value="" disabled=${!!busy} placeholder=${t("Merge into another provider…")} ariaLabel=${t("Merge into another provider")} onChange=${mergeInto} options=${mergeTargets.map((other) => ({ value: other.id, label: rowName(other) }))} />` : null}
-						<span class="grow" />
-						${row.group && several ? html`<button class="btn danger" disabled=${!!busy} onClick=${removeRow}><${Icon} name="trash" size=${13} />${busy === "delete" ? t("Deleting…") : t("Delete provider")}</button>` : null}
-					</div>`
-				: entry
-					? html`<${ProviderForm} key=${provider.id} initial=${{ id: entry.id, config: entry.config }} apiTypes=${apiTypes} defaults=${defaults} keyArea=${keyArea} hasStoredKey=${hasStoredKey} onSaved=${onSaved} onDirty=${(d) => onDirty(provider.id, d)}
-						footerStart=${html`<button class="btn danger" disabled=${!!busy} onClick=${removeRow}><${Icon} name="trash" size=${13} />${busy === "delete" ? t("Deleting…") : t("Delete provider")}</button>`} />`
-					: html`<section class="set-card">
-						<div class="set-card-head"><strong>${t("Connection")}</strong></div>
-						<div class="set-card-body pf-fields">
-							${provider.baseUrl ? html`<div class="col field-label"><span class="field-name">${t("Base URL")}</span><span class="mono">${provider.baseUrl}</span></div>` : null}
-							${keyArea}
-							<div class="col field-label"><span class="field-name">${t("Models")}</span><span>${t("{modelCount} models", { modelCount: provider.modelCount })}</span></div>
-							<span class="dim pf-hint">${t("This provider is not defined in models.json (it comes from an extension), so its address and models are managed there.")}</span>
-						</div>
-					</section>
-					${provider.settings?.length
-						? html`<section class="set-card">
-							<div class="set-card-head"><strong>${t("Provider settings")}</strong></div>
-							<div class="set-card-body pf-fields">
-								${provider.settings.map((setting) => html`<${ProviderSettingField} key=${setting.id} providerId=${provider.id} setting=${setting} onSaved=${reload} onDirty=${(d) => onDirty(`setting:${setting.id}`, d)} />`)}
-							</div>
-						</section>`
-						: null}`}
+			${body}
 		</div>
 	</div>`;
 }
@@ -677,13 +887,14 @@ export function ProvidersPage() {
 		await Promise.all([loadProviders(), loadCustom()]);
 		loadModels();
 	};
-	const saved = async (id, { missingBaseUrl } = {}) => {
+	// `keep`: a key saved in place; the page stays on what it shows instead of asking for the key just saved.
+	const saved = async (id, { missingBaseUrl, keep } = {}) => {
 		if (missingBaseUrl) toast(t("Saved. The Base URL is not filled in, so the provider is off."), "warning", 6000);
 		else toast(t("Provider saved"), "info", 2500);
 		const before = sel;
 		await reload();
 		// Another provider chosen while this was saving stays chosen.
-		setSel((current) => (current === before ? id : current));
+		if (!keep) setSel((current) => (current === before ? id : current));
 	};
 	const merged = async (groupId) => {
 		toast(t("Merged. The file as it was is kept as models.json.before-merge.bak."), "info", 6000);
@@ -703,7 +914,7 @@ export function ProvidersPage() {
 	};
 	const suggestions = (custom?.mergeSuggestions || []).filter((suggestion) => !dismissed.has(suggestion.key));
 	const takenIds = new Set([...(custom?.providers || []).map((entry) => entry.id), ...list.map((p) => p.id)]);
-	return html`<div class="stack">
+	return html`<div class="stack prov-page">
 		<${MergeSuggestions} suggestions=${suggestions} groups=${custom?.groups} onMerge=${mergeSuggested} onDismiss=${dismiss} />
 		<div class="prov">
 		<div class="prov-list" role="listbox" aria-label=${t("Providers")}>
@@ -734,9 +945,9 @@ export function ProvidersPage() {
 				: nebiusSetup
 					? html`<${NebiusSetup} onDone=${(result) => { setNebiusResult(result); setNebiusNonce((n) => n + 1); loadCustom(); setSel(NEBIUS); }} />`
 				: sel === NEW || !current
-					? html`<div class="stack">
-						<div class="prov-head"><div class="col grow"><div class="prov-title">${t("Add provider")}</div><div class="dim">${t("Any OpenAI-, Anthropic-, Gemini- or Mistral-compatible endpoint.")}</div></div></div>
-						<${ProviderForm} key="new" initial=${null} apiTypes=${custom.apiTypes} defaults=${custom.connectionDefaults} onSaved=${saved} onDirty=${(d) => markDirty(NEW, d)} />
+					? html`<div class="stack prov-fill">
+						<${ProviderForm} key="new" initial=${null} apiTypes=${custom.apiTypes} defaults=${custom.connectionDefaults} onSaved=${saved} onDirty=${(d) => markDirty(NEW, d)}
+							head=${html`<div class="prov-head prov-root-head"><div class="col grow"><div class="prov-title">${t("Add provider")}</div><div class="dim prov-root-sub">${t("Any OpenAI-, Anthropic-, Gemini- or Mistral-compatible endpoint.")}</div></div></div>`} />
 					</div>`
 					: html`${current.id === NEBIUS ? html`<${NebiusResult} result=${nebiusResult} /><${NebiusExtras} info=${nebiusInfo} />` : null}<${ProviderDetail} key=${`${current.members[0].provider.id}:${detailVersion}`} row=${current} rows=${rows} focus=${sel} takenIds=${takenIds} apiTypes=${custom.apiTypes} defaults=${custom.connectionDefaults} onSaved=${saved} onDirty=${markDirty} onShow=${setSel} onMerged=${merged} confirmDiscard=${confirmDiscard} reload=${reload} onDeleted=${() => (loadCustom(), setNebiusResult(null), setNebiusNonce((n) => n + 1), setSel(null))} />`}
 		</div>

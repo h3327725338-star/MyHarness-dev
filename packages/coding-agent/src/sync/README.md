@@ -13,7 +13,7 @@
 | `types.ts` | 同步协议：实体种类、版本向量、记录、批次、墓碑、冲突、本机状态、状态快照、`DrivePort` 窄接口 |
 | `util.ts` | SHA-256、原子 JSON 写、0600 私有写、版本向量比较/合并、稳定 JSON、字节与文本转换 |
 | `store.ts` | 本机持久化：`<agentDir>/sync/config.json`、按账号隔离的 `state-<hash>.json`、`credentials.json`（0600）、备份与恢复副本 |
-| `scope.ts` | 扫描同步范围：全部记忆（含归档、pending）、通用模式工作区/会话/附件/产物/资料/工具结果、通用个人指令与草稿、Web UI 常用提示词列表（`saved-prompts.ts`，只同步 `web-ui-prefs.json` 里的 `savedPrompts`）、内置浏览器的文件（`browser-data.ts`）、定时任务列表（`schedules.json`，见下文“定时任务”）；聊天的 `metadata/session.json` 去掉本机路径（`cwd`、`conversationPath`）后作为记录内容，聊天的搜索索引 `metadata/history-index.json` 只留本机 |
+| `scope.ts` | 扫描同步范围：全部记忆（含归档、pending）、通用模式工作区/会话/附件/产物/资料/工具结果（含不属于任何工作区的“默认”分组 `workspaces/unbound` 里的通用聊天，它不作为工作区记录发布）、通用个人指令与草稿、Web UI 常用提示词列表（`saved-prompts.ts`，只同步 `web-ui-prefs.json` 里的 `savedPrompts`）、内置浏览器的文件（`browser-data.ts`）、定时任务列表（`schedules.json`，见下文“定时任务”）；聊天的 `metadata/session.json` 去掉本机路径（`cwd`、`conversationPath`）后作为记录内容，聊天的搜索索引 `metadata/history-index.json` 只留本机 |
 | `record-merge.ts` | 记忆和浏览器以外的并发修改合并：个人指令与草稿正文按行合并，常用提示词与草稿附件逐项合并，定时任务按任务合并（`src/schedules/store.ts` 的 `mergeScheduleLists`），`session.json` 逐字段合并并保留本机路径，交接摘要取覆盖更多的一份，纯文本文件按行合并，其他文件两版都留（新的一版用原名，另一版在旁边命名为 `<名称> (conflicted copy <哈希>)`）；结果与哪边是本机无关 |
 | `browser-data.ts` | 内置浏览器数据（种类 `browser`）：`<agentDir>/desktop-profile/` 里的书签、新标签页快捷方式、缩放、深色、网站语言、网站权限文件，以及每台电脑一个、由桌面端用同步口令加密的 `browser-vault-<id>.json`；记录 id 与文件名的白名单映射，以及两台电脑同时改动时的对称合并 |
 | `apply.ts` | 应用远端内容：记忆写入（memory 锁）、会话 JSONL 按 entry id 合并、文件原子写（聊天的 `session.json` 只取对方的可同步字段，路径保留本机的）、工作区身份导入与本机绑定、草稿/指令写入、显式删除 |

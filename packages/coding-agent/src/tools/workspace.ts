@@ -13,7 +13,7 @@
  */
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import type { AgentTool } from "@myharness/agent-core";
 import { type Static, Type } from "typebox";
 import { loadSystemPrompt } from "../system-prompts/loader/index.ts";
@@ -697,9 +697,39 @@ const workspaceParametersUnion = Type.Union([
 			operation: Type.Literal("upload"),
 			tabId: tabIdSchema,
 			onUserTab: onUserTabSchema,
-			path: Type.String({ minLength: 1, description: "File inside the current workspace (relative or absolute)" }),
-			selector: Type.Optional(Type.String({ minLength: 1, description: "CSS selector of an <input type=file>" })),
-			index: Type.Optional(Type.Integer({ minimum: 0, description: "Index in operation interactive" })),
+			path: Type.Optional(
+				Type.String({
+					minLength: 1,
+					description:
+						"One file: a relative path is read from this chat's folder; an absolute path may be anywhere in the user's folder (Documents, Downloads, Google Drive, temp files you built) except where sign-ins and keys are kept",
+				}),
+			),
+			paths: Type.Optional(
+				Type.Array(Type.String({ minLength: 1 }), {
+					minItems: 1,
+					maxItems: 50,
+					description: "Several files at once, same rules as path (the page's input or chooser must take several)",
+				}),
+			),
+			label: Type.Optional(
+				Type.String({
+					minLength: 1,
+					maxLength: 200,
+					description:
+						'Words on the upload button ("Upload from this device", "Attach", "上传"); frames of other sites inside the page (Teams assignments) are searched too. The button is pressed and the file picker it opens is answered; no window appears',
+				}),
+			),
+			selector: Type.Optional(
+				Type.String({
+					minLength: 1,
+					description: "CSS selector of an <input type=file>, or of the button that opens the picker",
+				}),
+			),
+			index: Type.Optional(
+				Type.Integer({ minimum: 0, description: "Index in operation interactive (a file input or the button)" }),
+			),
+			x: Type.Optional(Type.Number({ description: "Point of the upload button on the last screenshot (with y)" })),
+			y: Type.Optional(Type.Number({ description: "Point of the upload button on the last screenshot (with x)" })),
 		},
 		{ additionalProperties: false },
 	),
@@ -957,6 +987,19 @@ function screenLine(reply: unknown): string {
 	return "";
 }
 
+/** A file picker the page opened on the Agent's press; the desktop host kept it from showing a window. */
+interface FileChooserNote {
+	mode?: string;
+	multiple?: boolean;
+	frame?: string;
+}
+
+/** The line that tells the model a picker is waiting for files and how to answer it. */
+function fileChooserLine(note: FileChooserNote | undefined): string {
+	if (!note) return "";
+	return `\n  file_picker: this opened the page's file picker${note.frame ? ` (in the frame ${note.frame})` : ""}; no window was shown. Answer it with operation upload and path${note.multiple ? " or paths" : " (one file)"}, no label/selector/index, within 2 minutes`;
+}
+
 export interface WorkspaceToolOptions {
 	/** Where the commands go; tests hand in a fake host, production uses the process IPC channel. */
 	channel?: () => DesktopWorkspaceChannel | undefined;
@@ -965,6 +1008,13 @@ export interface WorkspaceToolOptions {
 	 * another chat on screen) changes its own panel instead of the one the user is looking at.
 	 */
 	sessionId?: () => string | undefined;
+	/**
+	 * The chat's own folders for a page upload: its folder first (a relative path is read from it), then its artifacts
+	 * folder. Any file in them may be uploaded; elsewhere the desktop host takes files from the user's folder only, never
+	 * from the places that hold sign-ins and keys (packages/desktop/browser-file-chooser.cjs). Without this the host
+	 * reads relative paths from the folder it started in, which is not any chat's folder.
+	 */
+	uploadRoots?: () => string[];
 }
 
 export function createWorkspaceToolDefinition(
@@ -1487,6 +1537,7 @@ export function createWorkspaceToolDefinition(
 					target?: Record<string, unknown>;
 					viewport?: { width: number; height: number };
 					downloads?: unknown[];
+					fileChooser?: FileChooserNote;
 				};
 				if (!value?.ok) throw new Error("workspace: the mouse action returned no result");
 				if (Number.isFinite(fieldsIn.x) !== Number.isFinite(fieldsIn.y))
@@ -1513,7 +1564,7 @@ export function createWorkspaceToolDefinition(
 					content: [
 						{
 							type: "text",
-							text: `[workspace] mouse ${String(fieldsIn.action)} ${where} in ${id}${value.target ? ` on ${JSON.stringify(value.target)}` : ""}${missed}${started}`,
+							text: `[workspace] mouse ${String(fieldsIn.action)} ${where} in ${id}${value.target ? ` on ${JSON.stringify(value.target)}` : ""}${missed}${started}${fileChooserLine(value.fileChooser)}`,
 						},
 					],
 					details: { operation, activeId: id, result: value },
@@ -1527,12 +1578,12 @@ export function createWorkspaceToolDefinition(
 					tabId: id,
 					keys,
 					repeat: (input as { repeat?: number }).repeat,
-				})) as { ok?: boolean; focused?: Record<string, unknown> | null };
+				})) as { ok?: boolean; focused?: Record<string, unknown> | null; fileChooser?: FileChooserNote };
 				return {
 					content: [
 						{
 							type: "text",
-							text: `[workspace] pressed ${keys} in ${id} → focused ${JSON.stringify(value?.focused ?? null)}`,
+							text: `[workspace] pressed ${keys} in ${id} → focused ${JSON.stringify(value?.focused ?? null)}${fileChooserLine(value?.fileChooser)}`,
 						},
 					],
 					details: { operation, activeId: id, result: value },
@@ -1940,6 +1991,7 @@ export function createWorkspaceToolDefinition(
 					how?: string;
 					covered?: Record<string, unknown>;
 					downloads?: unknown[];
+					fileChooser?: FileChooserNote;
 				};
 				if (!value?.ok)
 					throw new Error(`workspace: the click failed: ${value?.error || "the page returned no result"}`);
@@ -1954,7 +2006,7 @@ export function createWorkspaceToolDefinition(
 					content: [
 						{
 							type: "text",
-							text: `[workspace] clicked ${id} ${label ? `label=${JSON.stringify(label)}` : selector ? `selector=${selector}` : `index=${index}`} → ${value.tag ?? ""} ${JSON.stringify(value.text || "")}${how}${started}`,
+							text: `[workspace] clicked ${id} ${label ? `label=${JSON.stringify(label)}` : selector ? `selector=${selector}` : `index=${index}`} → ${value.tag ?? ""} ${JSON.stringify(value.text || "")}${how}${started}${fileChooserLine(value.fileChooser)}`,
 						},
 					],
 					details: { operation, activeId: id, result: value },
@@ -2030,27 +2082,64 @@ export function createWorkspaceToolDefinition(
 			}
 			case "upload": {
 				const id = await resolveBrowserTab(tabId);
-				const file = String((input as { path?: string }).path || "");
-				if (!file) throw new Error("workspace: upload needs a workspace file path");
-				const selector = (input as { selector?: string }).selector;
-				const index = (input as { index?: number }).index;
-				if (!selector && !Number.isInteger(index))
-					throw new Error("workspace: upload needs the selector or index of the page's file input");
-				const value = (await browser({ action: "upload", tabId: id, path: file, selector, index })) as {
+				const fields = input as {
+					path?: string;
+					paths?: string[];
+					selector?: string;
+					index?: number;
+					label?: string;
+					x?: number;
+					y?: number;
+				};
+				const files =
+					Array.isArray(fields.paths) && fields.paths.length ? fields.paths : fields.path ? [fields.path] : [];
+				if (!files.length) throw new Error("workspace: upload needs path (one file) or paths (several)");
+				if (Number.isFinite(fields.x) !== Number.isFinite(fields.y))
+					throw new Error("workspace: upload needs both x and y for a point");
+				const roots = (options?.uploadRoots?.() ?? []).filter((root) => isAbsolute(root));
+				const value = (await browser(
+					{
+						action: "upload",
+						tabId: id,
+						// Read from this chat's folder, not from the folder the desktop host happened to start in.
+						paths: files.map((file) => (roots.length ? resolvePath(roots[0]!, file) : file)),
+						...(roots.length ? { roots } : {}),
+						selector: fields.selector,
+						index: fields.index,
+						label: fields.label,
+						x: fields.x,
+						y: fields.y,
+					},
+					// Pressing the button waits for the page's picker, and a large file takes a moment to hand over.
+					SLOW_TIMEOUT_MS,
+				)) as {
 					ok?: boolean;
+					how?: string;
 					name?: string;
 					size?: number;
 					count?: number;
 					path?: string;
+					files?: Array<{ name?: string; size?: number; path?: string }>;
+					frame?: string;
+					pressed?: { tag?: string; text?: string; x?: number; y?: number };
 					error?: string;
 				};
 				if (!value?.ok)
 					throw new Error(`workspace: the upload failed: ${value?.error || "the page returned no result"}`);
+				const list = (
+					value.files?.length ? value.files : [{ name: value.name, size: value.size, path: value.path }]
+				)
+					.map((file) => `${file.name} (${file.size ?? 0} bytes, ${file.path})`)
+					.join("; ");
+				const via =
+					value.how === "chooser"
+						? `answered the page's file picker${value.pressed ? ` opened by ${value.pressed.tag ?? ""} ${JSON.stringify(value.pressed.text || "")}` : ""} (no window was shown)`
+						: "put into the page's file input";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `[workspace] uploaded ${value.name || file} (${value.size ?? 0} bytes) into ${id}\n  path=${value.path || file} files=${value.count ?? 1}`,
+							text: `[workspace] uploaded ${list} into ${id}\n  files=${value.count ?? files.length} how=${via}${value.frame ? `\n  frame=${value.frame}` : ""}\n  note: the site may still be sending the file; check the page (wait for its name or a progress bar to finish) before submitting`,
 						},
 					],
 					details: { operation, activeId: id, result: value },
@@ -2483,6 +2572,7 @@ export function createWorkspaceToolDefinition(
 			"Leave the user's page alone: an action that would change a tab of the user's that they are looking at (click, type, mouse, key, scroll, navigate, back/forward/reload, exec, upload, login, collect, a scrolling read) runs in a background copy of it instead, with the same address and sign-in; the result names the copy, keep using it. Pass `onUserTab: true` only when the user asked you to act on their own page. Reading it (text, read without scroll, screenshot, find, state) never changes it.",
 			"Read whole pages, not screens: `read` returns a page's text without repeated lines in one call (`scroll: true` first scrolls to the end so feeds and lazy lists load; `links`/`tables` add those; `selector` reads one part). `collect` reads a paged list in one call: this page, then the next by `nextLabel`/`nextSelector` (the next-page control) or by `urlTemplate` with {page}, up to `pages`, stopping at the last page. `read_many` reads up to 10 addresses side by side in hidden reader pages (the user's sign-ins) that never appear in the panel. A background tab is not drawn, so a list that loads only as it scrolls into view may stop early there; `read` with `fresh: true` reads the tab's address again in such a reader. Prefer these to clicking and scrolling page by page.",
 			"Every browser command takes a `tabId` and works on that tab whether or not it is on screen, so several tabs can be driven side by side: navigate/back/forward/reload/stop, text/dom/ax/interactive, find/stop_find, upload, exec, screenshot, downloads, download and network.",
+			'Giving a page files: `upload` with `label` = the words on its upload or attach button (or the button\'s x/y from a screenshot) presses it and answers the file picker it opens, also inside frames of other sites (Teams assignments); `selector`/`index` may name an <input type=file> directly; with no target it answers the picker your last click opened, else the page\'s own file input. `paths` gives several files. Never try to work a system "Open" window: none is shown while you act on a tab. A button that opens a menu first: click it, then `upload` with the label of the menu item ("Upload from this device").',
 			"A tab on screen has exactly the size of the user's panel (a narrow panel can get a site's phone layout); a background tab is laid out at least 1280×800.",
 			"Files: a click that starts a download waits for it and its result gives the saved file's path (files go to the user's Downloads folder, so there is nothing to search for). `download` saves a link directly with the tab's sign-in and returns the path; `downloads` lists recent ones. Move or copy the file afterwards if it belongs elsewhere.",
 			'Your own mouse and keyboard: `screenshot` returns the picture of the tab; its pixels are the page\'s CSS pixels, so `mouse` (click/double_click/right_click/move/drag/wheel at x,y) hits exactly the point seen in it - images, canvases and custom controls included. `key` presses keys or combinations ("Control+A", "Enter"), `type` types into the focused element (or clicks x,y first). Selector/index clicks from `interactive` still work.',

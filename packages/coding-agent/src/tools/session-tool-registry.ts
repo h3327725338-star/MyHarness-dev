@@ -306,7 +306,15 @@ export class SessionToolRegistry {
 							workspaceId: sessionManager.getWorkspaceId(),
 						}),
 					},
-					workspace: { sessionId: () => sessionManager.getSessionId() },
+					workspace: {
+						sessionId: () => sessionManager.getSessionId(),
+						// A page upload reads relative paths from this chat's folder; its folder and the files it made are
+						// always allowed (the desktop host also takes other files of the user's folder).
+						uploadRoots: () => {
+							const artifacts = this.artifactEnvironment().MYHARNESS_ARTIFACTS_DIR;
+							return [this._options.cwd, ...(artifacts ? [artifacts] : [])];
+						},
+					},
 				});
 
 		this._baseToolDefinitions = new Map(

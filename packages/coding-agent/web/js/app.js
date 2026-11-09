@@ -1,6 +1,6 @@
 // Application shell: sidebar + conversation + optional inspector panel, plus global overlays and shortcuts.
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState, autofocusOnMount, Collapse, FoldIn, Icon, Modal, Overlay, Resizer, Spinner, usePresence, useRetainedRows } from "./ui.js";
-import { api, applyColumnWidths, attempt, chatTucked, dismissToast, panelInstance, post, setView, state, useStore } from "./store.js";
+import { api, applyColumnWidths, attempt, chatColumnMin, chatTucked, dismissToast, panelInstance, post, setView, state, useStore } from "./store.js";
 import { actions, confirmDialog, resolveConfirm } from "./actions.js";
 import { Sidebar } from "./sidebar.js";
 import { peekButtonEnter, peekButtonLeave } from "./sidebar-peek.js";
@@ -13,6 +13,7 @@ import { ChangesPanel } from "./panel-changes.js";
 import { FilesPanel, FileTab } from "./panel-files.js";
 import { TerminalPanel } from "./panel-terminal.js";
 import { ContextPanel } from "./panel-context.js";
+import { BackgroundPanel, useBackgroundRunning } from "./panel-background.js";
 import { BrowserPanel } from "./panel-browser.js";
 import { PanelNav, useRowFold, WorkspaceTabs, PANEL_TAB_TYPES, workspaceTabSection } from "./workspace-tabs.js";
 import { GitSetupDialog } from "./overlays-git.js";
@@ -77,6 +78,7 @@ function Header() {
 	const wsActive = useStore((s) => s.view.wsActive);
 	const wsTabs = useStore((s) => s.view.wsTabs);
 	const runningBash = useStore((s) => s.snap?.flags?.bashRunning);
+	const backgroundRunning = useBackgroundRunning();
 	const [editing, setEditing] = useState(false);
 	const [value, setValue] = useState("");
 	const firstUser = items.find((i) => i.kind === "user" && i.text);
@@ -111,6 +113,7 @@ function Header() {
 		${tabBtn("changes", "fileDiff", t("Changes"), changeCount ? String(changeCount) : "")}
 		${tabBtn("files", "folder", t("Files"))}
 		${tabBtn("terminal", "terminal", t("Terminal"), runningBash ? "•" : "")}
+		${tabBtn("background", "pulse", t("Background tasks"), backgroundRunning ? String(backgroundRunning) : "")}
 		${tabBtn("context", "layers", t("Session"))}
 		${window.myHarnessDesktop && !exportReadOnly() ? html`<button class=${`icon-btn ${browserActive ? "active" : ""}`} aria-pressed=${browserActive} title=${t("Browser")} aria-label=${t("Browser")} onClick=${() => actions.openBrowser()}><${Icon} name="globe" size=${17} /></button>` : null}
 		${rightColumn ? html`<button class="icon-btn chat-hide" aria-label=${t("Hide the conversation")} title=${t("Hide the conversation")} onClick=${() => actions.showConversation(false)}><${Icon} name="panelRight" size=${17} /></button>` : null}
@@ -137,6 +140,8 @@ function PanelContainer() {
 	const panelRef = useRef(null);
 	const headRef = useRef(null);
 	const active = tabs.find((item) => item.id === activeId) || tabs[0] || null;
+	// A website in collaboration mode: the mode's button closes the browser instead of going back to the side panel.
+	const onWebsite = tabs.find((item) => item.id === activeId)?.type === "browser";
 	// The header names every section; the section on screen adds its own tabs when it has any: the website tabs in the
 	// browser, the file list and the open files in Files. Changes, Terminal and Session are one panel each. Without a
 	// desktop browser (a plain web page, a read-only export) there is no browser entry unless website tabs are open.
@@ -172,6 +177,7 @@ function PanelContainer() {
 		if (type === "changes") return html`<${ChangesPanel} />`;
 		if (type === "files") return html`<${FilesPanel} embedded=${true} />`;
 		if (type === "terminal") return html`<${TerminalPanel} />`;
+		if (type === "background") return html`<${BackgroundPanel} />`;
 		if (type === "context") return html`<${ContextPanel} />`;
 		return null;
 	};
@@ -185,7 +191,7 @@ function PanelContainer() {
 				? html`<button class=${`icon-btn sm panel-chat ${fullChat ? "active" : ""}`} aria-pressed=${fullChat} title=${t(fullChat ? "Hide the conversation" : "Show the conversation")} aria-label=${t(fullChat ? "Hide the conversation" : "Show the conversation")} onClick=${() => setView({ browserFullChat: !fullChat })} onPointerEnter=${chatPeekButtonEnter} onPointerLeave=${chatPeekButtonLeave}><${Icon} name="chat" size=${15} /></button>
 					<button class="icon-btn sm panel-full" title=${`${t("Exit fullscreen")} (F11)`} aria-label=${t("Exit fullscreen")} onClick=${() => actions.toggleBrowserFull(false)}><${Icon} name="exitFullscreen" size=${14} /></button>`
 				: null}
-			${browserFull ? null : html`<button class=${`icon-btn sm panel-max ${wsMax ? "active" : ""}`} aria-pressed=${wsMax} title=${t(wsMax ? "Restore the workspace (Esc)" : "Maximize the workspace and keep chatting beside it")} aria-label=${t(wsMax ? "Restore the workspace" : "Maximize the workspace")} onClick=${() => actions.toggleWorkspaceMax()}><${Icon} name=${wsMax ? "minimize" : "maximize"} size=${14} /></button>`}
+			${browserFull ? null : html`<button class=${`icon-btn sm panel-max ${wsMax ? "active" : ""}`} aria-pressed=${wsMax} title=${t(wsMax ? (onWebsite ? "Close the browser (Esc)" : "Restore the workspace (Esc)") : "Maximize the workspace and keep chatting beside it")} aria-label=${t(wsMax ? (onWebsite ? "Close the browser" : "Restore the workspace") : "Maximize the workspace")} onClick=${() => (wsMax ? actions.restoreWorkspace() : actions.toggleWorkspaceMax(true))}><${Icon} name=${wsMax ? "minimize" : "maximize"} size=${14} /></button>`}
 			${chatHidden ? html`<button class="icon-btn sm panel-chat-show" title=${t("Show the conversation")} aria-label=${t("Show the conversation")} onClick=${() => actions.showConversation(true)} onPointerEnter=${chatPeekButtonEnter} onPointerLeave=${chatPeekButtonLeave}><${Icon} name="panelRight" size=${15} /></button>` : null}
 			${wsMax || browserFull ? null : html`<button class="icon-btn sm panel-close" aria-label=${t("Close panel")} title=${t("Close panel")} onClick=${() => actions.closePanel()}><${Icon} name="panelRight" size=${15} /></button>`}
 		</div>
@@ -193,7 +199,7 @@ function PanelContainer() {
 			${tabs.map((item) => html`<div class="panel-pane" key=${item.id} data-ws-tab=${item.id} hidden=${item.id !== active?.id}>
 				${item.id !== active?.id ? null : item.type === "file" ? html`<${FileTab} key=${item.id} path=${item.path} />` : item.type === "browser" ? html`<${BrowserPanel} key=${item.id} tabId=${item.id} url=${item.url} muted=${item.muted === true} />` : panelTab(item.type)}
 			</div>`)}
-			${!active ? html`<div class="panel-empty"><span class="dim">${t("No tabs open. Use the header buttons to open Changes, Files, Terminal, Session or the browser.")}</span></div>` : null}
+			${!active ? html`<div class="panel-empty"><span class="dim">${t("No tabs open. Use the header buttons to open Changes, Files, Terminal, Background, Session or the browser.")}</span></div>` : null}
 		</div>
 	</aside>`;
 }
@@ -453,15 +459,6 @@ function useShortcuts() {
 }
 
 /**
- * Narrowest chat column in collaboration mode. On the frameless desktop window the column's header also holds the
- * window buttons, so it keeps their width plus its own icon row (the `--chat-min-ws` floor in layout.css).
- */
-function chatColumnMin() {
-	const controls = document.querySelector(".window-controls");
-	return controls ? Math.max(320, controls.offsetWidth + 6 + 268) : 320;
-}
-
-/**
  * The panel is never wider than the room the window leaves it (the cap of --panel-width in layout.css). A drag starts
  * from the width that is on screen and stops at that cap, so the handle always moves with the pointer: a width saved
  * in a larger window, or a drag past the cap, leaves no dead stretch to drag back through.
@@ -481,8 +478,8 @@ function onChatWidth(value) {
 }
 
 /**
- * Esc leaves collaboration mode, unless something else is using it: a dialog or menu that is open, a field or editor that
- * has the focus, or a handler that already took the key.
+ * Esc in collaboration mode does what the mode's button does (actions.restoreWorkspace), unless something else is using
+ * it: a dialog or menu that is open, a field or editor that has the focus, or a handler that already took the key.
  */
 function useWorkspaceMaxEscape(active) {
 	useEffect(() => {
@@ -494,7 +491,7 @@ function useWorkspaceMaxEscape(active) {
 			// The selection bubble and the translation or quote card close first (quote-toolbar.js takes this Esc).
 			if (document.querySelector(".overlay-host [aria-modal='true'], .local-file-menu, .ws-menu, .popover, .lightbox-scrim, .composer.expanded, .floating-quote-bar, .quote-note-card")) return;
 			event.preventDefault();
-			actions.toggleWorkspaceMax(false);
+			actions.restoreWorkspace();
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);

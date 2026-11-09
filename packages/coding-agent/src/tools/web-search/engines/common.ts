@@ -1,3 +1,4 @@
+import { localStamp, localTimeZone } from "../../../schedules/timing.ts";
 import { WebSearchError } from "../errors.ts";
 import { BROWSER_HEADERS } from "../http.ts";
 import type { TransportPage } from "../transport.ts";
@@ -56,7 +57,10 @@ export function splitLeadingDate(snippet: string, now: number): { snippet: strin
 		time = now - Number(match[5]) * unit;
 	}
 	if (Number.isNaN(time)) return { snippet };
-	return { snippet: snippet.slice(match[0].length).trim(), publishedAt: new Date(time).toISOString().slice(0, 10) };
+	// A written date is that day already; "3 hours ago" is a moment, dated on this computer's clock like every other
+	// time the model sees (early in the morning here its UTC date is still yesterday).
+	const day = match[5] ? localStamp(time, localTimeZone()).slice(0, 10) : new Date(time).toISOString().slice(0, 10);
+	return { snippet: snippet.slice(match[0].length).trim(), publishedAt: day };
 }
 
 /** Words of a query that a relevant result list must mention somewhere. */

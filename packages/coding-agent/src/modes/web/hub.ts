@@ -16,13 +16,15 @@ import { basename, join, relative } from "node:path";
 import type { AgentSessionRuntime } from "../../agent/runtime/session-runtime.ts";
 import type { WorkspaceStore } from "../../application/workspace-store.ts";
 import { WorkspaceStore as WorkspaceStoreImpl } from "../../application/workspace-store.ts";
+import { UNBOUND_WORKSPACE_ID } from "../../config/paths/index.ts";
 import { getDataDir } from "../../config.ts";
 import { ensureDefaultWorkingDir } from "../../data/workspace-store.ts";
 import { getMissingSessionCwdIssue } from "../../session/manager/cwd.ts";
 import { SessionManager } from "../../session/manager/index.ts";
 import type { ChatMode } from "../../session/types.ts";
+import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { pathIdentityKey, resolvePath } from "../../utils/paths.ts";
-import { ChangeClaimRegistry } from "./change-claims.ts";
+import { ChangeClaimRegistry, type ShellWindow } from "./change-claims.ts";
 import { WebDialogBridge } from "./dialogs.ts";
 import { type SlotStatus, WebHost, type WebHostHubLink } from "./host.ts";
 import { HttpError, type WebHttpServer } from "./http-server.ts";
@@ -79,13 +81,33 @@ export interface WebHostHubOptions {
 	estimateSlotBytes?: (host: WebHost) => number;
 }
 
+/**
+ * The background shell jobs of this process as attribution windows: a job keeps writing after the tool call that
+ * started it returned, so its whole run (until it really ends) is a window of the chat that started it. Jobs are filed
+ * under `session:<id>` (tools/shell/session-scope.ts); a job without a session id belongs to no chat.
+ */
+function backgroundJobWindows(): ShellWindow[] {
+	const windows: ShellWindow[] = [];
+	for (const job of backgroundJobManager.list()) {
+		if (!job.sessionKey.startsWith("session:")) continue;
+		windows.push({
+			sessionKey: job.sessionKey.slice("session:".length),
+			runId: 0,
+			startedAt: job.startedAt,
+			...(job.status === "running" ? {} : { endedAt: job.endedAt ?? job.startedAt }),
+			kind: "job",
+		});
+	}
+	return windows;
+}
+
 export class WebHostHub implements WebHostHubLink {
 	private readonly slots = new Map<string, WebHost>();
 	private readonly scope = new AsyncLocalStorage<WebHost>();
 	private readonly opening = new Map<string, Promise<WebHost>>();
 	private readonly options: WebHostHubOptions;
 	/** Shared by all slots: what every open conversation changed, for cross-session attribution. */
-	private readonly changeClaims = new ChangeClaimRegistry();
+	private readonly changeClaims = new ChangeClaimRegistry({ windowSource: backgroundJobWindows });
 	private workspaceStore: WorkspaceStore | undefined;
 	private primary: WebHost | undefined;
 	private nextSlot = 1;
@@ -210,6 +232,8 @@ export class WebHostHub implements WebHostHubLink {
 			// Credentials go first: a key or login saved in the other session lives in auth.json, and the reload below is
 			// what lets this runtime's snapshot pick it up.
 			other.session.modelRuntime.reloadCredentials();
+			// A provider enabled or disabled elsewhere: the settings reloaded above hold the new list, this runtime does not.
+			other.session.modelRuntime.setDisabledProviders(other.session.settingsManager.getDisabledProviders());
 			await other.session.modelRuntime.reloadConfig();
 			await other.session.reconcileModelAfterConfigChange();
 			if (!this.slots.has(other.slotId)) return;
@@ -309,11 +333,12 @@ export class WebHostHub implements WebHostHubLink {
 				let sessionManager = SessionManager.open(path, undefined, cwdOverride);
 				if (cwdOverride === undefined) {
 					// A chat synced from another device stores that device's folder; this device's binding wins.
-					const local = this.localWorkspaceRootFor(
-						sessionManager.getCwd(),
-						sessionManager.getWorkspaceId(),
-						sessionManager.getMode(),
-					);
+					const local =
+						this.localWorkspaceRootFor(
+							sessionManager.getCwd(),
+							sessionManager.getWorkspaceId(),
+							sessionManager.getMode(),
+						) ?? this.localDefaultFolderFor(sessionManager, from);
 					if (local) sessionManager = SessionManager.open(path, undefined, local);
 				}
 				const issue = cwdOverride === undefined ? getMissingSessionCwdIssue(sessionManager, from.cwd) : undefined;
@@ -396,6 +421,23 @@ export class WebHostHub implements WebHostHubLink {
 			usable && dataRoot ? relative(join(resolvePath(dataRoot), "workspace-folders"), resolvePath(sessionCwd)) : "";
 		const inPlaceholder = !!placeholder && !placeholder.startsWith("..") && !/^[A-Za-z]:/.test(placeholder);
 		return !usable || inPlaceholder ? workspace.rootPath : undefined;
+	}
+
+	/**
+	 * A chat of the default group (no Workspace) runs in MyHarness's own default folder. One synced from another
+	 * device stores that device's default folder, which usually does not exist here (another user name, another
+	 * data folder): it runs in this device's default folder instead, like a new chat of that group would.
+	 */
+	private localDefaultFolderFor(sessionManager: SessionManager, from: WebHost): string | undefined {
+		if (sessionManager.getWorkspaceId() !== UNBOUND_WORKSPACE_ID || !sessionManager.usesDefaultSessionDir())
+			return undefined;
+		let usable = false;
+		try {
+			usable = existsSync(sessionManager.getCwd());
+		} catch {
+			usable = false;
+		}
+		return usable ? undefined : ensureDefaultWorkingDir(from.runtimeHost.services.agentDir);
 	}
 
 	/**
@@ -562,13 +604,15 @@ export class WebHostHub implements WebHostHubLink {
 
 	private isBusy(host: WebHost): boolean {
 		// A finished session whose result is still unread keeps its slot, so its sidebar marker cannot vanish unseen.
+		// A chat with a background command still running keeps it too: the command reports back to that session.
 		return (
 			!!host.gitTask ||
 			host.backgroundGit.size > 0 ||
 			!host.session.isIdle ||
 			host.completionActive ||
 			host.dialogs.requests.length > 0 ||
-			host.unread
+			host.unread ||
+			host.backgroundJobsPending
 		);
 	}
 

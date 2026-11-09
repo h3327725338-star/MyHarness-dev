@@ -21,6 +21,8 @@
 /* Settings: one design language for every page. A page is a title, a one-line note and cards; a card holds rows with
    the text on the left and the control in a fixed-width column on the right. */
 .settings-modal .modal-body { padding: 0; }
+/* Settings → Providers needs the room of a wider dialog; going to and from that page the width glides. */
+.settings-modal { transition: width var(--t-slow) var(--ease); }
 .language-progress { width: 160px; height: 5px; accent-color: var(--accent); border: 0; border-radius: var(--r-md); overflow: hidden; background: var(--bg-panel); }
 .language-progress::-webkit-progress-bar { background: var(--border); }
 .language-progress::-webkit-progress-value { background: var(--accent); }
@@ -222,12 +224,19 @@
 .about-kv { padding: 14px 0 6px; }
 .about-note { padding: 0 0 14px; max-width: none; }
 
-/* Providers: the list on the left, the chosen provider on the right. */
-.settings-body.wide { padding-right: 10px; padding-bottom: 0; }
-.prov { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 16px; align-items: start; }
+/* Providers: the list on the left, the chosen provider on the right. The page fills the height of the view (prov-page →
+   prov → prov-detail → prov-fill → the tree), so the save bar at the end of the tree rests at the bottom of the view
+   even for a short provider, and stays there (sticky) for a long one. */
+.settings-body.wide { display: flex; flex-direction: column; padding-right: 10px; padding-bottom: 0; }
+.settings-body.wide > .settings-title { flex: none; }
+.prov-page { flex: 1 0 auto; }
+.prov { flex: 1 0 auto; display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 16px; align-items: start; }
+.prov-detail { align-self: stretch; }
+.prov-fill { flex: 1 0 auto; }
 .prov-list { position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); max-height: calc(100vh - 260px); overflow-y: auto; }
-.prov-item { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 3px 8px; border-radius: var(--r-sm); text-align: left; color: var(--text-2); flex: none; }
+.prov-item { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 3px 8px; border-radius: var(--r-sm); text-align: left; color: var(--text-2); flex: none; transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
 .prov-item:hover { background: var(--surface-hover); color: var(--text); }
+.prov-item:active { background: var(--surface-active); }
 .prov-item.on { background: var(--surface-select); color: var(--text); }
 .prov-item-sub { font-size: var(--fs-xs); }
 /* Nebius Token Factory is offered ready-made (providers-page.js): first in the list, with its job plan and console links. */
@@ -243,20 +252,96 @@
 .prov-empty { padding: 8px 10px; }
 .prov-head { display: flex; align-items: center; gap: 12px; padding: 2px 2px 0; }
 .prov-title { font-size: 16px; font-weight: 650; }
-/* The layers of a provider: its global settings, then its keys, each a summary row that opens into its form. */
-.prov-global-body { padding: 14px 16px 16px; }
-.prov-global-foot { gap: 8px; }
-.prov-keys-head { padding: 2px 2px 0; gap: 8px; }
-.prov-keys-head strong { font-size: var(--fs-body); font-weight: 650; }
-.prov-key { min-width: 0; }
-.prov-key-head { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); }
-.prov-key-toggle { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 40px; text-align: left; color: var(--text); }
-.prov-key-name { font-weight: 600; }
+
+/* The tree of a provider (providers-page.js): its card on top (name, state, ⋯, its own settings or, for a key that
+   stands alone, the connection), its keys one level in, a key's models one level further. */
+.prov-tree, .pf-tree { display: flex; flex-direction: column; flex: 1 0 auto; min-width: 0; }
+.prov-root { flex: none; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); overflow: clip; }
+.prov-root-head { padding: 12px 12px 12px 16px; }
+.prov-root-sub { margin-top: 2px; font-size: var(--fs-sm); }
+.prov-root-body, .prov-merge { border-top: 1px solid var(--border); }
+.prov-root-body > .pf-error { margin: 12px 16px 0; }
+.prov-root-body > .pf-advanced { padding: 0 16px 14px; }
+.prov-root .pf-view > .pf-conn { padding: 14px 16px 16px; }
+.prov-root .pf-view > .pf-json { padding: 14px 16px 16px; }
+.prov-merge { gap: 8px; padding: 8px 12px 8px 16px; }
+.prov-merge > .select-like { flex: 0 1 260px; min-width: 0; }
+.prov-ico { flex: none; color: var(--text-3); }
+.prov-sep { margin: 0 6px; color: var(--text-4); }
+.prov-dirty { animation: prov-dot-in var(--t-slow) var(--ease); }
+@keyframes prov-dot-in { from { opacity: 0; transform: scale(0.2); } }
+/* One guide line per level and a short tick into each row; the line of the last row ends at its tick. Every level is
+   indented the same 36px. */
+.prov-branch { position: relative; display: flex; flex-direction: column; min-width: 0; margin-left: 15px; padding: 4px 0 0 21px; }
+.prov-node { position: relative; min-width: 0; }
+.prov-node::before { content: ""; position: absolute; left: -21px; top: 21px; width: 15px; border-top: 1.5px solid var(--border-strong); pointer-events: none; }
+.prov-node::after { content: ""; position: absolute; left: -21px; top: -4px; bottom: 0; border-left: 1.5px solid var(--border-strong); pointer-events: none; }
+.prov-node:last-child::after { bottom: auto; height: 25px; }
+.prov-node.prov-plain::before { display: none; }
+.pf-model-list > .prov-node::before { top: 19px; }
+.pf-model-list > .prov-node:last-child::after { height: 23px; }
+/* A row of the tree: the whole row is the button that folds it (its switch and ⋯ aside). It answers the pointer at
+   once: lighter on hover, darker while pressed, and tinted while open; its arrow turns with the fold. */
+.prov-row { display: flex; align-items: center; gap: 8px; min-height: 42px; padding: 0 6px 0 8px; border-radius: var(--r-md); min-width: 0; transition: background-color var(--t-fast) var(--ease); }
+.prov-row:hover { background: var(--surface-hover); }
+.prov-node.open > .prov-row { background: var(--surface-select); }
+.prov-row:has(> .prov-row-toggle:active) { background: var(--surface-active); }
+.prov-row-toggle { display: flex; align-items: center; gap: 9px; flex: 1 1 auto; min-width: 0; align-self: stretch; padding: 0; text-align: left; color: var(--text); border-radius: var(--r-md); }
+.prov-row-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.prov-row-toggle > .fold-chev, .prov-group-row > .fold-chev { transition: transform var(--t-slow) var(--ease); }
+.prov-row-toggle:active > .fold-chev, .prov-group-row:active > .fold-chev { color: var(--text); }
+/* Rows that fold are not text to select: a quick second click only folds, it never highlights the summary. */
+.prov-row, .prov-group-row, .pf-more-toggle, .pf-own-toggle, .prov-add-row, .prov-item, .prov-suggest .set-card-toggle, .prov-root-head .check-label { user-select: none; -webkit-user-select: none; }
+.prov-row input, .prov-row textarea { user-select: text; -webkit-user-select: text; }
+.prov-key-name { flex: 0 1 auto; max-width: 42%; font-weight: 600; }
+.prov-key-sum { flex: 1 1 0; min-width: 0; font-size: var(--fs-xs); }
+.prov-key-sum .mono { font-size: 11px; }
 .prov-key-count { flex: none; font-size: var(--fs-xs); }
-/* A key's form hangs off its row like the models hang off a key: one line down the side instead of a box in a box. */
-.prov-key-body { margin: 12px 0 0 8px; padding-left: 12px; border-left: 2px solid var(--border); }
-.prov-key.settled > .collapse > .collapse-inner { overflow: visible; }
-.prov-actions { gap: 8px; padding: 2px 2px 8px; }
+.prov-key-head > .toggle, .prov-key-head > .menu-wrap { flex: none; }
+.prov-key-body { padding: 8px 0 10px 8px; }
+.prov-key-body .pf-view > .pf-conn, .prov-key-body .pf-view > .pf-json { padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-panel); }
+.prov-key-body > .pf > .pf-error { margin: 0; }
+/* The key being added: open from the start, tinted until it is added. */
+.prov-new-head { background: var(--accent-soft); }
+.prov-new-chev { flex: none; color: var(--accent); }
+.prov-add-row { display: flex; align-items: center; gap: 10px; min-height: 40px; padding-left: 4px; }
+.prov-add-row .pf-hint { min-width: 0; }
+.prov-menu { flex: none; }
+.prov-more.active { background: var(--surface-active); color: var(--text); }
+/* The provider's own settings: one line of its card, what is set shown as chips; open, the chips give way to what the
+   layer does (a cross-fade in the same place, so the line keeps its height). */
+.prov-group-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 6px 12px 6px 16px; text-align: left; color: var(--text); transition: background-color var(--t-fast) var(--ease); }
+.prov-group-row:hover { background: var(--surface-hover); }
+.prov-group-row:active { background: var(--surface-active); }
+.prov-group-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.prov-group.open > .prov-group-row { background: var(--surface-select); }
+.prov-group-label { flex: none; margin-right: 4px; font-weight: 600; }
+.prov-group-sum { display: grid; flex: 1 1 auto; min-width: 0; align-items: center; }
+.prov-group-chips, .prov-group-hint { grid-area: 1 / 1; min-width: 0; transition: opacity var(--t-base) var(--ease), transform var(--t-slow) var(--ease); }
+.prov-group-chips { display: flex; gap: 6px; overflow: hidden; }
+.prov-group-hint { font-size: var(--fs-xs); opacity: 0; transform: translateY(4px); }
+.prov-group-row[aria-expanded="true"] .prov-group-chips { opacity: 0; transform: translateY(-4px); }
+.prov-group-row[aria-expanded="true"] .prov-group-hint { opacity: 1; transform: none; }
+.prov-chip { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; height: 22px; padding: 0 8px; border-radius: var(--r-pill); background: var(--surface-active); color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; }
+.prov-chip > span { flex: none; }
+/* Short of room, each chip keeps its label and ends its value with "…" instead of being cut off. */
+.prov-chip b { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; color: var(--text-2); }
+.prov-chip b.mono { font-weight: 500; font-size: 11px; }
+.prov-group-body { display: flex; flex-direction: column; gap: 14px; padding: 6px 16px 16px; }
+.prov-group-body > .pf-error { margin: 0; }
+/* The one save bar of a provider: it takes no room of its own; the space at the end of the tree is kept free for it,
+   so it never covers the last row. It rises in while something is unsaved and sinks away once it is saved. */
+.prov-tree-end { flex: none; height: 76px; margin-top: auto; }
+.prov-savebar { position: sticky; bottom: 0; z-index: 6; height: 0; pointer-events: none; }
+.prov-savebar-inner { position: absolute; left: 0; right: 0; bottom: 12px; display: flex; align-items: center; gap: 10px; padding: 9px 10px 9px 14px; border: 1px solid var(--accent-line); border-radius: var(--r-lg); background: var(--bg-raised); box-shadow: var(--shadow-pop); opacity: 0; transform: translateY(12px); transition: opacity var(--t-base) var(--ease), transform var(--t-slow) var(--ease); }
+.prov-savebar.shown .prov-savebar-inner { opacity: 1; transform: none; pointer-events: auto; }
+.prov-savebar-text { font-size: var(--fs-sm); color: var(--text); user-select: none; -webkit-user-select: none; }
+.prov-savebar-inner > .btn { flex: none; }
+/* Swapping between the form and the JSON view fades the new view in. */
+.prov-enter { animation: prov-enter var(--t-slow) var(--ease); }
+@keyframes prov-enter { from { opacity: 0; transform: translateY(4px); } }
+/* An extension's provider: its settings card under the provider's card. */
+.prov-ext-settings { margin-top: 14px; }
 .prov-suggest { background: var(--accent-soft); border-color: var(--accent-line); }
 .prov-suggest-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 16px 14px; border-top-color: var(--accent-line) !important; }
 .prov-suggest-item { display: flex; flex-direction: column; gap: 2px; }
@@ -341,33 +426,87 @@
 .fp-tools { display: flex; align-items: center; gap: 12px; padding: 6px 16px 6px 4px; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
 .fp-target { min-width: 0; font-size: var(--fs-sm); }
 
-/* Provider form */
+/* Provider form (provider-form.js): the connection as label / value rows with the rarely changed settings folded under
+   one line, then the models as rows of the tree. */
+.pf { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.pf.pf-tree { gap: 0; }
+.pf-view { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .pf-fields { display: flex; flex-direction: column; gap: 14px; }
 .field-label { gap: 6px; font-size: var(--fs-sm); color: var(--text-2); }
 .field-name { font-weight: 550; color: var(--text-2); }
 .pf-two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .pf-hint { font-size: var(--fs-xs); white-space: normal; line-height: 1.45; }
 .pf-problem { color: var(--danger); }
-.pf-model { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-panel); }
-.pf-model-head { gap: 8px; min-height: 38px; padding: 0 6px 0 10px; }
-.pf-model-body { gap: 14px; padding: 12px 12px 14px; border-top: 1px solid var(--border); }
+.pf-conn { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.pf-conn > .pf-fields { gap: 12px; }
+/* A label / value row: the label in a column of its own, what explains the value under it. */
+.pf-row { display: grid; grid-template-columns: 108px minmax(0, 1fr); align-items: center; column-gap: 12px; row-gap: 6px; }
+.pf-row > .field-name { grid-column: 1; }
+.pf-row > :not(.field-name) { grid-column: 2; }
+.pf-idline { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.pf-idline > .field { flex: 1 1 auto; min-width: 0; }
+.pf-id { display: inline-flex; flex: none; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--text-3); white-space: nowrap; }
+.pf-id .mono { font-size: 11px; }
+.pf-id-input { width: 150px; height: var(--h-control-sm); font-size: var(--fs-sm); }
+.pf-value { color: var(--text); overflow-wrap: anywhere; }
+/* "More connection settings": a quiet line under the values that opens into the rest; folded it says what is set there. */
+.pf-more-toggle { display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 30px; margin: -2px 0 0 114px; padding: 0 6px; border-radius: var(--r-sm); color: var(--text-3); font-size: var(--fs-sm); text-align: left; transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.pf-more-toggle:hover { background: var(--surface-hover); color: var(--text); }
+.pf-more-toggle:active { background: var(--surface-active); }
+.pf-more-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.pf-more-toggle[aria-expanded="true"] { color: var(--text-2); }
+.pf-more-label { flex: none; }
+.pf-more-sum { flex: 1 1 auto; min-width: 0; font-size: var(--fs-xs); }
+.pf-more { gap: 12px; padding-top: 6px; }
+/* The models: a heading with the detection field, then the models one level further in. */
+.pf-models { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.pf-models-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 40px; padding: 4px 2px 0 8px; }
+.pf-models-title { flex: 1 1 auto; font-size: var(--fs-body); font-weight: 650; }
+.pf-detect-bar { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pf-detect-bar > .field { width: 210px; min-width: 0; height: var(--h-control-sm); font-size: var(--fs-sm); }
+.pf-detect-bar > .btn, .pf-models-head > .btn { flex: none; height: var(--h-control-sm); }
+.pf-empty { padding: 0 2px 4px 8px; }
+.pf-model { display: flex; flex-direction: column; min-width: 0; }
+.pf-model-head { gap: 8px; min-height: 38px; padding: 0 4px 0 8px; }
+.pf-model-body { gap: 14px; margin: 4px 0 8px 8px; padding: 12px 14px 14px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-panel); }
 .pf-tick { flex: none; margin: 0; }
+/* Under a model's settings: what it really uses and from which layer, then its own values, folded unless it sets one. */
+.pf-uses { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 10px; border-top: 1px solid var(--border); font-size: var(--fs-xs); color: var(--text-3); }
+.pf-uses-list { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.pf-use { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: var(--r-pill); background: var(--surface-active); color: var(--text-2); white-space: nowrap; }
+.pf-use .mono { font-size: 11px; }
+.pf-use-from { color: var(--accent); }
+.pf-use.gap { background: var(--danger-soft); color: var(--danger); }
+.pf-own-toggle { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 2px 4px; color: var(--text-3); font-size: var(--fs-xs); }
+.pf-own-toggle:hover:not(:disabled) { color: var(--text); text-decoration: none; }
+.pf-own { gap: 14px; padding-top: 6px; }
+.pf-json { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.pf-json-head { gap: 8px; }
 /* Ticked models change together: the choice folds in under "Select all" once one is ticked. */
 .pf-batch { display: flex; flex-direction: column; gap: 6px; padding: 2px 10px; }
 .pf-batch > .check-label { align-self: flex-start; }
 .pf-batch-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; padding: 2px 0 4px; }
 .pf-switches { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .pf-levels { display: flex; flex-wrap: wrap; gap: 6px; }
-.pf-detect { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-inset); }
+.pf-detect { display: flex; flex-direction: column; gap: 6px; padding: 0 2px 0 8px; }
 .pf-detect .notice { margin: 0; flex-direction: column; gap: 2px; }
 .pf-auto { margin-left: 4px; }
-.pf-model-toggle { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 38px; text-align: left; color: var(--text); }
-.pf-model-title { font-weight: 550; }
-.pf-model-badges { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.pf-model-toggle { gap: 8px; min-height: 36px; }
+.pf-model-title { flex: 0 1 auto; font-weight: 550; }
+.pf-model-id { flex: 0 1 auto; font-size: 11px; }
+.pf-model-badges { display: flex; flex: none; align-items: center; gap: 6px; margin-left: auto; padding-left: 6px; }
+.pf-model-size { font-size: var(--fs-xs); }
 .pf-advanced { display: flex; justify-content: flex-start; padding: 0 2px; }
 .pf-advanced .link-btn { display: inline-flex; align-items: center; gap: 4px; }
-.pf-foot { position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: 8px; padding: 12px 2px 16px; background: var(--bg-panel); border-top: 1px solid var(--border); }
-@media (max-width: 900px) { .pf-two { grid-template-columns: 1fr; } .prov { grid-template-columns: 1fr; } .prov-list { position: static; } }
+@media (max-width: 900px) {
+	.pf-two { grid-template-columns: 1fr; }
+	.prov { grid-template-columns: 1fr; }
+	.prov-list { position: static; }
+	.pf-row { grid-template-columns: minmax(0, 1fr); }
+	.pf-row > .field-name, .pf-row > :not(.field-name) { grid-column: 1; }
+	.pf-more-toggle { margin-left: 0; }
+	.prov-group-chips { display: none; }
+}
 /* Token-count inputs in thousands: the fixed "K" unit sits inside the field. */
 .k-field { position: relative; display: flex; }
 .k-field .field { width: 100%; padding-right: 26px; }
@@ -385,6 +524,18 @@
 .personal-expand { position: relative; }
 .personal-expand > .personal-prompt { padding-right: 32px; }
 .personal-expand-btn { position: absolute; top: 6px; right: 6px; }
+/* Model prompts (ModelPrompts in overlays-settings.js): the model picker on one row, then the models that have a
+   prompt as a quiet list; the open one is marked. The card keeps clear of the personal prompts' Save row above it. */
+.personal-foot + .set-card { margin-top: 12px; }
+.model-prompt-pick { align-items: center; gap: 10px; }
+.model-prompt-pick .picker-anchor { min-width: 0; }
+.model-prompt-list { gap: 4px; }
+.model-prompt-item { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); gap: 2px 10px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--r-md); text-align: left; color: var(--text); background: transparent; cursor: pointer; }
+.model-prompt-item:hover { background: var(--surface-hover); }
+.model-prompt-item.on { border-color: var(--accent); }
+.model-prompt-name { font-weight: 550; overflow-wrap: anywhere; }
+.model-prompt-sub { overflow-wrap: anywhere; }
+.model-prompt-snippet { grid-column: 1 / -1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 /* Workspace settings (workspace-settings.js): two quiet groups told apart by spacing and a small heading; the
    instructions box reuses the personal prompt's maximize corner and keeps its own row count. */
 .ws-set { gap: 18px; }

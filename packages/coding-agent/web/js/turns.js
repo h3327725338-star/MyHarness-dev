@@ -468,6 +468,16 @@ export function* buildTurnsWork(items, ctx = { toolRuns: {} }, previous) {
 			scheduled = item.details && typeof item.details === "object" ? item.details : {};
 			return;
 		}
+		if (item.kind === "custom" && item.customType === BACKGROUND_JOB_REPORT && item.display) {
+			// MyHarness, not the user, sent it when background commands ended (background-job-reports.ts): a round of its
+			// own under a marker (JobReportMarker), so the answer before it keeps its place instead of folding into steps.
+			startTurn(null, index, item);
+			turn.jobReport = item;
+			turn.startedAt = item.ts;
+			turn.endedAt = item.ts;
+			turn.items.push(item);
+			return;
+		}
 		if (item.kind === "user") {
 			startTurn(item, index);
 			if (scheduled) turn.scheduled = scheduled;
@@ -739,16 +749,27 @@ export function turnOutcome(turn, { run, live, waiting }) {
 export const INTERRUPT_ENTRY = "web-interrupt";
 
 /**
+ * The message MyHarness sends when background commands of the chat end (agent/runtime/background-job-reports.ts): the
+ * turn it starts is shown as a round of its own (buildTurnsWork).
+ */
+export const BACKGROUND_JOB_REPORT = "background-job-complete";
+
+/**
  * A message sent with "interrupt" ends the run it lands in and is answered at once: that run was not given up, the
  * agent turned to the new message. The server says so: it writes INTERRUPT_ENTRY after the stopped reply (kept in the
  * saved transcript, so a reopened chat shows the same thing) and reports the run as "redirected". Chats saved before
- * that marker existed fall back to timing: the next message starting right where this turn's last entry was saved (a
- * person pressing Stop and then typing takes far longer). Only saved entries count there: a reply still on the page
- * carries the time it started, which for a long answer is long before the stop. A message queued before a Stop is saved
- * right after it too, but it is not answered: its one last turn inherits the cancellation (agent-session.ts), while an
- * interrupting message gets its answer.
+ * that marker existed (INTERRUPT_MARKER_SINCE) fall back to timing: the next message starting right where this turn's
+ * last entry was saved (a person pressing Stop and then typing takes far longer). Only saved entries count there: a
+ * reply still on the page carries the time it started, which for a long answer is long before the stop. A message
+ * queued before a Stop is saved right after it too, but it is not answered: its one last turn inherits the cancellation
+ * (agent-session.ts), while an interrupting message gets its answer. Later chats have the marker for every interrupt and
+ * are not timed: a new message sent right after Stop is still a stop. Timing them hid the "Cancelled" card until the
+ * next reload, because the next message's copy on the page carries the time it was sent and the saved copy the time it
+ * was saved, seconds later while memories are being picked.
  */
 const INTERRUPT_GAP_MS = 3_000;
+/** When the server began writing INTERRUPT_ENTRY (2026-10-25, before the first desktop release). */
+const INTERRUPT_MARKER_SINCE = Date.parse("2026-10-25T13:27:29Z");
 export function interruptedByNext(turn, next) {
 	if (turn?.interrupted) return true;
 	if (next?.lastAssistant?.stopReason === "aborted") return false;
@@ -756,7 +777,8 @@ export function interruptedByNext(turn, next) {
 	const last = turn?.items?.[turn.items.length - 1];
 	if (!sentAt || !last?.id || last.liveId) return false;
 	const stoppedAt = turn.endedAt || turn.startedAt;
-	return !!(stoppedAt && sentAt - stoppedAt <= INTERRUPT_GAP_MS);
+	if (!stoppedAt || stoppedAt >= INTERRUPT_MARKER_SINCE) return false;
+	return sentAt - stoppedAt <= INTERRUPT_GAP_MS;
 }
 
 export function turnDuration(turn, run) {

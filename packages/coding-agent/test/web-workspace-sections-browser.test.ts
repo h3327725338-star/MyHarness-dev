@@ -9,11 +9,10 @@ import { detectInstalledBrowsers, LocalBrowser } from "../src/tools/web-search/b
 const installed = detectInstalledBrowsers();
 
 /**
- * The sections of the workspace panel in a real browser: the navigation row reaches Changes, Files, Terminal, Session
- * and (after a divider) the browser in one click; the tabs of the browser and of Files sit in the same row, Files and
- * the browser come back on their last tab, closing stays in the section while it has tabs, and the file list leads
- * the Files tabs. This runs the shipped page modules
- * unchanged; only the API routes are stubs.
+ * The sections of the workspace panel in a real browser: the navigation row reaches Changes, Files, Terminal,
+ * Background, Session and (after a divider) the browser in one click; the tabs of the browser and of Files sit in the
+ * same row, Files and the browser come back on their last tab, closing stays in the section while it has tabs, and the
+ * file list leads the Files tabs. This runs the shipped page modules unchanged; only the API routes are stubs.
  */
 it.skipIf(!installed.length)(
 	"reaches every panel section from one row and keeps each section's own tabs",
@@ -100,22 +99,22 @@ try {
 	render(h(PanelNav,{section:'files',browser:true,onShow:value=>shown.push(value)}),host);
 	await wait(30);
 	const buttons=[...host.querySelectorAll('.ws-nav-btn')];
-	check(buttons.length===5,'the navigation row has '+buttons.length+' buttons');
+	check(buttons.length===6,'the navigation row has '+buttons.length+' buttons');
 	check(buttons[1].classList.contains('active')&&buttons[1].getAttribute('aria-selected')==='true','Files is not marked as on screen');
-	check(buttons[4].previousElementSibling?.classList.contains('ws-nav-sep'),'the browser is not set apart by a divider');
-	buttons[4].click();
+	check(buttons[5].previousElementSibling?.classList.contains('ws-nav-sep'),'the browser is not set apart by a divider');
+	buttons[5].click();
 	check(shown[0]==='browser','clicking the browser did not ask for it');
 	render(h(PanelNav,{section:'changes',browser:false,onShow:()=>{}}),host);
 	await wait(30);
-	check(host.querySelectorAll('.ws-nav-btn').length===4&&!host.querySelector('.ws-nav-sep'),'the browser entry shows without a browser');
+	check(host.querySelectorAll('.ws-nav-btn').length===5&&!host.querySelector('.ws-nav-sep'),'the browser entry shows without a browser');
 	// The tabs of the section sit in the same row: in the browser they take the browser entry's place after the divider,
 	// in Files they follow the browser entry; the section names fold to icons to make room.
 	render(h(PanelNav,{section:'browser',browser:true,onShow:()=>{}},h('span',{class:'probe-strip'})),host);
 	await wait(30);
-	check(host.querySelector('.ws-nav.compact')&&host.querySelectorAll('.ws-nav-btn').length===4&&host.querySelector('.ws-nav-sep + .ws-nav-strip .probe-strip'),'the browser tabs are not in the row in place of the browser entry');
+	check(host.querySelector('.ws-nav.compact')&&host.querySelectorAll('.ws-nav-btn').length===5&&host.querySelector('.ws-nav-sep + .ws-nav-strip .probe-strip'),'the browser tabs are not in the row in place of the browser entry');
 	render(h(PanelNav,{section:'files',browser:true,onShow:()=>{}},h('span',{class:'probe-strip'})),host);
 	await wait(30);
-	check(host.querySelectorAll('.ws-nav-btn').length===5&&host.querySelectorAll('.ws-nav-sep').length===2&&host.querySelector('.ws-nav-strip .probe-strip'),'the file tabs are not after the browser entry');
+	check(host.querySelectorAll('.ws-nav-btn').length===6&&host.querySelectorAll('.ws-nav-sep').length===2&&host.querySelector('.ws-nav-strip .probe-strip'),'the file tabs are not after the browser entry');
 	render(h(PanelNav,{section:'terminal',browser:true,onShow:()=>{}}),host);
 	await wait(30);
 	check(!host.querySelector('.ws-nav.compact'),'the section names stay folded without tabs');

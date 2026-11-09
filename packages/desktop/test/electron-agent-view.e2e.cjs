@@ -9,8 +9,9 @@
  * a tab the Agent drives in a 426 px wide panel is laid out at the desktop size while the panel shows the part that fits
  * (never a scaled-down picture), that the Agent's screenshot is the whole page, that a person's click gives the page the
  * panel's size back, that the Agent's click at a page point lands there, that a click between two controls names the
- * nearest one, that a background tab is laid out at the desktop size, and that a click on a download link reports the
- * saved file. It prints a JSON report and exits 1 at any broken invariant.
+ * nearest one, that a background tab is laid out at the desktop size, that a click on a download link reports the
+ * saved file, and that a box the user watches (`fit`: collaboration mode, browser fullscreen) keeps the page at exactly
+ * its size while the Agent acts. It prints a JSON report and exits 1 at any broken invariant.
  */
 const { app, BrowserWindow, nativeImage } = require('electron');
 const http = require('node:http');
@@ -167,6 +168,23 @@ async function main() {
   check(file?.state === 'completed' && file.name === 'notes.docx' && existsSync(file.savePath) && path.dirname(file.savePath) === downloads, 'the click that downloads reports the finished file and its path', download.downloads);
   const direct = await agent({ action: 'download', tabId: 'back', url: `${origin}/files/notes.docx` });
   check(direct.downloads?.[0]?.state === 'completed' && direct.downloads[0].name === 'notes (1).docx' && existsSync(direct.downloads[0].savePath), 'download saves a link and returns the path', direct.downloads);
+
+  // --- a box the user watches (collaboration mode, browser fullscreen): the page has exactly its size ---------------
+  // The Agent's click above widened the page in the side panel. Collaboration mode on a smaller screen: a box narrower and
+  // lower than the desktop size. The page takes it at once and keeps it while the Agent acts: nothing is cut off.
+  check((await size('narrow'))?.w === 1280, 'before: the Agent works on the page in the side panel at the desktop width', await size('narrow'));
+  const watched = { x: 100, y: 60, width: 1100, height: 700 };
+  await page({ action: 'bounds', tabId: 'narrow', rect: watched, fit: true });
+  const snapped = await until(async () => { const value = await size('narrow'); return value?.w === 1100 ? value : undefined; }, 4000);
+  check(snapped?.w === 1100 && snapped?.h === 700, 'a page widened for the Agent takes the watched box size as soon as the box is watched', snapped || (await size('narrow')));
+  const fittedShot = await agent({ action: 'snapshot', tabId: 'narrow' });
+  const fitted = await size('narrow');
+  const fittedState = await page({ action: 'state', tabId: 'narrow' });
+  check(fitted?.w === 1100 && fitted?.h === 700 && fittedState.bounds?.width === 1100 && fittedState.bounds?.height === 700, 'in a watched box the page keeps exactly its size while the Agent acts', { fitted, bounds: fittedState.bounds });
+  check(fittedShot.width === 1100 && fittedShot.height === 700, "the Agent's screenshot is what the user sees", { width: fittedShot.width, height: fittedShot.height });
+  await page({ action: 'bounds', tabId: 'narrow', rect: panel });
+  await agent({ action: 'snapshot', tabId: 'narrow' });
+  check((await size('narrow'))?.w === 1280, 'back in the side panel the Agent gets the desktop width again', await size('narrow'));
 
   await page({ action: 'close', tabId: '*' });
   report.passed = report.failures.length === 0;

@@ -338,7 +338,10 @@ export function createPwshToolDefinition(
 				const text =
 					`Started background job ${job.taskId} (pwsh, cwd=${job.cwd}). It keeps running after this call. ` +
 					`Use job_output {"taskId": "${job.taskId}"} for incremental output, job_list for all jobs, ` +
-					`and job_kill {"taskId": "${job.taskId}"} to terminate it. Full log: ${job.logPath}`;
+					`and job_kill {"taskId": "${job.taskId}"} to terminate it. ` +
+					`When it ends, MyHarness reports back by itself: a new turn brings you its status and the end of its output ` +
+					`(not when you already read its end with job_output, or stop it with job_kill). ` +
+					`The user sees it in the Background panel. Full log: ${job.logPath}`;
 				return { content: [{ type: "text", text }], details: { taskId: job.taskId } };
 			}
 

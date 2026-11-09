@@ -15,6 +15,7 @@ import { getAgentDir } from "../../config.ts";
 import { runGitSync } from "../../git/repository/command.ts";
 import type { ModelRuntime } from "../../providers/runtime/index.ts";
 import { sdkFirstByteTimeoutMs } from "../../providers/runtime/request-timeouts.ts";
+import { describeLocalTime, describeStoredTime, localTimeZone } from "../../schedules/timing.ts";
 import { assertDirectPath } from "../../session/artifacts/store.ts";
 import {
 	archiveMemoryFile,
@@ -652,7 +653,8 @@ function formatManifest(entries: MemoryEntry[]): string {
 			description,
 			type,
 			scope,
-			updatedAt,
+			// Local time, like the current time the task gives: the raw UTC text reads as the day before in the morning.
+			updatedAt: describeStoredTime(updatedAt),
 			...(importance ? { importance } : {}),
 			...(triggers?.length ? { triggers } : {}),
 			content,
@@ -1112,6 +1114,11 @@ export function readCrossScopeMemoryEntries(
 	return result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+/** 后台模型不知道今天几号：不告诉它，它会把记忆里已有的未来日期（考试、截止日）当成现在，写进新记忆。 */
+function currentTimeLine(): string {
+	return `Current local time: ${describeLocalTime(Date.now(), localTimeZone())}`;
+}
+
 function formatTranscript(entries: SessionEntry[], lastEntryId?: string): { text: string; lastEntryId?: string } {
 	const startIndex = lastEntryId ? entries.findIndex((entry) => entry.id === lastEntryId) + 1 : 0;
 	const candidates = entries.slice(Math.max(0, startIndex)).flatMap((entry) => {
@@ -1119,14 +1126,16 @@ function formatTranscript(entries: SessionEntry[], lastEntryId?: string): { text
 		if (entry.message.role !== "user" && entry.message.role !== "assistant") return [];
 		const text = contentText(entry.message.content, "\n").trim();
 		if (!text) return [];
-		return [{ id: entry.id, role: entry.message.role, text }];
+		return [{ id: entry.id, role: entry.message.role, time: describeStoredTime(entry.timestamp), text }];
 	});
 	if (candidates.length === 0) return { text: "", lastEntryId };
 
 	// 输入不设上限：本轮新增聊天全文都送给提取器，不再按 24KB 截断。输出侧仍保留上限。
 	const selected = candidates;
 	return {
-		text: selected.map((item) => `${item.role === "user" ? "User" : "Main AI"}:\n${item.text}`).join("\n\n"),
+		text: selected
+			.map((item) => `${item.role === "user" ? "User" : "Main AI"} [${item.time}]:\n${item.text}`)
+			.join("\n\n"),
 		lastEntryId: selected.at(-1)?.id,
 	};
 }
@@ -1545,7 +1554,7 @@ export class AutoMemoryManager {
 		});
 		const sortedSwept = [...all].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 		const format = (entry: MemoryEntry) =>
-			`ID: ${entry.id}\nScope: ${entry.scope}\nName: ${entry.name}\nDescription: ${entry.description}\nType: ${entry.type}${entry.importance ? `\nImportance: ${entry.importance}` : ""}${entry.triggers?.length ? `\nTriggers: ${JSON.stringify(entry.triggers)}` : ""}\nContent:\n${entry.content}`;
+			`ID: ${entry.id}\nScope: ${entry.scope}\nName: ${entry.name}\nDescription: ${entry.description}\nType: ${entry.type}\nLast updated: ${describeStoredTime(entry.updatedAt)}${entry.importance ? `\nImportance: ${entry.importance}` : ""}${entry.triggers?.length ? `\nTriggers: ${JSON.stringify(entry.triggers)}` : ""}\nContent:\n${entry.content}`;
 		for (let start = 0; start < sortedSwept.length; start += CONSOLIDATION_BATCH_SIZE) {
 			this.assertActive();
 			const batch = sortedSwept.slice(start, start + CONSOLIDATION_BATCH_SIZE);
@@ -1554,7 +1563,7 @@ export class AutoMemoryManager {
 				cwd: this.options.cwd,
 				settings,
 				systemPrompt: MEMORY_CONSOLIDATOR_PROMPT,
-				task: `Resident user profile entry ID (maintain it only if it is listed below): ${MEMORY_PROFILE_ID}\n\nPlease consolidate the following existing memories:\n\n${batch.map(format).join("\n\n---\n\n")}`,
+				task: `${currentTimeLine()}\nResident user profile entry ID (maintain it only if it is listed below): ${MEMORY_PROFILE_ID}\n\nPlease consolidate the following existing memories:\n\n${batch.map(format).join("\n\n---\n\n")}`,
 			});
 			this.assertActive();
 			const operations = parseMemoryOperations(output);
@@ -2336,7 +2345,7 @@ export class AutoMemoryManager {
 				settings,
 				systemPrompt: MEMORY_EXTRACTOR_PROMPT,
 				task: [
-					`Current project root: ${this.paths.projectRoot}\nWorkspace ID: ${this.paths.workspaceId}\nSession ID: ${this.paths.sessionId}\nResident user profile entry ID (never create or modify it): ${MEMORY_PROFILE_ID}`,
+					`${currentTimeLine()}\nCurrent project root: ${this.paths.projectRoot}\nWorkspace ID: ${this.paths.workspaceId}\nSession ID: ${this.paths.sessionId}\nResident user profile entry ID (never create or modify it): ${MEMORY_PROFILE_ID}`,
 					`Existing memory list:\n${formatManifest(existing)}`,
 					`New conversation since last extraction:\n${transcript.text}`,
 				].join("\n\n"),
@@ -2449,7 +2458,7 @@ export class AutoMemoryManager {
 			: `Resident user profile entry ID: ${MEMORY_PROFILE_ID} (it does not exist yet; you may create its first version from facts already present in this batch only if they contain enough stable identity, communication or workflow facts; otherwise skip it and never invent facts)`;
 		const otherBatchPrefix = `Resident user profile entry ID: ${MEMORY_PROFILE_ID} (it is maintained in another batch; do not create or modify it in this batch)`;
 		const format = (entry: MemoryEntry) =>
-			`ID: ${entry.id}\nScope: ${entry.scope}\nName: ${entry.name}\nDescription: ${entry.description}\nType: ${entry.type}${entry.importance ? `\nImportance: ${entry.importance}` : ""}${entry.triggers?.length ? `\nTriggers: ${JSON.stringify(entry.triggers)}` : ""}\nContent:\n${entry.content}`;
+			`ID: ${entry.id}\nScope: ${entry.scope}\nName: ${entry.name}\nDescription: ${entry.description}\nType: ${entry.type}\nLast updated: ${describeStoredTime(entry.updatedAt)}${entry.importance ? `\nImportance: ${entry.importance}` : ""}${entry.triggers?.length ? `\nTriggers: ${JSON.stringify(entry.triggers)}` : ""}\nContent:\n${entry.content}`;
 		let firstError: unknown;
 		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
 			const batch = batches[batchIndex];
@@ -2472,14 +2481,14 @@ export class AutoMemoryManager {
 						: `\n\nCandidate contradiction pairs (local heuristic, verify before acting; if a pair truly contradicts, merge with the newer winning and let the old version archive; if they are merely about the same topic, leave them alone):\n\n${batchContradictions
 								.map(
 									(pair) =>
-										`OLD ${pair.a.id} (${pair.a.updatedAt}): ${pair.a.content}\nNEW ${pair.b.id} (${pair.b.updatedAt}): ${pair.b.content}\nShared topic terms: ${pair.sharedTerms.join(", ")}${pair.cues.length > 0 ? `\nCorrective cues: ${pair.cues.join(", ")}` : ""}`,
+										`OLD ${pair.a.id} (${describeStoredTime(pair.a.updatedAt)}): ${pair.a.content}\nNEW ${pair.b.id} (${describeStoredTime(pair.b.updatedAt)}): ${pair.b.content}\nShared topic terms: ${pair.sharedTerms.join(", ")}${pair.cues.length > 0 ? `\nCorrective cues: ${pair.cues.join(", ")}` : ""}`,
 								)
 								.join("\n\n---\n\n")}`;
 				const output = await this.runModel({
 					cwd: this.options.cwd,
 					settings,
 					systemPrompt: MEMORY_CONSOLIDATOR_PROMPT,
-					task: `${batchIndex === 0 ? profileTaskPrefix : otherBatchPrefix}\n\nPlease consolidate the following existing memories:\n\n${batch.map(format).join("\n\n---\n\n")}${contradictionSection}`,
+					task: `${currentTimeLine()}\n${batchIndex === 0 ? profileTaskPrefix : otherBatchPrefix}\n\nPlease consolidate the following existing memories:\n\n${batch.map(format).join("\n\n---\n\n")}${contradictionSection}`,
 				});
 				this.assertActive();
 				const operations = parseMemoryOperations(output);

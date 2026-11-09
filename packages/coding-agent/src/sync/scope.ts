@@ -6,6 +6,7 @@ import {
 	getWorkspaceDir,
 	getWorkspaceMetadataPath,
 	getWorkspacesDir,
+	UNBOUND_WORKSPACE_ID,
 } from "../config/paths/index.ts";
 import { WEB_PREFS_FILE } from "../config/web-prefs.ts";
 import { WorkspaceStore } from "../data/workspace-store.ts";
@@ -190,7 +191,8 @@ function workspaceContent(workspace: Record<string, unknown>): string {
 
 /**
  * Collect every entity that belongs to the sync scope:
- * all memories (global, workspace, session, archived, pending), General-mode Workspaces and their Sessions,
+ * all memories (global, workspace, session, archived, pending), General-mode Workspaces and their Sessions
+ * (with the General Sessions of the default group, which belong to no Workspace),
  * the files inside those Sessions (uploads, artifacts, metadata), the Workspace library, the General personal
  * prompt and drafts, and the built-in browser's own files. Coding-mode chats are deliberately excluded; Coding
  * memories are included through the memory scan because memory is shared across modes.
@@ -259,7 +261,12 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 			const metadata = readWorkspaceMetadata(getWorkspaceMetadataPath(dataRoot, workspace));
 			workspaceMeta.set(workspace, metadata);
 			const metadataModes = Array.isArray(metadata?.modes) ? metadata.modes : [];
-			const general = registry ? registry.includes("general") : metadataModes.includes("general");
+			// The default group of chats with no Workspace ("unbound") has no registry entry or metadata of its own, yet
+			// its General chats are General chats like any other. It is never published as a Workspace: it has no
+			// metadata, and each computer runs those chats in its own default folder.
+			const general =
+				workspace === UNBOUND_WORKSPACE_ID ||
+				(registry ? registry.includes("general") : metadataModes.includes("general"));
 			if (general) generalWorkspaces.add(workspace);
 			const sessionsRoot = join(getWorkspaceDir(dataRoot, workspace), SESSIONS_DIR);
 			if (!existsSync(sessionsRoot)) continue;

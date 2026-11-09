@@ -57,6 +57,7 @@ import {
 } from "../models/custom-provider-manager.ts";
 import { DisabledProviderPolicy } from "../models/disabled.ts";
 import { groupCredentialId, MODEL_KEY_SOURCE, modelCredentialId } from "../models/layers.ts";
+import { withModelPrompt } from "../models/model-prompts.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "../models/store.ts";
 import { providerSpendLedger } from "./provider-spend.ts";
 
@@ -1095,11 +1096,20 @@ export class ModelRuntime implements Models {
 				);
 				return prepared.provider.stream(
 					prepared.model as Model<TApi>,
-					context,
+					this.withModelPrompt(model, context),
 					prepared.options as ApiStreamOptions<TApi>,
 				);
 			}),
 		);
+	}
+
+	/**
+	 * The user's own prompt for this model (model-prompts.ts) as the last block of the system prompt. Every request of
+	 * this process passes here, so the main chat, sub-agents and helper requests all carry it when they use this model.
+	 * Read at request time: a prompt saved in Settings applies from the next request on.
+	 */
+	private withModelPrompt(model: Model<Api>, context: Context): Context {
+		return withModelPrompt(context, this.modelsPath ? dirname(this.modelsPath) : undefined, model);
 	}
 
 	/** Adds the request's cost to this computer's estimate for the provider (provider-spend.ts) once it finished. */
@@ -1127,7 +1137,11 @@ export class ModelRuntime implements Models {
 			model,
 			lazyStream(model, async () => {
 				const prepared = await this.prepareRequest(model, options);
-				return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
+				return prepared.provider.streamSimple(
+					prepared.model,
+					this.withModelPrompt(model, context),
+					prepared.options as SimpleStreamOptions,
+				);
 			}),
 		);
 	}

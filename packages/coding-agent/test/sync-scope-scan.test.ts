@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { getSessionDir, getWorkspaceMetadataPath } from "../src/config/paths/index.ts";
+import { getSessionDir, getWorkspaceMetadataPath, UNBOUND_WORKSPACE_ID } from "../src/config/paths/index.ts";
 import { scanLocalEntities, scanLocalEntitiesAsync } from "../src/sync/scope.ts";
 
 const roots: string[] = [];
@@ -52,5 +52,26 @@ describe("sync scope scan", () => {
 		expect(keys.filter((key) => key.startsWith("session:"))).toHaveLength(40);
 		expect(keys.filter((key) => key.endsWith("note.txt"))).toHaveLength(40);
 		expect(keys.some((key) => /\.lock/u.test(key))).toBe(false);
+	});
+
+	it("includes the General chats of the default group, which has no Workspace, but not its Coding chats", () => {
+		const options = library(0);
+		const chat = (id: string, mode: "general" | "coding") => {
+			const session = getSessionDir(options.dataRoot, UNBOUND_WORKSPACE_ID, id);
+			write(
+				join(session, "conversation", `${id}.jsonl`),
+				`${JSON.stringify({ type: "session", id, mode, timestamp: "2026-11-05", cwd: "C:/elsewhere/default-workspace" })}\n`,
+			);
+			write(join(session, "artifacts", "report.md"), `report ${id}`);
+		};
+		chat("plain", "general");
+		chat("repo", "coding");
+		const keys = [...scanLocalEntities(options).keys()];
+		expect(keys).toContain(`session:${UNBOUND_WORKSPACE_ID}/plain`);
+		expect(keys).toContain(`file:workspaces/${UNBOUND_WORKSPACE_ID}/sessions/plain/artifacts/report.md`);
+		expect(keys).not.toContain(`session:${UNBOUND_WORKSPACE_ID}/repo`);
+		expect(keys.some((key) => key.includes("/sessions/repo/"))).toBe(false);
+		// It is a group, not a Workspace: no Workspace record names it.
+		expect(keys).not.toContain(`workspace:${UNBOUND_WORKSPACE_ID}`);
 	});
 });

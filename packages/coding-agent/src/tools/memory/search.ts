@@ -12,6 +12,7 @@ import {
 } from "../../agent/runtime/auto-memory.ts";
 import { getDataDir, UNBOUND_WORKSPACE_ID } from "../../config/paths/index.ts";
 import type { SettingsManager } from "../../config/settings/index.ts";
+import { describeStoredTime, describeZone, localStamp, localTimeZone } from "../../schedules/timing.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import { getMemoryPaths } from "../../session/memory/store.ts";
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
@@ -167,6 +168,16 @@ function loadVisibleEntries(
 	}
 }
 
+/** When a memory was last updated, as this computer's wall clock (the stored text is UTC); the zone is named once. */
+function updatedStamp(updatedAt: string): string {
+	const ms = Date.parse(updatedAt);
+	return Number.isFinite(ms) && ms > 0 ? localStamp(ms, localTimeZone()) : "unknown";
+}
+
+function zoneNote(): string {
+	return `时间为本机时间（${describeZone(Date.now(), localTimeZone())}）。`;
+}
+
 function crossScopeLabel(entry: CrossScopeMemoryEntry): string {
 	return entry.kind === "pending" ? entry.originLabel : `跨项目 · ${entry.originLabel}`;
 }
@@ -199,7 +210,7 @@ function formatDirectory(
 			importanceOf(entry),
 			entry.type,
 			entry.scope,
-			entry.updatedAt,
+			updatedStamp(entry.updatedAt),
 			"",
 		].join(" | ");
 		if (!pushRow(row, entry.id)) break;
@@ -213,7 +224,7 @@ function formatDirectory(
 			entry.importance ?? "normal",
 			entry.type,
 			entry.scope,
-			entry.updatedAt,
+			updatedStamp(entry.updatedAt),
 			crossScopeLabel(entry),
 		].join(" | ");
 		if (!pushRow(row, entry.id)) break;
@@ -221,7 +232,7 @@ function formatDirectory(
 	const total = sorted.length + sortedCross.length;
 	const truncated = rows.length < total;
 	const lines = [
-		`记忆目录：共 ${total} 条（本轮 ${sorted.length} 条，跨项目/待认领 ${sortedCross.length} 条），按更新时间由新到旧。用 memory_get 读取全文。`,
+		`记忆目录：共 ${total} 条（本轮 ${sorted.length} 条，跨项目/待认领 ${sortedCross.length} 条），按更新时间由新到旧。用 memory_get 读取全文。${zoneNote()}`,
 		header,
 		...rows,
 	];
@@ -295,13 +306,13 @@ function formatSearch(
 			ids,
 		});
 	}
-	const lines = [`找到 ${results.length} 条相关记忆（摘要，不含全文；用 memory_get 读取全文）：`];
+	const lines = [`找到 ${results.length} 条相关记忆（摘要，不含全文；用 memory_get 读取全文）。${zoneNote()}`];
 	results.forEach(({ entry, via, cross: crossEntry }, index) => {
 		const excerpt = cell(entry.content, EXCERPT_MAX_CHARS);
 		const importance = entry.importance ?? "normal";
 		const origin = crossEntry ? ` | 来源：${crossScopeLabel(crossEntry)}` : "";
 		lines.push(
-			`${index + 1}. ${entry.id} | ${cell(entry.name, 120)} | ${importance} | ${entry.type} | ${entry.scope} | ${entry.updatedAt} | 命中：${via === "trigger" ? "触发词" : "关键词"}${origin}`,
+			`${index + 1}. ${entry.id} | ${cell(entry.name, 120)} | ${importance} | ${entry.type} | ${entry.scope} | ${updatedStamp(entry.updatedAt)} | 命中：${via === "trigger" ? "触发词" : "关键词"}${origin}`,
 			`   说明：${cell(entry.description)}`,
 			`   摘录：${excerpt}`,
 		);
@@ -345,7 +356,7 @@ function formatMemory(entry: MemoryEntry, origin?: string): string {
 	const header = [
 		`=== ${entry.id} ===`,
 		`name: ${cell(entry.name, 200)}`,
-		`type: ${entry.type}; scope: ${entry.scope}; importance: ${importanceOf(entry)}; updatedAt: ${entry.updatedAt}`,
+		`type: ${entry.type}; scope: ${entry.scope}; importance: ${importanceOf(entry)}; updatedAt: ${describeStoredTime(entry.updatedAt)}`,
 		`description: ${cell(entry.description)}`,
 	];
 	if (origin) header.push(`origin: ${origin}`);

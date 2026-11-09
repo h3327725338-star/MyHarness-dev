@@ -345,7 +345,7 @@ export class ScheduleService {
 		const enabled = input.enabled ?? (newTime ? true : (existing?.enabled ?? true));
 		if (enabled && existing && !existing.enabled && repeat.type === "once" && Date.parse(repeat.at) <= now)
 			throw new ScheduleInputError(
-				`That time has already passed (${repeat.at}); give the task a new time to switch it on. It is now ${describeLocalTime(now, tz)}.`,
+				`That time has already passed (${describeDue(repeat.at, tz)}); give the task a new time to switch it on. It is now ${describeLocalTime(now, tz)}.`,
 			);
 		const schedule: Schedule = {
 			id: existing?.id ?? newScheduleId(),
@@ -401,7 +401,7 @@ export class ScheduleService {
 		if (repeat.type === "once" && !unchanged && Date.parse(repeat.at) <= now)
 			// The current time is part of the answer: a model that guessed the year from its training data can correct it.
 			throw new ScheduleInputError(
-				`That time has already passed (${repeat.at}). It is now ${describeLocalTime(now, tz)}.`,
+				`That time has already passed (${describeDue(repeat.at, tz)}). It is now ${describeLocalTime(now, tz)}.`,
 			);
 		return repeat;
 	}

@@ -11,6 +11,7 @@
 import { contentText } from "@myharness/ai";
 import type { SettingsManager } from "../../config/settings/index.ts";
 import { sdkFirstByteTimeoutMs } from "../../providers/runtime/request-timeouts.ts";
+import { describeLocalTime, localStamp, localTimeZone } from "../../schedules/timing.ts";
 import { type HandoffRecord, handoffStatus, readHandoff, writeHandoff } from "../../session/history/handoff-store.ts";
 import { loadHistoryRecords } from "../../session/history/index-store.ts";
 import type { HistoryRecord } from "../../session/history/records.ts";
@@ -59,16 +60,18 @@ function clip(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max)}…[truncated]` : text;
 }
 
-function formatRecord(record: HistoryRecord): string {
+/** A message's header carries when it was sent, on this computer's clock, so "today" in it can be dated. */
+function formatRecord(record: HistoryRecord, tz: string): string {
 	const state = record.stopReason
 		? ` (${record.stopReason === "aborted" ? "interrupted" : record.stopReason === "error" ? "failed" : "cut off"})`
 		: "";
-	return `[${record.role === "user" ? "User" : "Assistant"}${state} · entry ${record.id}]\n${clip(record.text, HANDOFF_MESSAGE_MAX_CHARS)}`;
+	const sent = record.ts > 0 ? ` · ${localStamp(record.ts, tz)}` : "";
+	return `[${record.role === "user" ? "User" : "Assistant"}${state}${sent} · entry ${record.id}]\n${clip(record.text, HANDOFF_MESSAGE_MAX_CHARS)}`;
 }
 
 /** The messages for one run: everything when it fits, otherwise the opening exchange plus the newest messages. */
-export function formatHandoffMessages(records: readonly HistoryRecord[]): string {
-	const blocks = records.map(formatRecord);
+export function formatHandoffMessages(records: readonly HistoryRecord[], tz = localTimeZone()): string {
+	const blocks = records.map((record) => formatRecord(record, tz));
 	const total = blocks.reduce((sum, block) => sum + block.length + 2, 0);
 	if (total <= HANDOFF_INPUT_MAX_CHARS) return blocks.join("\n\n");
 	const head = blocks.slice(0, 2);
@@ -120,12 +123,16 @@ export function handoffWork(file: string): HandoffWork | undefined {
 	};
 }
 
-export function buildHandoffTask(work: HandoffWork, title: string | undefined): string {
-	const parts = [`Conversation title: ${title?.trim() || "(untitled)"}`];
+export function buildHandoffTask(work: HandoffWork, title: string | undefined, now = Date.now()): string {
+	const tz = localTimeZone();
+	const parts = [
+		`Conversation title: ${title?.trim() || "(untitled)"}`,
+		`Current local time: ${describeLocalTime(now, tz)}. Message times below are on the same clock.`,
+	];
 	if (work.incremental && work.previous) {
 		parts.push(
 			`Existing note (covers the conversation up to entry ${work.previous.coveredEntryId}):\n<existing-note>\n${work.previous.summary.trim()}\n</existing-note>`,
-			`New messages since then (oldest first):\n<messages>\n${formatHandoffMessages(work.messages)}\n</messages>`,
+			`New messages since then (oldest first):\n<messages>\n${formatHandoffMessages(work.messages, tz)}\n</messages>`,
 			"Update the note with the new messages.",
 		);
 	} else {
@@ -134,7 +141,7 @@ export function buildHandoffTask(work: HandoffWork, title: string | undefined): 
 				"An older note exists but describes a branch the user has since left; it is not usable. Write a fresh note.",
 			);
 		parts.push(
-			`The conversation so far (oldest first):\n<messages>\n${formatHandoffMessages(work.messages)}\n</messages>`,
+			`The conversation so far (oldest first):\n<messages>\n${formatHandoffMessages(work.messages, tz)}\n</messages>`,
 			"Write the note.",
 		);
 	}
