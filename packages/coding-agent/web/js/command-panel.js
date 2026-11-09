@@ -824,7 +824,8 @@ function providerScreen(ctx, id) {
 			? { key: "enabled", label: t("Enabled"), desc: t("Fill in the Base URL and save to turn this provider on."), toggle: false, onEnter: (c) => (c.close(), setView({ providerEditor: { id } })) }
 			: { key: "enabled", label: t("Enabled"), toggle: provider.enabled, onEnter: () => act(() => post("/api/providers/enabled", { id, enabled: !provider.enabled })) },
 	];
-	for (const k of c?.apiKeys || []) {
+	if (provider.externalLogin) rows.push({ key: "external-login", label: provider.configured ? t("Sign in again") : t("Sign in"), icon: "key", chevron: true, onEnter: (cc) => (cc.close(), setView({ providerEditor: { id } })) });
+	for (const k of provider.externalLogin ? [] : c?.apiKeys || []) {
 		rows.push({ key: `k-${k.id}`, label: `${serverText(k.label)} ${k.suffix ? `••••${k.suffix}` : ""}`.trim(), value: k.active ? t("active") : "", chevron: true, onEnter: (cc) => cc.push((c2) => keyScreen(c2, id, k.id)) });
 	}
 	if (c?.hasOAuth) rows.push({ key: "oauth-use", label: t("OAuth login"), value: c.active?.type === "oauth" ? t("active") : "", onEnter: () => c.active?.type !== "oauth" && act(() => post("/api/providers/oauth/activate", { id })) });

@@ -316,6 +316,7 @@ export {
 export { type MainOptions, main } from "./main.ts";
 // The product exposes only the browser frontend.
 export { runWebMode, startWebBootstrap, type WebBootstrap, type WebModeOptions } from "./modes/web/index.ts";
+export { createClaudeCodeProvider, registerClaudeCodeProvider } from "./providers/claude-code/register.ts";
 export type {
 	ApiKeyCollectionStore,
 	ProviderCredentialOverview,

@@ -1,6 +1,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type Context,
 	EventStream,
 	type Message,
 	type Model,
@@ -1760,6 +1761,156 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(events.some((event) => event.type === "tool_execution_start")).toBe(true);
 		expect(events.some((event) => event.type === "tool_execution_end")).toBe(true);
 	});
+
+	it("preserves host tool messages when streaming text continues and the next request reuses context", async () => {
+		const parameters = Type.Object({ path: Type.String() });
+		let executions = 0;
+		const tool: AgentTool<typeof parameters, undefined> = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters,
+			execute: async (_toolCallId, args) => {
+				executions++;
+				return { content: [{ type: "text", text: `read:${args.path}` }], details: undefined };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "system", messages: [], tools: [tool] };
+		let followUpSent = false;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getFollowUpMessages: async () => {
+				if (followUpSent) return [];
+				followUpSent = true;
+				return [createUserMessage("next")];
+			},
+		};
+		let textStarted!: () => void;
+		const firstUpdate = new Promise<void>((resolve) => {
+			textStarted = resolve;
+		});
+		let requests = 0;
+		let nextContext: Message[] | undefined;
+		const streamFn = (
+			_model: Model<any>,
+			requestContext: Context,
+			options: { toolCallHandler?: AgentLoopConfig["toolCallHandler"] } | undefined,
+		) => {
+			const response = new MockAssistantStream();
+			if (requests++ > 0) {
+				nextContext = [...requestContext.messages];
+				queueMicrotask(() => {
+					response.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "next response" }]),
+					});
+				});
+				return response;
+			}
+			queueMicrotask(async () => {
+				response.push({ type: "start", partial: createAssistantMessage([]) });
+				const beforeTool = createAssistantMessage([{ type: "text", text: "before" }]);
+				response.push({ type: "text_start", contentIndex: 0, partial: beforeTool });
+				response.push({ type: "text_delta", contentIndex: 0, delta: "before", partial: beforeTool });
+				// Wait until the loop has inserted and updated its partial message.
+				await firstUpdate;
+				await options?.toolCallHandler?.({
+					type: "toolCall",
+					id: "streamed-host-call",
+					name: "read",
+					arguments: { path: "README.md" },
+				});
+				const finalMessage = createAssistantMessage([{ type: "text", text: "before after" }]);
+				finalMessage.usage.input = 100;
+				finalMessage.usage.totalTokens = 100;
+				response.push({ type: "text_delta", contentIndex: 0, delta: " after", partial: finalMessage });
+				response.push({ type: "text_end", contentIndex: 0, content: "before after", partial: finalMessage });
+				response.push({ type: "done", reason: "stop", message: finalMessage });
+			});
+			return response;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("use the tool")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+			if (
+				event.type === "message_update" &&
+				event.assistantMessageEvent.type === "text_delta" &&
+				event.assistantMessageEvent.delta === "before"
+			) {
+				textStarted();
+			}
+		}
+
+		const messages = await stream.result();
+		const finalized = events.filter((event) => event.type === "message_end").map((event) => event.message);
+		expect(executions).toBe(1);
+		expect(requests).toBe(2);
+		expect(nextContext).toEqual(messages.slice(0, -1));
+		expect(finalized).toEqual(messages);
+		expect(nextContext?.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+			"user",
+		]);
+		expect(nextContext?.[2]).toMatchObject({ toolCallId: "streamed-host-call", isError: false });
+		expect(nextContext?.[3]).toMatchObject({
+			content: [{ type: "text", text: "before after" }],
+			usage: { totalTokens: 100 },
+		});
+	});
+
+	it.each(["bridge", "terminal"] as const)(
+		"does not execute a provider tool call twice through %s",
+		async (repeat) => {
+			let executions = 0;
+			const tool: AgentTool = {
+				name: "noop",
+				label: "Noop",
+				description: "Noop",
+				parameters: Type.Object({}),
+				execute: async () => {
+					executions++;
+					return { content: [{ type: "text", text: "ok" }], details: undefined };
+				},
+			};
+			const toolCall = { type: "toolCall" as const, id: "same-provider-call", name: "noop", arguments: {} };
+			const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+			const stream = agentLoop(
+				[createUserMessage("use the tool")],
+				{ systemPrompt: "", messages: [], tools: [tool] },
+				config,
+				undefined,
+				(_model, _context, options) => {
+					const response = new MockAssistantStream();
+					queueMicrotask(async () => {
+						await options?.toolCallHandler?.(toolCall);
+						if (repeat === "bridge") await options?.toolCallHandler?.(toolCall);
+						const message = createAssistantMessage(
+							repeat === "terminal" ? [toolCall] : [{ type: "text", text: "done" }],
+							repeat === "terminal" ? "toolUse" : "stop",
+						);
+						response.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+					});
+					return response;
+				},
+			);
+
+			if (repeat === "terminal") {
+				await expect(stream.result()).rejects.toThrow('duplicate tool call id "same-provider-call"');
+			} else {
+				const messages = await stream.result();
+				expect(messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
+				expect(messages[3]).toMatchObject({ role: "toolResult", isError: true });
+			}
+			expect(executions).toBe(1);
+		},
+	);
 
 	describe("tool abort grace timeout fallback", () => {
 		it("abandons a tool that ignores abort signal after grace period expires", async () => {

@@ -33,6 +33,7 @@ import {
 	setProviderDispatcherResolver,
 } from "@myharness/ai";
 import { getAgentDir } from "../../config.ts";
+import { usageForAccounting } from "../../observability/usage-totals.ts";
 import { getProviderDispatcher } from "../../platform/process/http-dispatcher.ts";
 import type { ProviderCredentialOverview, StoredApiKeyInfo } from "../credentials/api-key-collection.ts";
 import { ProviderCredentialManager, sameApiKeyCredential } from "../credentials/manager.ts";
@@ -1018,6 +1019,12 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
+		const provider = this.models.getProvider(providerId) ?? this.catalogModels.getProvider(providerId);
+		if (provider?.auth.apiKey?.externalLogin) {
+			// The external program owns this login. Old stored placeholders do not prove it is still signed in.
+			const check = this.snapshot.auth.get(providerId);
+			return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
+		}
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
 		const group = this.config.getProvider(providerId)?.group;
 		if (group && this.snapshot.storedProviders.has(groupCredentialId(group))) {
@@ -1118,7 +1125,13 @@ export class ModelRuntime implements Models {
 		if (file) {
 			stream
 				.result()
-				.then((message) => providerSpendLedger(file).record(model.provider, message, model.cost?.currency))
+				.then((message) =>
+					providerSpendLedger(file).record(
+						model.provider,
+						{ usage: usageForAccounting(message) },
+						model.cost?.currency,
+					),
+				)
 				.catch(() => {});
 		}
 		return stream;

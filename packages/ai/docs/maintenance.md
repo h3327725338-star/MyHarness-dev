@@ -40,5 +40,6 @@ npm.cmd --workspace packages/ai run build:offline
 
 - credential store 的 secret 只能通过受控 read/modify/delete 路径处理；日志只写 provider ID、类型和脱敏来源。
 - OAuth refresh 使用 credential store 的串行修改语义，失败不能静默 fallback 到另一个 credential。
+- `apiKey.externalLogin()` 可为官方 CLI 等外部程序管理的 ambient 登录提供只读说明与命令；读取时不启动程序或暴露凭据。宿主显示命令后通过 `check()` 重新确认登录，不把它伪装成粘贴 API Key 的表单，也不持久化占位 Key。
 - `oauth`、`bun-oauth` 和 `auth/oauth` 当前主要提供 contract/通用工具；具体 Provider OAuth flow 需要明确由 extension 或其他宿主注册。
 - 直接调用 API implementation 会绕过 Provider auth；文档示例必须明确这一点。

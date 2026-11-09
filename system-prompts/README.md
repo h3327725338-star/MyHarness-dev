@@ -78,7 +78,7 @@ Extension Prompt 由 Coding Agent 的 ResourceLoader/context loader 独立处理
 
 主聊天稳定顺序为：用户个性化内容（有配置时）→ 当前模式身份 → 共用核心 → 当前工具说明 → 工具路由 → slash 命令 → 当前工具规则 → 自定义 Prompt → append Prompt → 项目上下文 → 技能 → 回复语言 → 角色边界（顺序冻结；工具按名确定性排序，缺 snippet 时行内占位不断条目）。工作目录与当前模型不再进 system，改走 messages 提醒：插在最后一条 user 之前、时间戳为 0 的 transient user 消息，不写盘、不占缓存前缀，内容不变；压缩 fork 原样复用父 system/tools 引用。
 
-模型专属提示词不属于上面的组合顺序：它在请求真正发出前，由 `packages/coding-agent/src/providers/models/model-prompts.ts` 经 `ModelRuntime.stream` / `streamSimple` 追加为 system prompt 的最后一块（扩展变换和角色边界之后），按 Provider ID + Model ID 精确匹配。凡是经过 ModelRuntime、用的是这个模型的请求都带上：主聊天、子智能体（子进程读同一个 agent 目录）、压缩、记忆、标题、交接摘要等辅助请求；其他模型的请求一律不带。不走 ModelRuntime 的只读委派 shell 审查请求（`tools/shell/read-only-guard.ts`）在生成时单独追加。`claude-code-shell` 扩展收到的就是带着这一块的完整 system prompt，原样交给 `claude`。文件每次请求按大小和修改时间判断是否重读，保存后从下一次请求起生效；文件损坏时打印一次 warning、不发送提示词，不让请求失败。
+模型专属提示词不属于上面的组合顺序：它在请求真正发出前，由 `packages/coding-agent/src/providers/models/model-prompts.ts` 经 `ModelRuntime.stream` / `streamSimple` 追加为 system prompt 的最后一块（扩展变换和角色边界之后），按 Provider ID + Model ID 精确匹配。凡是经过 ModelRuntime、用的是这个模型的请求都带上：主聊天、子智能体（子进程读同一个 agent 目录）、压缩、记忆、标题、交接摘要等辅助请求；其他模型的请求一律不带。不走 ModelRuntime 的只读委派 shell 审查请求（`tools/shell/read-only-guard.ts`）在生成时单独追加。`claude-code-shell` 扩展收到的就是带着这一块的完整 system prompt，整段追加在 Claude Code 自己的提示词之后交给 `claude`，这一块仍排在最后。文件每次请求按大小和修改时间判断是否重读，保存后从下一次请求起生效；文件损坏时打印一次 warning、不发送提示词，不让请求失败。
 
 扩展按原注册顺序变换 Prompt；随后按原条件追加 Auto Memory 规则，在持久化结构化 Session 中追加对话产出规则和实际目录，再去除旧角色块并重新追加当前角色边界。这保留了原来的角色块去重逻辑。Anthropic OAuth 身份由 adapter 单独放在以上文本前面。显式 `/commit` 的授权、失败恢复和 Git 事务由 `packages/coding-agent/src/agent/runtime/agent-session.ts`、`modes/web/` 等源码处理，不对应一个本目录中的静态 Prompt 文件。
 

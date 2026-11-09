@@ -1,5 +1,54 @@
-import type { Usage } from "@myharness/ai/compat";
+import type { AssistantMessage, Usage } from "@myharness/ai/compat";
 import type { SessionEntry } from "../session/types.ts";
+
+type AccountingMessage = Pick<AssistantMessage, "usage"> &
+	Partial<Pick<AssistantMessage, "provider" | "api" | "diagnostics">>;
+
+const tokenBuckets = ["input", "output", "cacheRead", "cacheWrite"] as const;
+const accountingCostBuckets = [...tokenBuckets, "total"] as const;
+type TokenBucket = (typeof tokenBuckets)[number];
+type AccountingTally = Record<TokenBucket, number> & {
+	totalTokens: number;
+	cost: Record<(typeof accountingCostBuckets)[number], number>;
+};
+const record = (value: unknown): value is Record<string, unknown> =>
+	value !== null && typeof value === "object" && !Array.isArray(value);
+const tokenCount = (value: unknown): value is number =>
+	typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+function accountingTally(value: unknown, anchor: Usage): value is AccountingTally {
+	if (!record(value) || !record(value.cost)) return false;
+	const cost = value.cost;
+	const total = tokenBuckets.reduce((sum, key) => sum + (tokenCount(value[key]) ? value[key] : 0), 0);
+	return (
+		tokenBuckets.every((key) => tokenCount(value[key]) && tokenCount(anchor[key]) && value[key] >= anchor[key]) &&
+		tokenCount(value.totalTokens) &&
+		tokenCount(total) &&
+		value.totalTokens === total &&
+		accountingCostBuckets.every((key) => cost[key] === 0)
+	);
+}
+
+/** Accounting may cover several native requests; message.usage remains the last main context anchor. */
+export function usageForAccounting(message: AccountingMessage): Usage {
+	if (message.provider !== "claude-code" || message.api !== "claude-code-cli") return message.usage;
+	const diagnostics = message.diagnostics?.filter((item) => item.type === "claude-code-interactive-usage");
+	if (diagnostics?.length !== 1) return message.usage;
+	const details = diagnostics[0].details;
+	if (
+		!record(details) ||
+		details.version !== 1 ||
+		details.transport !== "interactive-pty-mod" ||
+		details.contextUsage !== "last-main-request" ||
+		details.usageIncludesOnlyObservedModSteps !== true ||
+		!tokenCount(details.requestCount) ||
+		details.requestCount === 0
+	)
+		return message.usage;
+	const totals = details.turnTokens;
+	if (!accountingTally(totals, message.usage)) return message.usage;
+	return { ...message.usage, ...totals };
+}
 
 export interface UsageTotals {
 	input: number;
@@ -42,7 +91,7 @@ export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdo
 		let usage: Usage | undefined;
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			key = `${entry.message.provider}/${entry.message.responseModel ?? entry.message.model}`;
-			usage = entry.message.usage;
+			usage = usageForAccounting(entry.message);
 		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
 			key = "Tools/summaries";
 			usage = entry.message.usage;

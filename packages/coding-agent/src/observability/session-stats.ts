@@ -1,7 +1,7 @@
 import { type Api, type AssistantMessage, calculateCost, type Model } from "@myharness/ai/compat";
 import type { SessionEntry, SessionMessageTiming } from "../session/types.ts";
 import { type CacheMeasurements, type Measurement, measureCache, sumCache } from "./usage-measurements.ts";
-import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { addUsageToTotals, createUsageTotals, usageForAccounting } from "./usage-totals.ts";
 
 export interface SessionUsageStats {
 	userMessages: number;
@@ -150,12 +150,13 @@ export function collectSessionUsageStats(
 			if (Array.isArray(assistantMsg.content)) {
 				toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
 			}
-			trackAvailability(assistantMsg.usage);
-			addUsageToTotals(usageTotals, assistantMsg.usage);
+			const accountingUsage = usageForAccounting(assistantMsg);
+			trackAvailability(accountingUsage);
+			addUsageToTotals(usageTotals, accountingUsage);
 			const model = resolveModel?.(assistantMsg.provider, assistantMsg.model);
 			const cost = model
-				? calculateCost(model, { ...assistantMsg.usage, cost: { ...assistantMsg.usage.cost } }).total
-				: assistantMsg.usage.cost.total;
+				? calculateCost(model, { ...accountingUsage, cost: { ...accountingUsage.cost } }).total
+				: accountingUsage.cost.total;
 			addCost(model?.cost.currency ?? "USD", cost);
 		}
 	}

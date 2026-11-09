@@ -354,12 +354,14 @@ function composeApiKeyAuth(
 	const authHeader = extension?.authHeader ?? config?.authHeader ?? false;
 	return {
 		name: inherited?.name ?? "API key",
-		login:
-			inherited?.login ??
-			(async (interaction: AuthInteraction) => ({
-				type: "api_key",
-				key: await interaction.prompt({ type: "secret", message: "Enter API key" }),
-			})),
+		externalLogin: inherited?.externalLogin,
+		login: inherited?.externalLogin
+			? inherited.login
+			: (inherited?.login ??
+				(async (interaction: AuthInteraction) => ({
+					type: "api_key",
+					key: await interaction.prompt({ type: "secret", message: "Enter API key" }),
+				}))),
 		check: async (input) => {
 			if (input.credential && !prefersConfiguredKey(config, rawKey, input.credential)) {
 				if (inherited?.check) return inherited.check(input);

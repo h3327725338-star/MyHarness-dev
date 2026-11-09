@@ -2858,6 +2858,64 @@ describe("Web host (real runtime with a faux provider)", () => {
 		});
 	});
 
+	it("checks an external program login without storing an API key and distrusts stale placeholders", async () => {
+		const fx = await start();
+		const runtime = fx.hub.host.session.modelRuntime;
+		const id = "external-login-fixture";
+		const model = { ...fx.faux.getModel(), provider: id, id: "external-model" };
+		let signedIn = false;
+		const externalLogin = {
+			instructions: "Complete sign-in in the isolated program, then check again.",
+			command: "fixture.exe --isolated",
+		};
+		runtime.registerNativeProvider({
+			id,
+			name: "External login fixture",
+			auth: {
+				apiKey: {
+					name: "External program",
+					externalLogin: () => externalLogin,
+					check: async () => (signedIn ? { type: "api_key", source: "isolated program" } : undefined),
+					resolve: async () => (signedIn ? { auth: {}, source: "isolated program" } : undefined),
+				},
+			},
+			getModels: () => [model],
+			stream: () => {
+				throw new Error("No inference expected");
+			},
+			streamSimple: () => {
+				throw new Error("No inference expected");
+			},
+		});
+		const find = async () => (await fx.get("/api/providers")).providers.find((p: any) => p.id === id);
+		const offered = async () => (await fx.get("/api/models")).providers.find((p: any) => p.id === id);
+		const credentialsBefore = await fx.authStorage.read(id);
+		expect(await find()).toMatchObject({
+			configured: false,
+			supportsApiKeyLogin: false,
+			supportsOAuth: false,
+			externalLogin,
+		});
+		expect(await fx.post("/api/providers/auth/check", { id })).toEqual({ ok: true, configured: false });
+		expect(await offered()).toBeUndefined();
+
+		signedIn = true;
+		expect(await fx.post("/api/providers/auth/check", { id })).toEqual({ ok: true, configured: true });
+		expect(await find()).toMatchObject({ configured: true, authSource: "external", externalLogin });
+		expect((await offered()).models.map((m: any) => m.id)).toContain(model.id);
+		expect(await fx.authStorage.read(id)).toEqual(credentialsBefore);
+
+		await fx.authStorage.modify(id, async () => ({ type: "api_key", key: "old-placeholder" }));
+		signedIn = false;
+		expect(await find()).toMatchObject({ configured: false });
+		expect(await fx.post("/api/providers/auth/check", { id })).toEqual({ ok: true, configured: false });
+		expect(runtime.getProviderAuthStatus(id).configured).toBe(false);
+		expect(await offered()).toBeUndefined();
+		await expect(fx.post("/api/providers/auth/check", { id: "unknown-provider" })).rejects.toThrow(/^404:/);
+		await expect(fx.post("/api/providers/auth/check", { id: fx.faux.getModel().provider })).rejects.toThrow(/^400:/);
+		expect(fx.events.some((event) => event.event === "models_changed")).toBe(true);
+	});
+
 	it("removes credentials for real, including a key written into models.json", async () => {
 		const fx = await start();
 		const agentDir = process.env.MYHARNESS_CODING_AGENT_DIR as string;

@@ -1,39 +1,25 @@
 /**
- * Claude Code shell: MyHarness is the agent; the user's own, unmodified `claude` program only carries its requests on
- * the user's Claude subscription.
+ * Claude Code shell: MyHarness is the interface, the user's own unmodified `claude` program does the work.
  *
- * A chat on this provider gets what a chat on any other provider gets: MyHarness's system prompt (built-in prompt, the
- * mode's personal prompt, the model's own prompt, project and workspace context), MyHarness's tools under their own
- * names with MyHarness's cards and approvals, MyHarness's record of the conversation, and MyHarness's compaction.
- * `claude` (run the way its documentation describes, `claude -p` with stream-json on stdin and stdout) adds none of its
- * own:
- * - Its built-in tools are off (`--tools ""`). MyHarness's tools come from an SDK-hosted MCP server that this file
- *   answers over the control channel, under their own names (CLAUDE_AGENT_SDK_MCP_NO_PREFIX). A call comes back through
- *   the provider as an ordinary tool call, so MyHarness runs it with its own approval and card, and the result MyHarness
- *   records is the one `claude` gets.
- * - The system prompt is MyHarness's, given in the initialize request and rendered fresh for every request
- *   (systemPromptSnapshot false). A changed prompt applies from the next turn on: `claude` only reads it when it starts,
- *   and starting it again between two tool rounds would drop the thinking of the turn under way.
- * - The output limit of a request is MyHarness's for the model (maxTokens, CLAUDE_CODE_MAX_OUTPUT_TOKENS), not
- *   `claude`'s own (128K on Opus). A request that reaches it ends the round as cut off ("length") and `claude` is ended:
- *   it would otherwise ask the model by itself to go on, up to three times, each a request as long as the first,
- *   unseen by MyHarness. The task goes on through MyHarness instead, as many times as it takes: tool calls in the cut
- *   response are failed and asked for again, and a cut response without one is followed by a note (OUTPUT_LIMIT_NOTE)
- *   that asks the model to go on more briefly. Each of those requests is a round of its own, with its own usage.
- * - CLAUDE.md files, auto memory, skills and slash commands, settings files (and with them hooks, plugins, output
- *   styles), other MCP servers, claude.ai connectors, tool search and its own compaction are switched off (LAUNCH_ENV,
- *   launchArgs).
- * What stays is what the program does not let go of (seen in its requests and transcripts, version 2.1.317):
- * - the identity line it puts first ("You are a Claude agent, built on Anthropic's Claude Agent SDK."), after a billing
- *   line (`x-anthropic-billing-header: …`);
- * - once per conversation, a block of its own: the environment (working directory, whether it is a Git repository,
- *   platform, shell, OS version, a rule about downloaded files), the model's name and knowledge cutoff, today's date
- *   and, signed in with a Claude account, the account's email address. Only its bare mode leaves these out, and bare
- *   mode cannot use the subscription's login;
- * - its wording around a message the user sends while it works, and what it says when a request fails;
- * - how it sends a request (cache marks, effort, retries).
+ * The provider never talks to Anthropic and never touches credentials. It runs the official program the way its own
+ * documentation describes (`claude -p` with stream-json on stdin/stdout), with that program's own login and its own
+ * system prompt; its CLAUDE.md files and auto memory are left out (see Instructions below).
  *
- * The provider never talks to Anthropic and never touches credentials: `claude` uses its own login.
+ * Which tools a chat has is MyHarness's decision, as on every other provider: the tools switched on in that chat (its
+ * mode, the user's switches, the sub-agent setting). Tool calls take two routes:
+ * - Reading, writing, editing, searching files and running commands is done by Claude Code's own tools (Read, Write,
+ *   Edit, Grep, Glob, Bash), inside `claude`. Each is offered only while the MyHarness tool it stands in for is switched
+ *   on (OWN_TOOLS_FOR, `--tools`). A call shows here as a `claude_code_tool` card with a one-line summary, which waits
+ *   for the result `claude` reports.
+ * - Every other MyHarness tool that is switched on (web search, memory, earlier chats, schedules, background jobs, the
+ *   to-do list, questions to the user, sub-agents, mail, the built-in browser) is offered to `claude` over a local MCP
+ *   endpoint (loopback, random token per process), all of them in every request (ENABLE_TOOL_SEARCH=false: none sits
+ *   behind a search tool that costs a request of its own). A call comes back through the provider as an ordinary tool
+ *   call, so MyHarness runs it with its own approval and cards.
+ * Nothing else is offered: none of Claude Code's other tools (its sub-agents, skills, web search and fetch, notebooks,
+ * worktrees, monitors), no MCP server of the user's own Claude Code setup (`--strict-mcp-config`) and no connector of
+ * their claude.ai account (ENABLE_CLAUDEAI_MCP_SERVERS=false). A change of the chat's tools applies from the next
+ * turn: `claude` reads its tool list when it starts, so it is started again between turns.
  *
  * What is left of the subscription's plan limits (the 5-hour and the weekly window) shows in the status bar of every
  * Claude Code chat, the same in all of them: the limits belong to the subscription, not to a chat. Any chat's `claude`
@@ -41,53 +27,109 @@
  * window that resets, has a short-lived `claude` asked for them the way its own /usage does (get_usage, with no model
  * request). The usage endpoint behind it refuses frequent questions, so they are few (LIMITS_*).
  *
- * MyHarness's record is the conversation. `claude` keeps its transcript only as a cache. A chat's `claude` goes on, or is
- * resumed at the end of the last turn that ended cleanly (`--resume-session-at`), only while MyHarness's record still
- * starts with exactly the messages it holds (messageKey); it is then sent only what it has not seen. Otherwise a new
- * `claude` conversation gets the earlier messages as text. A process stays open for an hour after its last turn, the
- * lifetime of the subscription's prompt cache. A side request that shares the chat's history, such as MyHarness's
- * compaction summary, runs in a fork of the chat's `claude` conversation, so it reads the chat's cached prefix.
+ * Compaction belongs to `claude` as well: its conversation holds the real context, so these models are marked
+ * managesOwnContext. MyHarness shows how full the window is and neither gates on it nor compacts. "Compact now" is passed
+ * on to `claude`.
  *
- * Nothing of `claude` runs after its reply: MyHarness's own tools (background jobs, schedules, sub-agents) are the only
- * ones it has, and MyHarness's system prompt says how they report back.
+ * Instructions: Claude Code's own system prompt stays, and MyHarness's whole system prompt (its built-in prompt, the
+ * mode's personal prompt, the model's own prompt, project and workspace context) is appended after a short section on
+ * how MyHarness's tool names map to this chat's tools; where the two differ, MyHarness's instructions win. No CLAUDE.md
+ * of any level and no auto memory files are loaded (CLAUDE_CODE_DISABLE_CLAUDE_MDS). The appended prompt is read again
+ * for every request (`--system-prompt-snapshot off`), and a changed one restarts `claude` between turns, never in one.
+ *
+ * Output limit: a request may write at most the model's maxTokens (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not `claude`'s own
+ * 128K. A request that reaches it ends the round as cut off ("length") and the turn in `claude` is interrupted at once:
+ * it would otherwise ask the model by itself to go on, up to three times, each a request as long as the first. The task
+ * goes on through MyHarness instead, as often as it takes: tool calls in the cut response are failed and asked for
+ * again (CUT_CALLS_NOTE), and a cut response without one is followed by a hidden note (OUTPUT_LIMIT_NOTE) asking the
+ * model to go on more briefly.
+ *
+ * Nothing of `claude` may count on a later turn it starts by itself: its background tasks, scheduled and wake-up turns
+ * and monitors would report back into a turn that never comes, and it would promise the user to "check back later".
+ * Those are switched off (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, CLAUDE_CODE_DISABLE_CRON, and the tools are not in
+ * `--tools`), and its own Bash runs each command until it finishes. A process that has to keep running goes through
+ * MyHarness's bash/pwsh (the Background panel). What MyHarness itself brings back in a new turn (a background job that
+ * ends, a sub-agent, a scheduled task) is described by MyHarness's own prompt, and the appended section only says what
+ * of Claude Code does not exist here.
+ *
+ * Client name: `claude` reports MyHarness as the program that started it (ENTRYPOINT, in its billing line, User-Agent
+ * and transcript) instead of `claude -p`'s own `sdk-cli`. It is MyHarness's own name, never one of Anthropic's clients.
+ * Anthropic's servers accept it for this shape of request (Claude Code's own prompt and tools); a request that carries
+ * only another app's prompt and tools under such a name is refused as a third-party app.
  *
  * The Windows installer carries this file and loads it by itself. From source, copy it to ~/.myharness/agent/extensions/
  * and restart MyHarness; a copy there takes over from the bundled one. `claude` must be installed and signed in on that
- * computer.
+ * computer. It runs with bypassPermissions, so `claude`'s own tools do not ask before they act.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { createAssistantMessageEventStream, createProvider, parseStreamingJson } from "@myharness/ai";
 import type { ExtensionAPI } from "@myharness/coding-agent";
+import { Type } from "typebox";
 
 const PROVIDER_ID = "claude-code";
-/** The MCP server that offers MyHarness's tools. `claude` reaches it over the control channel of its stdin and stdout. */
-export const MCP_SERVER = "myharness";
-/** The note that sends a task on after a response cut off at the output limit with no tool call in it. */
-export const OUTPUT_LIMIT_NOTE = "claude-code-output-limit";
-/** An idle `claude` closes after this long: the subscription's prompt cache lives an hour. */
-export const IDLE_CLOSE_MS = 60 * 60_000;
-/** MyHarness's tools can wait for the user, such as a sign-in. */
-const APP_TOOL_TIMEOUT_MS = 24 * 3600_000;
-/** What `claude` puts in an MCP call's `_meta`: the id of its tool_use, which is also the id of MyHarness's card. */
-const TOOL_USE_ID_META = "claudecode/toolUseId";
-/** A call MyHarness never saw is answered after this long instead of waiting for a card that never runs. */
-const UNSEEN_CALL_MS = 60_000;
-const INITIALIZE_TIMEOUT_MS = 60_000;
-/** A process that has not ended this long after its input closed is ended. */
-const CLOSE_GRACE_MS = 3_000;
-const MAX_TOOL_ARGS_CHARS = 2_000;
-const MAX_TOOL_RESULT_CHARS = 20_000;
-const MAX_TRANSCRIPT_CHARS = 800_000;
-const MAX_TRANSCRIPT_IMAGES = 20;
-const DEFAULT_CONTEXT_WINDOW = 1_000_000;
-const MIN_CONTEXT_WINDOW = 100_000;
-/** Links of earlier versions, whose `claude` kept its own prompt and tools, carry no version and are never resumed. */
-const LINK_VERSION = 2;
+const PASSTHROUGH_TOOL = "claude_code_tool";
+const MCP_SERVER = "myharness";
+const MCP_PREFIX = `mcp__${MCP_SERVER}__`;
+/**
+ * Which tools a chat has is MyHarness's decision (the mode, the user's switches, the sub-agent setting): `claude` gets
+ * one of its own tools only while the MyHarness tool it stands in for is switched on in that chat, and every other
+ * MyHarness tool over MCP. These are the MyHarness tools whose work Claude Code's own tool does, by MyHarness's name.
+ * Claude Code tools that stand in for none (its sub-agents, skills, web search and fetch, notebooks, worktrees,
+ * monitors, wake-ups) are never offered: MyHarness's own sub-agents, search and schedules are, when they are on.
+ */
+export const OWN_TOOLS_FOR: Readonly<Record<string, readonly string[]>> = {
+	read: ["Read"],
+	write: ["Write"],
+	edit: ["Edit"],
+	apply_patch: ["Edit", "Write"],
+	grep: ["Grep"],
+	find: ["Glob"],
+	ls: ["Glob"],
+	bash: ["Bash"],
+	pwsh: ["Bash"],
+};
+/**
+ * MyHarness's shells, offered only for a process that keeps running after the reply: `claude`'s own Bash runs every
+ * other command and, with its background tasks off, cannot leave one running. The call always starts a background job,
+ * which the Background panel lists with its output and a stop button.
+ */
+const BACKGROUND_SHELLS: Record<string, string> = {
+	bash: `Start a long-running process (a dev server, a file watcher) in the background of MyHarness and get its job id at once. It keeps running after your reply ends; the user sees it in MyHarness's Background panel with its output and a stop button. Use your own Bash tool for every other command. Read its output with ${MCP_PREFIX}job_output and stop it with ${MCP_PREFIX}job_kill; what MyHarness's instructions say about a background job that ends applies to it.`,
+	pwsh: `The same as ${MCP_PREFIX}bash, in PowerShell: start a long-running process in the background of MyHarness and get its job id at once. Use your own Bash tool for every other command.`,
+};
+/** MyHarness tools `claude` is not offered over MCP: the card tool, and the ones its own tool does the work of. */
+const notOffered = (name: string) =>
+	name === PASSTHROUGH_TOOL || (name in OWN_TOOLS_FOR && !(name in BACKGROUND_SHELLS));
+
+/** Claude Code's own tools for a chat whose MyHarness tools are `active`: the `--tools` list, sorted, without repeats. */
+export function ownToolsFor(active: string[]): string[] {
+	return [...new Set(active.flatMap((name) => OWN_TOOLS_FOR[name] ?? []))].sort();
+}
+
+/** The MyHarness tools of `active` that `claude` gets over MCP, by name. */
+export function offeredNames(active: string[]): string[] {
+	return active.filter((name) => !notOffered(name));
+}
+const BACKGROUND_SHELL_SCHEMA = {
+	type: "object",
+	properties: {
+		command: { type: "string", description: "The command that starts the process." },
+		run_in_background: {
+			type: "boolean",
+			const: true,
+			description: "Always true: the process runs in the background.",
+		},
+	},
+	required: ["command", "run_in_background"],
+	additionalProperties: false,
+};
+const IDLE_CLOSE_MS = 15 * 60_000;
 /** A Claude Code chat that opens asks `claude` for the plan limits when the newest reading is older than this. */
 const LIMITS_FRESH_MS = 5 * 60_000;
 /** At most one such question a minute, and none for ten minutes after one failed: the usage endpoint refuses many. */
@@ -97,181 +139,138 @@ const LIMITS_TIMEOUT_MS = 30_000;
 /** A window that reset is asked about this long after its reset time. */
 const LIMITS_RESET_DELAY_MS = 5_000;
 const MAX_TIMER_MS = 2 ** 31 - 1;
-
-/** Settings `claude` gets on its command line; no settings file is read (`--setting-sources ""`). */
-export const FLAG_SETTINGS = { autoCompactEnabled: false, disableAllHooks: true };
-
+/** A program that has not stopped this long after an interrupt is ended; the next turn resumes the conversation. */
+const INTERRUPT_GRACE_MS = 10_000;
 /**
- * Every part of Claude Code that would add instructions, tools or context of its own, switched off. The variables are
- * the program's own; one it does not know is ignored.
+ * MyHarness's tools can wait for the user, such as a sign-in. `claude` gives up on an MCP tool after 60 s
+ * (`MCP_TOOL_TIMEOUT`) and, separately, after 300 s without a reply or a progress message (the server's `timeout`).
  */
-export const LAUNCH_ENV: Readonly<Record<string, string>> = {
-	// No CLAUDE.md of any level (managed, user, project, local, rules, nested), and no auto memory.
-	CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
-	CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
-	// None of the user's Claude Code customizations (skills, plugins, hooks, MCP servers, commands, agents, output
-	// styles); its sign-in stays.
-	CLAUDE_CODE_SAFE_MODE: "1",
-	// Nothing it would add to the conversation by itself: files named in a message, reminders, and the
-	// "<total_tokens>N tokens left</total_tokens>" note after every message and tool result.
-	CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
-	CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
-	// MyHarness's tools keep the names MyHarness's prompt uses, without the mcp__<server>__ prefix.
-	CLAUDE_AGENT_SDK_MCP_NO_PREFIX: "1",
-	// No connectors of the user's claude.ai account.
-	ENABLE_CLAUDEAI_MCP_SERVERS: "false",
-	// Every tool's definition is in every request: none is deferred behind a search tool.
-	ENABLE_TOOL_SEARCH: "false",
-	// MyHarness compacts with its own prompt; `claude` never does, also not when a request is too long.
-	DISABLE_AUTO_COMPACT: "1",
-	DISABLE_COMPACT: "1",
-	// `claude` gives up on an MCP tool after 60 s by default.
-	MCP_TOOL_TIMEOUT: String(APP_TOOL_TIMEOUT_MS),
-};
-
+const APP_TOOL_TIMEOUT_MS = 24 * 3600_000;
+/** What `claude` puts in an MCP call's `_meta`: the id of its tool_use, which is also the id of MyHarness's card. */
+const TOOL_USE_ID_META = "claudecode/toolUseId";
 /**
- * Variables that would switch `claude` away from the user's own login (or to API-key-only bare mode), or confuse it
- * about where it runs.
+ * A call MyHarness never sees in the main conversation, such as one from `claude`'s own sub-agent, is answered after
+ * this long instead of waiting for a card that never runs. The tool_use event comes before the call, in milliseconds.
  */
-export const STRIPPED_ENV = [
-	"ANTHROPIC_API_KEY",
-	"ANTHROPIC_AUTH_TOKEN",
-	"ANTHROPIC_BASE_URL",
-	"ANTHROPIC_MODEL",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"CLAUDE_CODE_USE_VERTEX",
-	"CLAUDE_CODE_USE_FOUNDRY",
-	"CLAUDE_CODE_SIMPLE",
-	"ELECTRON_RUN_AS_NODE",
-	"CLAUDECODE",
-	"CLAUDE_CODE_ENTRYPOINT",
-];
-
-const MODELS = [
-	{ id: "claude-opus-5-5", name: "Claude Code · Opus 5.5" },
-	{ id: "claude-sonnet-5-5", name: "Claude Code · Sonnet 5.5" },
-	{ id: "claude-fable-5-1", name: "Claude Code · Fable 5.1" },
-	{ id: "claude-haiku-5-5", name: "Claude Code · Haiku 5.5" },
-];
-
-// One registry per process: every chat's extension instance shares the same `claude` children.
-type Shared = {
-	chats: Map<string, Chat>;
-	contexts: Map<string, any>;
-	/** Chats whose next request is MyHarness's compaction summary, not a turn of the conversation. */
-	compacting: Set<string>;
-	runs: Set<ClaudeRun>;
-	models?: any[];
-	exitHook?: boolean;
-	/** The subscription's plan limits as seen last by any chat, shown in every Claude Code chat. */
-	limits?: Limits;
-	/** The get_usage question under way, when the last one was asked, and when one failed last. */
-	limitsQuery?: Promise<void>;
-	limitsQueriedAt?: number;
-	limitsFailedAt?: number;
-	/** Fires when the next window resets. */
-	limitsTimer?: ReturnType<typeof setTimeout>;
-};
-const SHARED_KEY = Symbol.for("myharness.claude-code-shell.v2");
-const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
-	chats: new Map(),
-	contexts: new Map(),
-	compacting: new Set(),
-	runs: new Set(),
-};
-(globalThis as any)[SHARED_KEY] = shared;
-
-const dataDir = () =>
-	path.join(
-		process.env.MYHARNESS_CODING_AGENT_DIR || path.join(os.homedir(), ".myharness", "agent"),
-		"claude-code-shell",
-	);
-
-/** One JSON line per decision when MYHARNESS_CLAUDE_SHELL_TRACE names a file (labs and diagnosis). */
-function trace(record: Record<string, unknown>): void {
-	const file = process.env.MYHARNESS_CLAUDE_SHELL_TRACE;
-	if (!file) return;
-	try {
-		fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`);
-	} catch {}
-}
-
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
-// ---------------------------------------------------------------------------------------------------------------------
-// How `claude` is started
-// ---------------------------------------------------------------------------------------------------------------------
-
-export type LaunchOptions = {
-	model: string;
-	effort?: string;
-	/** `claude`'s conversation to continue, and the message of it to continue after. */
-	resume?: { id: string; at?: string };
-	/** A side request: a new conversation that starts as a copy of `resume`. */
-	fork?: boolean;
-	/** Whether `claude` keeps a transcript of this conversation (only a chat's own conversation does). */
-	persist: boolean;
-};
-
-export function launchArgs(options: LaunchOptions): string[] {
-	const args = [
-		"-p",
-		"--input-format",
-		"stream-json",
-		"--output-format",
-		"stream-json",
-		"--verbose",
-		"--include-partial-messages",
-		"--model",
-		options.model,
-		// None of Claude Code's own tools, no settings files, only MyHarness's MCP server, no skills or slash commands.
-		"--tools",
-		"",
-		"--setting-sources",
-		"",
-		"--settings",
-		JSON.stringify(FLAG_SETTINGS),
-		"--strict-mcp-config",
-		"--disable-slash-commands",
-		"--no-chrome",
-		// MyHarness applies its own approval when a call comes back through the provider.
-		"--permission-mode",
-		"bypassPermissions",
-		"--permission-prompt-tool",
-		"stdio",
-	];
-	if (options.effort) args.push("--effort", options.effort);
-	if (options.resume) {
-		args.push("--resume", options.resume.id);
-		if (options.resume.at) args.push("--resume-session-at", options.resume.at);
-		if (options.fork) args.push("--fork-session");
+const UNSEEN_CALL_MS = 60_000;
+/**
+ * MyHarness bounds what its tools return (50 KB by default) and every model gets a result as MyHarness made it. Left
+ * alone, `claude` saves an MCP result of over 50,000 characters, or 25,000 tokens, to a file and gives the model the
+ * path instead, which a chat without its Read tool could not open. These are the most `claude` lets a tool declare.
+ */
+const APP_RESULT_META = { "anthropic/maxResultSizeChars": 500_000 };
+const APP_RESULT_TOKENS = 125_000;
+const MAX_CARD_CHARS = 30_000;
+const MAX_TOOL_RESULT_CHARS = 20_000;
+const MAX_TRANSCRIPT_CHARS = 800_000;
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+const MIN_CONTEXT_WINDOW = 100_000;
+/** Whatever the user's own Claude Code settings say, these chats have no other compaction. */
+const AUTO_COMPACT_ON = JSON.stringify({ autoCompactEnabled: true });
+/** How MyHarness's checkpoint starts once it is a user message; `claude` already holds its own summary. */
+const CHECKPOINT_PREFIX = "The conversation history before this point has been compacted";
+/** The hidden message that keeps a task going after a response was cut off at the output limit (see turn_end). */
+export const OUTPUT_LIMIT_NOTE = "claude-code-output-limit";
+/** "read → Read, edit and apply_patch → Edit": the MyHarness names of `active` that one of Claude Code's own tools does. */
+function ownEquivalents(active: string[]): string {
+	const byOwn = new Map<string, string[]>();
+	for (const name of active) {
+		const own = OWN_TOOLS_FOR[name]?.join(" and ");
+		if (own) byOwn.set(own, [...(byOwn.get(own) ?? []), name]);
 	}
-	if (!options.persist) args.push("--no-session-persistence");
-	return args;
+	return [...byOwn].map(([own, names]) => `${names.join(" and ")} → ${own}`).join(", ");
+}
+/**
+ * What `claude` is told about where it runs, for a chat whose MyHarness tools are `active` (MyHarness's names): that
+ * MyHarness's instructions follow and win, which of the tool names they use are its own tools and which are app tools,
+ * and what of Claude Code does not exist here. What MyHarness itself can bring back after a reply (a background job, a
+ * sub-agent, a scheduled task) is left to MyHarness's own instructions, which describe it.
+ */
+export function appendPromptFor(active: string[]): string {
+	const offered = offeredNames(active);
+	const tool = (name: string) => `${MCP_PREFIX}${name}`;
+	const shells = ["bash", "pwsh"].filter((name) => offered.includes(name)).map(tool);
+	const equivalents = ownEquivalents(active);
+	const lines = [
+		"# MyHarness",
+		"- You are running inside MyHarness, a desktop app the user chose as the interface for Claude Code.",
+		"- Your replies appear in MyHarness's chat window, which renders Markdown; they are not shown in a terminal.",
+		"- After this section come MyHarness's own instructions: its built-in prompt, the user's personal prompt and model prompt, and project context. Follow all of them; where they differ from Claude Code's instructions above, MyHarness's instructions win.",
+		"",
+		"# Tools in this chat",
+		"- MyHarness decides which tools this chat has. Its instructions name them by MyHarness's plain names.",
+		...(equivalents
+			? [
+					`- These names are your own tools: ${equivalents}. Where MyHarness's instructions describe the arguments of such a tool, your own tool's arguments apply; their rules on when to use it and what to check first still hold.`,
+				]
+			: []),
+		...(offered.length > 0
+			? [
+					`- Every other tool name they list is the ${MCP_PREFIX}<name> tool. MyHarness runs it and shows it to the user.`,
+				]
+			: []),
+		"- A tool they do not list is not available in this chat.",
+		...(shells.length > 0
+			? [
+					`- bash and pwsh: your own Bash runs a command that finishes. Start a process that must keep running after your reply (a dev server, a file watcher) with ${shells.join(" or ")}, which always starts a background job; what MyHarness's instructions say about background jobs applies to it.`,
+				]
+			: []),
+		"",
+		"# What does not exist here",
+		"- Claude Code's own wake-ups, scheduled turns, loops, monitors, background tasks and task notifications do not exist in this app. Your own Bash commands run in the foreground: each one finishes before you go on.",
+		"- After your reply ends, only what MyHarness's instructions name can bring you back. Never say you will check back or report later on anything else.",
+	];
+	return lines.join("\n");
+}
+/** What `claude` gets appended to its own system prompt in a chat: the section above, then MyHarness's whole prompt. */
+export function appendedPrompt(active: string[], systemPrompt: string | undefined): string {
+	return [appendPromptFor(active), (systemPrompt ?? "").trim()].filter(Boolean).join("\n\n");
 }
 
-export function launchEnv(base: NodeJS.ProcessEnv, oneShot: boolean, maxOutputTokens?: number): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...base };
-	for (const name of STRIPPED_ENV) delete env[name];
-	Object.assign(env, LAUNCH_ENV);
-	// A request whose prefix no other request shares is not worth an hour of cache.
-	if (oneShot) env.CLAUDE_CODE_PROMPT_CACHE_TTL = "5m";
-	// MyHarness's output limit for the model in place of `claude`'s own: it bounds a request whose thinking runs on.
-	if (maxOutputTokens) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxOutputTokens);
-	return env;
+/** A file inside the chat's folder is named from that folder ("src/app.ts"); any other by its whole path. */
+function shownPath(file: string, cwd: string | undefined): string {
+	if (!file || !cwd || !path.isAbsolute(file)) return file;
+	const relative = path.relative(cwd, file);
+	return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative.replace(/\\/g, "/") : file;
 }
+
+/**
+ * What a tool `claude` runs by itself is doing, in one line, for its card: "Read src/app.ts", "Bash npm test". `claude`
+ * names files by their whole path; `cwd` is the chat's folder.
+ */
+export function callSummary(name: string, input: any, cwd?: string): string {
+	const text = (value: unknown) => (typeof value === "string" ? value : "");
+	const file = (value: unknown) => shownPath(text(value), cwd);
+	const subject =
+		name === "Bash"
+			? text(input?.command)
+			: name === "Grep" || name === "Glob"
+				? [text(input?.pattern), file(input?.path) || text(input?.glob)].filter(Boolean).join(" · ")
+				: file(input?.file_path) || file(input?.path) || text(input?.pattern) || text(input?.command);
+	const line = subject.split(/\r?\n/, 1)[0].slice(0, 160);
+	return line ? `${name} ${line}` : name;
+}
+
+const partsOf = (message: any): any[] => (Array.isArray(message?.content) ? message.content : []);
 
 /**
  * What the model reads before it goes on after a response cut off at the output limit with no tool call in it. The
- * thinking of a cut-off request is gone (`claude` keeps none of it either), so a response that wrote nothing is asked
- * to go on more briefly, and one that wrote text to go on from where it stopped.
+ * thinking of a cut-off request is not kept, so a response that wrote nothing is asked to go on more briefly, and one
+ * that wrote text to go on from where it stopped.
  */
 export function outputLimitNote(message: any): string {
 	const wrote = partsOf(message).some((part) => part.type === "text" && String(part.text ?? "").trim());
 	return wrote
-		? "[system-reminder] Your last response was cut off at the output limit. Go on from where it stopped, without repeating what it already wrote, and keep each response well within the limit: split large work into smaller steps."
-		: "[system-reminder] Your last response reached the output limit while still thinking, before it wrote any text or tool call, and that thinking is lost. Go on with the task from the conversation above: think much more briefly, and write your answer or next tool call well within the limit, splitting large work into smaller steps.";
+		? `[system-reminder] Your last response was cut off at the output limit. ${STOPPED_BY_APP} Go on from where it stopped, without repeating what it already wrote, and keep each response well within the limit: split large work into smaller steps.`
+		: `[system-reminder] Your last response reached the output limit while still thinking, before it wrote any text or tool call, and that thinking is lost. ${STOPPED_BY_APP} Go on with the task from the conversation above: think much more briefly, and write your answer or next tool call well within the limit, splitting large work into smaller steps.`;
 }
+
+/** `claude` marks the turn it was told to stop as interrupted by the user, and refuses the calls of a cut response. */
+const STOPPED_BY_APP =
+	"MyHarness stopped that request there; an interruption or refused tool call shown above comes from that, not from the user.";
+
+/** What `claude` reads after a response cut off at the output limit whose tool calls were therefore never run. */
+export const CUT_CALLS_NOTE = `[system-reminder] Your last response was cut off at the output limit, so none of its tool calls ran. ${STOPPED_BY_APP} Go on with the task: make the calls again, and keep each response well within the limit, splitting large work into smaller steps.`;
 
 /**
  * The most a request may write, thinking included: the model's maxTokens, as on MyHarness's own Anthropic requests. A
@@ -283,29 +282,130 @@ export function outputLimitFor(model: any): number | undefined {
 	return Number.isFinite(limit) && limit > 0 ? limit : undefined;
 }
 
-/** The first line `claude` reads: MyHarness's system prompt in place of Claude Code's, and MyHarness's MCP server. */
-export function initializeRequest(systemPrompt: string, withTools: boolean): Record<string, unknown> {
-	return {
-		subtype: "initialize",
-		systemPrompt: [systemPrompt],
-		systemPromptSnapshot: false,
-		...(withTools
-			? {
-					sdkMcpServers: [MCP_SERVER],
-					sdkMcpServerConfigs: { [MCP_SERVER]: { timeout: APP_TOOL_TIMEOUT_MS } },
-				}
-			: {}),
-	};
+/** Variables that would switch `claude` away from the user's own login, or confuse it about where it runs. */
+export const STRIPPED_ENV = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_MODEL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ELECTRON_RUN_AS_NODE",
+	"CLAUDECODE",
+	"CLAUDE_CODE_ENTRYPOINT",
+	"DISABLE_AUTO_COMPACT",
+	"DISABLE_COMPACT",
+	"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+];
+
+/**
+ * The client name `claude` reports with every request (`cc_entrypoint` in its billing line, its User-Agent and the
+ * transcript's `entrypoint`), set over any inherited one. Left alone, `claude -p` reports `sdk-cli`, and users measured
+ * requests under the `sdk-*` names using the subscription's 5-hour window about 1.7 to 2.4 times as fast per token as
+ * the same work under a client's own name (anthropics/claude-code#97074; Anthropic has not said whether that is
+ * intended, and it was not measured on this account). This names MyHarness itself, never one of Anthropic's own clients
+ * (`cli`, `claude-desktop`, `claude-vscode`).
+ */
+export const ENTRYPOINT = "myharness";
+
+/** The environment `claude` starts with. */
+export function launchEnv(
+	base: NodeJS.ProcessEnv,
+	maxOutputTokens: number | undefined,
+	contextWindow: number,
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...base };
+	for (const name of STRIPPED_ENV) delete env[name];
+	env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(contextWindow);
+	env.MCP_TOOL_TIMEOUT = String(APP_TOOL_TIMEOUT_MS);
+	// Nothing of it may wait for a later turn of its own (see the top of this file): its Bash runs in the foreground,
+	// and it has no scheduled turns.
+	env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+	env.CLAUDE_CODE_DISABLE_CRON = "1";
+	// MyHarness's prompt instead: no CLAUDE.md of any level (user, project, local) and no auto memory files.
+	env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+	// MyHarness's tools are in every request, not behind a search tool that costs a request of its own to find one;
+	// and no tools from the connectors of the user's claude.ai account, which MyHarness does not switch.
+	env.ENABLE_TOOL_SEARCH = "false";
+	env.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
+	// A MyHarness tool's result reaches the model as MyHarness bounded it (see APP_RESULT_META).
+	env.MAX_MCP_OUTPUT_TOKENS = String(APP_RESULT_TOKENS);
+	env.CLAUDE_CODE_ENTRYPOINT = ENTRYPOINT;
+	// What `claude` leaves out by itself only for the `sdk-*` client names, off again: the small-model request that
+	// names each conversation, the Artifact feature, and feedback that Claude drafts to Anthropic.
+	env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1";
+	env.CLAUDE_CODE_DISABLE_ARTIFACT = "1";
+	env.CLAUDE_CODE_SEND_FEEDBACK = "0";
+	// MyHarness's output limit for the model in place of `claude`'s own: it bounds a request whose thinking runs on.
+	if (maxOutputTokens) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxOutputTokens);
+	return env;
 }
 
-/** MyHarness's tools as `tools/list` returns them. */
-export function toolList(tools: any[]): any[] {
-	return tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description ?? "",
-		inputSchema: JSON.parse(JSON.stringify(tool.parameters ?? { type: "object", properties: {} })),
-	}));
+const MODELS = [
+	{ id: "claude-opus-5-5", name: "Claude Code · Opus 5.5" },
+	{ id: "claude-sonnet-5-5", name: "Claude Code · Sonnet 5.5" },
+	{ id: "claude-fable-5-1", name: "Claude Code · Fable 5.1" },
+	{ id: "claude-haiku-5-5", name: "Claude Code · Haiku 5.5" },
+];
+
+// One registry per process: every chat's extension instance shares the same `claude` children and MCP endpoint.
+type Shared = {
+	sessions: Map<string, CliSession>;
+	contexts: Map<string, any>;
+	configFiles: Set<string>;
+	/** Chats whose next request is MyHarness's summary, not a turn of the conversation. */
+	compacting: Set<string>;
+	models?: any[];
+	mcp?: McpEndpoint;
+	/** The subscription's plan limits as seen last by any chat, shown in every Claude Code chat. */
+	limits?: Limits;
+	/** The get_usage question under way, when the last one was asked, and when one failed last. */
+	limitsQuery?: Promise<void>;
+	limitsQueriedAt?: number;
+	limitsFailedAt?: number;
+	/** Fires when the next window resets. */
+	limitsTimer?: ReturnType<typeof setTimeout>;
+};
+const SHARED_KEY = Symbol.for("myharness.claude-code-shell");
+const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
+	sessions: new Map(),
+	contexts: new Map(),
+	configFiles: new Set(),
+	compacting: new Set(),
+};
+(globalThis as any)[SHARED_KEY] = shared;
+
+/** An app tool `claude` called: the card MyHarness runs and the MCP request `claude` sends meet here, in either order. */
+type AppCall = {
+	name: string;
+	/** The arguments as stable JSON; unknown while they are still streaming. */
+	key?: string;
+	/** An MCP request belongs to this call. */
+	claimed: boolean;
+	result?: any;
+	waiters: ((result: any) => void)[];
+};
+type AppRequest = { name: string; key: string; toolUseId?: string; done: (result: any) => void };
+const appError = (text: string) => ({ content: [{ type: "text", text }], isError: true });
+
+type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
 }
+
+const dataDir = () =>
+	path.join(
+		process.env.MYHARNESS_CODING_AGENT_DIR || path.join(os.homedir(), ".myharness", "agent"),
+		"claude-code-shell",
+	);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Locating the program and remembering which Claude Code conversation belongs to which chat
+// ---------------------------------------------------------------------------------------------------------------------
 
 function compareVersions(a: string, b: string): number {
 	const left = a.split(".").map(Number);
@@ -349,214 +449,29 @@ function findClaude(): string | undefined {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// MyHarness's record and the conversation `claude` holds
-// ---------------------------------------------------------------------------------------------------------------------
-
-const sha = (text: string) => createHash("sha256").update(text).digest("hex");
-
-function partsOf(message: any): any[] {
-	return typeof message.content === "string" ? [{ type: "text", text: message.content }] : (message.content ?? []);
-}
-
-function textOf(parts: any[]): string {
-	return parts
-		.filter((part) => part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\n");
-}
-
-/** A message MyHarness adds anew to every request (the reminder with the working directory and model) and never keeps. */
-export const isTransient = (message: any) => message.role === "user" && !message.timestamp;
-
+type LinkEntry = { claudeSessionId: string; cwd: string };
 /**
- * What identifies a message of MyHarness's record, for telling whether `claude`'s conversation still matches it. None
- * for a transient message, and none for an assistant message that ended in an error or was stopped: providers leave
- * those out of a request. A user message is told by what the model reads, not by its timestamp: MyHarness stamps a note
- * it adds (the local time) when making it and again a few milliseconds later when writing it down, and a request built
- * from the session file (after a restart, or for the compaction summary) carries the written stamp.
+ * Which Claude Code conversation each chat continues. Not `sessions.json`: a chat this version has not seen may have gone
+ * on under the 2026-11-08 version, which kept its own links, so a link from that file can point at a conversation that
+ * stops before the chat's latest turns. Such a chat starts a new conversation with its earlier messages as text, once.
  */
-export function messageKey(message: any): string | undefined {
-	if (message.role === "assistant") {
-		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
-		if (message.responseId) return `a:${message.responseId}`;
-		const calls = partsOf(message)
-			.filter((part) => part.type === "toolCall")
-			.map((part) => part.id)
-			.join(",");
-		return `a:${sha(textOf(partsOf(message))).slice(0, 16)}:${calls}`;
-	}
-	if (message.role === "toolResult") return `t:${message.toolCallId}`;
-	if (message.role === "user" && !isTransient(message)) {
-		const parts = partsOf(message);
-		const images = parts
-			.filter((part) => part.type === "image")
-			.map((part) => String(part.data ?? "").length)
-			.join(",");
-		return `u:${sha(textOf(parts)).slice(0, 16)}:${images}`;
-	}
-	return undefined;
-}
-
-export type Keyed = { message: any; key: string };
-
-export function keyedMessages(messages: any[]): Keyed[] {
-	const keyed: Keyed[] = [];
-	for (const message of messages) {
-		const key = messageKey(message);
-		if (key) keyed.push({ message, key });
-	}
-	return keyed;
-}
-
-export const hashKeys = (keys: string[]) => sha(keys.join("\n"));
-
-export function startsWith(keyed: Keyed[], keys: string[]): boolean {
-	if (keyed.length < keys.length) return false;
-	for (let i = 0; i < keys.length; i++) if (keyed[i].key !== keys[i]) return false;
-	return true;
-}
-
-/** A user message's parts as Anthropic content blocks. */
-export function userContent(message: any): any[] {
-	return partsOf(message)
-		.filter((part) => part.type === "text" || part.type === "image")
-		.map((part) =>
-			part.type === "image"
-				? { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } }
-				: { type: "text", text: part.text ?? "" },
-		);
-}
-
-function transcriptLine(message: any, image: (part: any) => string): string {
-	const parts = partsOf(message);
-	if (message.role === "toolResult") {
-		const text = parts.map((part) => (part.type === "image" ? image(part) : (part.text ?? ""))).join("\n");
-		const clipped = text.length > MAX_TOOL_RESULT_CHARS ? `${text.slice(0, MAX_TOOL_RESULT_CHARS)} ...` : text;
-		return `tool result (${message.toolName}${message.isError ? ", error" : ""}): ${clipped}`;
-	}
-	const pieces = parts
-		.map((part) => {
-			if (part.type === "text") return part.text ?? "";
-			if (part.type === "image") return image(part);
-			if (part.type === "toolCall") {
-				const args = JSON.stringify(part.arguments ?? {});
-				return `[called ${part.name} ${args.length > MAX_TOOL_ARGS_CHARS ? `${args.slice(0, MAX_TOOL_ARGS_CHARS)} ...` : args}]`;
-			}
-			return "";
-		})
-		.filter(Boolean);
-	return pieces.length ? `${message.role}: ${pieces.join("\n")}` : "";
-}
-
-/**
- * Messages of MyHarness's record that `claude`'s conversation never held, as one text block (and their newest images),
- * for a conversation that starts anew or missed some messages. Newest first under a size limit, so a limit only ever
- * costs the oldest messages.
- */
-export function earlierBlocks(messages: any[]): any[] {
-	let first = messages.length;
-	let total = 0;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const size = transcriptLine(messages[i], () => "[image]").length;
-		if (first < messages.length && total + size > MAX_TRANSCRIPT_CHARS) break;
-		total += size;
-		first = i;
-	}
-	const included = messages.slice(first);
-	const kept = new Set<any>();
-	for (let i = included.length - 1; i >= 0 && kept.size < MAX_TRANSCRIPT_IMAGES; i--) {
-		const images = partsOf(included[i]).filter((part) => part.type === "image" && part.data);
-		for (let j = images.length - 1; j >= 0 && kept.size < MAX_TRANSCRIPT_IMAGES; j--) kept.add(images[j]);
-	}
-	const attached: any[] = [];
-	const lines = included
-		.map((message) =>
-			transcriptLine(message, (part) => {
-				if (!kept.has(part)) return "[image]";
-				attached.push(part);
-				return `[image ${attached.length}]`;
-			}),
-		)
-		.filter(Boolean);
-	if (!lines.length && !attached.length) return [];
-	const omitted = first > 0 ? `\n(${first} older messages are not included.)` : "";
-	const blocks: any[] = [
-		{
-			type: "text",
-			text: `<earlier-conversation>\nMessages of this chat that were not part of this conversation, oldest first:${omitted}\n\n${lines.join("\n\n")}\n</earlier-conversation>`,
-		},
-	];
-	attached.forEach((part, index) => {
-		blocks.push({ type: "text", text: `[image ${index + 1}]` });
-		blocks.push({ type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } });
-	});
-	return blocks;
-}
-
-/**
- * What to send `claude` for the messages it has not seen: the earlier ones as text, then the user's newest messages as
- * they are. With no new user message (a turn resumed between two tool rounds), it is asked to go on.
- */
-export function turnContent(rest: any[]): any[] {
-	let cut = rest.length;
-	while (cut > 0 && rest[cut - 1].role === "user") cut--;
-	const content = [...earlierBlocks(rest.slice(0, cut)), ...rest.slice(cut).flatMap(userContent)];
-	if (cut === rest.length) content.push({ type: "text", text: "Continue where you left off." });
-	return content;
-}
-
-// Which `claude` conversation belongs to which chat, at the end of its last clean turn
-
-type Link = {
-	v: number;
-	claudeSessionId: string;
-	cwd: string;
-	/** How many keyed messages of MyHarness's record the conversation holds, and their hashKeys. */
-	count: number;
-	hash: string;
-	/** `claude`'s last message of that turn, where a resumed conversation continues. */
-	uuid?: string;
-	/** sha of the transient text the conversation was given last. */
-	reminder: string;
-};
-
-const linkFile = (sessionId: string) => path.join(dataDir(), "links", `${encodeURIComponent(sessionId)}.json`);
-
-function readLink(sessionId: string): Link | undefined {
+const linksFile = () => path.join(dataDir(), "classic-links.json");
+function readLinks(): Record<string, LinkEntry> {
 	try {
-		const link = JSON.parse(fs.readFileSync(linkFile(sessionId), "utf8"));
-		return link?.v === LINK_VERSION && typeof link.claudeSessionId === "string" ? link : undefined;
+		return JSON.parse(fs.readFileSync(linksFile(), "utf8"));
 	} catch {
-		return undefined;
+		return {};
 	}
 }
-
-function writeLink(sessionId: string, link: Link | undefined): void {
-	const file = linkFile(sessionId);
-	try {
-		if (!link) {
-			fs.rmSync(file, { force: true });
-			return;
-		}
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const temporary = `${file}.${process.pid}.tmp`;
-		fs.writeFileSync(temporary, JSON.stringify(link, null, "\t"));
-		fs.renameSync(temporary, file);
-	} catch {}
+function writeLink(sessionId: string, entry: LinkEntry | undefined): void {
+	const links = readLinks();
+	if (entry) links[sessionId] = entry;
+	else delete links[sessionId];
+	fs.mkdirSync(dataDir(), { recursive: true });
+	const temporary = `${linksFile()}.${process.pid}.tmp`;
+	fs.writeFileSync(temporary, JSON.stringify(links, null, "\t"));
+	fs.renameSync(temporary, linksFile());
 }
-
-/** A link fits a request when MyHarness's record still starts with the messages the conversation holds. */
-function linkFits(link: Link | undefined, keyed: Keyed[], cwd: string): link is Link {
-	return (
-		!!link &&
-		path.resolve(link.cwd) === path.resolve(cwd) &&
-		keyed.length >= link.count &&
-		hashKeys(keyed.slice(0, link.count).map((item) => item.key)) === link.hash
-	);
-}
-
-// Context length, set by the user in Settings → Providers → Claude Code or /context-length
 
 const settingsFile = () => path.join(dataDir(), "settings.json");
 function saveContextWindow(tokens: number): void {
@@ -586,135 +501,87 @@ function parseContextWindow(text: string): number | undefined {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// One running `claude`
+// Local MCP endpoint offering MyHarness's tools to `claude`
 // ---------------------------------------------------------------------------------------------------------------------
 
-type RunHandlers = {
-	onEvent: (event: any) => void;
-	onControl: (request: any) => Promise<object>;
-	onExit: (problem: string | undefined) => void;
-};
+type McpEndpoint = { server: Server; port: number; token: string };
 
-class ClaudeRun {
-	readonly child: ChildProcess;
-	claudeSessionId?: string;
-	exited = false;
-	private readonly handlers: RunHandlers;
-	private stderr = "";
-	private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+function stableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	if (value && typeof value === "object") {
+		const entries = Object.entries(value as object)
+			.filter(([, item]) => item !== undefined)
+			.sort(([a], [b]) => (a < b ? -1 : 1));
+		return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
 
-	constructor(binary: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, handlers: RunHandlers) {
-		this.handlers = handlers;
-		const child = spawn(binary, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-		this.child = child;
-		shared.runs.add(this);
-		child.stderr?.on("data", (chunk) => {
-			this.stderr = `${this.stderr}${chunk}`.slice(-2000);
+function ensureMcp(): Promise<McpEndpoint> {
+	if (shared.mcp) return Promise.resolve(shared.mcp);
+	const token = randomBytes(32).toString("hex");
+	const server = createServer((request, response) => {
+		const match = /^\/mcp\/([^/?]+)/.exec(request.url ?? "");
+		if (request.method !== "POST" || !match || request.headers.authorization !== `Bearer ${token}`) {
+			response.writeHead(request.headers.authorization === `Bearer ${token}` ? 405 : 401).end();
+			return;
+		}
+		const session = shared.sessions.get(decodeURIComponent(match[1]));
+		let body = "";
+		request.on("data", (chunk) => {
+			body += chunk;
 		});
-		child.stdin?.on("error", () => {});
-		child.on("error", (error) => this.finish(error.message));
-		// "close" comes after the last line of its output has been read, "exit" may come before.
-		child.on("close", (code) => this.finish(code ? `claude 退出，代码 ${code}` : undefined));
-		createInterface({ input: child.stdout! }).on("line", (line) => {
-			let event: any;
+		request.on("end", async () => {
+			let message: any;
 			try {
-				event = JSON.parse(line);
+				message = JSON.parse(body);
 			} catch {
+				response.writeHead(400).end();
 				return;
 			}
-			this.onLine(event);
-		});
-	}
-
-	private onLine(event: any): void {
-		if (event.type === "control_response") {
-			const response = event.response ?? {};
-			const waiting = this.pending.get(response.request_id);
-			if (!waiting) return;
-			this.pending.delete(response.request_id);
-			if (response.subtype === "error") waiting.reject(new Error(response.error || "claude 拒绝了这个请求"));
-			else waiting.resolve(response.response ?? {});
-			return;
-		}
-		if (event.type === "control_request") {
-			void this.answer(event);
-			return;
-		}
-		if (event.type === "control_cancel_request" || event.type === "keep_alive") return;
-		if (event.type === "system" && event.subtype === "init") this.claudeSessionId = event.session_id;
-		this.handlers.onEvent(event);
-	}
-
-	private async answer(event: any): Promise<void> {
-		let response: object;
-		try {
-			response = {
-				subtype: "success",
-				request_id: event.request_id,
-				response: await this.handlers.onControl(event.request ?? {}),
+			if (message.id === undefined) {
+				response.writeHead(202).end();
+				return;
+			}
+			const reply = (payload: object) => {
+				response.writeHead(200, { "content-type": "application/json" });
+				response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, ...payload }));
 			};
-		} catch (error) {
-			response = { subtype: "error", request_id: event.request_id, error: errorText(error) };
-		}
-		this.send({ type: "control_response", response });
-	}
-
-	send(value: unknown): void {
-		if (!this.exited) this.child.stdin?.write(`${JSON.stringify(value)}\n`);
-	}
-
-	request(body: Record<string, unknown>, timeoutMs: number): Promise<any> {
-		const requestId = randomUUID();
-		return new Promise((resolve, reject) => {
-			if (this.exited) {
-				reject(new Error("claude 已退出"));
-				return;
+			if (message.method === "initialize") {
+				reply({
+					result: {
+						protocolVersion: message.params?.protocolVersion ?? "2025-03-26",
+						capabilities: { tools: {} },
+						serverInfo: { name: MCP_SERVER, version: "1.0.0" },
+					},
+				});
+			} else if (message.method === "ping") {
+				reply({ result: {} });
+			} else if (message.method === "tools/list") {
+				reply({ result: { tools: session?.offeredTools() ?? [] } });
+			} else if (message.method === "tools/call" && session) {
+				const toolUseId = message.params?._meta?.[TOOL_USE_ID_META];
+				reply({
+					result: await session.waitForAppTool(
+						message.params?.name,
+						message.params?.arguments ?? {},
+						typeof toolUseId === "string" && toolUseId ? toolUseId : undefined,
+					),
+				});
+			} else {
+				reply({ error: { code: -32601, message: `Unsupported method: ${message.method}` } });
 			}
-			const timer = setTimeout(() => {
-				this.pending.delete(requestId);
-				reject(new Error(`claude 没有回应 ${body.subtype} 请求`));
-			}, timeoutMs);
-			timer.unref?.();
-			this.pending.set(requestId, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				reject: (error) => {
-					clearTimeout(timer);
-					reject(error);
-				},
-			});
-			this.send({ type: "control_request", request_id: requestId, request: body });
 		});
-	}
-
-	sendUser(content: any[]): void {
-		this.send({ type: "user", session_id: "", parent_tool_use_id: null, message: { role: "user", content } });
-	}
-
-	private finish(problem: string | undefined): void {
-		if (this.exited) return;
-		this.exited = true;
-		shared.runs.delete(this);
-		const detail = problem && this.stderr.trim() ? `${problem}\n${this.stderr.trim()}` : problem;
-		for (const waiting of this.pending.values()) waiting.reject(new Error(detail ?? "claude 已退出"));
-		this.pending.clear();
-		this.handlers.onExit(detail);
-	}
-
-	/** Ends the program. `now` for a turn that must not go on alone; otherwise it may first finish writing. */
-	stop(now: boolean): void {
-		if (this.exited) return;
-		this.child.stdin?.end();
-		if (now) {
-			this.child.kill();
-			return;
-		}
-		setTimeout(() => {
-			if (!this.exited) this.child.kill();
-		}, CLOSE_GRACE_MS).unref();
-	}
+	});
+	return new Promise((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			server.unref();
+			const address = server.address();
+			shared.mcp = { server, port: typeof address === "object" && address ? address.port : 0, token };
+			resolve(shared.mcp);
+		});
+	});
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -818,22 +685,27 @@ function usesClaudeCode(ctx: any): boolean {
 	}
 }
 
-function setLimitsStatus(ctx: any, text: string | undefined): void {
+/** One status line per chat: the plan limits, the same in every chat, and what this chat's `claude` is doing. */
+function showStatus(
+	sessionId: string,
+	ctx: any = shared.contexts.get(sessionId),
+	onClaudeCode = usesClaudeCode(ctx),
+): void {
+	const limits = onClaudeCode ? limitsText(shared.limits ?? {}, Date.now()) : undefined;
+	const compacting = shared.sessions.get(sessionId)?.compactingNow ? "Claude Code 正在压缩上下文…" : undefined;
 	try {
-		ctx?.ui?.setStatus?.(PROVIDER_ID, text);
+		ctx?.ui?.setStatus?.(PROVIDER_ID, [limits, compacting].filter(Boolean).join(" · ") || undefined);
 	} catch {}
 }
 
 /** Every open Claude Code chat shows the same limits. */
 function showLimits(): void {
-	const text = limitsText(shared.limits ?? {}, Date.now());
-	for (const ctx of shared.contexts.values()) if (usesClaudeCode(ctx)) setLimitsStatus(ctx, text);
+	for (const [sessionId, ctx] of shared.contexts) showStatus(sessionId, ctx);
 }
 
-function noteLimits(next: Limits, source: string): void {
+function noteLimits(next: Limits): void {
 	if (!LIMIT_WINDOWS.some((name) => next[name])) return;
 	shared.limits = mergeLimits(shared.limits ?? {}, next);
-	trace({ event: "limits", source, limits: shared.limits });
 	showLimits();
 	scheduleLimitsReset();
 }
@@ -875,11 +747,10 @@ function refreshLimits(): Promise<void> {
 	const query: Promise<void> = queryLimits()
 		.then((limits) => {
 			shared.limitsFailedAt = undefined;
-			noteLimits(limits, "get_usage");
+			noteLimits(limits);
 		})
-		.catch((error) => {
+		.catch(() => {
 			shared.limitsFailedAt = Date.now();
-			trace({ event: "limits", source: "get_usage", error: errorText(error) });
 		})
 		.finally(() => {
 			if (shared.limitsQuery === query) shared.limitsQuery = undefined;
@@ -892,168 +763,321 @@ function refreshLimits(): Promise<void> {
  * A `claude` of its own answers get_usage and ends: no model request, about a second. It uses the user's login like
  * every other `claude` here; nothing reads it here.
  */
-async function queryLimits(): Promise<Limits> {
+function queryLimits(): Promise<Limits> {
 	const binary = findClaude();
-	if (!binary) throw new Error("找不到 claude 程序");
+	if (!binary) return Promise.reject(new Error("找不到 claude 程序"));
 	const observedAt = Date.now();
-	const run = new ClaudeRun(binary, LIMITS_ARGS, launchEnv(process.env, false), os.homedir(), {
-		onEvent: () => {},
-		onControl: async (request) => {
-			throw new Error(`Unsupported: ${request.subtype}`);
-		},
-		onExit: () => {},
+	return new Promise((resolve, reject) => {
+		const env = launchEnv(process.env, undefined, readContextWindow());
+		const child = spawn(binary, LIMITS_ARGS, {
+			cwd: os.homedir(),
+			env,
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
+		let settled = false;
+		const finish = (problem: string | undefined, limits?: Limits) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			child.stdin?.end();
+			setTimeout(() => {
+				if (child.exitCode === null) child.kill();
+			}, 3000).unref();
+			if (limits) resolve(limits);
+			else reject(new Error(problem ?? "claude 没有给出额度"));
+		};
+		const timer = setTimeout(() => finish("claude 没有回应 get_usage 请求"), LIMITS_TIMEOUT_MS);
+		timer.unref?.();
+		const ask = (id: string, request: object) =>
+			child.stdin?.write(`${JSON.stringify({ type: "control_request", request_id: id, request })}\n`);
+		child.stdin?.on("error", () => {});
+		child.on("error", (error) => finish(error.message));
+		child.on("close", () => finish("claude 已退出"));
+		createInterface({ input: child.stdout! }).on("line", (line) => {
+			let event: any;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				return;
+			}
+			if (event.type !== "control_response") return;
+			const response = event.response ?? {};
+			if (response.subtype === "error") {
+				finish(response.error || "claude 拒绝了这个请求");
+			} else if (response.request_id === "limits-initialize") {
+				ask("limits-usage", { subtype: "get_usage", skip_behaviors: true });
+			} else if (response.request_id === "limits-usage") {
+				const limits = limitsFromUsage(response.response ?? {}, observedAt);
+				finish(undefined, LIMIT_WINDOWS.some((name) => limits[name]) ? limits : undefined);
+			}
+		});
+		ask("limits-initialize", { subtype: "initialize" });
 	});
-	try {
-		await run.request({ subtype: "initialize" }, INITIALIZE_TIMEOUT_MS);
-		const answer = await run.request({ subtype: "get_usage", skip_behaviors: true }, LIMITS_TIMEOUT_MS);
-		const limits = limitsFromUsage(answer, observedAt);
-		if (!LIMIT_WINDOWS.some((name) => limits[name])) throw new Error("claude 没有给出额度");
-		return limits;
-	} finally {
-		run.stop(false);
-	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// A chat's conversation with `claude`, and side requests
+// One running `claude` per chat
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** An app tool `claude` called: the card MyHarness runs and the MCP request `claude` sends meet here, in either order. */
-type AppCall = {
-	name: string;
-	/** The arguments as stable JSON; unknown while they are still streaming. */
-	key?: string;
-	/** An MCP request belongs to this call. */
-	claimed: boolean;
-	result?: any;
-	waiters: ((result: any) => void)[];
-};
-type AppRequest = { name: string; key: string; toolUseId?: string; done: (result: any) => void };
-const appError = (text: string) => ({ content: [{ type: "text", text }], isError: true });
+function userContent(message: any): any[] {
+	const parts =
+		typeof message.content === "string" ? [{ type: "text", text: message.content }] : (message.content ?? []);
+	return parts.map((part: any) =>
+		part.type === "image"
+			? { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } }
+			: { type: "text", text: part.text ?? "" },
+	);
+}
 
-function stableJson(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-	if (value && typeof value === "object") {
-		const entries = Object.entries(value as object)
-			.filter(([, item]) => item !== undefined)
-			.sort(([a], [b]) => (a < b ? -1 : 1));
-		return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+function plainText(content: any): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part: any) => {
+			if (part.type === "text") return part.text;
+			if (part.type === "thinking") return "";
+			if (part.type === "toolCall") return `[tool ${part.name}: ${JSON.stringify(part.arguments).slice(0, 300)}]`;
+			if (part.type === "image") return "[image]";
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+/** What an earlier part of a chat said, for a Claude Code conversation that did not see it happen. */
+function renderTranscript(messages: any[]): string {
+	const lines: string[] = [];
+	let total = 0;
+	// Newest first, so a limit only ever costs the oldest messages. A compacted chat is far below it, summary included.
+	for (let i = messages.length - 1; i >= 0 && total < MAX_TRANSCRIPT_CHARS; i--) {
+		const message = messages[i];
+		const text = plainText(message.content);
+		if (!text) continue;
+		const isTool = message.role === "toolResult";
+		const clipped =
+			isTool && text.length > MAX_TOOL_RESULT_CHARS ? `${text.slice(0, MAX_TOOL_RESULT_CHARS)} ...` : text;
+		lines.unshift(`${isTool ? `tool result (${message.toolName})` : message.role}: ${clipped}`);
+		total += clipped.length;
 	}
-	return JSON.stringify(value) ?? "null";
+	return lines.join("\n\n");
 }
 
-/** The MyHarness tool a tool_use names. Should a `claude` ignore CLAUDE_AGENT_SDK_MCP_NO_PREFIX, the prefix comes off. */
-function appToolName(name: string | undefined): string {
-	const prefix = `mcp__${MCP_SERVER}__`;
-	return name?.startsWith(prefix) ? name.slice(prefix.length) : (name ?? "");
-}
-
-type StartOptions = {
-	model: any;
-	effort?: string;
-	maxOutputTokens?: number;
-	systemPrompt: string;
-	tools: any[];
-	resume?: Link;
-	fork?: boolean;
-};
-
-/**
- * A chat's conversation with `claude` (side false), or one side request (side true: a fork of the chat's conversation or
- * a one-off conversation, ended after its answer and never kept).
- */
-class Chat {
-	readonly sessionId: string;
-	readonly side: boolean;
-	run?: ClaudeRun;
+class CliSession {
+	child?: ChildProcess;
 	signature = "";
-	/** sha of the system prompt the running `claude` was given. */
-	prompt = "";
-	/** Keys of the messages of MyHarness's record the conversation holds, in order. */
-	synced: string[] = [];
-	/** sha of the transient text the conversation was given last. */
-	reminder = "";
-	/** A turn was sent, and the provider has not yet passed on its end. */
+	/** A turn was sent and its `result` has not arrived. */
 	turnActive = false;
-	/** `claude` changed its conversation by itself (it compacted): start again next time. */
-	diverged = false;
-	/** `claude`'s last assistant message so far, where a resumed conversation continues. */
-	private lastUuid?: string;
-	private tools: any[] = [];
+	/** An interrupted turn's leftovers still to be thrown away. */
+	draining = false;
+	/** The last round was cut off at the output limit and its turn interrupted; MyHarness has not gone on yet. */
+	cutOff = false;
+	lastUserTimestamp?: number;
+	tools: any[] = [];
+	alwaysAllowed = new Set<string>();
 	private queue: any[] = [];
 	private waiter?: (event: any) => void;
 	private idleTimer?: ReturnType<typeof setTimeout>;
-	private reported = false;
+	private interruptTimer?: ReturnType<typeof setTimeout>;
+	private stderr = "";
+	private gotInit = false;
+	private resumedFrom?: string;
+	/** Results of Claude Code's own tools, by tool_use id. */
+	private toolResults = new Map<string, Deferred<any>>();
 	/** App tool calls of this turn by tool_use id, in the order `claude` made them. */
 	private appCalls = new Map<string, AppCall>();
-	/** The calls of the round the provider passed on last; MyHarness's next request carries their results. */
-	private roundCalls: string[] = [];
 	/** MCP requests that arrived before the call they belong to was seen. */
 	private unboundRequests: AppRequest[] = [];
-	/** API messages of this turn that arrived piece by piece, whose whole copies are left out. */
-	private streamed = new Set<string>();
+	/** Tool_use ids of app tools `claude`'s own sub-agents called; MyHarness never runs those. */
+	private sideCalls = new Set<string>();
+	private seenMessageIds = new Set<string>();
+	private files = new Set<string>();
+	/** `claude` is compacting this chat's context right now; part of the chat's status line. */
+	compactingNow = false;
+	/** A boundary was reported; the next user message is the summary `claude` continues from. */
+	private summaryPending = false;
+	private lastCompaction?: { summary: string; tokensBefore: number };
+	/** "Compact now" is running: its `result` belongs to this and not to any turn. */
+	private compactDone?: (result: { summary: string; tokensBefore: number } | undefined) => void;
 
-	constructor(sessionId: string, side: boolean) {
+	readonly sessionId: string;
+	readonly ephemeral: boolean;
+
+	constructor(sessionId: string, ephemeral = false) {
 		this.sessionId = sessionId;
-		this.side = side;
+		this.ephemeral = ephemeral;
 	}
 
 	get cwd(): string {
 		return shared.contexts.get(this.sessionId)?.cwd ?? process.cwd();
 	}
 
-	async start(options: StartOptions): Promise<void> {
-		const binary = findClaude();
-		if (!binary) throw new Error("找不到 claude 程序。请先安装 Claude Code，或设置 MYHARNESS_CLAUDE_BIN。");
-		this.tools = toolList(options.tools);
-		const fork = !!(options.fork && options.resume);
-		const args = launchArgs({
-			model: options.model.id,
-			effort: options.effort,
-			resume: options.resume ? { id: options.resume.claudeSessionId, at: options.resume.uuid } : undefined,
-			fork,
-			persist: !this.side,
-		});
-		this.queue.length = 0;
-		this.lastUuid = options.resume?.uuid;
-		this.diverged = false;
-		const env = launchEnv(process.env, this.side && !fork, options.maxOutputTokens);
-		const run: ClaudeRun = new ClaudeRun(binary, args, env, this.cwd, {
-			onEvent: (event) => {
-				if (this.run === run) this.onEvent(event);
-			},
-			onControl: (request) => this.onControl(request),
-			onExit: (problem) => {
-				if (this.run !== run) return;
-				this.run = undefined;
-				this.turnActive = false;
-				this.forgetAppCalls(problem ?? "claude 已退出");
-				this.push({ type: "__exit", problem });
-			},
-		});
-		this.run = run;
-		trace({
-			event: "start",
-			chat: this.sessionId,
-			side: this.side,
-			args,
-			maxOutputTokens: env.CLAUDE_CODE_MAX_OUTPUT_TOKENS,
-		});
-		await run.request(initializeRequest(options.systemPrompt, this.tools.length > 0), INITIALIZE_TIMEOUT_MS);
+	/** The MyHarness tools switched on in this chat, by name: what decides which tools `claude` has. */
+	activeNames(): string[] {
+		return this.tools.map((tool) => tool.name).filter((name) => name !== PASSTHROUGH_TOOL);
 	}
 
-	/** Ends the program; `now` when a turn may still be running in it. */
-	close(now = false): void {
-		if (this.idleTimer) clearTimeout(this.idleTimer);
-		const run = this.run;
-		this.run = undefined;
-		this.turnActive = false;
-		this.synced = [];
-		this.queue.length = 0;
-		this.forgetAppCalls("已关闭");
-		// A provider reading this chat now or next learns that nothing more comes.
-		this.push({ type: "__closed" });
-		run?.stop(now || this.side);
+	/** Claude Code's own tools this chat gets: the ones a switched-on MyHarness tool stands for. */
+	ownTools(): string[] {
+		return ownToolsFor(this.activeNames());
+	}
+
+	offeredTools(): any[] {
+		return this.tools
+			.filter((tool) => !notOffered(tool.name))
+			.map((tool) =>
+				BACKGROUND_SHELLS[tool.name]
+					? { name: tool.name, description: BACKGROUND_SHELLS[tool.name], inputSchema: BACKGROUND_SHELL_SCHEMA }
+					: {
+							name: tool.name,
+							description: tool.description,
+							inputSchema: JSON.parse(JSON.stringify(tool.parameters ?? { type: "object", properties: {} })),
+							_meta: APP_RESULT_META,
+						},
+			);
+	}
+
+	/**
+	 * What is appended to Claude Code's prompt for the app tools this chat offers now and MyHarness's prompt; a change
+	 * restarts `claude` with the new one between turns.
+	 */
+	appendPrompt(systemPrompt: string | undefined): string {
+		return appendedPrompt(this.activeNames(), systemPrompt);
+	}
+
+	/** A file of this chat's for `claude` to read when it starts; removed when MyHarness exits (a side request's at close). */
+	private privateFile(kind: string, extension: string, content: string): string {
+		fs.mkdirSync(dataDir(), { recursive: true });
+		// Side requests of one chat can run at the same time, so theirs are told apart.
+		const unique = this.ephemeral ? `-${randomUUID().slice(0, 8)}` : "";
+		const file = path.join(
+			dataDir(),
+			`${kind}-${process.pid}-${encodeURIComponent(this.sessionId)}${unique}${extension}`,
+		);
+		fs.writeFileSync(file, content, { mode: 0o600 });
+		this.files.add(file);
+		if (!shared.configFiles.size) {
+			process.once("exit", () => {
+				for (const name of shared.configFiles) fs.rmSync(name, { force: true });
+			});
+		}
+		shared.configFiles.add(file);
+		return file;
+	}
+
+	async start(model: any, effort: string | undefined, systemPrompt?: string): Promise<void> {
+		const binary = findClaude();
+		if (!binary) throw new Error("找不到 claude 程序。请先安装 Claude Code，或设置 MYHARNESS_CLAUDE_BIN。");
+		const args = [
+			"-p",
+			"--input-format",
+			"stream-json",
+			"--output-format",
+			"stream-json",
+			"--verbose",
+			"--include-partial-messages",
+			"--model",
+			model.id,
+			"--settings",
+			AUTO_COMPACT_ON,
+			// Only MyHarness's MCP endpoint: none of the MCP servers of the user's own Claude Code setup.
+			"--strict-mcp-config",
+		];
+		if (effort) args.push("--effort", effort);
+		// Prompts go in files: MyHarness's is far longer than a Windows command line may be (32,767 characters).
+		if (this.ephemeral) {
+			args.push("--no-session-persistence", "--tools", "");
+			if (systemPrompt) args.push("--system-prompt-file", this.privateFile("system-prompt", ".md", systemPrompt));
+		} else {
+			// No permission prompts for `claude`'s own tools. The prompt tool stays for questions it still has to put to the user.
+			args.push(
+				"--permission-mode",
+				"bypassPermissions",
+				"--permission-prompt-tool",
+				"stdio",
+				// Of its own tools, the ones MyHarness has switched on in this chat, and no other.
+				"--tools",
+				this.ownTools().join(","),
+				"--append-system-prompt-file",
+				this.privateFile("append-prompt", ".md", this.appendPrompt(systemPrompt)),
+				// A resumed conversation would otherwise keep the prompt of its first request until it is compacted.
+				"--system-prompt-snapshot",
+				"off",
+			);
+			if (this.offeredTools().length > 0) {
+				const mcp = await ensureMcp();
+				const config = {
+					mcpServers: {
+						[MCP_SERVER]: {
+							type: "http",
+							url: `http://127.0.0.1:${mcp.port}/mcp/${encodeURIComponent(this.sessionId)}`,
+							headers: { Authorization: `Bearer ${mcp.token}` },
+							// Without it `claude` drops a MyHarness tool that has said nothing for 300 s.
+							timeout: APP_TOOL_TIMEOUT_MS,
+							// `claude` waits for this endpoint (it is on this computer) before its first request, so the
+							// tools are in every request from the first and the cached start of the prompt never changes.
+							alwaysLoad: true,
+						},
+					},
+				};
+				args.push("--mcp-config", this.privateFile("mcp", ".json", JSON.stringify(config)));
+			}
+			const link = readLinks()[this.sessionId];
+			if (link && path.resolve(link.cwd) === path.resolve(this.cwd)) {
+				args.push("--resume", link.claudeSessionId);
+				this.resumedFrom = link.claudeSessionId;
+			} else {
+				this.resumedFrom = undefined;
+			}
+		}
+		const env = launchEnv(process.env, outputLimitFor(model), readContextWindow());
+		const child = spawn(binary, args, { cwd: this.cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		this.child = child;
+		this.gotInit = false;
+		this.stderr = "";
+		child.stderr?.on("data", (chunk) => {
+			this.stderr = `${this.stderr}${chunk}`.slice(-2000);
+		});
+		child.stdin?.on("error", () => {});
+		child.on("error", (error) => this.finishChild(child, error.message));
+		child.on("exit", (code) => this.finishChild(child, code ? `claude 退出，代码 ${code}` : undefined));
+		createInterface({ input: child.stdout! }).on("line", (line) => {
+			if (this.child !== child) return;
+			let event: any;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				return;
+			}
+			this.onEvent(event);
+		});
+	}
+
+	private finishChild(child: ChildProcess, problem: string | undefined): void {
+		if (this.child !== child) return;
+		this.child = undefined;
+		this.releaseWaiting(problem ?? "claude 已退出");
+		this.push({
+			type: "__exit",
+			problem: problem && this.stderr ? `${problem}\n${this.stderr}` : problem,
+			gotInit: this.gotInit,
+			resumedFrom: this.resumedFrom,
+		});
+	}
+
+	/** Nothing may keep waiting on a process or turn that is gone. */
+	private releaseWaiting(reason: string): void {
+		for (const [id, waiting] of this.toolResults) {
+			waiting.resolve({ is_error: true, content: reason });
+			this.toolResults.delete(id);
+		}
+		this.forgetAppCalls(reason);
+		this.compactDone?.(undefined);
+		this.compactDone = undefined;
+		if (this.compactingNow) {
+			this.compactingNow = false;
+			showStatus(this.sessionId);
+		}
 	}
 
 	private push(event: any): void {
@@ -1074,143 +1098,257 @@ class Chat {
 		});
 	}
 
-	/** A new turn: nothing left over may be taken for its answer, and no earlier call for one of its calls. */
+	send(value: unknown): void {
+		this.child?.stdin?.write(`${JSON.stringify(value)}\n`);
+	}
+
 	sendUser(content: any[]): void {
 		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.queue.length = 0;
-		this.forgetAppCalls("这一轮已经结束");
-		this.streamed.clear();
-		this.turnActive = true;
-		this.run?.sendUser(content);
-	}
-
-	/** Between two tool rounds: a message the user wrote meanwhile, which `claude` takes into its next request. */
-	sendDuringTurn(content: any[]): void {
-		this.run?.sendUser(content);
-	}
-
-	/** The provider passed on a round of tool calls; MyHarness runs them and its next request brings the results. */
-	endRound(calls: string[]): void {
-		this.roundCalls = calls;
-	}
-
-	/** The turn ended cleanly: the conversation now holds exactly `synced`, which a later start may resume. */
-	endTurn(): void {
-		this.turnActive = false;
-		this.roundCalls = [];
-		if (this.side) return;
-		const run = this.run;
-		if (run?.claudeSessionId && !this.diverged) {
-			writeLink(this.sessionId, {
-				v: LINK_VERSION,
-				claudeSessionId: run.claudeSessionId,
-				cwd: this.cwd,
-				count: this.synced.length,
-				hash: hashKeys(this.synced),
-				uuid: this.lastUuid,
-				reminder: this.reminder,
-			});
+		// Nothing left over may be taken for this turn's answer, nor an earlier turn's tool call for one of this turn.
+		if (!this.turnActive) {
+			this.queue.length = 0;
+			this.forgetAppCalls("这一轮已经结束");
 		}
+		this.turnActive = true;
+		this.send({ type: "user", session_id: "", parent_tool_use_id: null, message: { role: "user", content } });
+	}
+
+	interrupt(): void {
+		if (!this.turnActive) return;
+		this.turnActive = false;
+		this.draining = true;
+		this.queue.length = 0;
+		this.send({ type: "control_request", request_id: randomUUID(), request: { subtype: "interrupt" } });
+		this.releaseWaiting("已中断");
+		if (this.interruptTimer) clearTimeout(this.interruptTimer);
+		this.interruptTimer = setTimeout(() => {
+			if (this.draining) this.close();
+		}, INTERRUPT_GRACE_MS);
+		this.interruptTimer.unref();
+	}
+
+	close(): void {
 		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.idleTimer = setTimeout(() => this.close(), IDLE_CLOSE_MS);
-		this.idleTimer.unref();
+		if (this.interruptTimer) clearTimeout(this.interruptTimer);
+		const child = this.child;
+		this.child = undefined;
+		this.turnActive = false;
+		this.draining = false;
+		this.queue.length = 0;
+		this.releaseWaiting("已关闭");
+		if (child) {
+			child.stdin?.end();
+			setTimeout(() => {
+				if (child.exitCode === null) child.kill();
+			}, 3000).unref();
+		}
+		if (this.ephemeral) {
+			for (const file of this.files) {
+				fs.rmSync(file, { force: true });
+				shared.configFiles.delete(file);
+			}
+			this.files.clear();
+		}
 	}
 
 	private onEvent(event: any): void {
-		if (event.type === "rate_limit_event") {
-			noteLimits(limitsFromEvent(event.rate_limit_info, Date.now()), "rate_limit_event");
+		if (event.type === "control_request") {
+			void this.onControlRequest(event);
+			return;
 		}
-		if (event.type === "system" && event.subtype === "init") this.checkInit(event);
-		// MyHarness compacts; should `claude` still have changed the conversation, it no longer matches the record.
-		if (event.type === "system" && event.subtype === "compact_boundary") this.diverged = true;
-		if (event.type === "assistant" && !event.parent_tool_use_id && event.uuid) this.lastUuid = event.uuid;
-		this.expectAppCalls(event);
+		if (event.type === "system" && event.subtype === "init") {
+			this.gotInit = true;
+			if (!this.ephemeral) writeLink(this.sessionId, { claudeSessionId: event.session_id, cwd: this.cwd });
+			if (event.apiKeySource && event.apiKeySource !== "none") {
+				shared.contexts
+					.get(this.sessionId)
+					?.ui?.notify(`Claude Code 正在使用 ${event.apiKeySource} 的 API key，会按用量计费。`, "warning");
+			}
+		}
+		if (event.type === "rate_limit_event") noteLimits(limitsFromEvent(event.rate_limit_info, Date.now()));
+		if (this.draining) {
+			if (event.type === "result") {
+				this.draining = false;
+				if (this.interruptTimer) clearTimeout(this.interruptTimer);
+			}
+			return;
+		}
+		if (event.type === "system" && event.subtype === "status") {
+			this.compactingNow = event.status === "compacting";
+			showStatus(this.sessionId);
+		}
+		if (event.type === "system" && event.subtype === "compact_boundary")
+			this.onCompactBoundary(event.compact_metadata);
+		if (event.type === "user" && this.summaryPending && !event.parent_tool_use_id) {
+			this.summaryPending = false;
+			if (this.lastCompaction) this.lastCompaction.summary = plainText(event.message?.content);
+			return;
+		}
+		this.expectTools(event);
+		// Results come whether or not the provider is reading right now: tool cards are waiting for them.
+		if (event.type === "user" && Array.isArray(event.message?.content) && !event.parent_tool_use_id) {
+			for (const block of event.message.content) {
+				if (block.type !== "tool_result") continue;
+				// The entry stays: a fast tool can finish before its card starts waiting. takeToolResult removes it.
+				this.toolResults.get(block.tool_use_id)?.resolve(block);
+			}
+			return;
+		}
+		if (event.type === "result") {
+			this.turnActive = false;
+			this.seenMessageIds.clear();
+			if (this.idleTimer) clearTimeout(this.idleTimer);
+			this.idleTimer = setTimeout(() => this.close(), IDLE_CLOSE_MS);
+			this.idleTimer.unref();
+			if (this.compactDone) {
+				this.compactDone(event.is_error ? undefined : this.lastCompaction);
+				this.compactDone = undefined;
+				return;
+			}
+		}
+		if (this.compactDone) return;
 		if (event.type === "stream_event" || event.type === "assistant" || event.type === "result") this.push(event);
 	}
 
-	/** `claude` lists what it loaded: anything besides MyHarness's tools, or an API key in place of its login, is reported. */
-	private checkInit(event: any): void {
-		const offered = new Set(this.tools.map((tool) => tool.name));
-		const extra = (event.tools ?? []).filter((name: string) => !offered.has(appToolName(name)));
-		trace({ event: "init", chat: this.sessionId, tools: event.tools, extra, apiKeySource: event.apiKeySource });
-		if (this.reported) return;
-		this.reported = true;
-		const ui = shared.contexts.get(this.sessionId)?.ui;
-		if (event.apiKeySource && event.apiKeySource !== "none") {
-			ui?.notify(`Claude Code 正在使用 ${event.apiKeySource} 的 API key，会按用量计费。`, "warning");
-		}
-		if (extra.length) ui?.notify(`Claude Code 还带了它自己的工具：${extra.join(", ")}`, "warning");
-	}
-
-	private async onControl(request: any): Promise<object> {
-		if (request.subtype === "mcp_message") {
-			if (request.server_name !== MCP_SERVER) throw new Error(`Unknown MCP server: ${request.server_name}`);
-			return { mcp_response: await this.answerMcp(request.message ?? {}) };
-		}
-		if (request.subtype === "can_use_tool") {
-			// Only MyHarness's tools exist here, and MyHarness applies its own approval when the call comes back.
-			const known = this.tools.some((tool) => tool.name === appToolName(request.tool_name));
-			return known
-				? { behavior: "allow", updatedInput: request.input }
-				: { behavior: "deny", message: "Only MyHarness's tools run here." };
-		}
-		throw new Error(`Unsupported: ${request.subtype}`);
-	}
-
-	private async answerMcp(message: any): Promise<any> {
-		// A notification gets an empty result, the way the SDK's own hosts answer one.
-		if (message.id === undefined || message.id === null) return { jsonrpc: "2.0", result: {}, id: 0 };
-		const reply = (result: object) => ({ jsonrpc: "2.0", id: message.id, result });
-		switch (message.method) {
-			case "initialize":
-				return reply({
-					protocolVersion: message.params?.protocolVersion ?? "2025-06-18",
-					capabilities: { tools: {} },
-					serverInfo: { name: MCP_SERVER, version: "2.0.0" },
-				});
-			case "ping":
-				return reply({});
-			case "tools/list":
-				return reply({ tools: this.tools });
-			case "tools/call": {
-				if (this.side) return reply(appError("MyHarness runs no tools for this request. Answer in text."));
-				const toolUseId = message.params?._meta?.[TOOL_USE_ID_META];
-				return reply(
-					await this.waitForAppTool(
-						appToolName(message.params?.name),
-						message.params?.arguments ?? {},
-						typeof toolUseId === "string" && toolUseId ? toolUseId : undefined,
-					),
+	private onCompactBoundary(metadata: any): void {
+		this.summaryPending = true;
+		this.lastCompaction = { summary: "", tokensBefore: metadata?.pre_tokens ?? 0 };
+		this.compactingNow = false;
+		showStatus(this.sessionId);
+		if (metadata?.trigger === "auto") {
+			shared.contexts
+				.get(this.sessionId)
+				?.ui?.notify(
+					`Claude Code 压缩了上下文：${formatTokens(metadata.pre_tokens ?? 0)} → ${formatTokens(metadata.post_tokens ?? 0)}`,
+					"info",
 				);
+		}
+	}
+
+	/** `claude`'s own /compact. A program started only for this has none of the chat's tools, so it does not stay. */
+	async compact(
+		model: any,
+		instructions: string | undefined,
+		signal: AbortSignal,
+	): Promise<{ summary: string; tokensBefore: number } | undefined> {
+		const startedHere = !this.child;
+		if (startedHere) await this.start(model, undefined);
+		// A turn still going would run first, and its `result` would be taken for this one's.
+		this.interrupt();
+		this.lastCompaction = undefined;
+		const done = new Promise<{ summary: string; tokensBefore: number } | undefined>((resolve) => {
+			this.compactDone = resolve;
+		});
+		const onAbort = () => this.interrupt();
+		signal.addEventListener("abort", onAbort, { once: true });
+		this.sendUser([{ type: "text", text: instructions ? `/compact ${instructions}` : "/compact" }]);
+		try {
+			return await done;
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+			if (startedHere) this.close();
+		}
+	}
+
+	private async onControlRequest(event: any): Promise<void> {
+		const respond = (response: object) =>
+			this.send({
+				type: "control_response",
+				response: { subtype: "success", request_id: event.request_id, response },
+			});
+		const request = event.request ?? {};
+		if (request.subtype !== "can_use_tool") {
+			this.send({
+				type: "control_response",
+				response: { subtype: "error", request_id: event.request_id, error: `Unsupported: ${request.subtype}` },
+			});
+			return;
+		}
+		const allow = (updatedPermissions?: unknown) =>
+			respond({
+				behavior: "allow",
+				updatedInput: request.input,
+				...(updatedPermissions ? { updatedPermissions } : {}),
+			});
+		const name: string = request.tool_name ?? "";
+		// MyHarness applies its own approval when the call comes back through the provider.
+		if (name.startsWith(MCP_PREFIX) || this.alwaysAllowed.has(name)) {
+			allow();
+			return;
+		}
+		const ui = shared.contexts.get(this.sessionId)?.hasUI ? shared.contexts.get(this.sessionId).ui : undefined;
+		if (!ui) {
+			respond({ behavior: "deny", message: "No interface is available to approve this tool." });
+			return;
+		}
+		try {
+			if (name === "AskUserQuestion" && Array.isArray(request.input?.questions)) {
+				const answers: Record<string, string> = {};
+				for (const question of request.input.questions) {
+					const labels = (question.options ?? []).map((option: any) => option.label);
+					const answer = await ui.select(question.question, labels);
+					if (answer === undefined) {
+						respond({ behavior: "deny", message: "The user dismissed the question." });
+						return;
+					}
+					answers[question.question] = answer;
+				}
+				respond({ behavior: "allow", updatedInput: { ...request.input, answers } });
+				return;
 			}
-			default:
-				return {
-					jsonrpc: "2.0",
-					id: message.id,
-					error: { code: -32601, message: `Unsupported method: ${message.method}` },
-				};
+			const summary = request.description ?? request.title ?? JSON.stringify(request.input ?? {}).slice(0, 400);
+			const onceLabel = "允许这一次";
+			const alwaysLabel = `这个对话里都允许 ${name}`;
+			const choice = await ui.select(`Claude Code 想使用 ${name}\n${summary}`, [onceLabel, alwaysLabel, "拒绝"]);
+			if (choice === onceLabel) {
+				allow();
+			} else if (choice === alwaysLabel) {
+				this.alwaysAllowed.add(name);
+				allow();
+			} else {
+				respond({ behavior: "deny", message: "The user denied this tool." });
+			}
+		} catch (error) {
+			respond({ behavior: "deny", message: error instanceof Error ? error.message : String(error) });
 		}
 	}
 
 	// Pairing app tool calls with the MCP requests `claude` makes for them
 
 	/**
-	 * Tool calls are noted the moment `claude` reports them, before the provider reads that far: `claude` starts a tool as
-	 * soon as its block is complete, so the MCP request can arrive before the provider has mapped the call.
+	 * Tool calls are noted the moment `claude` reports them, before the provider reads that far:
+	 * - ToolSearch answers about 2 ms after it is asked for, which can be in the same read. A result with nothing waiting
+	 *   for it is lost and its card never ends, so the wait for an own tool's result starts here.
+	 * - `claude` starts a tool as soon as its block is complete, so the MCP request for an app tool can arrive before the
+	 *   provider has mapped the call; noting it here lets the request find its call at once.
+	 * Calls `claude`'s own sub-agents make are only remembered, so their MCP requests can be answered (see waitForAppTool).
 	 */
-	private expectAppCalls(event: any): void {
-		if (event.parent_tool_use_id) return;
+	private expectTools(event: any): void {
 		const assistant = event.type === "assistant";
 		const blocks = assistant
 			? event.message?.content
 			: event.type === "stream_event" && event.event?.type === "content_block_start"
 				? [event.event.content_block]
 				: [];
+		const side = !!event.parent_tool_use_id;
 		for (const block of blocks ?? []) {
 			if (block?.type !== "tool_use" || typeof block.id !== "string") continue;
-			// The arguments are complete only in the assistant message; a block that has just started has none yet.
-			this.noteAppCall(block.id, appToolName(block.name), assistant ? block.input : undefined);
+			if (block.name?.startsWith(MCP_PREFIX)) {
+				if (side) this.noteSideCall(block.id);
+				// The arguments are complete only in the assistant message; a block that has just started has none yet.
+				else this.noteAppCall(block.id, block.name.slice(MCP_PREFIX.length), assistant ? block.input : undefined);
+				continue;
+			}
+			if (side || this.toolResults.has(block.id)) continue;
+			this.toolResults.set(block.id, deferred());
 		}
+	}
+
+	takeToolResult(id: string): Promise<any> | undefined {
+		const waiting = this.toolResults.get(id);
+		// Stays listed until it settles, so an interrupt or a dead process can still release it.
+		void waiting?.promise.then(() => this.toolResults.delete(id));
+		return waiting?.promise;
 	}
 
 	/** An app tool call of the main conversation, from the stream or from the provider; the arguments may come later. */
@@ -1224,40 +1362,35 @@ class Chat {
 		this.bindWaitingRequests();
 	}
 
-	/** A result of MyHarness's record: it goes to the MCP request of that very call, now or when it arrives. */
+	private noteSideCall(id: string): void {
+		this.sideCalls.add(id);
+		this.bindWaitingRequests();
+	}
+
+	/** MyHarness finished a card: its result goes to the MCP request of that very call, now or when it arrives. */
 	deliverAppResult(message: any): void {
-		this.settle(message.toolCallId, {
-			content: partsOf(message).map((part: any) =>
+		const call = this.appCalls.get(message.toolCallId);
+		if (!call || call.result !== undefined) return;
+		call.result = {
+			content: (message.content ?? []).map((part: any) =>
 				part.type === "image"
 					? { type: "image", data: part.data, mimeType: part.mimeType }
 					: { type: "text", text: part.text ?? "" },
 			),
 			isError: !!message.isError,
-		});
-	}
-
-	/** Every call of the last round has an answer, so `claude` never waits for one MyHarness does not have. */
-	settleRound(): void {
-		for (const id of this.roundCalls) this.settle(id, appError("MyHarness 没有这次调用的结果。"));
-		this.roundCalls = [];
-	}
-
-	private settle(id: string, result: any): void {
-		const call = this.appCalls.get(id);
-		if (!call || call.result !== undefined) return;
-		call.result = result;
-		for (const done of call.waiters.splice(0)) done(result);
+		};
+		for (const done of call.waiters.splice(0)) done(call.result);
 	}
 
 	/**
 	 * `claude`'s MCP request for an app tool. It names the tool_use it belongs to (TOOL_USE_ID_META), so it gets exactly
-	 * that card's result even when the same tool runs several times in a round.
+	 * that card's result. Pairing by tool and arguments alone, as before, gave one call's result to another when the
+	 * same tool ran several times in a round and the cards finished in another order than `claude` asked: one request
+	 * was then left with nothing and `claude` sat 300 s on it (seen 2026-11-03 with four session_search calls).
 	 */
-	private waitForAppTool(name: string, args: unknown, toolUseId?: string): Promise<any> {
+	waitForAppTool(name: string, args: unknown, toolUseId?: string): Promise<any> {
 		return new Promise((done) => {
 			const request: AppRequest = { name, key: stableJson(args), toolUseId, done };
-			// Without streaming, this request is the first sign that the message with the call is complete.
-			this.push({ type: "__tool_request" });
 			if (this.bindRequest(request)) return;
 			this.unboundRequests.push(request);
 			setTimeout(() => {
@@ -1270,6 +1403,14 @@ class Chat {
 	}
 
 	private bindRequest(request: AppRequest): boolean {
+		if (request.toolUseId && this.sideCalls.has(request.toolUseId)) {
+			request.done(
+				appError(
+					`MyHarness tools only run for the main conversation, where the user sees them; a sub-agent cannot use ${request.name}. Call it from the main conversation instead.`,
+				),
+			);
+			return true;
+		}
 		const id = this.findAppCall(request);
 		if (id === undefined) return false;
 		const call = this.appCalls.get(id)!;
@@ -1308,15 +1449,15 @@ class Chat {
 		for (const call of this.appCalls.values()) for (const done of call.waiters.splice(0)) done(error);
 		for (const request of this.unboundRequests.splice(0)) request.done(error);
 		this.appCalls.clear();
-		this.roundCalls = [];
+		this.sideCalls.clear();
 	}
 
-	markStreamed(messageId: string | undefined): void {
-		if (messageId) this.streamed.add(messageId);
+	alreadySeen(messageId: string): boolean {
+		return this.seenMessageIds.has(messageId);
 	}
 
-	wasStreamed(messageId: string | undefined): boolean {
-		return !!messageId && this.streamed.has(messageId);
+	markSeen(messageId: string): void {
+		this.seenMessageIds.add(messageId);
 	}
 }
 
@@ -1353,24 +1494,32 @@ function effortFor(model: any, level: string | undefined): string | undefined {
 	return level ? (model.thinkingLevelMap?.[level] ?? undefined) : undefined;
 }
 
-/** A tool `claude` uses as a MyHarness call, also while its arguments are still arriving. */
-function shapeToolCall(id: string, name: string, input: any): any {
-	return { type: "toolCall", id, name: appToolName(name), arguments: input };
+/**
+ * How a tool `claude` uses looks as a MyHarness call, also while its arguments are still arriving. MyHarness's shells
+ * are offered only to start background jobs (BACKGROUND_SHELLS), so such a call is one whatever its arguments say.
+ */
+function shapeToolCall(id: string, name: string, input: any, cwd: string): any {
+	// The summary comes first: a card shows the first text among a call's arguments.
+	if (!name.startsWith(MCP_PREFIX))
+		return {
+			type: "toolCall",
+			id,
+			name: PASSTHROUGH_TOOL,
+			arguments: { summary: callSummary(name, input, cwd), tool: name, input },
+		};
+	const appName = name.slice(MCP_PREFIX.length);
+	const args =
+		BACKGROUND_SHELLS[appName] && input && typeof input === "object" ? { ...input, run_in_background: true } : input;
+	return { type: "toolCall", id, name: appName, arguments: args };
 }
 
-/** What makes `claude` start again: everything it only reads when it starts, but the system prompt (see runTurn). */
-function signatureOf(
-	model: any,
-	effort: string | undefined,
-	maxOutputTokens: number | undefined,
-	tools: any[],
-	cwd: string,
-): string {
-	return sha(JSON.stringify([model.id, effort ?? "", maxOutputTokens ?? 0, toolList(tools), path.resolve(cwd)]));
+function mapToolCall(session: CliSession, id: string, name: string, input: any): any {
+	if (name.startsWith(MCP_PREFIX)) session.noteAppCall(id, name.slice(MCP_PREFIX.length), input);
+	return shapeToolCall(id, name, input, session.cwd);
 }
 
-function newOutput(model: any): any {
-	return {
+async function runTurn(stream: any, session: CliSession, model: any, context: any, options: any): Promise<void> {
+	const output: any = {
 		role: "assistant",
 		content: [],
 		api: model.api,
@@ -1380,263 +1529,134 @@ function newOutput(model: any): any {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
-}
-
-type Plan = "live" | "resume" | "fresh" | "fork" | "one-off";
-type OpenBlock = { index: number; json: string; id?: string; name?: string };
-
-/**
- * One request. A chat's own turn continues its `claude` conversation (as it is, resumed from the link, or anew); a side
- * request runs in a fork of that conversation when it shares its history, otherwise in a one-off conversation.
- */
-async function runTurn(stream: any, chat: Chat, model: any, context: any, options: any): Promise<void> {
-	const output = newOutput(model);
-	let ended = false;
-	const end = (event: any) => {
-		if (ended) return;
-		ended = true;
-		stream.push(event);
-		stream.end();
-	};
 	const fail = (reason: "aborted" | "error", message: string) => {
 		output.stopReason = reason;
 		output.errorMessage = message;
-		end({ type: "error", reason, error: output });
+		stream.push({ type: "error", reason, error: output });
+		stream.end();
 	};
 	stream.push({ type: "start", partial: output });
-	const signal: AbortSignal | undefined = options?.signal;
-	// Stop ends the program at once; the next turn resumes the last turn that ended cleanly.
-	const onAbort = () => chat.close(true);
-	signal?.addEventListener("abort", onAbort, { once: true });
-	try {
-		if (signal?.aborted) return fail("aborted", "已中断");
-		const messages: any[] = context.messages ?? [];
-		const systemPrompt: string = context.systemPrompt ?? "";
-		const tools: any[] = context.tools ?? [];
-		const effort = effortFor(model, options?.reasoning);
-		const maxOutputTokens = outputLimitFor(model);
-		const signature = signatureOf(model, effort, maxOutputTokens, tools, chat.cwd);
-		const prompt = sha(systemPrompt);
-		const keyed = keyedMessages(messages);
-		const transient = messages.filter(isTransient);
-		const reminder = sha(JSON.stringify(transient.map((message) => partsOf(message))));
 
-		// The conversation `claude` holds must be exactly the start of MyHarness's record, with these tools. A changed
-		// system prompt waits for the turn to end: started again between two tool rounds, `claude` would get the turn so
-		// far only as text, without its thinking, and the model would think it all over again.
-		if (
-			chat.run &&
-			(chat.diverged ||
-				chat.signature !== signature ||
-				(chat.prompt !== prompt && !chat.turnActive) ||
-				!startsWith(keyed, chat.synced))
-		) {
-			chat.close(true);
+	const messages: any[] = context.messages ?? [];
+	const last = messages[messages.length - 1];
+	const effort = effortFor(model, options?.reasoning);
+	const maxOutputTokens = outputLimitFor(model);
+	session.tools = context.tools ?? [];
+	// The length, the output limit and the appended prompt (MyHarness's, and the one about the offered app tools) reach
+	// `claude` when it starts, so a new one restarts it between turns (the conversation is resumed).
+	const prompt = session.ephemeral ? "" : session.appendPrompt(context.systemPrompt);
+	const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+	// So do its own tools (`--tools`) and the app tools it lists once, when it connects to MyHarness's MCP endpoint.
+	const toolSet = session.ephemeral
+		? ""
+		: `${session.ownTools().join(",")}|${offeredNames(session.activeNames()).join(",")}`;
+	const signature = `${model.id}|${effort ?? ""}|${readContextWindow()}|${maxOutputTokens ?? ""}|${promptHash}|${toolSet}`;
+	/**
+	 * The request reached its output limit. `claude` would now ask the model by itself to go on, unseen here. MyHarness
+	 * decides what follows a cut-off answer, as on every provider (calls in it are failed, an answer without calls is
+	 * followed by OUTPUT_LIMIT_NOTE), so the turn is interrupted at once. Interrupted, not ended: a program ended this
+	 * early has not yet written the turn's user message to its transcript, so a resumed conversation would lack it.
+	 */
+	const stopAtLimit = () => {
+		session.cutOff = true;
+		session.interrupt();
+		output.stopReason = "length";
+		if (!session.ephemeral) {
+			const written = formatTokens(output.usage.output || maxOutputTokens || 0);
+			shared.contexts
+				.get(session.sessionId)
+				?.ui?.notify(
+					`Claude Code 这一步写到了输出上限（${written} token），这次请求已停下，任务自动接着做。`,
+					"warning",
+				);
 		}
-		let plan = "live" as Plan;
-		const begin = async (link: Link | undefined) => {
-			chat.signature = signature;
-			chat.prompt = prompt;
-			await chat.start({
-				model,
-				effort,
-				maxOutputTokens,
-				systemPrompt,
-				tools,
-				resume: link,
-				fork: chat.side && !!link,
-			});
-			chat.synced = link ? keyed.slice(0, link.count).map((item) => item.key) : [];
-			chat.reminder = link ? link.reminder : "";
-		};
-		const startOver = async () => {
-			chat.close(true);
-			if (!chat.side) writeLink(chat.sessionId, undefined);
-			plan = chat.side ? "one-off" : "fresh";
-			await begin(undefined);
-		};
-		const openChat = async () => {
-			const link = readLink(chat.sessionId);
-			const fits = linkFits(link, keyed, chat.cwd) && (!chat.side || tools.length > 0);
-			plan = fits ? (chat.side ? "fork" : "resume") : chat.side ? "one-off" : "fresh";
-			trace({
-				event: "open",
-				chat: chat.sessionId,
-				side: chat.side,
-				plan,
-				keyed: keyed.length,
-				tools: tools.length,
-				link: link && {
-					count: link.count,
-					cwd: path.resolve(link.cwd) === path.resolve(chat.cwd),
-					history:
-						keyed.length >= link.count &&
-						hashKeys(keyed.slice(0, link.count).map((item) => item.key)) === link.hash,
-				},
-			});
-			try {
-				await begin(fits ? link : undefined);
-			} catch (error) {
-				// A remembered conversation that cannot be opened: start over with the chat's history.
-				if (!fits || signal?.aborted) throw error;
-				await startOver();
-			}
-		};
-		if (!chat.run) await openChat();
+		stream.push({ type: "done", reason: "length", message: output });
+		stream.end();
+	};
 
-		const send = () => {
-			const rest = keyed.slice(chat.synced.length).map((item) => item.message);
-			if (chat.turnActive) {
-				// Between two tool rounds `claude` waits for the last round's results. A message the user wrote meanwhile goes
-				// first, so that `claude` takes it into the same next request as the results.
-				const written = rest.filter((message) => message.role === "user");
-				if (written.length) chat.sendDuringTurn(written.flatMap(userContent));
-				for (const message of rest) if (message.role === "toolResult") chat.deliverAppResult(message);
-				chat.settleRound();
-			} else {
-				chat.sendUser([
-					...(reminder !== chat.reminder ? transient.flatMap(userContent) : []),
-					...turnContent(rest),
-				]);
-				chat.reminder = reminder;
-			}
-			chat.synced = keyed.map((item) => item.key);
-			trace({
-				event: "send",
-				chat: chat.sessionId,
-				plan,
-				side: chat.side,
-				held: chat.synced.length,
-				rest: rest.length,
+	const prepareUserTurn = async (withHistory: boolean) => {
+		let start = messages.length;
+		while (start > 0 && messages[start - 1].role === "user") start--;
+		const content = messages
+			.slice(start)
+			.filter((message) => withHistory || !plainText(message.content).startsWith(CHECKPOINT_PREFIX))
+			.flatMap(userContent);
+		const earlier = withHistory ? renderTranscript(messages.slice(0, start)) : "";
+		if (earlier) {
+			content.unshift({
+				type: "text",
+				text: `<earlier-conversation>\nThis chat started before this Claude Code conversation. Earlier messages, for context:\n\n${earlier}\n</earlier-conversation>`,
 			});
-		};
-		send();
+		}
+		session.lastUserTimestamp = last?.timestamp;
+		session.cutOff = false;
+		session.sendUser(content);
+	};
 
-		const blocks = new Map<number, OpenBlock>();
-		const calls: string[] = [];
-		let received = false;
+	if (session.child && session.signature !== signature && !session.turnActive) session.close();
+	const fresh = !session.child;
+	if (fresh) {
+		session.signature = signature;
+		await session.start(model, effort, context.systemPrompt);
+	}
+	const hasLink = !session.ephemeral && !!readLinks()[session.sessionId];
+	if (last?.role === "toolResult") {
+		for (let i = messages.length - 1; i >= 0 && messages[i].role === "toolResult"; i--) {
+			session.deliverAppResult(messages[i]);
+		}
+		// The turn is over in `claude`: the program went away between two tool rounds (restart, idle close, a compaction),
+		// or the round was cut off at the output limit and interrupted. Pick the conversation back up.
+		if (!session.turnActive) {
+			const earlier = hasLink ? "" : renderTranscript(messages);
+			const history = earlier ? `<earlier-conversation>\n${earlier}\n</earlier-conversation>\n\n` : "";
+			const goOn = session.cutOff ? CUT_CALLS_NOTE : "Continue where you left off.";
+			session.cutOff = false;
+			session.sendUser([{ type: "text", text: `${history}${goOn}` }]);
+		}
+	} else if (!(session.turnActive && session.lastUserTimestamp === last?.timestamp)) {
+		await prepareUserTurn(!hasLink);
+	}
+
+	const onAbort = () => session.interrupt();
+	options?.signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		const blocks = new Map<number, { index: number; json: string; id?: string; name?: string }>();
+		let calls = 0;
 		let retried = false;
-		/** The message being read arrived piece by piece (it ends with message_stop). */
-		let streamedNow = false;
-		/** Where the streamed message being read began, while its message_stop has not come. */
-		let open: { content: number; calls: number } | undefined;
-		/** What `claude` wrote in place of an answer when a request failed. */
-		let failure: string | undefined;
-		const finishRound = (reason: "toolUse" | "stop") => {
-			output.stopReason = reason;
-			if (!chat.side) {
-				const key = messageKey(output);
-				if (key) chat.synced.push(key);
-				if (reason === "toolUse") chat.endRound([...calls]);
-				else chat.endTurn();
-			}
-			trace({
-				event: "round",
-				chat: chat.sessionId,
-				plan,
-				side: chat.side,
-				reason,
-				usage: {
-					input: output.usage.input,
-					cacheRead: output.usage.cacheRead,
-					cacheWrite: output.usage.cacheWrite,
-				},
-			});
-			end({ type: "done", reason, message: output });
-		};
-		/** A whole (not streamed) message that ended at the output limit; more blocks of it may still come. */
-		let cutOff: string | undefined;
-		/**
-		 * The request reached its output limit. `claude` would now ask the model by itself to go on, unseen here. MyHarness
-		 * decides what follows a cut-off answer, as on every provider (calls in it are failed, an answer without calls ends
-		 * the turn), so the program ends at once and the next request resumes the last turn that ended cleanly.
-		 */
-		const stopAtLimit = () => {
-			chat.close(true);
-			output.stopReason = "length";
-			if (!chat.side) {
-				const written = formatTokens(output.usage.output || maxOutputTokens || 0);
-				shared.contexts
-					.get(chat.sessionId)
-					?.ui?.notify(
-						`Claude Code 这一步写到了输出上限（${written} token），这次请求已停下，任务自动接着做。`,
-						"warning",
-					);
-			}
-			trace({
-				event: "round",
-				chat: chat.sessionId,
-				plan,
-				side: chat.side,
-				reason: "length",
-				output: output.usage.output,
-			});
-			end({ type: "done", reason: "length", message: output });
-		};
-		const addToolCall = (id: string, name: string, input: any, contentIndex?: number) => {
-			const toolCall = shapeToolCall(id, name, input);
-			chat.noteAppCall(id, toolCall.name, input);
-			const index = contentIndex ?? output.content.push(toolCall) - 1;
-			output.content[index] = toolCall;
-			if (contentIndex === undefined) stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-			stream.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
-			calls.push(id);
-		};
-		/** A side request answers with its last message only: its tool calls are refused and it writes again. */
-		const startMessage = () => {
-			if (!chat.side || !output.content.length) return;
-			output.content = [];
-			blocks.clear();
-		};
 		for (;;) {
-			const event = await chat.next();
-			if (signal?.aborted || event.type === "__closed") return fail("aborted", "已中断");
-			// A conversation that went away or could not be opened before it answered is opened once more: resumed from the
-			// link, or anew. (`claude` reports a conversation it cannot open as an error result of no turns.)
-			const unopened =
-				event.type === "__exit" || (event.type === "result" && event.is_error && event.num_turns === 0);
-			if (unopened && !received && !retried && plan !== "fresh" && plan !== "one-off") {
-				retried = true;
-				if (plan === "live") await openChat();
-				else await startOver();
-				send();
-				continue;
+			if (options?.signal?.aborted) {
+				fail("aborted", "已中断");
+				return;
+			}
+			const abortPromise = new Promise<any>((resolve) => {
+				if (options?.signal)
+					options.signal.addEventListener("abort", () => resolve({ type: "__abort" }), { once: true });
+			});
+			const event = await Promise.race([session.next(), abortPromise]);
+			if (event.type === "__abort") {
+				fail("aborted", "已中断");
+				return;
 			}
 			if (event.type === "__exit") {
-				return cutOff ? stopAtLimit() : fail("error", event.problem ?? failure ?? "claude 意外结束了这一轮");
-			}
-			if (event.type === "__tool_request") {
-				if (cutOff) return stopAtLimit();
-				if (!chat.side && !streamedNow && calls.length) return finishRound("toolUse");
-				continue;
-			}
-			received = true;
-			if (event.parent_tool_use_id) continue;
-			// Anything after the last block of a whole message cut off at the limit is `claude` going on by itself.
-			if (cutOff && !(event.type === "assistant" && event.message?.id === cutOff)) return stopAtLimit();
-			if (event.type === "result") {
-				if (event.is_error || (failure && !output.content.length)) {
-					// The conversation may now hold part of this turn: the next turn starts from the last clean one.
-					chat.close(true);
-					return fail(
-						"error",
-						event.result || failure || (event.errors ?? []).join("\n") || `claude 报错：${event.subtype}`,
-					);
-				}
-				return finishRound("stop");
-			}
-			if (event.type === "assistant") {
-				const message = event.message;
-				// A request that failed: `claude` writes the error as a message of its own, which is no answer.
-				if (message?.model === "<synthetic>") {
-					failure = textOf(message.content ?? []) || failure;
+				// A remembered conversation that no longer exists: start over with the chat's history.
+				if (!event.gotInit && event.resumedFrom && !retried) {
+					retried = true;
+					writeLink(session.sessionId, undefined);
+					await session.start(model, effort, context.systemPrompt);
+					await prepareUserTurn(true);
 					continue;
 				}
-				// Normally already read piece by piece; without streaming this is the only copy, one block per message.
-				if (!message || chat.wasStreamed(message.id)) continue;
-				if (output.responseId !== message.id) startMessage();
+				session.turnActive = false;
+				fail("error", event.problem ?? "claude 意外结束了这一轮");
+				return;
+			}
+			if (event.parent_tool_use_id) continue;
+			if (event.type === "assistant") {
+				// Normally already seen piece by piece; without streaming this is the only copy.
+				const message = event.message;
+				if (!message?.id || session.alreadySeen(message.id)) continue;
+				session.markSeen(message.id);
 				output.responseId = message.id;
-				streamedNow = false;
 				applyUsage(output.usage, message.usage);
 				for (const block of message.content ?? []) {
 					if (block.type === "text") {
@@ -1644,31 +1664,50 @@ async function runTurn(stream: any, chat: Chat, model: any, context: any, option
 						stream.push({ type: "text_start", contentIndex, partial: output });
 						stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
 						stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
-					} else if (block.type === "tool_use" && !chat.side) {
-						addToolCall(block.id, block.name, block.input ?? {});
+					} else if (block.type === "tool_use") {
+						const toolCall = mapToolCall(session, block.id, block.name, block.input ?? {});
+						const contentIndex = output.content.push(toolCall) - 1;
+						stream.push({ type: "toolcall_start", contentIndex, partial: output });
+						stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+						calls++;
 					}
 				}
-				if (message.stop_reason === "max_tokens") cutOff = message.id;
+				if (message.stop_reason === "max_tokens") {
+					stopAtLimit();
+					return;
+				}
+				if (calls > 0) {
+					output.stopReason = "toolUse";
+					stream.push({ type: "done", reason: "toolUse", message: output });
+					stream.end();
+					return;
+				}
 				continue;
+			}
+			if (event.type === "result") {
+				// `result` adds up every request of the turn, which is not how full the context is; the last request's own
+				// usage, already applied above, is. MyHarness compares that number with the context length.
+				if (event.is_error) {
+					fail("error", event.result || (event.errors ?? []).join("\n") || `claude 报错：${event.subtype}`);
+					return;
+				}
+				output.stopReason = "stop";
+				stream.push({ type: "done", reason: "stop", message: output });
+				stream.end();
+				return;
 			}
 			const part = event.event;
 			if (part?.type === "message_start") {
-				// A message that started and never ended was a failed attempt `claude` makes again: it is dropped.
-				if (open) {
-					output.content.length = open.content;
-					calls.length = open.calls;
-					blocks.clear();
-				}
-				startMessage();
-				open = { content: output.content.length, calls: calls.length };
-				chat.markStreamed(part.message?.id);
+				session.markSeen(part.message?.id);
 				output.responseId = part.message?.id;
-				streamedNow = true;
 				applyUsage(output.usage, part.message?.usage);
 			} else if (part?.type === "message_delta") {
 				applyUsage(output.usage, part.usage);
 				// Every block of the message has ended by now.
-				if (part.delta?.stop_reason === "max_tokens") return stopAtLimit();
+				if (part.delta?.stop_reason === "max_tokens") {
+					stopAtLimit();
+					return;
+				}
 			} else if (part?.type === "content_block_start") {
 				const block = part.content_block;
 				if (block?.type === "text") {
@@ -1680,8 +1719,8 @@ async function runTurn(stream: any, chat: Chat, model: any, context: any, option
 					const index = output.content.push({ type: "thinking", thinking: "" }) - 1;
 					blocks.set(part.index, { index, json: "" });
 					stream.push({ type: "thinking_start", contentIndex: index, partial: output });
-				} else if (block?.type === "tool_use" && !chat.side) {
-					const index = output.content.push(shapeToolCall(block.id, block.name, {})) - 1;
+				} else if (block?.type === "tool_use") {
+					const index = output.content.push(shapeToolCall(block.id, block.name, {}, session.cwd)) - 1;
 					blocks.set(part.index, { index, json: "", id: block.id, name: block.name });
 					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 				}
@@ -1706,6 +1745,7 @@ async function runTurn(stream: any, chat: Chat, model: any, context: any, option
 						block.id ?? "",
 						block.name ?? "",
 						parseStreamingJson(block.json),
+						session.cwd,
 					);
 					stream.push({
 						type: "toolcall_delta",
@@ -1735,37 +1775,56 @@ async function runTurn(stream: any, chat: Chat, model: any, context: any, option
 					} catch {
 						input = { unparsed: block.json };
 					}
-					addToolCall(block.id, block.name ?? "", input, block.index);
+					const toolCall = mapToolCall(session, block.id, block.name ?? "", input);
+					output.content[block.index] = toolCall;
+					stream.push({ type: "toolcall_end", contentIndex: block.index, toolCall, partial: output });
+					calls++;
 				}
-			} else if (part?.type === "message_stop") {
-				open = undefined;
-				if (calls.length && !chat.side) return finishRound("toolUse");
+			} else if (part?.type === "message_stop" && calls > 0) {
+				output.stopReason = "toolUse";
+				stream.push({ type: "done", reason: "toolUse", message: output });
+				stream.end();
+				return;
 			}
 		}
-	} catch (error) {
-		chat.close(true);
-		fail(signal?.aborted ? "aborted" : "error", signal?.aborted ? "已中断" : errorText(error));
 	} finally {
-		signal?.removeEventListener("abort", onAbort);
-		if (chat.side) chat.close(true);
+		options?.signal?.removeEventListener("abort", onAbort);
 	}
 }
 
 function streamSimple(model: any, context: any, options: any): any {
 	const stream = createAssistantMessageEventStream();
 	const sessionId: string | undefined = options?.sessionId;
-	// Side requests (titles, memory, MyHarness's compaction summary) answer apart, so they never enter the chat's
-	// conversation. A chat's own turns always carry its tools; a summary on the chat's own model carries them too, for the
-	// cache, so it is told by the flag.
-	const side = !sessionId || !context.tools?.length || shared.compacting.has(sessionId);
-	let chat: Chat;
-	if (side) {
-		chat = new Chat(sessionId ?? randomUUID(), true);
+	// Side requests (titles, summaries) answer apart, so they never enter the chat's conversation. Most have no tools;
+	// a summary on the chat's own model carries the chat's tools for the provider cache, so it is told by the flag.
+	const compacting = !!sessionId && shared.compacting.has(sessionId);
+	const ephemeral = !sessionId || !context.tools?.length || compacting;
+	let session: CliSession;
+	if (ephemeral) {
+		session = new CliSession(sessionId ?? randomUUID(), true);
 	} else {
-		chat = shared.chats.get(sessionId) ?? new Chat(sessionId, false);
-		shared.chats.set(sessionId, chat);
+		session = shared.sessions.get(sessionId) ?? new CliSession(sessionId);
+		shared.sessions.set(sessionId, session);
 	}
-	void runTurn(stream, chat, model, context, options);
+	runTurn(stream, session, model, context, options)
+		.catch((error) => {
+			const message: any = {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: zeroUsage(),
+				stopReason: "error",
+				errorMessage: error instanceof Error ? error.message : String(error),
+				timestamp: Date.now(),
+			};
+			stream.push({ type: "error", reason: "error", error: message });
+			stream.end();
+		})
+		.finally(() => {
+			if (ephemeral) session.close();
+		});
 	return stream;
 }
 
@@ -1792,8 +1851,9 @@ export default function (pi: ExtensionAPI) {
 		},
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		// MyHarness compacts these chats by this length, the way it does on every other provider (see /context-length).
 		contextWindow: readContextWindow(),
+		// `claude` decides when to compact, by the same length (see /context-length).
+		managesOwnContext: true,
 		maxTokens: 64_000,
 	}));
 	pi.registerProvider({
@@ -1817,7 +1877,7 @@ export default function (pi: ExtensionAPI) {
 			{
 				id: "context-length",
 				label: "上下文长度",
-				description: "MyHarness 快到这个长度时按自己的方式压缩对话。可填 100K 到 1M，例如 300k，下一轮生效。",
+				description: "Claude Code 快到这个长度时自己压缩，大约提前 34K。可填 100K 到 1M，例如 300k，下一轮生效。",
 				placeholder: "1M",
 				get: () => formatTokens(readContextWindow()),
 				set: (value: string) => {
@@ -1830,10 +1890,57 @@ export default function (pi: ExtensionAPI) {
 	} as any);
 
 	const usingClaudeCode = (model: any) => model?.provider === PROVIDER_ID;
-	const sessionIdOf = (ctx: any): string => ctx.sessionManager.getSessionId();
+	/** The card tool means nothing to other models, so it is only active while this provider is. */
+	const syncActiveTools = (model: any) => {
+		const active = pi.getActiveTools();
+		const present = active.includes(PASSTHROUGH_TOOL);
+		if (usingClaudeCode(model) && !present) pi.setActiveTools([...active, PASSTHROUGH_TOOL]);
+		if (!usingClaudeCode(model) && present) pi.setActiveTools(active.filter((name) => name !== PASSTHROUGH_TOOL));
+	};
+
+	pi.registerTool({
+		name: PASSTHROUGH_TOOL,
+		label: "Claude Code",
+		description:
+			"Internal to the Claude Code provider: shows a tool Claude Code is running by itself and waits for its result. Never call this directly.",
+		parameters: Type.Object({ summary: Type.Optional(Type.String()), tool: Type.String(), input: Type.Any() }),
+		async execute(id: string, _params: any, signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
+			const session = shared.sessions.get(ctx.sessionManager.getSessionId());
+			const pending = session?.takeToolResult(id);
+			if (!session || !pending) throw new Error("Claude Code 已不再等待这个工具的结果。");
+			const onAbort = () => session.interrupt();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				const block = await pending;
+				const parts =
+					typeof block.content === "string" ? [{ type: "text", text: block.content }] : (block.content ?? []);
+				const content = parts
+					.map((part: any) =>
+						part.type === "image"
+							? { type: "image", data: part.source?.data, mimeType: part.source?.media_type }
+							: { type: "text", text: String(part.text ?? part.tool_name ?? "").slice(0, MAX_CARD_CHARS) },
+					)
+					.filter((part: any) => part.type === "image" || part.text);
+				if (block.is_error) throw new Error(plainText(content) || "工具失败");
+				return { content: content.length ? content : [{ type: "text", text: "(no output)" }], details: {} };
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+		},
+	} as any);
+
+	// `claude` may wait for an app tool before starting its own next tool, while MyHarness only asks the provider to go on
+	// once every card of the round is done. So each app tool's answer goes back the moment it finishes, not next round.
+	pi.on("tool_execution_end", async (event: any, ctx: any) => {
+		shared.sessions.get(ctx.sessionManager.getSessionId())?.deliverAppResult({
+			toolCallId: event.toolCallId,
+			content: event.result?.content,
+			isError: event.isError,
+		});
+	});
 
 	/**
-	 * An early version of this extension recorded the sum of a turn's requests as its usage, which reads as millions of
+	 * An earlier version of this extension recorded the sum of a turn's requests as its usage, which reads as millions of
 	 * tokens and blocks the chat. Such a number cannot be a context's size, so it is dropped here, in memory only; MyHarness
 	 * then estimates from the messages until the next real answer. The session file stays as it was.
 	 */
@@ -1851,26 +1958,31 @@ export default function (pi: ExtensionAPI) {
 	 * when they may be old; a chat that switches away no longer shows them.
 	 */
 	const followLimits = (ctx: any, model: any) => {
+		const sessionId = ctx.sessionManager.getSessionId();
 		if (!usingClaudeCode(model)) {
-			setLimitsStatus(ctx, undefined);
+			try {
+				ctx.ui?.setStatus?.(PROVIDER_ID, undefined);
+			} catch {}
 			return;
 		}
-		const limits = shared.limits ?? {};
-		setLimitsStatus(ctx, limitsText(limits, Date.now()));
-		if (limitsNeedQuery(limits, Date.now())) void refreshLimits();
+		// The event's model, not the context's: a chat that is switching may still report the model it leaves.
+		showStatus(sessionId, ctx, true);
+		if (limitsNeedQuery(shared.limits ?? {}, Date.now())) void refreshLimits();
 	};
 
 	pi.on("session_start", async (_event: any, ctx: any) => {
-		shared.contexts.set(sessionIdOf(ctx), ctx);
+		shared.contexts.set(ctx.sessionManager.getSessionId(), ctx);
+		syncActiveTools(ctx.model);
 		forgetImpossibleUsage(ctx);
-		if (usingClaudeCode(ctx.model)) followLimits(ctx, ctx.model);
+		followLimits(ctx, ctx.model);
 	});
 	pi.on("model_select", async (event: any, ctx: any) => {
-		shared.contexts.set(sessionIdOf(ctx), ctx);
+		shared.contexts.set(ctx.sessionManager.getSessionId(), ctx);
+		syncActiveTools(event.model);
 		followLimits(ctx, event.model);
 	});
 	pi.registerCommand("context-length", {
-		description: "设置 Claude Code 对话的上下文长度（MyHarness 按它压缩），例如 /context-length 300k",
+		description: "设置 Claude Code 自动压缩用的上下文长度，例如 /context-length 300k",
 		handler: async (args: string, ctx: any) => {
 			const current = readContextWindow();
 			const label = (tokens: number) =>
@@ -1895,27 +2007,45 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			saveContextWindow(tokens);
-			ctx.ui.notify(`上下文长度已设为 ${label(tokens)}，MyHarness 下一轮起按它压缩。`, "info");
+			ctx.ui.notify(`上下文长度已设为 ${label(tokens)}，Claude Code 下一轮起按它自动压缩。`, "info");
 		},
 	} as any);
 
+	const sessionIdOf = (ctx: any): string => ctx.sessionManager.getSessionId();
 	pi.on("agent_start", async (_event: any, ctx: any) => {
 		shared.compacting.delete(sessionIdOf(ctx));
 	});
-	// MyHarness's own compaction runs as on any provider; its summary request is a side request (see streamSimple).
-	pi.on("session_before_compact", async (_event: any, ctx: any) => {
-		if (usingClaudeCode(ctx.model)) shared.compacting.add(sessionIdOf(ctx));
-		return undefined;
-	});
-	// The record now starts with MyHarness's checkpoint, which `claude`'s conversation does not: it starts again.
-	pi.on("session_compact", async (_event: any, ctx: any) => {
+	pi.on("session_before_compact", async (event: any, ctx: any) => {
+		if (!usingClaudeCode(ctx.model)) return undefined;
 		const sessionId = sessionIdOf(ctx);
-		shared.compacting.delete(sessionId);
-		shared.chats.get(sessionId)?.close(true);
+		// Only moving to a model with a smaller window, or a chat `claude` has not seen, is left to MyHarness's summary.
+		if (event.reason !== "manual" || !readLinks()[sessionId]) {
+			shared.compacting.add(sessionId);
+			return undefined;
+		}
+		const session = shared.sessions.get(sessionId) ?? new CliSession(sessionId);
+		const result = await session.compact(ctx.model, event.customInstructions, event.signal);
+		if (!result) {
+			ctx.ui.notify("Claude Code 没有完成这次压缩。", "error");
+			return { cancel: true };
+		}
+		return {
+			compaction: {
+				summary: result.summary || "Claude Code compacted this chat's context.",
+				firstKeptEntryId: event.preparation.firstKeptEntryId,
+				tokensBefore: result.tokensBefore,
+			},
+		};
 	});
-	// Another branch of the chat: the next request finds out what of it `claude`'s conversation still holds.
+	pi.on("session_compact", async (_event: any, ctx: any) => {
+		shared.compacting.delete(sessionIdOf(ctx));
+	});
+	// Moving to another branch of the chat leaves the Claude Code conversation behind: rebuild it from the branch.
 	pi.on("session_tree", async (_event: any, ctx: any) => {
-		shared.chats.get(sessionIdOf(ctx))?.close(true);
+		const sessionId = ctx.sessionManager.getSessionId();
+		shared.sessions.get(sessionId)?.close();
+		shared.sessions.delete(sessionId);
+		writeLink(sessionId, undefined);
 	});
 	// A response cut off at the output limit with no tool call in it would end the task. It goes on instead, in the same
 	// run and as often as it takes (Stop ends it); a cut response with tool calls goes on by itself, since MyHarness fails
@@ -1929,23 +2059,15 @@ export default function (pi: ExtensionAPI) {
 			{ deliverAs: "followUp" },
 		);
 	});
-	// A run can end between two tool rounds (Stop, a tool that ends the run), with no provider call there to pass that on.
-	// `claude` would wait for results that never come, so it is ended; the next turn resumes the last clean one.
+	// A run can end between two tool rounds (Stop, Compact now), with no provider call there to pass that on. `claude` would
+	// carry on alone, and every MyHarness tool it called would wait for a card that never runs.
 	pi.on("agent_end", async (_event: any, ctx: any) => {
-		const chat = shared.chats.get(sessionIdOf(ctx));
-		if (chat?.turnActive) chat.close(true);
+		shared.sessions.get(ctx.sessionManager.getSessionId())?.interrupt();
 	});
 	pi.on("session_shutdown", async (_event: any, ctx: any) => {
-		const sessionId = sessionIdOf(ctx);
-		shared.chats.get(sessionId)?.close();
-		shared.chats.delete(sessionId);
+		const sessionId = ctx.sessionManager.getSessionId();
+		shared.sessions.get(sessionId)?.close();
+		shared.sessions.delete(sessionId);
 		shared.contexts.delete(sessionId);
 	});
-	if (!shared.exitHook) {
-		shared.exitHook = true;
-		// No `claude` may outlive MyHarness: on Windows a child keeps running when its parent ends.
-		process.once("exit", () => {
-			for (const run of shared.runs) run.stop(true);
-		});
-	}
 }

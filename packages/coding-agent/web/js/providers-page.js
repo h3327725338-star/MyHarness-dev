@@ -15,6 +15,7 @@ import { N_, serverText, t, tNodes } from "./i18n.js";
 import { Field, ProviderForm, SaveBar, apiLabel, apiOptions, apiShort, focusField, followIntoView, shortUrl, steadyRow, useUnsaved } from "./provider-form.js";
 import { BASE_URL_EXAMPLE, baseUrlProblem, entryHasSharedKey, findRow, isLayeredMember, memberGapCount, memberValues, providerTree, rowName, uniqueProviderId } from "./provider-models.js";
 import { nebiusSummary, openServicePage, useNebiusInfo } from "./service-keys.js";
+import { ExternalLogin } from "./provider-login.js";
 
 const NEW = "\u0000new";
 // The forms of the right side that are not a key: the provider's own settings and the key being added.
@@ -104,7 +105,7 @@ export function ProviderEditorHost({ id }) {
 	return null;
 }
 
-const statusOf = (p) => (p.missingBaseUrl ? { cls: "danger", text: t("No Base URL") } : !p.enabled ? { cls: "", text: t("Off") } : p.configured ? { cls: "ok", text: t("Ready") } : { cls: "danger", text: t("No API key") });
+const statusOf = (p) => (p.missingBaseUrl ? { cls: "danger", text: t("No Base URL") } : !p.enabled ? { cls: "", text: t("Off") } : p.configured ? { cls: "ok", text: t("Ready") } : { cls: "danger", text: p.externalLogin ? t("Not signed in") : t("No API key") });
 
 /** The status of one key: what its entry reports, or how many of its models lack something on every layer. */
 function memberStatus(member, group) {
@@ -126,6 +127,7 @@ const totalModels = (row) => row.members.reduce((sum, member) => sum + modelsOf(
 
 /** The key in use, with the entry to manage all keys of the provider (the form puts its label beside it). */
 function KeySummary({ provider, onManage, busy }) {
+	if (provider.externalLogin) return html`<${ExternalLogin} key=${provider.id} provider=${provider} />`;
 	const c = provider.credentials;
 	const active = c?.apiKeys.find((k) => k.active);
 	const oauthActive = c?.active?.type === "oauth";
@@ -653,7 +655,7 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 				<div class="prov-root-body">
 					<div class="pf-conn"><div class="pf-fields">
 						${provider.baseUrl ? html`<div class="col field-label pf-row"><span class="field-name">${t("Base URL")}</span><span class="mono pf-value">${provider.baseUrl}</span></div>` : null}
-						<div class="col field-label pf-row"><span class="field-name">${t("API key")}</span>${keyArea}</div>
+						<div class="col field-label pf-row"><span class="field-name">${provider.externalLogin ? t("Sign-in status") : t("API key")}</span>${keyArea}</div>
 						<div class="col field-label pf-row"><span class="field-name">${t("Models")}</span><span class="pf-value">${t("{modelCount} models", { modelCount: provider.modelCount })}</span></div>
 						<span class="dim pf-hint">${t("This provider is not defined in models.json (it comes from an extension), so its address and models are managed there.")}</span>
 					</div></div>

@@ -168,6 +168,14 @@ export interface ApiKeyAuth {
 	login?(interaction: AuthInteraction): Promise<ApiKeyCredential>;
 
 	/**
+	 * Optional instructions for an ambient login owned by the provider's program.
+	 * Reading these must not launch it or expose credentials. Hosts display the
+	 * command for the user to run, then use `check` to refresh availability;
+	 * no placeholder API key or OAuth token needs to be stored by the host.
+	 */
+	externalLogin?: () => { instructions: string; command: string };
+
+	/**
 	 * Optional side-effect-free availability check. Use this when `resolve()` may
 	 * execute commands or perform other request-time work. Missing means Models
 	 * checks availability by resolving auth.

@@ -250,7 +250,8 @@ export function registerProviderRoutes(
 			// the same rule getProviderAuthStatus applies for its "stored" source, which it can only see after a refresh.
 			const storedCredential =
 				!!overview && (overview.apiKeys.length > 0 || overview.hasOAuth || overview.runtimeOverride === true);
-			const configured = status.configured || storedCredential;
+			const externalLogin = provider.auth.apiKey?.externalLogin?.();
+			const configured = externalLogin ? !!(await rt.checkAuth(provider.id)) : status.configured || storedCredential;
 			// A models.json provider saved without a Base URL is unfinished: it is off until the address is filled in.
 			const missingBaseUrl = modelsJsonProviderLacksBaseUrl(configEntries.get(provider.id));
 			providers.push({
@@ -260,7 +261,16 @@ export function registerProviderRoutes(
 				enabled: !disabled.has(provider.id) && !missingBaseUrl,
 				missingBaseUrl,
 				configured,
-				authSource: status.configured ? (status.source ?? null) : storedCredential ? "stored" : null,
+				authSource: externalLogin
+					? configured
+						? "external"
+						: null
+					: status.configured
+						? (status.source ?? null)
+						: storedCredential
+							? "stored"
+							: null,
+				externalLogin: externalLogin ?? null,
 				supportsApiKeyLogin: typeof provider.auth.apiKey?.login === "function",
 				supportsOAuth: provider.auth.oauth !== undefined,
 				/** Defined in models.json: edited, renamed and deleted from its card. */
@@ -338,6 +348,24 @@ export function registerProviderRoutes(
 		}
 		host.broadcast("models_changed", {});
 		return { ok: true, value: setting.get() };
+	});
+
+	/** Recheck a login owned by the provider's program; never create a fake saved API key. */
+	server.route("POST", "/api/providers/auth/check", async ({ body }) => {
+		const id = str(asObject(body).id, "id");
+		const rt = runtime();
+		const provider = rt.getProvider(id) ?? rt.getProviderCatalogProvider(id);
+		if (!provider) throw new HttpError(404, `Unknown provider: ${id}`);
+		if (!provider.auth.apiKey?.externalLogin)
+			throw new HttpError(400, "This provider does not use an external program for sign-in.");
+		try {
+			rt.reloadCredentials();
+			await rt.refresh({ allowNetwork: false });
+			await afterCredentialChange();
+			return { ok: true, configured: rt.getProviderAuthStatus(id).configured };
+		} catch (error) {
+			throw new HttpError(400, error instanceof Error ? error.message : String(error));
+		}
 	});
 
 	server.route("POST", "/api/providers/api-key/add", async ({ body }) => {

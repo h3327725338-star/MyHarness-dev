@@ -557,7 +557,7 @@ async function streamAssistantResponse(
 	});
 
 	let partialMessage: AssistantMessage | null = null;
-	let addedPartial = false;
+	let partialMessageIndex: number | undefined;
 	let sawStart = false;
 	let sawTerminal = false;
 	let terminalMessage: AssistantMessage | undefined;
@@ -571,8 +571,8 @@ async function streamAssistantResponse(
 				if (sawStart) throw new Error("Invalid provider stream: duplicate start event");
 				sawStart = true;
 				partialMessage = event.partial;
+				partialMessageIndex = context.messages.length;
 				context.messages.push(partialMessage);
-				addedPartial = true;
 				await emit({ type: "message_start", message: { ...partialMessage } });
 				break;
 
@@ -585,9 +585,9 @@ async function streamAssistantResponse(
 			case "toolcall_start":
 			case "toolcall_delta":
 			case "toolcall_end":
-				if (partialMessage) {
+				if (partialMessageIndex !== undefined) {
 					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
+					context.messages[partialMessageIndex] = partialMessage;
 					await emit({
 						type: "message_update",
 						assistantMessageEvent: event,
@@ -613,9 +613,13 @@ async function streamAssistantResponse(
 					toolCallIds,
 				);
 				terminalMessage = finalMessage;
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
+				if (partialMessageIndex !== undefined && partialMessageIndex === context.messages.length - 1) {
+					context.messages[partialMessageIndex] = finalMessage;
 				} else {
+					// Host tool calls can append their own messages while this response is
+					// streaming. Keep them intact and finalize after them, in the same order
+					// as message_end events and the returned newMessages transcript.
+					if (partialMessageIndex !== undefined) context.messages.splice(partialMessageIndex, 1);
 					context.messages.push(finalMessage);
 				}
 				break;
@@ -627,7 +631,7 @@ async function streamAssistantResponse(
 		throw new Error("Invalid provider stream: stream ended without a done or error event");
 	}
 
-	if (!addedPartial) {
+	if (partialMessageIndex === undefined) {
 		await emit({ type: "message_start", message: { ...terminalMessage } });
 	}
 	await emit({ type: "message_end", message: terminalMessage });

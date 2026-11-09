@@ -7,9 +7,11 @@
  * without creating a loader -> facade -> loader cycle. The full event/context surface stays
  * in `runtime/types.ts`.
  */
+
 export { convertToLlm } from "../agent/runtime/messages.ts";
 export { CONFIG_DIR_NAME, getAgentDir, VERSION } from "../config.ts";
 export { serializeConversation } from "../context/compact/index.ts";
+export { createClaudeCodeProvider, registerClaudeCodeProvider } from "../providers/claude-code/register.ts";
 export { SessionManager } from "../session/manager/index.ts";
 export {
 	createBashTool,

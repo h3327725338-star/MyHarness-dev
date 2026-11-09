@@ -1,263 +1,192 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-	earlierBlocks,
-	FLAG_SETTINGS,
-	hashKeys,
-	initializeRequest,
-	isTransient,
-	keyedMessages,
-	LAUNCH_ENV,
-	launchArgs,
+	appendedPrompt,
+	appendPromptFor,
+	CUT_CALLS_NOTE,
+	callSummary,
+	ENTRYPOINT,
 	launchEnv,
 	limitsFromEvent,
 	limitsFromUsage,
 	limitsNeedQuery,
 	limitsText,
-	MCP_SERVER,
 	mergeLimits,
-	messageKey,
+	OUTPUT_LIMIT_NOTE,
+	OWN_TOOLS_FOR,
+	offeredNames,
 	outputLimitFor,
 	outputLimitNote,
+	ownToolsFor,
 	STRIPPED_ENV,
-	startsWith,
-	toolList,
-	turnContent,
 } from "../examples/extensions/claude-code-shell.ts";
 
-const user = (text: string, timestamp = 1000, images: string[] = []) => ({
-	role: "user",
-	content: [{ type: "text", text }, ...images.map((data) => ({ type: "image", data, mimeType: "image/png" }))],
-	timestamp,
+describe("claude-code-shell tools", () => {
+	const coding = [
+		"read",
+		"write",
+		"edit",
+		"bash",
+		"pwsh",
+		"web_search",
+		"todo_write",
+		"ask_user_question",
+		"job_output",
+	];
+
+	it("gives claude one of its own tools only while the MyHarness tool it stands in for is switched on", () => {
+		expect(ownToolsFor(coding)).toEqual(["Bash", "Edit", "Read", "Write"]);
+		// A chat without file or shell tools gets none of Claude Code's.
+		expect(ownToolsFor(["web_search", "memory_search", "todo_write"])).toEqual([]);
+		expect(ownToolsFor([])).toEqual([]);
+		expect(ownToolsFor(["grep", "find", "ls"])).toEqual(["Glob", "Grep"]);
+		// Either shell is Claude Code's one Bash; a patch tool both edits and creates files.
+		expect(ownToolsFor(["pwsh"])).toEqual(["Bash"]);
+		expect(ownToolsFor(["apply_patch"])).toEqual(["Edit", "Write"]);
+		// Nothing of Claude Code's that stands in for no MyHarness tool is ever in the list.
+		const everything = ownToolsFor([
+			...Object.keys(OWN_TOOLS_FOR),
+			"agent",
+			"agent_tasks",
+			"web_search",
+			"web_fetch",
+		]);
+		for (const name of ["Agent", "Task", "Skill", "WebSearch", "WebFetch", "NotebookEdit", "AskUserQuestion"])
+			expect(everything).not.toContain(name);
+	});
+
+	it("offers over MCP every other MyHarness tool that is on, and its shells for background jobs", () => {
+		expect(offeredNames(coding)).toEqual([
+			"bash",
+			"pwsh",
+			"web_search",
+			"todo_write",
+			"ask_user_question",
+			"job_output",
+		]);
+		// MyHarness's own sub-agents, to-do list and questions are MyHarness's to run, with its own cards and settings.
+		expect(offeredNames(["agent", "agent_tasks", "read", "claude_code_tool"])).toEqual(["agent", "agent_tasks"]);
+		expect(offeredNames(["read", "write", "edit", "apply_patch", "grep", "find", "ls"])).toEqual([]);
+	});
+
+	it("summarizes a call of claude's own tool in one line for its card", () => {
+		expect(callSummary("Read", { file_path: "C:/p/src/app.ts", limit: 20 })).toBe("Read C:/p/src/app.ts");
+		expect(callSummary("Bash", { command: "npm test\nnpm run lint", description: "run tests" })).toBe(
+			"Bash npm test",
+		);
+		expect(callSummary("Grep", { pattern: "TODO", path: "src" })).toBe("Grep TODO · src");
+		expect(callSummary("Glob", { pattern: "**/*.ts" })).toBe("Glob **/*.ts");
+		expect(callSummary("Edit", {})).toBe("Edit");
+		// While the arguments are still arriving there may be nothing to show yet.
+		expect(callSummary("Write", undefined)).toBe("Write");
+		expect(callSummary("Bash", { command: "x".repeat(500) })).toHaveLength("Bash ".length + 160);
+	});
+
+	it("names a file inside the chat's folder from that folder, and any other by its whole path", () => {
+		const cwd = join(tmpdir(), "chat-folder");
+		const inside = join(cwd, "src", "app.ts");
+		const outside = join(tmpdir(), "elsewhere", "notes.md");
+		expect(callSummary("Read", { file_path: inside }, cwd)).toBe("Read src/app.ts");
+		expect(callSummary("Edit", { file_path: inside.replace(/\\/g, "/") }, cwd)).toBe("Edit src/app.ts");
+		expect(callSummary("Grep", { pattern: "TODO", path: join(cwd, "src") }, cwd)).toBe("Grep TODO · src");
+		expect(callSummary("Write", { file_path: outside }, cwd)).toBe(`Write ${outside}`);
+		// A path that is already relative, the folder itself and a command are left as they are.
+		expect(callSummary("Read", { file_path: "src/app.ts" }, cwd)).toBe("Read src/app.ts");
+		expect(callSummary("Glob", { pattern: "*.ts", path: cwd }, cwd)).toBe(`Glob *.ts · ${cwd}`);
+		expect(callSummary("Bash", { command: `ls ${inside}` }, cwd)).toBe(`Bash ls ${inside}`);
+	});
 });
-const assistant = (text: string, extra: Record<string, unknown> = {}) => ({
-	role: "assistant",
-	content: [{ type: "text", text }],
-	stopReason: "stop",
-	timestamp: 2000,
-	...extra,
-});
-const toolResult = (toolCallId: string, text: string) => ({
-	role: "toolResult",
-	toolCallId,
-	toolName: "read",
-	content: [{ type: "text", text }],
-	isError: false,
-	timestamp: 3000,
+
+describe("claude-code-shell prompt", () => {
+	it("appends MyHarness's whole prompt after the section on where claude runs and how tool names map", () => {
+		const systemPrompt =
+			'<user_personalization priority="highest">\nPERSONAL_PROMPT_MARKER\n</user_personalization>\n\n# Coding mode\nMYHARNESS_BUILT_IN\n\n<model_instructions priority="highest">\nMODEL_PROMPT\n</model_instructions>';
+		const active = ["read", "edit", "apply_patch", "bash", "schedule", "job_output", "memory_search"];
+		const text = appendedPrompt(active, systemPrompt);
+		const section = appendPromptFor(active);
+		expect(text.startsWith(section)).toBe(true);
+		// Every part of MyHarness's prompt arrives, unchanged and in MyHarness's order, with the model's own prompt last.
+		expect(text.endsWith(systemPrompt)).toBe(true);
+		expect(text.trimEnd().endsWith("</model_instructions>")).toBe(true);
+		expect(section).toContain("MyHarness's instructions win");
+		expect(section).toContain("read → Read, edit → Edit, apply_patch → Edit and Write, bash → Bash.");
+		// Two MyHarness tools that one tool of claude's does are named together.
+		expect(appendPromptFor(["bash", "pwsh", "find", "ls"])).toContain("bash and pwsh → Bash, find and ls → Glob.");
+		expect(section).toContain("mcp__myharness__<name>");
+		expect(section).toContain("mcp__myharness__bash");
+		expect(section).toContain("A tool they do not list is not available in this chat.");
+		// Without a prompt of MyHarness's only the section is appended.
+		expect(appendedPrompt(active, undefined)).toBe(section);
+		expect(appendedPrompt(active, "  ")).toBe(section);
+	});
+
+	it("names only the tools the chat really has, and leaves what comes back after a reply to MyHarness's prompt", () => {
+		const chatOnly = appendPromptFor(["web_search", "memory_search"]);
+		expect(chatOnly).not.toContain("→");
+		expect(chatOnly).not.toContain("mcp__myharness__bash");
+		expect(chatOnly).toContain("mcp__myharness__<name>");
+		const none = appendPromptFor([]);
+		expect(none).not.toContain("mcp__myharness__");
+		expect(none).toContain("A tool they do not list is not available in this chat.");
+		// Claude Code's own later turns do not exist; MyHarness's job reports and schedules are not denied here.
+		for (const section of [chatOnly, none, appendPromptFor(["bash", "job_output"])]) {
+			expect(section).toContain("Claude Code's own wake-ups");
+			expect(section).not.toContain("never reports back");
+			expect(section).not.toMatch(/Agent|TodoWrite|AskUserQuestion/);
+		}
+	});
 });
 
 describe("claude-code-shell launch", () => {
-	it("starts claude with none of its own tools, settings, MCP servers or slash commands", () => {
-		const args = launchArgs({ model: "claude-haiku-5-5", persist: true });
-		const flagValue = (flag: string) => args[args.indexOf(flag) + 1];
-		expect(args.slice(0, 7)).toEqual([
-			"-p",
-			"--input-format",
-			"stream-json",
-			"--output-format",
-			"stream-json",
-			"--verbose",
-			"--include-partial-messages",
-		]);
-		expect(flagValue("--model")).toBe("claude-haiku-5-5");
-		expect(flagValue("--tools")).toBe("");
-		expect(flagValue("--setting-sources")).toBe("");
-		expect(JSON.parse(flagValue("--settings"))).toEqual(FLAG_SETTINGS);
-		expect(FLAG_SETTINGS).toEqual({ autoCompactEnabled: false, disableAllHooks: true });
-		for (const flag of ["--strict-mcp-config", "--disable-slash-commands", "--no-chrome"])
-			expect(args).toContain(flag);
-		expect(flagValue("--permission-prompt-tool")).toBe("stdio");
-		for (const flag of [
-			"--effort",
-			"--resume",
-			"--resume-session-at",
-			"--fork-session",
-			"--no-session-persistence",
-		]) {
-			expect(args).not.toContain(flag);
+	it("loads no CLAUDE.md, caps a request at MyHarness's limit, keeps the user's login and puts no tool behind a search", () => {
+		const base: NodeJS.ProcessEnv = { PATH: "p", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "128000" };
+		for (const name of STRIPPED_ENV) base[name] ??= "x";
+		const env = launchEnv(base, 64_000, 300_000);
+		for (const name of STRIPPED_ENV.filter(
+			(name) => name !== "CLAUDE_CODE_MAX_OUTPUT_TOKENS" && name !== "CLAUDE_CODE_ENTRYPOINT",
+		))
+			expect(env[name]).toBeUndefined();
+		expect(env).toMatchObject({
+			PATH: "p",
+			CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+			CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000",
+			CLAUDE_CODE_AUTO_COMPACT_WINDOW: "300000",
+			CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+			CLAUDE_CODE_DISABLE_CRON: "1",
+			ENABLE_TOOL_SEARCH: "false",
+			ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+			// A MyHarness tool's result is not cut or moved to a file at claude's own 25,000 tokens.
+			MAX_MCP_OUTPUT_TOKENS: "125000",
+		});
+		// An inherited cap never outlives a model without a limit of its own, and the base is left alone.
+		expect(launchEnv(base, undefined, 300_000).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
+		expect(base.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("128000");
+	});
+
+	it("names MyHarness as the client, over a name inherited from a Claude Code or Agent SDK session", () => {
+		expect(ENTRYPOINT).toBe("myharness");
+		expect(["cli", "claude-desktop", "claude-vscode"]).not.toContain(ENTRYPOINT);
+		expect(ENTRYPOINT.startsWith("sdk-")).toBe(false);
+		for (const inherited of [undefined, "sdk-cli", "sdk-ts", "cli"]) {
+			const base: NodeJS.ProcessEnv = { PATH: "p", CLAUDE_CODE_ENTRYPOINT: inherited };
+			expect(launchEnv(base, undefined, 300_000).CLAUDE_CODE_ENTRYPOINT).toBe(ENTRYPOINT);
+			expect(base.CLAUDE_CODE_ENTRYPOINT).toBe(inherited);
 		}
 	});
 
-	it("resumes a chat at its last clean turn, forks it for a side request, and keeps nothing of a one-off", () => {
-		const resumed = launchArgs({ model: "m", effort: "high", resume: { id: "c1", at: "u9" }, persist: true });
-		expect(resumed.slice(-6)).toEqual(["--effort", "high", "--resume", "c1", "--resume-session-at", "u9"]);
-
-		const fork = launchArgs({ model: "m", resume: { id: "c1", at: "u9" }, fork: true, persist: false });
-		expect(fork.slice(-6)).toEqual([
-			"--resume",
-			"c1",
-			"--resume-session-at",
-			"u9",
-			"--fork-session",
-			"--no-session-persistence",
-		]);
-
-		const oneOff = launchArgs({ model: "m", fork: true, persist: false });
-		expect(oneOff.at(-1)).toBe("--no-session-persistence");
-		expect(oneOff).not.toContain("--resume");
-		expect(oneOff).not.toContain("--fork-session");
-	});
-
-	it("switches off every part of Claude Code that adds its own instructions, keeps the login, and leaves the base alone", () => {
-		const base: NodeJS.ProcessEnv = {
-			PATH: "p",
-			ANTHROPIC_API_KEY: "k",
-			ANTHROPIC_BASE_URL: "u",
-			CLAUDE_CODE_SIMPLE: "1",
-		};
-		for (const name of STRIPPED_ENV) base[name] ??= "x";
-		const env = launchEnv(base, false);
-		for (const name of STRIPPED_ENV) expect(env[name]).toBeUndefined();
-		expect(env.PATH).toBe("p");
-		expect(base.ANTHROPIC_API_KEY).toBe("k");
-		for (const [name, value] of Object.entries(LAUNCH_ENV)) expect(env[name]).toBe(value);
-		expect(LAUNCH_ENV).toMatchObject({
-			CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
-			CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
-			CLAUDE_CODE_SAFE_MODE: "1",
-			CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
-			CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
-			CLAUDE_AGENT_SDK_MCP_NO_PREFIX: "1",
-			ENABLE_CLAUDEAI_MCP_SERVERS: "false",
-			ENABLE_TOOL_SEARCH: "false",
-			DISABLE_AUTO_COMPACT: "1",
-			DISABLE_COMPACT: "1",
-		});
-		// A chat keeps the subscription's hour of cache; a request no other request shares writes the cheaper 5 minutes.
-		expect(env.CLAUDE_CODE_PROMPT_CACHE_TTL).toBeUndefined();
-		expect(launchEnv(base, true).CLAUDE_CODE_PROMPT_CACHE_TTL).toBe("5m");
-	});
-
-	it("caps a request's output at MyHarness's limit for the model, over one claude may have inherited", () => {
+	it("takes the output limit from the model and words the note by what the cut response wrote", () => {
 		expect(outputLimitFor({ maxTokens: 64_000 })).toBe(64_000);
 		expect(outputLimitFor({ maxTokens: 0 })).toBeUndefined();
 		expect(outputLimitFor({})).toBeUndefined();
-		const base: NodeJS.ProcessEnv = { PATH: "p", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "128000" };
-		expect(launchEnv(base, false, 64_000).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("64000");
-		expect(launchEnv(base, true, 64_000).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("64000");
-		// Without a limit of MyHarness's, claude's own applies.
-		expect(launchEnv({ PATH: "p" }, false).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
-	});
-
-	it("sends a task on after a cut-off response: briefer when it only thought, from where it stopped when it wrote", () => {
-		const thoughtOnly = { role: "assistant", content: [{ type: "thinking", thinking: "" }], stopReason: "length" };
-		const wroteText = {
-			...thoughtOnly,
-			content: [
-				{ type: "thinking", thinking: "" },
-				{ type: "text", text: "Part one" },
-			],
-		};
-		expect(outputLimitNote(thoughtOnly)).toContain("think much more briefly");
-		expect(outputLimitNote(wroteText)).toContain("Go on from where it stopped");
-		expect(outputLimitNote({ ...thoughtOnly, content: [{ type: "text", text: "  " }] })).toContain("still thinking");
-	});
-
-	it("gives claude MyHarness's system prompt, rendered fresh, and MyHarness's MCP server only when there are tools", () => {
-		expect(initializeRequest("MH PROMPT", true)).toEqual({
-			subtype: "initialize",
-			systemPrompt: ["MH PROMPT"],
-			systemPromptSnapshot: false,
-			sdkMcpServers: [MCP_SERVER],
-			sdkMcpServerConfigs: { [MCP_SERVER]: { timeout: 24 * 3600_000 } },
-		});
-		expect(initializeRequest("MH PROMPT", false)).toEqual({
-			subtype: "initialize",
-			systemPrompt: ["MH PROMPT"],
-			systemPromptSnapshot: false,
-		});
-	});
-
-	it("lists MyHarness's tools under their own names, as copies", () => {
-		const parameters = { type: "object", properties: { path: { type: "string" } }, required: ["path"] };
-		const listed = toolList([{ name: "read", description: "Read a file", parameters }, { name: "todo_write" }]);
-		expect(listed).toEqual([
-			{ name: "read", description: "Read a file", inputSchema: parameters },
-			{ name: "todo_write", description: "", inputSchema: { type: "object", properties: {} } },
-		]);
-		listed[0].inputSchema.required.push("changed");
-		expect(parameters.required).toEqual(["path"]);
-	});
-});
-
-describe("claude-code-shell record matching", () => {
-	it("keys what the model reads: a message rebuilt from the session file with another timestamp keeps its key", () => {
-		// MyHarness stamps its local-time note when making it and again when writing it down.
-		expect(messageKey(user("[system-reminder] The current local time is …", 1794138024387))).toBe(
-			messageKey(user("[system-reminder] The current local time is …", 1794138024404)),
-		);
-		expect(messageKey(user("a"))).not.toBe(messageKey(user("b")));
-		expect(messageKey(user("a", 1000, ["xx"]))).not.toBe(messageKey(user("a", 1000, ["xxxx"])));
-		expect(messageKey(assistant("hi", { responseId: "msg_1" }))).toBe("a:msg_1");
-		expect(messageKey(assistant("hi"))).toBe(messageKey(assistant("hi")));
-		expect(messageKey(toolResult("toolu_1", "out"))).toBe("t:toolu_1");
-	});
-
-	it("leaves out what providers leave out of a request: the transient reminder, failed and stopped answers", () => {
-		const reminder = user("[system-reminder] Dynamic session context", 0);
-		expect(isTransient(reminder)).toBe(true);
-		expect(messageKey(reminder)).toBeUndefined();
-		expect(messageKey(assistant("", { stopReason: "aborted" }))).toBeUndefined();
-		expect(messageKey(assistant("boom", { stopReason: "error", responseId: "msg_2" }))).toBeUndefined();
-		const keyed = keyedMessages([reminder, user("one"), assistant("", { stopReason: "aborted" }), user("two")]);
-		expect(keyed.map((item) => item.message.content[0].text)).toEqual(["one", "two"]);
-	});
-
-	it("goes on only while the record starts with exactly what claude holds", () => {
-		const keyed = keyedMessages([user("one"), assistant("ok", { responseId: "msg_1" }), user("two")]);
-		const held = keyed.slice(0, 2).map((item) => item.key);
-		expect(startsWith(keyed, held)).toBe(true);
-		expect(startsWith(keyed, [])).toBe(true);
-		expect(startsWith(keyed.slice(0, 1), held)).toBe(false);
-		expect(startsWith(keyedMessages([user("one"), assistant("other", { responseId: "msg_9" })]), held)).toBe(false);
-		expect(hashKeys(held)).toBe(hashKeys([...held]));
-		expect(hashKeys(held)).not.toBe(hashKeys(held.slice(0, 1)));
-	});
-});
-
-describe("claude-code-shell what is sent", () => {
-	it("sends a new user message as it is", () => {
-		expect(turnContent([user("hello")])).toEqual([{ type: "text", text: "hello" }]);
-		expect(turnContent([user("look", 1000, ["AAAA"])])).toEqual([
-			{ type: "text", text: "look" },
-			{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
-		]);
-	});
-
-	it("gives a conversation that starts anew the earlier messages as text, then the new message", () => {
-		const call = {
-			role: "assistant",
-			content: [{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "a.txt" } }],
-			stopReason: "toolUse",
-			timestamp: 2000,
-		};
-		const content = turnContent([
-			user("first"),
-			call,
-			toolResult("toolu_1", "file text"),
-			assistant("done"),
-			user("next"),
-		]);
-		expect(content).toHaveLength(2);
-		expect(content[0].text).toBe(
-			'<earlier-conversation>\nMessages of this chat that were not part of this conversation, oldest first:\n\nuser: first\n\nassistant: [called read {"path":"a.txt"}]\n\ntool result (read): file text\n\nassistant: done\n</earlier-conversation>',
-		);
-		expect(content[1]).toEqual({ type: "text", text: "next" });
-	});
-
-	it("asks claude to go on when no new user message came (a turn resumed between two tool rounds)", () => {
-		const content = turnContent([assistant("working"), toolResult("toolu_1", "out")]);
-		expect(content.at(-1)).toEqual({ type: "text", text: "Continue where you left off." });
-		expect(content[0].text).toContain("tool result (read): out");
-	});
-
-	it("drops only the oldest messages when the earlier conversation is too long", () => {
-		const big = "x".repeat(300_000);
-		const blocks = earlierBlocks([user(`a${big}`), user(`b${big}`), user(`c${big}`), user(`d${big}`)]);
-		expect(blocks[0].text).toContain("(2 older messages are not included.)");
-		expect(blocks[0].text).toContain("user: c");
-		expect(blocks[0].text).toContain("user: d");
-		expect(blocks[0].text).not.toContain("user: b");
-		expect(earlierBlocks([])).toEqual([]);
+		expect(OUTPUT_LIMIT_NOTE).toBe("claude-code-output-limit");
+		const thinkingOnly = outputLimitNote({ content: [{ type: "thinking", thinking: "" }] });
+		expect(thinkingOnly).toContain("think much more briefly");
+		const wrote = outputLimitNote({ content: [{ type: "text", text: "half an answer" }] });
+		expect(wrote).toContain("Go on from where it stopped");
+		// `claude` shows the stopped request as the user's interruption; each note says it was not.
+		for (const text of [thinkingOnly, wrote, CUT_CALLS_NOTE]) expect(text).toContain("not from the user");
+		expect(CUT_CALLS_NOTE).toContain("make the calls again");
 	});
 });
 
@@ -276,7 +205,7 @@ describe("claude-code-shell plan limits", () => {
 			},
 			now,
 		);
-		// The shape `claude` 2.1.317 answered get_usage with, other fields left out.
+		// The shape `claude` answered get_usage with, other fields left out.
 		const fromUsage = limitsFromUsage(
 			{
 				subscription_type: "max",

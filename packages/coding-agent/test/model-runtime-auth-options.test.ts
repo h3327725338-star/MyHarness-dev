@@ -1,6 +1,8 @@
-import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@myharness/ai";
+import { type AuthType, type CredentialStore, InMemoryCredentialStore, type Provider } from "@myharness/ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/providers/credentials/auth-storage.ts";
+import { composeModelProvider } from "../src/providers/models/composer.ts";
+import { ModelConfig } from "../src/providers/models/config.ts";
 import { ModelRuntime } from "../src/providers/runtime/index.ts";
 
 function authOptions(runtime: ModelRuntime, type?: AuthType) {
@@ -33,6 +35,38 @@ function testModel(id: string) {
 }
 
 describe("ModelRuntime auth options", () => {
+	it("preserves external sign-in metadata through model overrides without inventing an API key login", async () => {
+		const setup = { instructions: "Use the fixture program", command: "fixture.exe --isolated" };
+		const base: Provider = {
+			id: "external-fixture",
+			name: "External fixture",
+			auth: {
+				apiKey: {
+					name: "Fixture program login",
+					externalLogin: () => setup,
+					check: async () => undefined,
+					resolve: async () => undefined,
+				},
+			},
+			getModels: () => [],
+			stream: () => {
+				throw new Error("No inference expected");
+			},
+			streamSimple: () => {
+				throw new Error("No inference expected");
+			},
+		};
+		const composed = composeModelProvider(base.id, base, await ModelConfig.load(undefined), {
+			name: "Renamed fixture",
+		});
+		expect(composed.name).toBe("Renamed fixture");
+		expect(composed.auth.apiKey?.externalLogin?.()).toEqual(setup);
+		expect(composed.auth.apiKey?.login).toBeUndefined();
+		expect(
+			await composed.auth.apiKey?.check?.({ ctx: { env: async () => undefined, fileExists: async () => false } }),
+		).toBeUndefined();
+	});
+
 	it("accepts a myharness-ai CredentialStore", async () => {
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));

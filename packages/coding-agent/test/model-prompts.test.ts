@@ -10,7 +10,7 @@ import {
 	type Provider,
 } from "@myharness/ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { initializeRequest } from "../examples/extensions/claude-code-shell.ts";
+import { appendedPrompt } from "../examples/extensions/claude-code-shell.ts";
 import { AuthStorage } from "../src/providers/credentials/auth-storage.ts";
 import {
 	appendModelInstructions,
@@ -192,10 +192,14 @@ describe("model prompts", () => {
 	it("lets the claude-code-shell provider pass the block on to its own claude session", () => {
 		const block = modelInstructionsBlock("Answer in English only.");
 		const prompt = appendModelInstructions("Base prompt.", "Answer in English only.");
-		for (const withTools of [true, false]) {
-			for (const systemPrompt of [prompt, block, "Base prompt.", ""]) {
-				expect(initializeRequest(systemPrompt, withTools).systemPrompt).toEqual([systemPrompt]);
+		// The plugin appends MyHarness's whole prompt to claude's own, so the block stays the last thing claude reads.
+		for (const active of [["read", "bash", "todo_write"], []]) {
+			for (const systemPrompt of [prompt, block]) {
+				const appended = appendedPrompt(active, systemPrompt);
+				expect(appended.endsWith(systemPrompt)).toBe(true);
+				expect(appended.endsWith("</model_instructions>")).toBe(true);
 			}
+			expect(appendedPrompt(active, "Base prompt.")).not.toContain("model_instructions");
 		}
 	});
 });
