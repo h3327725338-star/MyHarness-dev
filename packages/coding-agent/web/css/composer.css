@@ -366,21 +366,49 @@ button.env-chip:hover { color: var(--text); background: var(--surface-hover); }
 .strip { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: var(--r-md); background: var(--bg-inset); border: 1px solid var(--border); font-size: var(--fs-sm); color: var(--text-2); }
 /* A provider problem the agent is retrying on its own: a neutral strip; only its status ("Retry 2/5 in 3s") is coloured. */
 .strip.warn .strip-status { color: var(--warn); }
-/* The outcome of a Git operation: one line (what happened, the real hash or reason), the real output folded under it. */
-.strip.git-result { flex-direction: column; align-items: stretch; gap: 0; padding: 0; }
-.strip-line { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 6px 0 12px; }
+/* A Git record in the conversation (git-record.js): the commit or push result, and each round in which the agent
+   repaired what a pre-commit check found. One card of the same family as the change card: a head line with the state,
+   quiet buttons at the right, and what the round did folded under a rule. */
+.strip.git-result { flex-direction: column; align-items: stretch; gap: 0; padding: 0; overflow: hidden; border-radius: var(--r-lg); background: var(--bg-raised); }
+.strip-line { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 8px 0 13px; font-size: var(--fs-body); line-height: 16px; }
 .strip-line > svg { flex: none; }
 .strip-title { font-weight: 600; flex: none; }
+/* The state of a repair round is a sentence, not a name: regular weight, and it gives way when the card is narrow. */
+.strip-title.truncate { flex: 0 1 auto; min-width: 0; font-weight: 500; }
+.strip.git-result.running .strip-title { color: var(--text); }
 .strip-hash { flex: none; padding: 0 5px; border-radius: var(--r-xs); background: color-mix(in srgb, currentColor 12%, transparent); font-size: var(--fs-xs); }
 .strip-detail { min-width: 0; color: var(--text-2); }
-.strip-lines { margin: 0 12px 8px; padding: 8px 10px; max-height: 180px; overflow: auto; background: var(--code-bg); border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-code); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-.strip-activity { padding: 0 12px 8px 34px; font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.strip-lines { margin: 0 12px 10px; padding: 8px 10px; max-height: 180px; overflow: auto; background: var(--code-bg); border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-code); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.strip-activity { margin-top: -3px; padding: 0 12px 9px 35px; font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .strip.git-result.ok { color: var(--text); }
 .strip.git-result.error { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
 .strip.git-result.warn { color: var(--warn); }
 .strip.git-result.info { color: var(--text); }
-.strip.git-result .link-btn { flex: none; white-space: nowrap; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+/* The fold: its name and a chevron that turns, as on the process rows. */
+.strip-toggle { flex: none; display: inline-flex; align-items: center; gap: 3px; height: 24px; padding: 0 5px 0 8px; border-radius: var(--r-sm); color: var(--text-3); font-size: var(--fs-sm); line-height: 16px; white-space: nowrap; transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.strip-toggle:hover { background: var(--surface-hover); color: var(--text); }
+.strip-toggle .fold-chev { color: inherit; }
+/* An action on the card (cancel the task, let the agent fix a failure): a small outlined button. */
+.strip-btn { flex: none; height: 24px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-sm); line-height: 16px; white-space: nowrap; transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.strip-btn:hover { background: var(--surface-hover); color: var(--text); }
+.strip-btn:active { background: var(--surface-active); }
+:is(.strip-toggle, .strip-btn):focus-visible { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+.strip.git-result:is(.error, .warn) :is(.strip-toggle, .strip-btn) { color: inherit; }
+.strip.git-result:is(.error, .warn) .strip-btn { border-color: color-mix(in srgb, currentColor 35%, transparent); }
+.strip.git-result:is(.error, .warn) :is(.strip-toggle, .strip-btn):hover { background: color-mix(in srgb, currentColor 12%, transparent); }
 .strip.git-result .icon-btn { color: inherit; opacity: 0.8; }
+/* What a repair round did. Inset so the round's rows start under the head line's icon; its answer reads one size
+   smaller than a reply of the conversation, since it is a record inside a card. */
+.strip-body { padding: 8px 9px 10px; border-top: 1px solid var(--border); color: var(--text); }
+.strip.git-result.error .strip-body { border-top-color: color-mix(in srgb, var(--danger) 22%, transparent); }
+.strip-body .turn { gap: 6px; }
+.strip-body > * + * { margin-top: 10px; }
+/* A round that ends in an answer ends in that answer's hover actions, which already leave room below the text. */
+.strip-body:has(> .turn:last-child .final-actions) { padding-bottom: 3px; }
+.strip-body .final { padding: 0 4px; }
+.strip-body .final .md { font-size: var(--fs-md); line-height: 1.6; }
+/* Records of one commit follow each other closely: the rounds and the result read as one group. */
+.transcript-inner > .strip.git-result + .strip.git-result { margin-top: -12px; }
 .strip > span:not(.spinner) { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .strip > span.strip-time { flex: none; color: var(--text-3); font-variant-numeric: tabular-nums; }
 /* The strip's action (Cancel, Cancel retry): a compact bordered control on one line, vertically centered with the

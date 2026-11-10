@@ -498,7 +498,8 @@ async function deleteSessionDirectory(
 		let failed: DeleteResult | undefined;
 		try {
 			// The memory lock is taken before anything moves, so a lock that cannot be had changes nothing.
-			failed = provenance ? await withMemoryLock(scope.dataRoot, run) : await run();
+			// A brief wait: the user is looking at the delete dialog, and a busy lock is reported to them.
+			failed = provenance ? await withMemoryLock(scope.dataRoot, run, { brief: true }) : await run();
 		} catch (error) {
 			// ELOCKED: an extraction or consolidation kept the memory lock, so nothing has moved yet.
 			const busy = (error as NodeJS.ErrnoException)?.code === "ELOCKED";

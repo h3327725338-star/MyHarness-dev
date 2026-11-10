@@ -1,8 +1,17 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	promises,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify as stringifyYaml } from "yaml";
 import { AutoMemoryManager } from "../src/agent/runtime/auto-memory.ts";
 import { getSessionConversationPath, getSessionDir, parseSessionDataPath } from "../src/config/paths/index.ts";
@@ -242,6 +251,82 @@ describe("hierarchical memory storage", () => {
 		symlinkSync(outside, join(f.dataRoot, "memory"), process.platform === "win32" ? "junction" : "dir");
 		await expect(writeMemoryFile(join(f.dataRoot, "memory", "note.md"), "unsafe")).rejects.toThrow();
 		expect(existsSync(join(outside, "note.md"))).toBe(false);
+	});
+});
+
+describe("memory lock and catalogs", () => {
+	it("waits for a memory write that holds the lock for more than a second instead of failing", async () => {
+		const f = fixture();
+		const order: string[] = [];
+		const first = withMemoryLock(f.dataRoot, async () => {
+			order.push("first in");
+			await new Promise((resolve) => setTimeout(resolve, 1200));
+			order.push("first out");
+		});
+		await vi.waitFor(() => expect(order).toEqual(["first in"]));
+		await withMemoryLock(f.dataRoot, async () => {
+			order.push("second");
+		});
+		await first;
+		expect(order).toEqual(["first in", "first out", "second"]);
+	});
+
+	it("rebuilds the catalogs without reading unchanged memory files again", async () => {
+		const f = fixture();
+		const p = getMemoryPaths({ ...f, workspaceId: "a", sessionId: "one" });
+		const kept = join(p.globalDir, "kept.md");
+		const changed = join(p.workspaceDir, "changed.md");
+		const removed = join(p.sessionDir, "removed.md");
+		await writeMemoryFile(kept, memory("global", "kept"));
+		await writeMemoryFile(changed, memory("workspace", "changed"));
+		await writeMemoryFile(removed, memory("session", "removed"));
+		await archiveMemoryFile(kept, "test");
+		const catalog = () =>
+			(
+				JSON.parse(readFileSync(join(f.dataRoot, "memory", "index.json"), "utf8")) as {
+					entries: Array<{ id: string; name: string; archived: boolean }>;
+				}
+			).entries
+				.map((entry) => `${entry.id}|${entry.name}|${entry.archived}`)
+				.sort();
+		const workspaceCatalog = () =>
+			(
+				JSON.parse(readFileSync(join(p.workspaceDir, "index.json"), "utf8")) as { entries: Array<{ id: string }> }
+			).entries
+				.map((entry) => entry.id)
+				.sort();
+		await refreshMemoryIndexes(f.dataRoot);
+		expect(catalog()).toEqual([
+			"global/kept|kept|false",
+			"global/kept|kept|true",
+			"session/removed|removed|false",
+			"workspace/changed|changed|false",
+		]);
+		expect(workspaceCatalog()).toEqual(["session/removed", "workspace/changed"]);
+
+		const read = vi.spyOn(promises, "readFile");
+		try {
+			await refreshMemoryIndexes(f.dataRoot);
+			expect(read.mock.calls.filter(([file]) => String(file).endsWith(".md"))).toHaveLength(0);
+
+			await writeMemoryFile(
+				changed,
+				memory("workspace", "changed", "a longer body").replace("name: changed", "name: renamed"),
+			);
+			rmSync(removed);
+			await refreshMemoryIndexes(f.dataRoot);
+			expect(read.mock.calls.filter(([file]) => String(file).endsWith(".md")).map(([file]) => file)).toEqual([
+				changed,
+			]);
+		} finally {
+			read.mockRestore();
+		}
+		expect(catalog()).toEqual(["global/kept|kept|false", "global/kept|kept|true", "workspace/changed|renamed|false"]);
+		expect(workspaceCatalog()).toEqual(["workspace/changed"]);
+		// The memories themselves are still listed with their text.
+		expect(listMemoryFiles(f.dataRoot).find((entry) => entry.id === "workspace/changed")?.content).toContain(
+			"a longer body",
+		);
 	});
 });
 

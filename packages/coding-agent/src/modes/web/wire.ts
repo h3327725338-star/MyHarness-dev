@@ -536,8 +536,17 @@ export function messageToWire(
 		case "assistant": {
 			const blocks: WireAssistantBlock[] = [];
 			for (const block of message.content) {
-				if (block.type === "text") blocks.push({ type: "text", text: block.text });
-				else if (block.type === "thinking") {
+				if (block.type === "text") {
+					// claude-code-shell recorded some answers with their text block twice in a row (fixed 2026-11-10); those
+					// records stay as they are on disk and are shown once.
+					const before = blocks[blocks.length - 1];
+					const repeated =
+						message.provider === "claude-code" &&
+						before?.type === "text" &&
+						before.text === block.text &&
+						block.text.trim() !== "";
+					if (!repeated) blocks.push({ type: "text", text: block.text });
+				} else if (block.type === "thinking") {
 					blocks.push({
 						type: "thinking",
 						text: block.thinking ?? "",

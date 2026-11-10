@@ -75,6 +75,8 @@ function createHarness() {
 		t: (s: string) => s,
 		looseStrong: () => null,
 		localLinkPath: () => null,
+		// Every inline position is offered to the media tokenizer; none of these texts holds a media reference.
+		scanMedia: () => null,
 		linkifyLocalFiles: async () => {},
 		openLocalFileInWorkspace: async () => {},
 		showLocalFileMenu: async () => {},

@@ -170,7 +170,7 @@ export async function removeWorkspaceData(
 		: new Set();
 	if (deleteMemory) {
 		try {
-			await withMemoryLock(dataRoot, async () => {
+			const removeMemories = async () => {
 				if (!deleteChats) {
 					for (const chat of memoryChats) {
 						if (!withMemories.has(chat.sessionId)) continue;
@@ -180,7 +180,9 @@ export async function removeWorkspaceData(
 					}
 				}
 				await deleteWorkspaceMemories(dataRoot, workspaceId, { wholeWorkspace, forgetSessionIds: [] });
-			});
+			};
+			// A brief wait: the user is looking at the dialog, and a busy lock is reported to them.
+			await withMemoryLock(dataRoot, removeMemories, { brief: true });
 		} catch (error) {
 			const busy = (error as NodeJS.ErrnoException)?.code === "ELOCKED";
 			throw new WorkspaceRemovalError(

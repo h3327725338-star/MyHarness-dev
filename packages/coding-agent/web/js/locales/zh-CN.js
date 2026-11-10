@@ -218,6 +218,7 @@ export const zhCN = {
 	"Close preview": "关闭预览",
 	"Image preview": "图片预览",
 	"Preview image {name}": "预览图片 {name}",
+	"Cannot show {name}": "无法显示 {name}",
 	"Loading files…": "正在载入文件…",
 	"Could not read the file.": "无法读取文件。",
 	"Images must be 32 MiB or smaller.": "图片不能超过 32 MiB。",

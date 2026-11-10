@@ -79,7 +79,7 @@ cpSync(join(root, 'system-prompts'), join(runtime, 'system-prompts'), { recursiv
 const { BUNDLED_EXTENSIONS } = createRequire(import.meta.url)('./bundled-extensions.cjs');
 for (const name of BUNDLED_EXTENSIONS) cpSync(join(root, 'packages/coding-agent/examples/extensions', name), join(runtime, 'extensions', name));
 writeFileSync(join(stage, 'runtime.json'), JSON.stringify(installer ? {} : { workingDirectory: resolve(process.env.MYHARNESS_DESKTOP_CWD || root) }));
-writeFileSync(join(stage, 'package.json'), JSON.stringify({ name: 'myharness-desktop', productName: 'MyHarness', version: '0.0.7', main: 'main.cjs', author: 'MyHarness', description: 'MyHarness Windows desktop', license: 'Apache-2.0' }));
+writeFileSync(join(stage, 'package.json'), JSON.stringify({ name: 'myharness-desktop', productName: 'MyHarness', version: '0.0.8', main: 'main.cjs', author: 'MyHarness', description: 'MyHarness Windows desktop', license: 'Apache-2.0' }));
 // The SVG is drawn at a high density first: at the default 72 dpi its 32-unit box would be scaled up blurry.
 await sharp(join(root, 'packages/coding-agent/web/favicon.svg'), { density: 600 }).resize(256, 256).png().toFile(join(stage, 'icon.png'));
 // ICO of PNG frames (Windows Vista and later). The taskbar, title bar and tray pick the small frames; with only a

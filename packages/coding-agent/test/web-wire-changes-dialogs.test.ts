@@ -68,6 +68,26 @@ describe("web wire format", () => {
 		expect(item.usage?.cost).toBe(0.5);
 	});
 
+	it("shows once an answer that claude-code-shell recorded with its text block twice in a row", () => {
+		const recorded = (provider: string, texts: string[]) =>
+			messageToWire({
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "" }, ...texts.map((text) => ({ type: "text", text }))],
+				provider,
+				model: "m",
+				stopReason: "stop",
+				timestamp: 1,
+			} as never);
+		const texts = (item: ReturnType<typeof messageToWire>) =>
+			item?.kind === "assistant"
+				? item.blocks.filter((block) => block.type === "text").map((block) => block.text)
+				: [];
+		expect(texts(recorded("claude-code", ["Answer.", "Answer."]))).toEqual(["Answer."]);
+		// Only an exact repeat right after the same text, and only that provider's records.
+		expect(texts(recorded("claude-code", ["Answer.", "More.", "Answer."]))).toEqual(["Answer.", "More.", "Answer."]);
+		expect(texts(recorded("p", ["Answer.", "Answer."]))).toEqual(["Answer.", "Answer."]);
+	});
+
 	it("recovers built-in prompt commands and skill blocks for display", () => {
 		const workflow = messageToWire({
 			role: "user",

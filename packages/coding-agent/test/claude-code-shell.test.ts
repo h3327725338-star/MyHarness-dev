@@ -7,6 +7,7 @@ import {
 	CUT_CALLS_NOTE,
 	callSummary,
 	ENTRYPOINT,
+	internals,
 	launchEnv,
 	limitsFromEvent,
 	limitsFromUsage,
@@ -260,5 +261,65 @@ describe("claude-code-shell plan limits", () => {
 		expect(limitsNeedQuery({ five_hour: window(now - 60_000, now - 1), seven_day: window(now - 60_000) }, now)).toBe(
 			true,
 		);
+	});
+});
+
+describe("claude-code-shell turn", () => {
+	/** The events `claude` writes for one streamed answer: every piece, the whole text again, then the turn's end. */
+	const answerEvents = (id: string, text: string) => [
+		{ type: "stream_event", event: { type: "message_start", message: { id, usage: {} } } },
+		{ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text" } } },
+		{ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } },
+		{ type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+		{ type: "assistant", message: { id, usage: {}, content: [{ type: "text", text }] } },
+		{ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: {} } },
+		{ type: "stream_event", event: { type: "message_stop" } },
+		{ type: "result", subtype: "success", is_error: false },
+	];
+
+	/** Reads one turn from events fed by hand. `claude` is never started: the turn is already under way. */
+	async function readTurn(feed: (session: any) => Promise<void> | void): Promise<any> {
+		const session: any = new internals.CliSession("turn-test", true);
+		session.child = { stdin: { write() {}, end() {} }, exitCode: 0 };
+		session.start = async () => {
+			throw new Error("a test must not start claude");
+		};
+		session.turnActive = true;
+		session.lastUserTimestamp = 1;
+		const events: any[] = [];
+		const stream = { push: (event: any) => events.push(event), end() {} };
+		const model = { id: "claude-opus-5-5", api: "claude-code-cli", provider: "claude-code" };
+		const context = { messages: [{ role: "user", content: "hi", timestamp: 1 }], tools: [] };
+		const turn = internals.runTurn(stream, session, model, context, {});
+		try {
+			await feed(session);
+			await turn;
+		} finally {
+			session.child = undefined;
+			session.close();
+		}
+		return events[events.length - 1];
+	}
+	/** Lets the provider read everything that has arrived so far. */
+	const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+	it("keeps one copy of an answer whose whole text and turn end arrive in one read", async () => {
+		const events = answerEvents("msg_1", "The answer.");
+		const done = await readTurn(async (session) => {
+			// The pieces so far are read as they come; the last read holds the whole message and the turn's end together.
+			for (const event of events.slice(0, 3)) session.onEvent(event);
+			await settle();
+			for (const event of events.slice(3)) session.onEvent(event);
+		});
+		expect(done.type).toBe("done");
+		expect(done.message.content).toEqual([{ type: "text", text: "The answer." }]);
+	});
+
+	it("still takes the whole message as the only copy when nothing was streamed", async () => {
+		const done = await readTurn((session) => {
+			for (const event of answerEvents("msg_2", "Whole.").filter((event) => event.type !== "stream_event"))
+				session.onEvent(event);
+		});
+		expect(done.message.content).toEqual([{ type: "text", text: "Whole." }]);
 	});
 });

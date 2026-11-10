@@ -8,11 +8,43 @@ import { localLinkPath } from "./local-file-links.js";
 import { linkifyLocalFiles, openLocalFileInWorkspace, showLocalFileMenu } from "./local-files.js";
 import { exportReadOnly } from "./export-mode.js";
 import { activeSlotId } from "./store.js";
+import { mediaName, parseMediaLayout, scanMedia } from "./reply-media-model.js";
+import { forgetReplyMedia, openReplyPicture, showReplyMedia } from "./reply-media.js";
 
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
 
 const SAFE_LINK = /^(https?:|mailto:|#|\/(?!\/)|\.{0,2}\/)/i;
+
+/**
+ * One picture, video or sound of a reply (`![caption](path "layout")`, reply-media-model.js): an empty figure that
+ * reply-media.js fills once it is on the page. Spans, because it stands inside a paragraph. The caption is the text in
+ * the square brackets; a picture inside a line of text has none.
+ */
+function figureHtml(token) {
+	const name = mediaName(token.target);
+	// A read-only export copy has no server to load the file from: it keeps the caption, as before.
+	if (exportReadOnly()) return esc(token.alt || name);
+	const { layout, width, title } = parseMediaLayout(token.title);
+	// Sound has no shape to place: it is always a player on a line of its own.
+	const placed = token.kind === "audio" ? "block" : layout;
+	const attributes = [
+		'class="md-fig"',
+		`data-layout="${placed}"`,
+		`data-media-kind="${token.kind}"`,
+		`data-media-src="${esc(token.target)}"`,
+		`data-media-name="${esc(name)}"`,
+		`data-media-alt="${esc(token.alt)}"`,
+		`data-local-path="${esc(token.target)}"`,
+		width ? `style="--fig-w:${width}%"` : "",
+		title ? `title="${esc(title)}"` : "",
+	];
+	const caption = token.alt && placed !== "inline" ? `<span class="md-fig-cap">${esc(token.alt)}</span>` : "";
+	return `<span ${attributes.filter(Boolean).join(" ")}><span class="md-fig-frame"><span class="md-fig-wait">${esc(token.alt || name)}</span></span>${caption}</span>`;
+}
+
+/** Layouts in which a figure takes a line of its own, so several of them in one paragraph can stand side by side. */
+const ROW_LAYOUTS = new Set(["block", "center", "wide"]);
 
 let engine;
 function getEngine() {
@@ -21,9 +53,34 @@ function getEngine() {
 	if (!marked) return null;
 	engine = new marked.Marked({ gfm: true, breaks: false, async: false });
 	engine.use({
+		extensions: [
+			{
+				name: "replyMedia",
+				level: "inline",
+				start: (src) => {
+					const at = src.indexOf("![");
+					return at === -1 ? undefined : at;
+				},
+				tokenizer(src) {
+					const found = scanMedia(src);
+					return found ? { type: "replyMedia", ...found } : undefined;
+				},
+				renderer: figureHtml,
+			},
+		],
 		renderer: {
 			html({ text }) {
 				return esc(text);
+			},
+			paragraph({ tokens }) {
+				// Two or more pictures written in one paragraph, with nothing else in it, stand side by side.
+				const parts = tokens.filter((token) => !(token.type === "br" || (token.type === "text" && !token.raw.trim())));
+				const row =
+					parts.length > 1 &&
+					parts.every((token) => token.type === "replyMedia" && token.kind !== "audio" && ROW_LAYOUTS.has(parseMediaLayout(token.title).layout)) &&
+					!exportReadOnly();
+				return row ? `<p class="md-fig-row">${parts.map(figureHtml).join("")}</p>
+` : false;
 			},
 			code({ text, lang }) {
 				const language = (lang || "").trim().split(/\s+/)[0];
@@ -264,7 +321,7 @@ export class Markdown extends Component {
 		if (previous.text !== this.props.text || previous.breaks !== this.props.breaks) this.parseLarge();
 		this.linkify();
 	}
-	componentWillUnmount() { this.generation++; this.parseGeneration++; }
+	componentWillUnmount() { this.generation++; this.parseGeneration++; if (this.root) forgetReplyMedia(this.root); }
 	parseLarge() {
 		const generation = ++this.parseGeneration;
 		const { text = "", breaks = false } = this.props;
@@ -284,7 +341,10 @@ export class Markdown extends Component {
 	linkify() {
 		const generation = ++this.generation;
 		this.slot = activeSlotId();
-		if (this.root) void linkifyLocalFiles(this.root, this.slot, () => generation === this.generation);
+		if (!this.root) return;
+		// Pictures first, in the same frame the HTML went in (see showReplyMedia).
+		showReplyMedia(this.root, this.slot);
+		void linkifyLocalFiles(this.root, this.slot, () => generation === this.generation);
 	}
 	onContextMenu = (event) => {
 		const link = event.target.closest?.("[data-local-path]");
@@ -293,7 +353,11 @@ export class Markdown extends Component {
 	shouldComponentUpdate(next, state) {
 		return state !== this.state || next.text !== this.props.text || next.class !== this.props.class || next.breaks !== this.props.breaks;
 	}
+	onKeyDown = (event) => { openReplyPicture(event); };
 	onClick = (event) => {
+		// A picture opens large; its file is one right-click away, like any file link.
+		if (openReplyPicture(event)) return;
+		if (event.target.closest?.(".md-fig")) return;
 		const link = event.target.closest?.("[data-local-path]");
 		// Left click opens the file in the right-hand workspace; the right-click menu keeps the other ways to open it.
 		if (link) { event.preventDefault(); void openLocalFileInWorkspace(link.dataset.localPath, this.slot); return; }
@@ -318,7 +382,7 @@ export class Markdown extends Component {
 			const base = parsed === undefined ? this.reusable(source, breaks) : null;
 			content = parsed ?? (base ? base.html + pendingHtml(source.slice(base.text.length)) : pendingHtml(source));
 		}
-		return h("div", { class: `md ${cls || ""}`, dangerouslySetInnerHTML: { __html: content }, onClick: this.onClick, onContextMenu: this.onContextMenu, ref: (node) => { this.root = node; } });
+		return h("div", { class: `md ${cls || ""}`, dangerouslySetInnerHTML: { __html: content }, onClick: this.onClick, onKeyDown: this.onKeyDown, onContextMenu: this.onContextMenu, ref: (node) => { this.root = node; } });
 	}
 }
 

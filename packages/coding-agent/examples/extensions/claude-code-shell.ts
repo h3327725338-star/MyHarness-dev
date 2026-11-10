@@ -344,6 +344,7 @@ export function launchEnv(
 const MODELS = [
 	{ id: "claude-opus-5-5", name: "Claude Code · Opus 5.5" },
 	{ id: "claude-sonnet-5-5", name: "Claude Code · Sonnet 5.5" },
+	{ id: "claude-fable-5-2", name: "Claude Code · Fable 5.2" },
 	{ id: "claude-fable-5-1", name: "Claude Code · Fable 5.1" },
 	{ id: "claude-haiku-5-5", name: "Claude Code · Haiku 5.5" },
 ];
@@ -890,6 +891,11 @@ class CliSession {
 	private unboundRequests: AppRequest[] = [];
 	/** Tool_use ids of app tools `claude`'s own sub-agents called; MyHarness never runs those. */
 	private sideCalls = new Set<string>();
+	/**
+	 * Responses whose pieces the provider has read. Kept until the next turn is sent, not until this one's `result`
+	 * arrives: the provider reads behind, so the whole message of the last response can still be waiting in the queue
+	 * when the `result` comes in with it, and forgetting its id then put the answer's text into the reply twice.
+	 */
 	private seenMessageIds = new Set<string>();
 	private files = new Set<string>();
 	/** `claude` is compacting this chat's context right now; part of the chat's status line. */
@@ -1107,6 +1113,7 @@ class CliSession {
 		// Nothing left over may be taken for this turn's answer, nor an earlier turn's tool call for one of this turn.
 		if (!this.turnActive) {
 			this.queue.length = 0;
+			this.seenMessageIds.clear();
 			this.forgetAppCalls("这一轮已经结束");
 		}
 		this.turnActive = true;
@@ -1196,7 +1203,6 @@ class CliSession {
 		}
 		if (event.type === "result") {
 			this.turnActive = false;
-			this.seenMessageIds.clear();
 			if (this.idleTimer) clearTimeout(this.idleTimer);
 			this.idleTimer = setTimeout(() => this.close(), IDLE_CLOSE_MS);
 			this.idleTimer.unref();
@@ -1791,6 +1797,9 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 		options?.signal?.removeEventListener("abort", onAbort);
 	}
 }
+
+/** For tests: one turn read from events fed by hand, with no `claude` started. */
+export const internals = { CliSession, runTurn };
 
 function streamSimple(model: any, context: any, options: any): any {
 	const stream = createAssistantMessageEventStream();

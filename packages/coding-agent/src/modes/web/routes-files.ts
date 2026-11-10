@@ -1006,6 +1006,73 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			.pipe(res);
 	});
 
+	// A picture, video or sound a reply shows inside its text (`![caption](path)`, web/js/reply-media.js). The path is
+	// the one the reply wrote, found the way a file link in the chat is (resolveLocalFile: also a chat written on
+	// another computer); only these media types are served, never another file. The validator lets the page ask again
+	// for a file it already holds and get it only when it changed (a chart drawn again under the same name).
+	server.route("GET", "/api/files/media", async ({ url, req, res }) => {
+		let written: string = url.searchParams.get("path") ?? "";
+		if (!written) throw new HttpError(400, "Missing path");
+		if (written.startsWith("/api/artifacts/download?")) {
+			try {
+				written = resolveArtifact(
+					artifactDataRoot(),
+					new URL(written, "http://localhost").searchParams.get("path") ?? "",
+				);
+			} catch {
+				throw new HttpError(404, "Unknown artifact");
+			}
+		}
+		const dataRoot = host.session?.sessionManager?.getDataRoot?.() ?? getDataDir();
+		const target = await resolveLocalFile(root(), written, [dataRoot]);
+		if (target.directory) throw new HttpError(400, "Not a file");
+		const ext = path.extname(target.path).toLowerCase();
+		const media = MEDIA_TYPES[ext];
+		const type = IMAGE_TYPES[ext] ?? (media && media.kind !== "pdf" ? media.mime : undefined);
+		if (!type) throw new HttpError(415, "Not an image, video or audio file");
+		const stat = await statAsync(target.path);
+		const etag = `"${stat.size.toString(36)}-${Math.round(stat.mtimeMs).toString(36)}"`;
+		const headers: Record<string, string | number> = {
+			"content-type": type,
+			"accept-ranges": "bytes",
+			"cache-control": "no-cache",
+			etag,
+			"x-content-type-options": "nosniff",
+			// An SVG opened by its address runs nothing; inside the reply it is an <img>, which never runs scripts.
+			"content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+		};
+		if (req.headers["if-none-match"] === etag) {
+			res.writeHead(304, headers);
+			res.end();
+			return;
+		}
+		const parsed = req.headers.range ? /^bytes=(\d*)-(\d*)$/.exec(req.headers.range.trim()) : null;
+		if (parsed && (parsed[1] !== "" || parsed[2] !== "")) {
+			const start = parsed[1] === "" ? Math.max(0, stat.size - Number(parsed[2])) : Number(parsed[1]);
+			const end = parsed[1] === "" || parsed[2] === "" ? stat.size - 1 : Math.min(Number(parsed[2]), stat.size - 1);
+			if (start > end || start >= stat.size) {
+				res.writeHead(416, { "content-range": `bytes */${stat.size}` });
+				res.end();
+				return;
+			}
+			res.writeHead(206, {
+				...headers,
+				"content-range": `bytes ${start}-${end}/${stat.size}`,
+				"content-length": end - start + 1,
+			});
+			if (req.method === "HEAD") return res.end();
+			createReadStream(target.path, { start, end })
+				.on("error", () => res.destroy())
+				.pipe(res);
+			return;
+		}
+		res.writeHead(200, { ...headers, "content-length": stat.size });
+		if (req.method === "HEAD") return res.end();
+		createReadStream(target.path)
+			.on("error", () => res.destroy())
+			.pipe(res);
+	});
+
 	// Plain-text save for the code/text editor. The byte-for-byte baseline makes a concurrent Agent, editor or Git write
 	// a conflict instead of being overwritten; a failed check writes nothing.
 	server.route("POST", "/api/files/text", ({ body }) => {

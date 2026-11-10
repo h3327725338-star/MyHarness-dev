@@ -99,7 +99,8 @@ it("runs at three hours without another message and counts real updates", async 
 	await m.runExtraction(f.entry("a"));
 	await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000 - 30_000);
 	expect(f.runner).toHaveBeenCalledTimes(1);
-	await vi.advanceTimersByTimeAsync(30_000);
+	// The check runs every 30 seconds, so the first one after the three hours comes at most 30 seconds later.
+	await vi.advanceTimersByTimeAsync(60_000);
 	await vi.waitFor(() => expect(f.state().pendingChanges).toBe(0));
 	expect(f.runner).toHaveBeenCalledTimes(2);
 	f.change(2);
@@ -241,6 +242,43 @@ it("rewrites the profile in batch 0 and drops profile operations from later batc
 	const rewritten = readFileSync(f.profileFile, "utf8");
 	expect(rewritten).toContain("首批重写");
 	expect(rewritten).not.toContain("其它批次写入");
+});
+
+it("keeps a consolidation batch when another chat saves a memory during the model call", async () => {
+	let during: (() => void) | undefined;
+	const f = profileFixture(async ({ systemPrompt }) => {
+		if (!systemPrompt.includes("merge duplicates")) return '{"operations":[]}';
+		during?.();
+		return JSON.stringify({
+			operations: [
+				{
+					action: "upsert",
+					id: "global/seed-1",
+					scope: "global",
+					type: "feedback",
+					name: "global/seed-1",
+					description: "global/seed-1 相关时",
+					content: "合并后的正文。",
+				},
+			],
+		});
+	});
+	const file = (name: string) => readFileSync(join(f.dataRoot, "memory", `${name}.md`), "utf8");
+	f.seedGlobal("global/seed-1", "原正文一。");
+	f.seedGlobal("global/seed-2", "原正文二。");
+	const manager = f.create();
+
+	// A memory that is not in the batch: the batch's answer still stands.
+	during = () => f.seedGlobal("global/other-chat", "另一个聊天刚存的记忆。");
+	expect(await manager.runConsolidation(true)).toBe(true);
+	expect(file("seed-1")).toContain("合并后的正文。");
+	expect(file("other-chat")).toContain("另一个聊天刚存的记忆。");
+
+	// An entry of the batch itself changed during the call: the answer was made from the old text, so it is dropped.
+	during = () => f.seedGlobal("global/seed-1", "另一个聊天改过的正文。");
+	expect(await manager.runConsolidation(true)).toBe(false);
+	expect(file("seed-1")).toContain("另一个聊天改过的正文。");
+	expect(file("seed-1")).not.toContain("合并后的正文。");
 });
 
 it("never creates the profile from the sweep path", async () => {

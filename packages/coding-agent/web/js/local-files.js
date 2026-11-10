@@ -322,7 +322,8 @@ export async function linkifyLocalFiles(root, slot, isCurrent) {
 	const jobs = [];
 	while (walker.nextNode()) {
 		const node = walker.currentNode;
-		if (!node.textContent || node.parentElement?.closest("a, pre, button, .code-head")) continue;
+		// A figure's caption and file name are not links: the figure itself opens its file.
+		if (!node.textContent || node.parentElement?.closest("a, pre, button, .code-head, .md-fig")) continue;
 		const code = node.parentElement?.closest("code");
 		if (code && node.textContent === code.textContent) {
 			// Inline code: the whole `` `...` `` may be a path with spaces (e.g. `C:/My Dir/a.txt`),

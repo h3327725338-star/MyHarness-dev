@@ -62,14 +62,30 @@ export async function writeMemoryFile(file: string, content: string): Promise<vo
 	}
 }
 
-export async function withMemoryLock<T>(dataRoot: string, action: () => Promise<T>): Promise<T> {
+// How long a call waits for the memory lock before it fails with ELOCKED ("Lock file is already being held"). One holder
+// rebuilds the catalogs of every memory file, which takes about a second with a few thousand of them, and several
+// chats write at once: the former wait of about 0.3 s made the others fail while that one finished. The default is
+// about half a minute, which is also longer than proper-lockfile's 10-second stale limit, so a lock left behind by a
+// process that died is taken over. The brief wait, about two seconds, outlasts one such write.
+const MEMORY_LOCK_RETRIES = { retries: 60, factor: 2, minTimeout: 20, maxTimeout: 500, randomize: true };
+const MEMORY_LOCK_BRIEF_RETRIES = { retries: 8, factor: 2, minTimeout: 20, maxTimeout: 500, randomize: true };
+
+/**
+ * Run `action` holding the memory lock of this data root. `brief` is for something the user is waiting on that
+ * reports a busy lock instead (deleting a chat or a workspace with its memories).
+ */
+export async function withMemoryLock<T>(
+	dataRoot: string,
+	action: () => Promise<T>,
+	options: { brief?: boolean } = {},
+): Promise<T> {
 	const root = path.join(path.resolve(dataRoot), "memory");
 	assertDirectPath(root);
 	await fs.promises.mkdir(root, { recursive: true });
 	let lost = false;
 	const release = await lockfile.lock(root, {
 		realpath: false,
-		retries: { retries: 5, minTimeout: 20, maxTimeout: 100 },
+		retries: options.brief ? MEMORY_LOCK_BRIEF_RETRIES : MEMORY_LOCK_RETRIES,
 		// The lock folder vanished or another process took the lock over while this one was held (a pause longer than
 		// the stale time). proper-lockfile's default handler throws from a timer, which ended the whole server; the
 		// write in progress finishes on its own either way.
@@ -317,9 +333,18 @@ export async function recordMemoryWriteConsolidation(
 	await writeMemoryFile(statePath, `${JSON.stringify({ version: 1, sessions, consolidation }, null, 2)}\n`);
 }
 
+// The catalogs hold no memory text, so a file whose size, times and inode are unchanged is not read again. Every
+// memory write rebuilds them while it holds the lock: reading all the files each time (thousands of archived versions
+// among them) kept the lock for seconds. One data root at a time; another root starts over.
+let indexMetadataCache: { root: string; files: NonNullable<MemoryListOptions["metadataCache"]> } | undefined;
+
 /** Rebuild global and workspace reference catalogs without copying memory bodies. Caller owns the lock. */
 export async function refreshMemoryIndexes(dataRoot: string): Promise<void> {
-	const entries = (await listMemoryFilesAsync(dataRoot)).map(({ content: _content, ...entry }) => entry);
+	const root = path.resolve(dataRoot);
+	if (indexMetadataCache?.root !== root) indexMetadataCache = { root, files: new Map() };
+	const entries = (await listMemoryFilesAsync(dataRoot, { metadataCache: indexMetadataCache.files })).map(
+		({ content: _content, ...entry }) => entry,
+	);
 	await writeMemoryFile(
 		path.join(dataRoot, "memory", "index.json"),
 		`${JSON.stringify({ version: 2, entries }, null, 2)}\n`,

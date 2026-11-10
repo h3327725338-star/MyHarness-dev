@@ -2,11 +2,15 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 
+// markdown.js reads media references with this module; the other imports are not reached by these texts.
+const { scanMedia } = await import(new URL("../web/js/reply-media-model.js", import.meta.url).href);
+
 function renderer() {
 	const context = vm.createContext({
 		Component: class {},
 		t: (text: string) => text,
 		looseStrong: () => null,
+		scanMedia,
 	});
 	vm.runInContext(readFileSync(new URL("../src/exports/html/vendor/marked.min.js", import.meta.url), "utf8"), context);
 	const source = readFileSync(new URL("../web/js/markdown.js", import.meta.url), "utf8");

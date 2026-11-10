@@ -255,6 +255,10 @@ function recalledSoFar(earlier: readonly unknown[]) {
 // 稳定性切块：提取按 30 条聊天一切逐块推进、整理按 20 张记忆一批独立存，
 // 单次模型输出仍受 maxTokens 限制、单条记忆正文 10KB 只算正文。主聊天的召回按分层 token 预算发送（画像固定位＋目录位＋动态卡片位），不在此列。
 const EXTRACT_CHUNK_ENTRIES = 30;
+// What an extraction request keeps free of the model's context window for its thinking and its list of operations.
+const EXTRACT_OUTPUT_TOKEN_RESERVE = 20_000;
+// The provider keeps 4096 tokens of the window free by its own count (clampMaxTokensToContext in @myharness/ai).
+const EXTRACT_CONTEXT_SAFETY_TOKENS = 5000;
 const CONSOLIDATION_BATCH_SIZE = 20;
 // 词面排序保证的最低条数：阈值之外的最佳匹配也至少带这么多，保证“找得到”。
 // 用户拍板：保底 8 条（上下文开销最大一档）。触发词直达（最多 3 条）不计入此数。
@@ -662,6 +666,51 @@ function formatManifest(entries: MemoryEntry[]): string {
 		rows.push(row);
 	}
 	return JSON.stringify(rows, null, 2);
+}
+
+const MANIFEST_BRIEF_NOTE =
+	"Other existing memories, listed without their content because the whole list does not fit in one request (ID | scope | name | when it is relevant). Never give one of these IDs in an upsert: it would replace content you cannot see. When the conversation adds to or corrects one of them, return a new entry without an ID.";
+
+/**
+ * The existing memories as one extraction request shows them. All of them with their text when that fits
+ * `tokenBudget` (undefined: no limit), which is how it always was. When it does not fit, the memories closest to the
+ * new conversation keep their text, then the newest ones, and the rest are listed by name only: `brief` holds their
+ * IDs, which this request must not overwrite because the model never saw what an update would replace.
+ */
+function fitManifest(
+	entries: MemoryEntry[],
+	transcript: string,
+	tokenBudget: number | undefined,
+): { text: string; brief: Set<string> } {
+	const full = formatManifest(entries);
+	if (tokenBudget === undefined || estimateMemoryTokens(full) <= tokenBudget) return { text: full, brief: new Set() };
+	const briefLine = (entry: MemoryEntry) =>
+		`${entry.id} | ${entry.scope} | ${oneLine(entry.name)} | ${oneLine(entry.description)}`;
+	const briefCost = new Map(entries.map((entry) => [entry, estimateMemoryTokens(`${briefLine(entry)}\n`)]));
+	const ranked = rankLexically(transcript, entries).map(({ entry }) => entry);
+	const matched = new Set(ranked);
+	const order = [
+		...ranked,
+		...entries.filter((entry) => !matched.has(entry)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+	];
+	// Every memory is at least named, so that part is spent first; the text is given out with what is left.
+	let left =
+		tokenBudget -
+		estimateMemoryTokens(`${MANIFEST_BRIEF_NOTE}\n\n`) -
+		[...briefCost.values()].reduce((sum, cost) => sum + cost, 0);
+	const withText = new Set<MemoryEntry>();
+	for (const entry of order) {
+		const cost = estimateMemoryTokens(formatManifest([entry])) - (briefCost.get(entry) ?? 0);
+		// One that does not fit is passed over: a shorter one further down still may.
+		if (cost > left) continue;
+		withText.add(entry);
+		left -= cost;
+	}
+	const rest = entries.filter((entry) => !withText.has(entry));
+	return {
+		text: `${formatManifest(entries.filter((entry) => withText.has(entry)))}\n\n${MANIFEST_BRIEF_NOTE}\n${rest.map(briefLine).join("\n")}`,
+		brief: new Set(rest.map((entry) => entry.id)),
+	};
 }
 
 function lexicalTerms(value: string): Set<string> {
@@ -1588,6 +1637,8 @@ export class AutoMemoryManager {
 					projectDir: sweptPaths.workspaceDir,
 					sessionDir: sweptPaths.sessionDir,
 				},
+				// As in consolidateLocked: only the batch's own entries must be unchanged.
+				{ snapshotIds: ids },
 			);
 		}
 		await this.withLock(async () => {
@@ -1604,6 +1655,10 @@ export class AutoMemoryManager {
 	}
 
 	private async initializeConsolidationState(): Promise<void> {
+		// Already set up, which is the case on all but the first run: nothing to write, so no lock. Every open chat
+		// comes here every 30 seconds, and taking the lock each time made those checks fail whenever a memory write
+		// held it. The check is repeated inside the lock.
+		if (readState(this.paths.statePath).consolidation[this.paths.workspaceId]?.pendingChanges !== undefined) return;
 		await this.withLock(async () => {
 			const state = readState(this.paths.statePath);
 			const value = state.consolidation[this.paths.workspaceId] ?? { sessionIds: [] };
@@ -2117,6 +2172,15 @@ export class AutoMemoryManager {
 			projectDir: string;
 			sessionDir: string;
 		},
+		guard: {
+			/**
+			 * The only entries the model's answer was made from and can change (a consolidation batch): the snapshot
+			 * check looks at these alone, so a memory saved elsewhere in the meantime does not void the batch.
+			 */
+			snapshotIds?: ReadonlySet<string>;
+			/** Entries the model saw by name only (fitManifest): an upsert onto one is saved beside it, never over it. */
+			briefIds?: ReadonlySet<string>;
+		} = {},
 	): Promise<void> {
 		this.assertActive();
 		const ctxWorkspaceId = scopeContext ? scopeContext.workspaceId : this.paths.workspaceId;
@@ -2133,7 +2197,17 @@ export class AutoMemoryManager {
 				).map((entry) => [entry.id, entry]),
 			);
 			let changedCount = 0;
-			if (snapshot) {
+			if (snapshot && guard.snapshotIds) {
+				const before = new Map(snapshot.map((entry) => [entry.id, entry]));
+				for (const id of guard.snapshotIds) {
+					// Gone, new or rewritten since the model was asked: all show as a difference here.
+					if (
+						existing.get(id)?.updatedAt !== before.get(id)?.updatedAt ||
+						existing.get(id)?.content !== before.get(id)?.content
+					)
+						throw new Error("Memory changed during maintenance; retry with fresh context");
+				}
+			} else if (snapshot) {
 				if (existing.size !== snapshot.length)
 					throw new Error("Memory changed during maintenance; retry with fresh context");
 				for (const entry of snapshot) {
@@ -2199,6 +2273,15 @@ export class AutoMemoryManager {
 				}
 				// Only the consolidator maintains the resident profile; extraction must not stack turn-by-turn notes on it.
 				if (!allowDelete && isMemoryProfile({ id, scope })) continue;
+				// The model saw this entry by name only, so what it returned cannot be a rewrite of text it never read:
+				// it becomes a new entry and the old one keeps its facts. Consolidation merges the two later.
+				if (guard.briefIds?.has(id) && existing.has(id)) {
+					const base = `${scope}/${slugify(operation.name)}`;
+					let suffix = 2;
+					id = base;
+					while (existing.has(id)) id = `${base}-${suffix++}`;
+					if (!isSafeMemoryId(id)) continue;
+				}
 				const previous = existing.get(id);
 				const now = new Date().toISOString();
 				let name: string;
@@ -2311,6 +2394,36 @@ export class AutoMemoryManager {
 		});
 	}
 
+	/**
+	 * How many tokens of existing memories one extraction request can carry: the model's context window less the
+	 * prompt, the rest of the task and room for the answer. Undefined when the window is not known (no limit, as
+	 * before). Counted with estimateMemoryTokens, which is never below the provider's own count (UTF-8 bytes / 4).
+	 * Past the window the provider cuts the output limit down to one token, and the reply comes back empty.
+	 */
+	private extractionManifestBudget(
+		settings: Required<Pick<AutoMemorySettings, "provider" | "model">>,
+		restOfTask: string,
+	): number | undefined {
+		let model: { contextWindow?: number; maxTokens?: number } | undefined;
+		try {
+			model = this.options.modelRuntime?.getModel(settings.provider, settings.model);
+		} catch {
+			return undefined;
+		}
+		const contextWindow = model?.contextWindow;
+		if (typeof contextWindow !== "number" || !(contextWindow > 0)) return undefined;
+		const maxTokens = typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : contextWindow;
+		const reserve = Math.min(EXTRACT_OUTPUT_TOKEN_RESERVE, maxTokens, Math.floor(contextWindow / 4));
+		return Math.max(
+			0,
+			contextWindow -
+				EXTRACT_CONTEXT_SAFETY_TOKENS -
+				reserve -
+				estimateMemoryTokens(MEMORY_EXTRACTOR_PROMPT) -
+				estimateMemoryTokens(restOfTask),
+		);
+	}
+
 	private async extract(
 		entries: SessionEntry[],
 		settings: Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">>,
@@ -2331,12 +2444,20 @@ export class AutoMemoryManager {
 			if (!transcript.text || !transcript.lastEntryId) continue;
 			didWork = true;
 			const existing = this.loadEntries();
+			const taskHead = `${currentTimeLine()}\nCurrent project root: ${this.paths.projectRoot}\nWorkspace ID: ${this.paths.workspaceId}\nSession ID: ${this.paths.sessionId}\nResident user profile entry ID (never create or modify it): ${MEMORY_PROFILE_ID}`;
+			const taskTail = `New conversation since last extraction:\n${transcript.text}`;
+			const manifest = fitManifest(
+				existing,
+				transcript.text,
+				this.extractionManifestBudget(settings, `${taskHead}\n\nExisting memory list:\n\n\n${taskTail}`),
+			);
 			this.logMaintenance("extract-chunk-start", {
 				chunkIndex: Math.floor(start / EXTRACT_CHUNK_ENTRIES),
 				chunkSize: chunk.length,
 				transcriptLength: transcript.text.length,
 				transcriptPreview: truncateLogPreview(transcript.text),
 				existingCount: existing.length,
+				existingWithoutContent: manifest.brief.size,
 				cursor,
 				lastEntryId: transcript.lastEntryId,
 			});
@@ -2344,11 +2465,7 @@ export class AutoMemoryManager {
 				cwd: this.options.cwd,
 				settings,
 				systemPrompt: MEMORY_EXTRACTOR_PROMPT,
-				task: [
-					`${currentTimeLine()}\nCurrent project root: ${this.paths.projectRoot}\nWorkspace ID: ${this.paths.workspaceId}\nSession ID: ${this.paths.sessionId}\nResident user profile entry ID (never create or modify it): ${MEMORY_PROFILE_ID}`,
-					`Existing memory list:\n${formatManifest(existing)}`,
-					`New conversation since last extraction:\n${transcript.text}`,
-				].join("\n\n"),
+				task: [taskHead, `Existing memory list:\n${manifest.text}`, taskTail].join("\n\n"),
 			});
 			this.assertActive();
 			const operations = parseMemoryOperations(output);
@@ -2367,7 +2484,9 @@ export class AutoMemoryManager {
 				lastEntryId: transcript.lastEntryId,
 			});
 			try {
-				await this.applyOperations(operations, false, existing, transcript.lastEntryId);
+				await this.applyOperations(operations, false, existing, transcript.lastEntryId, undefined, {
+					briefIds: manifest.brief,
+				});
 				this.logMaintenance("extract-apply-success", {
 					chunkIndex: Math.floor(start / EXTRACT_CHUNK_ENTRIES),
 					operationCount: operations.length,
@@ -2508,7 +2627,15 @@ export class AutoMemoryManager {
 						(batchIds.has(operation.id) || (batchIndex === 0 && operation.id === MEMORY_PROFILE_ID)),
 				);
 				try {
-					await this.applyOperations(filtered, true, snapshot);
+					// The answer came from this batch's entries and the pairs shown with it, and changes only the batch
+					// (and the profile in the first one): only those must be as the model saw them. Checking every
+					// visible memory voided the batch whenever any chat saved a memory during the model call.
+					const dependsOn = new Set([
+						...batchIds,
+						...batchContradictions.flatMap((pair) => [pair.a.id, pair.b.id]),
+						...(batchIndex === 0 ? [MEMORY_PROFILE_ID] : []),
+					]);
+					await this.applyOperations(filtered, true, snapshot, undefined, undefined, { snapshotIds: dependsOn });
 					this.logMaintenance("consolidate-batch-done", {
 						batchIndex,
 						batchSize: batch.length,

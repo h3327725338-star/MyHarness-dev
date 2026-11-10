@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AUTO_MEMORY_SYSTEM_PROMPT,
 	AutoMemoryManager,
+	estimateMemoryTokens,
 	getAutoMemoryPaths,
 	MEMORY_PROFILE_ID,
 	parseMemoryOperations,
@@ -15,6 +16,7 @@ import { SettingsManager } from "../src/config/settings/index.ts";
 import type { ModelRuntime } from "../src/providers/runtime/index.ts";
 import { describeLocalTime, localTimeZone } from "../src/schedules/timing.ts";
 import type { SessionEntry } from "../src/session/manager/index.ts";
+import { withMemoryLock } from "../src/session/memory/store.ts";
 
 describe("auto memory", () => {
 	const testRoot = join(process.env.MYHARNESS_TEMP_DIR ?? tmpdir(), "myharness-auto-memory-tests");
@@ -369,6 +371,120 @@ describe("auto memory", () => {
 		expect(tasks[1]).toContain("Alex Tan studies at Taylor's University.");
 	});
 
+	it("keeps an extraction request inside the model's context window and never overwrites text it did not show", async () => {
+		const projectDir = join(testRoot, "window-project");
+		const agentDir = join(testRoot, "window-agent");
+		mkdirSync(projectDir, { recursive: true });
+		const location = { dataRoot, workspaceId: "window", sessionId: "window-session" };
+		const paths = getAutoMemoryPaths(projectDir, agentDir, location);
+		mkdirSync(paths.globalDir, { recursive: true });
+		const seed = (slug: string, name: string, day: string, content: string) =>
+			writeFileSync(
+				join(paths.globalDir, `${slug}.md`),
+				`---\nid: global/${slug}\nname: ${name}\ndescription: When ${name} matters\ntype: reference\nscope: global\ncreatedAt: ${day}T00:00:00.000Z\nupdatedAt: ${day}T00:00:00.000Z\n---\n\n${content}\n`,
+			);
+		// Eight memories of about 1000 tokens each. The two the conversation is about are the oldest.
+		seed(
+			"pineapple-pizza",
+			"Pineapple pizza",
+			"2026-01-01",
+			`The user dislikes pineapple on pizza. ${"zzfact1 ".repeat(490)}`,
+		);
+		seed(
+			"marathon-training",
+			"Marathon training",
+			"2026-01-02",
+			`The user trains for a marathon in May. ${"zzfact2 ".repeat(490)}`,
+		);
+		for (let index = 3; index <= 8; index++)
+			seed(`filler-${index}`, `Filler ${index}`, `2026-02-0${index}`, `zzfact${index} `.repeat(500));
+
+		const requests: Array<{ systemPrompt: string; task: string }> = [];
+		const create = (sessionId: string, contextWindow: number, operations: unknown[]) =>
+			new AutoMemoryManager({
+				cwd: projectDir,
+				...location,
+				sessionId,
+				settingsManager: SettingsManager.inMemory({
+					autoMemory: { enabled: true, provider: "test", model: "small-window", thinkingLevel: "high" },
+				}),
+				persisted: true,
+				agentDir,
+				modelRuntime: {
+					getModel: () => ({ provider: "test", id: "small-window", contextWindow, maxTokens: 1000 }),
+				} as unknown as ModelRuntime,
+				modelRunner: async ({ systemPrompt, task }) => {
+					// The seeded memories also make a consolidation due; only the extraction requests are looked at.
+					if (systemPrompt.includes("merge duplicates")) return '{"operations":[]}';
+					requests.push({ systemPrompt, task });
+					return JSON.stringify({ operations });
+				},
+			});
+		const turn = (id: string, text: string) =>
+			[
+				{
+					type: "message",
+					id,
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					message: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+				},
+			] as unknown as SessionEntry[];
+		const upsert = (fields: Record<string, string>) => ({
+			action: "upsert",
+			scope: "global",
+			type: "reference",
+			description: "When it matters",
+			...fields,
+		});
+
+		const small = create("window-session", 12_000, [
+			upsert({ id: "global/filler-3", name: "Filler 3", content: "Filler 3 now also covers kiwis." }),
+			upsert({
+				id: "global/pineapple-pizza",
+				name: "Pineapple pizza",
+				content: "The user now puts pineapple on every pizza.",
+			}),
+			upsert({ name: "Filler 4", content: "Filler 4 gained a new detail." }),
+		]);
+		expect(
+			await small.runExtraction(turn("user-1", "I now put pineapple on every pizza, and my marathon is in March.")),
+		).toBe(true);
+		await stopManager(small);
+
+		expect(requests).toHaveLength(1);
+		const { systemPrompt, task } = requests[0];
+		// The request leaves the window's safety margin and the room for the answer free.
+		expect(estimateMemoryTokens(systemPrompt) + estimateMemoryTokens(task)).toBeLessThanOrEqual(12_000 - 5000 - 1000);
+		// With their text: the two the conversation is about, then the newest. The rest by name only.
+		expect(task).toContain("The user dislikes pineapple on pizza.");
+		expect(task).toContain("The user trains for a marathon in May.");
+		expect(task).toContain("zzfact8");
+		expect(task).toContain("Other existing memories, listed without their content");
+		for (const index of [3, 4, 5]) {
+			expect(task).not.toContain(`zzfact${index}`);
+			expect(task).toContain(`global/filler-${index} | global | Filler ${index} | When Filler ${index} matters`);
+		}
+
+		const stored = (slug: string) => readFileSync(join(paths.globalDir, `${slug}.md`), "utf8");
+		// An update of an entry that was shown with its text is applied as always.
+		expect(stored("pineapple-pizza")).toContain("The user now puts pineapple on every pizza.");
+		expect(stored("pineapple-pizza")).not.toContain("dislikes");
+		// An update aimed at an entry shown by name only, by ID or by the same name, is saved beside it.
+		expect(stored("filler-3")).toContain("zzfact3");
+		expect(stored("filler-3-2")).toContain("Filler 3 now also covers kiwis.");
+		expect(stored("filler-4")).toContain("zzfact4");
+		expect(stored("filler-4-2")).toContain("Filler 4 gained a new detail.");
+
+		// A window that holds everything gets everything, as before.
+		const large = create("window-session-2", 1_000_000, []);
+		expect(await large.runExtraction(turn("user-2", "Nothing new today."))).toBe(true);
+		await stopManager(large);
+		expect(requests).toHaveLength(2);
+		expect(requests[1].task).not.toContain("Other existing memories, listed without their content");
+		for (let index = 3; index <= 8; index++) expect(requests[1].task).toContain(`zzfact${index}`);
+	});
+
 	it("reports a failed synchronous extraction without leaving the queue pending", async () => {
 		const projectDir = join(testRoot, "failed-project");
 		mkdirSync(projectDir, { recursive: true });
@@ -665,6 +781,46 @@ describe("auto memory", () => {
 			await manager.waitForBackgroundTasks();
 			await manager.waitForMaintenancePersistence();
 			vi.useRealTimers();
+		}
+	});
+
+	it("runs the 30-second check without the memory lock when nothing is due", async () => {
+		const manager = new AutoMemoryManager({
+			cwd: testRoot,
+			sessionId: "idle-check",
+			workspaceId: "workspace",
+			dataRoot,
+			agentDir: join(testRoot, "agent"),
+			persisted: true,
+			settingsManager: SettingsManager.inMemory({
+				autoMemory: { enabled: true, provider: "test", model: "memory" },
+			}),
+			modelRunner: vi.fn(async () => '{"operations":[]}'),
+		});
+		try {
+			// The first check sets the workspace's state up, under the lock.
+			expect(await manager.runConsolidation()).toBe(true);
+			// Another chat's memory write now holds the lock for as long as this check runs.
+			let release: (() => void) | undefined;
+			const held = withMemoryLock(
+				dataRoot,
+				() =>
+					new Promise<void>((resolve) => {
+						release = resolve;
+					}),
+			);
+			await vi.waitFor(() => expect(release).toBeDefined());
+			try {
+				const started = Date.now();
+				expect(await manager.runConsolidation()).toBe(true);
+				expect(Date.now() - started).toBeLessThan(2000);
+				expect(manager.getMaintenanceStatus().phase).toBe("idle");
+			} finally {
+				release?.();
+				await held;
+			}
+		} finally {
+			await stopManager(manager);
 		}
 	});
 

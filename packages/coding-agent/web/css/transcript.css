@@ -245,6 +245,54 @@ button.summary-head:hover { background: var(--surface-hover); color: var(--text-
 .md table { border-collapse: collapse; font-size: 0.92em; min-width: 60%; }
 .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; }
 .md th { background: var(--bg-inset); font-weight: 600; }
+/* Pictures, video and sound inside a reply (`![caption](path "layout")`; markdown.js writes the figure, reply-media.js
+   fills it). A figure is a span, since it stands inside a paragraph; data-layout places it the way a word processor
+   places a picture: on a line of its own (block, center, wide), at a side with the text flowing around it (left,
+   right), or inside the line (inline). --fig-w is the width the reply asked for, as a share of the reply's width. */
+.md-fig { display: block; width: fit-content; max-width: 100%; margin: 0.35em 0 0.9em; line-height: 1.4; text-indent: 0; }
+.md-fig[style*="--fig-w"] { width: var(--fig-w); }
+.md-fig-frame { display: block; overflow: hidden; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-inset); line-height: 0; }
+.md-fig-frame > img { display: block; width: auto; height: auto; max-width: 100%; max-height: 460px; }
+.md-fig[style*="--fig-w"] .md-fig-frame > img, .md-fig[data-layout="wide"] .md-fig-frame > img { width: 100%; max-height: none; }
+.md-fig-frame > img[role="button"] { cursor: zoom-in; transition: filter var(--t-fast) var(--ease); }
+.md-fig-frame > img[role="button"]:hover { filter: brightness(1.06); }
+.md-fig-frame > img:focus-visible { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+.md-fig-frame > video { display: block; width: 100%; max-height: 460px; background: #000; }
+.md-fig[data-media-kind="video"]:not([style*="--fig-w"], [data-layout="wide"]) { width: min(100%, 560px); }
+.md-fig[data-media-kind="audio"] { width: min(100%, 420px); }
+.md-fig[data-media-kind="audio"] .md-fig-frame { border: 0; background: none; }
+.md-fig-frame > audio { display: block; width: 100%; }
+/* The caption never makes its figure wider than the picture: it takes the picture's width and wraps inside it. */
+.md-fig-cap { display: block; width: 0; min-width: 100%; margin-top: 6px; color: var(--text-3); font-size: var(--fs-sm); text-align: center; overflow-wrap: anywhere; }
+/* Before its file arrives, and when it cannot be shown: a quiet box with the caption or the file's name. */
+.md-fig-wait, .md-fig-missing { display: flex; align-items: center; justify-content: center; min-width: 180px; min-height: 96px; padding: 10px 14px; color: var(--text-3); font-size: var(--fs-sm); line-height: 1.4; text-align: center; overflow-wrap: anywhere; }
+.md-fig[data-media-state="missing"] .md-fig-frame { border-style: dashed; background: none; }
+.md-fig-missing { min-height: 0; }
+.md-fig[data-layout="center"] { margin-inline: auto; }
+.md-fig[data-layout="wide"] { width: 100%; }
+.md-fig[data-layout="left"] { float: left; width: var(--fig-w, 40%); max-width: 62%; margin: 0.3em 1.15em 0.5em 0; }
+.md-fig[data-layout="right"] { float: right; width: var(--fig-w, 40%); max-width: 62%; margin: 0.3em 0 0.5em 1.15em; }
+.md-fig:is([data-layout="left"], [data-layout="right"]) .md-fig-frame > img { width: 100%; max-height: none; }
+/* A column too narrow for text beside a picture (reply-media.js measures it): the picture takes its own line. */
+.md-fig[data-unwrapped] { float: none; width: fit-content; max-width: 100%; margin: 0.35em 0 0.9em; }
+.md-fig[data-unwrapped] .md-fig-frame > img { width: auto; max-height: 460px; }
+/* Text flows around a picture to the end of its reply at most, and never squeezes a table, code or a heading. */
+.md:has(.md-fig:is([data-layout="left"], [data-layout="right"])) { display: flow-root; }
+.md :is(h1, h2, h3, h4, hr, .code-block, .table-wrap, blockquote, .md-fig-row) { clear: both; }
+/* A list beside a picture at the left keeps its bullets: as a block of its own it starts where the picture ends. */
+.md:has(.md-fig[data-layout="left"]:not([data-unwrapped])) :is(ul, ol) { display: flow-root; }
+.md-fig[data-layout="inline"] { display: inline-block; width: auto; margin: 0 0.15em; vertical-align: -0.32em; }
+.md-fig[data-layout="inline"] .md-fig-frame { border-radius: var(--r-xs); }
+.md-fig[data-layout="inline"] .md-fig-frame > img { height: 1.5em; max-height: none; }
+.md-fig[data-layout="inline"][style*="--fig-w"] { width: var(--fig-w); }
+.md-fig[data-layout="inline"][style*="--fig-w"] .md-fig-frame > img { width: 100%; height: auto; }
+.md-fig[data-layout="inline"] :is(.md-fig-wait, .md-fig-missing) { min-width: 0; min-height: 0; padding: 0 6px; line-height: 1.5; }
+/* Several pictures written in one paragraph stand side by side at one height: each takes a share of the row in
+   proportion to its shape (--fig-ratio, set when its file has loaded). */
+.md p.md-fig-row { display: flex; align-items: flex-start; gap: 10px; margin: 0.35em 0 0.9em; }
+.md-fig-row > .md-fig { flex: var(--fig-ratio, 1) 1 0; width: auto; min-width: 0; max-width: none; margin: 0; }
+.md-fig-row > .md-fig .md-fig-frame > img { width: 100%; max-height: none; }
+.md-fig-row > .md-fig :is(.md-fig-wait, .md-fig-missing) { min-width: 0; }
 .hljs { color: var(--text); }
 .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-built_in, .hljs-doctag { color: var(--hl-keyword); }
 .hljs-string, .hljs-regexp, .hljs-addition, .hljs-meta .hljs-string { color: var(--hl-string); }

@@ -74,6 +74,8 @@ describe("cooperative frontend scheduling", () => {
 			// raw-text fallback, which would compare equal no matter what the renderer did.
 			localLinkPath: () => null,
 			exportReadOnly: () => false,
+			// Every inline position is offered to the media tokenizer; none of these texts holds a media reference.
+			scanMedia: () => null,
 		});
 		vm.runInContext(
 			readFileSync(new URL("../src/exports/html/vendor/marked.min.js", import.meta.url), "utf8"),
