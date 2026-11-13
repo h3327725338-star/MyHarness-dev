@@ -2339,6 +2339,7 @@ export const zhCN = {
 	"Pages not read": "未读取的网页",
 	"{count} returned": "返回 {count}",
 	"{count} opened": "打开 {count}",
+	"summaries only, no page opened": "只读了摘要，未打开网页",
 	"Results": "搜索结果",
 	"Opened pages": "已打开的网页",
 	"cached": "缓存",

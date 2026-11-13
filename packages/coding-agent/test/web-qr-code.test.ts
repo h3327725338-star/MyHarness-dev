@@ -11,13 +11,13 @@ function fingerprint(text: string, level = "M"): { version: number; hash: string
 }
 
 const PAIRING =
-	"myharness://link?v=1&h=192.168.1.23,10.8.0.2&p=47821&d=dv_Ab3kQ9xLm2pRt&k=Zk9yQ2x3b1F4d0tQa1ZtN2hYc0w0ZkR1T2pJeUJ6QWE&n=BOB-PC";
+	"myharness://link?v=1&h=192.168.1.23,10.8.0.2&p=47821&d=dv_Ab3kQ9xLm2pRt&k=Zk9yQ2x3b1F4d0tQa1ZtN2hYc0w0ZkR1T2pJeUJ6QWE&n=LAB-PC";
 
 describe("QR code encoder", () => {
 	it("draws the same codes a QR reader decoded when they were recorded", () => {
 		expect(fingerprint("A")).toEqual({ version: 1, hash: "a0dff01ceb1a8d05" });
 		expect(fingerprint("hello world")).toEqual({ version: 1, hash: "9c68b9e89f5c9d0e" });
-		expect(fingerprint(PAIRING)).toEqual({ version: 8, hash: "70ca57b8f19dc239" });
+		expect(fingerprint(PAIRING)).toEqual({ version: 8, hash: "ab9922f87eac0715" });
 	});
 
 	it("has the three finder patterns, the timing lines and the dark module", () => {

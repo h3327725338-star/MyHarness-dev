@@ -31,6 +31,19 @@ function saveDraft(text) {
 }
 
 // ---- Model picker ------------------------------------------------------------------------------
+/**
+ * A model's name without its provider's in front ("Claude Code · Opus 5.5" → "Opus 5.5"): the chip under the input and
+ * the title bar have room for the model only, and the picker lists models under their provider anyway.
+ */
+export function shortModelName(name, providerName) {
+	const full = String(name || "");
+	const lead = String(providerName || "");
+	if (!lead || full.length <= lead.length || !full.toLowerCase().startsWith(lead.toLowerCase())) return full;
+	const rest = full.slice(lead.length).replace(/^\s*[·•|:/\-–—]\s*/, "");
+	return rest && rest.length < full.length - lead.length ? rest : full;
+}
+
+/** One sheet for both choices, as the chip shows both: the model, and how hard it thinks. */
 function ModelSheet({ close, onManage }) {
 	const models = useStore((s) => side(s).models);
 	const mode = useStore((s) => s.mode);
@@ -41,6 +54,8 @@ function ModelSheet({ close, onManage }) {
 		.map((provider) => ({ ...provider, models: provider.models.filter((model) => !needle || `${model.name} ${model.id} ${provider.name}`.toLowerCase().includes(needle)) }))
 		.filter((provider) => provider.models.length);
 	return html`<${Sheet} title=${t("Model")} sub=${mode === "pc" ? t("on the PC") : t("on this phone")} close=${close}>
+		${models.efforts.length > 1 &&
+		html`<div class="rows" style="margin-bottom:14px"><${Row} icon="brain" title=${t("Reasoning effort")} value=${effortName(models.effort)} chevron onClick=${pickEffort} /></div>`}
 		${total > 8 && html`<input class="field sheet-search" style="width:calc(100% - 8px)" placeholder=${t("Search models")} value=${query} onInput=${(event) => setQuery(event.target.value)} />`}
 		${groups.map(
 			(provider) => html`<div key=${provider.id} style="margin-bottom:14px">
@@ -50,7 +65,7 @@ function ModelSheet({ close, onManage }) {
 						const on = models.current?.provider === provider.id && models.current?.id === model.id;
 						return html`<${Row}
 							key=${model.id}
-							title=${model.name}
+							title=${shortModelName(model.name, provider.name)}
 							sub=${model.name !== model.id ? model.id : ""}
 							on=${on}
 							check=${on}
@@ -199,7 +214,8 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 
 	const busy = attachments.some((entry) => entry.busy);
 	const canSend = !busy && (text.trim().length > 0 || attachments.length > 0);
-	const blocked = mode === "local" ? (models.loaded && !models.current) || pcChatOpening : !link.paired || link.status !== "online" || noPcChat;
+	// While the PC is being connected a message can be sent already: it waits for the connection.
+	const blocked = mode === "local" ? (models.loaded && !models.current) || pcChatOpening : !link.paired || (link.status !== "online" && link.status !== "connecting") || noPcChat;
 
 	// As on the desktop, the box is emptied at once and the message shows in the chat; the PC (or the phone's agent)
 	// takes it in the background. If it is refused, what was sent comes back into the box, unless something new was
@@ -236,7 +252,7 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 	};
 
 	const showStop = running && !text.trim() && !attachments.length;
-	const modelLabel = models.current?.name || (mode === "pc" ? t("Model") : t("Choose a model"));
+	const modelLabel = models.current ? shortModelName(models.current.name, models.current.providerName) : mode === "pc" ? t("Model") : t("Choose a model");
 
 	return html`<div class="composer-wrap">
 		${mode === "local" &&
@@ -277,10 +293,9 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 			></textarea>
 			<div class="composer-bar">
 				<button class="round-btn" onClick=${attachMenu} aria-label=${t("Add attachment")}><${Icon} name="plus" size=${22} /></button>
-				<button class="chip" onClick=${() => openSheet((close) => html`<${ModelSheet} close=${close} onManage=${() => onOpenSettings("models")} />`)} aria-label=${t("Model")}>
-					<${Icon} name=${mode === "pc" ? "desktop" : "phone"} size=${15} /><span class="label">${modelLabel}</span>
+				<button class="chip model-chip" onClick=${() => openSheet((close) => html`<${ModelSheet} close=${close} onManage=${() => onOpenSettings("models")} />`)} aria-label=${t("Model and reasoning effort")}>
+					<span class="label">${modelLabel}</span>${models.current && models.efforts.length > 1 ? html`<span class="effort">${effortName(models.effort)}</span>` : null}
 				</button>
-				${models.efforts.length > 1 && html`<button class="chip" onClick=${pickEffort} aria-label=${t("Reasoning effort")}><${Icon} name="brain" size=${15} /><span class="label">${effortName(models.effort)}</span></button>`}
 				<span class="spacer"></span>
 				${showStop
 					? html`<button class="round-btn stop" onClick=${stop} aria-label=${t("Stop")}><span class="swap" key="stop"><${Icon} name="stop" size=${18} /></span></button>`

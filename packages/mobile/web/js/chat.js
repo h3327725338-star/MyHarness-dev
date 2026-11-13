@@ -2,7 +2,7 @@
 import { serverText, t } from "/shared/i18n.js";
 import { Spinner, html, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/shared/ui.js";
 import { backend, nav } from "./backends.js";
-import { Composer } from "./composer.js";
+import { Composer, shortModelName } from "./composer.js";
 import { awaitingFirstReply } from "./live.js";
 import { Icon, Mark } from "./micons.js";
 import { haptic, onInsets } from "./native.js";
@@ -37,7 +37,7 @@ function Welcome({ mode, link }) {
 	return html`<div class="welcome">
 		<${Mark} size=${56} class="welcome-mark" />
 		<h1>${greeting()}</h1>
-		<p>${mode === "pc" ? (link.paired ? t("Messages go to {name}.", { name: link.paired.name }) : t("Connect a PC to control it from here.")) : t("What can I help you with?")}</p>
+		${mode === "pc" && link.paired ? null : html`<p>${mode === "pc" ? t("Connect a PC to control it from here.") : t("What can I help you with?")}</p>`}
 		${mode === "local" &&
 		html`<div class="welcome-chips">
 			${SUGGESTIONS.map(
@@ -80,7 +80,6 @@ export function Chat() {
 	});
 	const models = useStore((s) => side(s).models);
 	const link = useStore((s) => s.pc.link);
-	const tabs = useStore((s) => s.browser.tabs.length);
 	const scroll = useRef(null);
 	const stick = useRef(true);
 	const [away, setAway] = useState(false);
@@ -154,7 +153,7 @@ export function Chat() {
 	const firstLine = (chat.items.find((item) => item.kind === "user")?.text || "").trim().split("\n")[0].slice(0, 60);
 	const title = chat.title || firstLine || (empty ? t("New chat") : t("Chat"));
 	const where = mode === "pc" ? link.paired?.name || t("PC") : t("This phone");
-	const sub = [where, mode === "pc" ? chat.place : "", models.current?.name].filter(Boolean).join(" · ");
+	const sub = [where, mode === "pc" ? chat.place : "", models.current ? shortModelName(models.current.name, models.current.providerName) : ""].filter(Boolean).join(" · ");
 	const awaiting = awaitingFirstReply({ running: chat.running, items: chat.items });
 
 	const newChat = async () => {
@@ -169,11 +168,7 @@ export function Chat() {
 				<span class="name title-swap" key=${title}>${title}</span>
 				<span class="sub"><span class="where"><${Icon} name=${mode === "pc" ? "desktop" : "phone"} size=${12} /></span>${sub}</span>
 			</div>
-			<button class="icon-btn" onClick=${newChat} aria-label=${t("New chat")} disabled=${mode === "pc" && link.status !== "online"}><${Icon} name="compose" size=${21} /></button>
-			<button class="icon-btn" onClick=${() => nav.go("browser")} aria-label=${t("Browser")} style="position:relative">
-				<${Icon} name="globe" size=${21} />
-				${tabs > 0 && html`<span class="dot live" style="position:absolute;top:9px;right:9px;width:7px;height:7px;animation:none"></span>`}
-			</button>
+			<button class="icon-btn" onClick=${newChat} aria-label=${t("New chat")} disabled=${mode === "pc" && link.status !== "online" && link.status !== "connecting"}><${Icon} name="compose" size=${21} /></button>
 		</div>
 		<div class="chat-scroll" ref=${scroll} onScroll=${onScroll}>
 			${chat.loading && chat.items.length === 0

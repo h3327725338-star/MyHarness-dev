@@ -18,7 +18,9 @@ import android.os.IBinder;
  */
 public final class RunService extends Service {
 	static final String RUN_CHANNEL = "run";
-	static final String DONE_CHANNEL = "done";
+	// "reply", not the "done" of the first versions: a channel keeps the importance it was made with, and that one was
+	// made too low to show a banner when a reply ends.
+	static final String DONE_CHANNEL = "reply";
 	private static final int RUN_ID = 1;
 	private static final String EXTRA_TITLE = "title";
 
@@ -28,7 +30,8 @@ public final class RunService extends Service {
 		NotificationChannel run = new NotificationChannel(RUN_CHANNEL, context.getString(R.string.run_channel), NotificationManager.IMPORTANCE_LOW);
 		run.setShowBadge(false);
 		manager.createNotificationChannel(run);
-		manager.createNotificationChannel(new NotificationChannel(DONE_CHANNEL, context.getString(R.string.done_channel), NotificationManager.IMPORTANCE_DEFAULT));
+		manager.deleteNotificationChannel("done");
+		manager.createNotificationChannel(new NotificationChannel(DONE_CHANNEL, context.getString(R.string.done_channel), NotificationManager.IMPORTANCE_HIGH));
 	}
 
 	static void start(Context context, String title) {

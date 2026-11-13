@@ -20,6 +20,7 @@ import { getDataDir } from "../../config/paths/index.ts";
 import { getAgentDir, getExportTemplateDir, getWebUiDir, VERSION } from "../../config.ts";
 import type { ProjectTrustContext } from "../../extensions/compat/types.ts";
 import { WorktreeDisplayNames } from "../../git/worktrees/display-name.ts";
+import { WebSearchApiKeys } from "../../providers/credentials/web-search-keys.ts";
 import { setMirrorSessionsAllowed } from "../../session/manager/index.ts";
 import { SyncService, signInRequiredByEnvironment } from "../../sync/service.ts";
 import { WebDialogBridge } from "./dialogs.ts";
@@ -338,6 +339,11 @@ export async function runWebMode(
 					thinkingLevel: settings.getDefaultThinkingLevel() ?? null,
 				};
 			},
+			// The phone's own agent searches as this computer does, with the keys saved here (not one from the environment).
+			search: () => ({
+				engines: runtimeHost.services.settingsManager.getWebSearchSettings().engines,
+				tavilyKeys: new WebSearchApiKeys().listStored("tavily").map((entry) => entry.key),
+			}),
 			isSessionActive,
 			onImported: (info) => {
 				// A phone continued a chat or saved a Provider: the files changed on disk; sync carries them on.

@@ -1684,6 +1684,13 @@ describe("Web UI: what the agent really did on the web and in files", () => {
 		expect(groupLabel("web", [step(fetchCall("4", 3), "web_fetch", "d")])).toBe("Opened 3 web pages");
 	});
 
+	it("says a search was answered from the result summaries when it opened no page", () => {
+		// The model asked for the list only (readPages 0) and answered from it: "0 pages opened" read as a miscount.
+		const calls = [step(searchCall("1", 15, 0), "web_search", "a")];
+		expect(webStats(calls)).toEqual({ rounds: 1, returned: 15, opened: 0 });
+		expect(groupLabel("web", calls)).toBe("1 search round · 15 results returned · summaries only, no page opened");
+	});
+
 	it("counts nothing for a call that has no result yet", () => {
 		const running = describeAction(
 			{ id: "9", name: "web_search", args: { query: "z" } },

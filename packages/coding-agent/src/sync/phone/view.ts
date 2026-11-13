@@ -1,9 +1,12 @@
 /**
- * What one computer tells a phone (`phone-v1/views/<deviceId>.json.gz` and `<deviceId>.memories.json.gz`).
+ * What one computer tells a phone (`phone-v1/views/<deviceId>.json.gz`, `<deviceId>.memories.json.gz` and
+ * `<deviceId>.dial.json.gz`).
  *
  * A view only describes: the chats this computer has committed to the sync space (the content stays in
  * `sync-v1/objects/<hash>`, so a phone downloads a chat only when it opens it), the Providers and API keys that a phone
- * can use, the global memories and the user profile, and the built-in browser's bookmarks. Every computer writes its
+ * can use, the web search sources and keys, the global memories and the user profile, and the built-in browser's
+ * bookmarks and the shortcuts of its new-tab page (a file of their own: their icons are large and change rarely, the
+ * view changes with every chat). Every computer writes its
  * own view; a phone combines them (each chat from the view that has its newest version, the settings, memories and
  * bookmarks from the computer that has seen the most of them), so no computer has to be the "main" one.
  */
@@ -92,9 +95,42 @@ export interface PhoneView {
 		/** The model new General chats start with on the computer. */
 		model: { provider: string; id: string } | null;
 		thinkingLevel: string | null;
+		/** The web search sources switched on here, and the keys saved for them (absent from computers before 0.0.10). */
+		search?: PhoneSearch;
 	};
 	chats: PhoneChatRow[];
 	bookmarks: { rank: number; items: Array<{ title: string; url: string; icon?: string }> };
+}
+
+/** Web search as this computer is set up: the phone's own agent searches the same way without being set up again. */
+export interface PhoneSearch {
+	engines: string[];
+	/** Tavily API keys saved in MyHarness (never one from an environment variable), in the order they are tried. */
+	tavilyKeys: string[];
+}
+
+export interface PhoneDialSite {
+	id: string;
+	type: "site";
+	title: string;
+	url: string;
+	icon?: string;
+}
+
+export interface PhoneDialGroup {
+	id: string;
+	type: "group";
+	title: string;
+	items: PhoneDialSite[];
+}
+
+/** The shortcuts of the built-in browser's new-tab page, in their order, groups included. */
+export interface PhoneDialPack {
+	version: 1;
+	device: { id: string; name: string };
+	writtenAt: string;
+	rank: number;
+	items: Array<PhoneDialSite | PhoneDialGroup>;
 }
 
 export interface PhoneMemoryPack {
@@ -234,6 +270,67 @@ export function buildPhoneBookmarks(agentDir: string): Array<{ title: string; ur
 	} catch {
 		return [];
 	}
+}
+
+const MAX_DIAL_ICON_CHARS = 160 * 1024;
+const MAX_DIAL_ICONS_CHARS = 2 * 1024 * 1024;
+const MAX_DIAL_ITEMS = 120;
+
+/**
+ * The shortcuts of the new-tab page (desktop profile, `browser-speed-dial.json`) as the desktop draws them: sites and
+ * groups of sites in their order. Before the user arranged any, the desktop shows the first bookmarks there; so does
+ * this. Icons too large to send are left out (the phone then shows the site's first letter).
+ */
+export function buildPhoneSpeedDial(agentDir: string): Array<PhoneDialSite | PhoneDialGroup> {
+	let budget = MAX_DIAL_ICONS_CHARS;
+	const site = (entry: Record<string, unknown>, index: number): PhoneDialSite | null => {
+		if (typeof entry.url !== "string" || !/^https?:\/\//iu.test(entry.url)) return null;
+		const icon = typeof entry.icon === "string" && entry.icon.startsWith("data:image/") ? entry.icon : "";
+		const keep = icon.length > 0 && icon.length <= MAX_DIAL_ICON_CHARS && icon.length <= budget;
+		if (keep) budget -= icon.length;
+		return {
+			id: typeof entry.id === "string" && entry.id ? entry.id : `site-${index}`,
+			type: "site",
+			title: typeof entry.title === "string" ? entry.title.slice(0, 80) : "",
+			url: entry.url,
+			...(keep ? { icon } : {}),
+		};
+	};
+	const sites = (list: unknown): PhoneDialSite[] =>
+		(Array.isArray(list) ? list : [])
+			.map((entry, index) =>
+				entry && typeof entry === "object" ? site(entry as Record<string, unknown>, index) : null,
+			)
+			.filter((entry): entry is PhoneDialSite => entry !== null);
+	try {
+		const value = JSON.parse(readFileSync(join(agentDir, "desktop-profile", "browser-speed-dial.json"), "utf8")) as {
+			items?: Array<Record<string, unknown>>;
+		};
+		const items: Array<PhoneDialSite | PhoneDialGroup> = [];
+		for (const [index, entry] of (Array.isArray(value.items) ? value.items : []).entries()) {
+			if (!entry || typeof entry !== "object") continue;
+			if (entry.type === "group") {
+				const inside = sites(entry.items);
+				if (!inside.length) continue;
+				items.push({
+					id: typeof entry.id === "string" && entry.id ? entry.id : `group-${index}`,
+					type: "group",
+					title: typeof entry.title === "string" ? entry.title.slice(0, 80) : "",
+					items: inside,
+				});
+			} else {
+				const one = site(entry, index);
+				if (one) items.push(one);
+			}
+			if (items.length >= MAX_DIAL_ITEMS) break;
+		}
+		if (items.length) return items;
+	} catch {
+		// Not arranged yet (or unreadable): the first bookmarks, as on the desktop.
+	}
+	return buildPhoneBookmarks(agentDir)
+		.slice(0, 12)
+		.map((entry, index) => ({ id: `bookmark-${index}`, type: "site" as const, ...entry }));
 }
 
 /** How much of a kind of record this computer has seen: what a phone uses to choose between two computers' views. */

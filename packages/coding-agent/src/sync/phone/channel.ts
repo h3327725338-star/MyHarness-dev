@@ -3,8 +3,8 @@
  * with Google it
  *
  * - says it is on (`pcs/<deviceId>.json`, every minute), so a phone lists it among the computers it can connect to;
- * - describes its chats, Providers and keys, memories and bookmarks for phones (`views/`, view.ts) whenever they
- *   changed;
+ * - describes its chats, Providers and keys, web search sources, memories, bookmarks and new-tab shortcuts for phones
+ *   (`views/`, view.ts) whenever they changed;
  * - applies what phones sent (`outbox/`, importer.ts) and removes each file once it is applied. Of the computers
  *   that are on, the one with the smallest device id does this, so two computers rarely apply the same file; when
  *   they do, the result is the same (importer.ts);
@@ -22,8 +22,11 @@ import {
 	buildPhoneBookmarks,
 	buildPhoneChats,
 	buildPhoneMemories,
+	buildPhoneSpeedDial,
+	type PhoneDialPack,
 	type PhoneMemoryPack,
 	type PhoneProvider,
+	type PhoneSearch,
 	type PhoneView,
 	rankOf,
 } from "./view.ts";
@@ -81,6 +84,8 @@ export interface PhoneChannelOptions {
 	caughtUp: () => boolean;
 	providers: () => Promise<PhoneProvider[]>;
 	defaults: () => { model: { provider: string; id: string } | null; thinkingLevel: string | null };
+	/** The web search sources switched on here and their saved keys; absent, the view says nothing about search. */
+	search?: () => PhoneSearch;
 	link: () => { accepts: boolean; lan: { addresses: string[]; port: number } | null };
 	isSessionActive?: (workspaceId: string, sessionId: string) => boolean;
 	onPhones?: (phones: PhoneRegistration[]) => void;
@@ -139,6 +144,7 @@ export class PhoneChannel {
 	private lastViewText = "";
 	private lastMemoriesAt = 0;
 	private lastMemoriesText = "";
+	private lastDialText = "";
 	private lastPhonesAt = 0;
 	/** Registration files as last downloaded, by name: their modified time and what they said. */
 	private phoneFiles = new Map<string, { modifiedTime: string; phone: PhoneRegistration | null }>();
@@ -365,6 +371,7 @@ export class PhoneChannel {
 					providers,
 					model: defaults.model,
 					thinkingLevel: defaults.thinkingLevel,
+					...(this.options.search ? { search: this.options.search() } : {}),
 				},
 				chats: await buildPhoneChats({
 					dataRoot: this.options.dataRoot,
@@ -381,6 +388,20 @@ export class PhoneChannel {
 				const written: PhoneView = { ...view, writtenAt: new Date(now).toISOString() };
 				await port.phoneWrite("views", `${device.id}.json.gz`, gzipSync(Buffer.from(JSON.stringify(written))));
 				this.lastViewText = text;
+			}
+			// The new-tab shortcuts go in a file of their own: with their icons they are far larger than the rest, and a
+			// phone downloads a view again whenever a chat changed.
+			const dial: Omit<PhoneDialPack, "writtenAt"> = {
+				version: 1,
+				device,
+				rank: rankOf(committed, "browser", "browser-speed-dial.json"),
+				items: buildPhoneSpeedDial(this.options.agentDir),
+			};
+			const dialText = JSON.stringify(dial);
+			if (dialText !== this.lastDialText) {
+				const written: PhoneDialPack = { ...dial, writtenAt: new Date(now).toISOString() };
+				await port.phoneWrite("views", `${device.id}.dial.json.gz`, gzipSync(Buffer.from(JSON.stringify(written))));
+				this.lastDialText = dialText;
 			}
 			this.lastViewAt = now;
 		}

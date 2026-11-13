@@ -9,7 +9,7 @@
 // - It leaves changes made on the phone in `outbox/` (chat lines, Provider edits). A PC applies each file to its own
 //   files and removes it; the PCs' ordinary sync then carries the change to every PC.
 import { t } from "/shared/i18n.js";
-import { listPcs, mergeViews, pickMemories } from "./account-view.js";
+import { listPcs, mergeViews, pickDial, pickMemories } from "./account-view.js";
 import * as db from "./db.js";
 import { bytesToText, DriveError, gunzip, PhoneDrive } from "./drive.js";
 import { googleAccount, signInWithGoogle, signOutOfGoogle } from "./google.js";
@@ -29,12 +29,18 @@ const pcsListeners = new Set();
 const presences = new Map(); // file name → { modifiedTime, value }
 const views = new Map(); // file name → { modifiedTime, value }
 const memoryPacks = new Map();
+const dialPacks = new Map();
 let refreshing = null;
 let timer = 0;
 let registeredKey = "";
 let flushTimer = 0;
 let lastView = null;
 let lastMemories = [];
+
+function setDial(items) {
+	state.pcDial = Array.isArray(items) ? items : [];
+	emit();
+}
 
 function setAccount(patch) {
 	state.account = { ...state.account, ...patch };
@@ -131,7 +137,7 @@ export function refreshAccount() {
 			const viewFiles = await drive.phoneList("views");
 			const changedViews = await readChanged(
 				"views",
-				viewFiles.filter((file) => file.name.endsWith(".json.gz") && !file.name.endsWith(".memories.json.gz")),
+				viewFiles.filter((file) => file.name.endsWith(".json.gz") && !file.name.endsWith(".memories.json.gz") && !file.name.endsWith(".dial.json.gz")),
 				views,
 				gunzip,
 			);
@@ -141,6 +147,17 @@ export function refreshAccount() {
 				memoryPacks,
 				gunzip,
 			);
+			// The new-tab shortcuts of the PCs' browser (a file of their own: large, and rarely changed).
+			const changedDial = await readChanged(
+				"views",
+				viewFiles.filter((file) => file.name.endsWith(".dial.json.gz")),
+				dialPacks,
+				gunzip,
+			);
+			if (changedDial) {
+				setDial(pickDial([...dialPacks.values()].map((entry) => entry.value)));
+				await db.kvSet("account-dial", state.pcDial).catch(() => {});
+			}
 			if (changedViews || changedMemories || !lastView) {
 				lastView = mergeViews([...views.values()].map((entry) => entry.value));
 				lastMemories = pickMemories([...memoryPacks.values()].map((entry) => entry.value));
@@ -234,6 +251,9 @@ async function forget() {
 	presences.clear();
 	views.clear();
 	memoryPacks.clear();
+	dialPacks.clear();
+	setDial([]);
+	await db.kvSet("account-dial", []).catch(() => {});
 	lastView = null;
 	lastMemories = [];
 	await db.kvSet("account-view", null).catch(() => {});
@@ -250,9 +270,10 @@ export const account = {
 		// What was read last time, so Providers and chats are there before Drive answers (or without a network).
 		lastView = await db.kvGet("account-view", null).catch(() => null);
 		lastMemories = (await db.kvGet("account-memories", [])) || [];
+		setDial(await db.kvGet("account-dial", []).catch(() => []));
 		if (lastView) publish();
 		onNative("lifecycle", (event) => {
-			if (event.state === "resume") refreshAccount();
+			if (event.state === "foreground") refreshAccount();
 		});
 		document.addEventListener("visibilitychange", () => {
 			if (document.visibilityState === "visible") refreshAccount();

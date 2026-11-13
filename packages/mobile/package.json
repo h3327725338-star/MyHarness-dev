@@ -1,6 +1,6 @@
 {
 	"name": "@myharness/mobile",
-	"version": "0.0.8",
+	"version": "0.0.10",
 	"private": true,
 	"type": "module",
 	"description": "MyHarness Android app: phone UI, on-device agent, built-in browser and PC link",

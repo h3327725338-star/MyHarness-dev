@@ -73,6 +73,11 @@ final class BrowserController {
 		switch (action) {
 			case "create": {
 				WebView view = create(id);
+				// A page the app reads by itself (never shown) may name the browser it is; tabs keep the web view's own.
+				String agent = input.optString("userAgent", "");
+				if (!agent.isEmpty()) view.getSettings().setUserAgentString(agent);
+				// Such a page may also ask for a fresh copy: what it reads must not be an answer kept from last time.
+				if (input.optBoolean("fresh", false)) view.getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
 				String url = input.optString("url", "");
 				if (!url.isEmpty()) view.loadUrl(url);
 				if (input.optBoolean("activate", true)) activate(id);
@@ -281,6 +286,19 @@ final class BrowserController {
 		view.setWebChromeClient(new TabChrome(id));
 		view.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) ->
 				download(id, url, userAgent, contentDisposition, mimeType));
+		view.setFindListener((activeMatch, matches, done) -> {
+			try {
+				JSONObject payload = new JSONObject();
+				payload.put("type", "find");
+				payload.put("id", id);
+				payload.put("active", activeMatch);
+				payload.put("count", matches);
+				payload.put("done", done);
+				owner.emit("browser", payload);
+			} catch (Exception ignored) {
+				// The count is simply not shown.
+			}
+		});
 		host.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 		tabs.put(id, view);
 		return view;

@@ -17,7 +17,7 @@ import { httpFetch, nativeInfo, notifyDone, runActive, secretDelete, secretGet, 
 import { prefs, resolvedLang, setPrefs } from "./prefs.js";
 import { PROMPTS } from "./prompts.generated.js";
 import { emit, emptyChat, state, toast } from "./store.js";
-import { buildTools, memoryTools } from "./tools.js";
+import { buildTools, memoryTools, setPcSearch } from "./tools.js";
 import { textOf, wireAssistant, wireEntries, wireEntry } from "./wire.js";
 
 // ---- Providers ---------------------------------------------------------------------------------
@@ -406,6 +406,8 @@ async function openPcChat(key) {
 function applyAccountView(view, list) {
 	memories = Array.isArray(list) ? list : [];
 	state.pcBookmarks = view ? view.bookmarks || [] : [];
+	// The PCs' web search sources and keys: the phone searches the same way without being set up again.
+	setPcSearch(view ? view.settings?.search : null);
 	if (!view) {
 		// Signed out: what came from the account leaves the phone; chats stay, as chats of this phone.
 		const before = providers.length;

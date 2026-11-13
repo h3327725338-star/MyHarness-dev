@@ -310,7 +310,9 @@ export function groupLabel(kind, actions) {
 			if (running) return t("Searching the web");
 			const { rounds, returned, opened } = webStats(actions);
 			if (!rounds) return t("Opened {pages}", { pages: count(opened, "web page") });
-			return [count(rounds, "search round"), t("{count} returned", { count: count(returned, "result") }), t("{count} opened", { count: count(opened, "page") })].join(" · ");
+			// A search that opened no page was answered from the engines' result summaries: said so, since "0 opened" beside an
+			// answer reads as a miscount.
+			return [count(rounds, "search round"), t("{count} returned", { count: count(returned, "result") }), opened ? t("{count} opened", { count: count(opened, "page") }) : t("summaries only, no page opened")].join(" · ");
 		}
 		case "github":
 			return pick(N_("Querying GitHub {times}"), N_("Queried GitHub {times}"), { times: count(n, "time") });

@@ -84,7 +84,7 @@ function WebStep({ step, raw }) {
 			<span class="action-text truncate" title=${step.target}>
 				<span class=${step.status === "running" ? "shimmer-text" : "verb"}>${step.verb}</span>${step.target ? html` <span class="target">${step.target}</span>` : null}
 			</span>
-			${step.web ? html`<span class="action-tail dim">${[step.web.search ? t("{count} returned", { count: count(step.web.returned, "result") }) : "", t("{count} opened", { count: count(step.web.opened, "page") })].filter(Boolean).join(" · ")}</span>` : null}
+			${step.web ? html`<span class="action-tail dim">${[step.web.search ? t("{count} returned", { count: count(step.web.returned, "result") }) : "", step.web.search && !step.web.opened ? t("summaries only, no page opened") : t("{count} opened", { count: count(step.web.opened, "page") })].filter(Boolean).join(" · ")}</span>` : null}
 		</div>
 		${progress ? html`<div class="web-progress dim truncate">${serverText(clip(progress.trim().split("\n").pop(), 140))}</div>` : null}
 		<div class="web-body">

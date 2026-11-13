@@ -701,7 +701,7 @@ export class PhoneRemoteLink {
 					lastWrite = this.now();
 					void flush();
 				},
-				urgent ? 120 : 600,
+				urgent ? 30 : 600,
 			);
 			timer.unref?.();
 		};

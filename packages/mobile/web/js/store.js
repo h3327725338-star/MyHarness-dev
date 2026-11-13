@@ -54,6 +54,7 @@ export const state = {
 	booted: false,
 	mode: prefs.mode === "pc" ? "pc" : "local",
 	pane: "chat", // drawer | chat | browser
+	browserPeek: false, // any part of the browser pane is on screen (a finger is dragging it in or out)
 	local: { chats: [], chatsLoaded: false, chat: emptyChat(), models: emptyModels() },
 	pc: {
 		chats: [],
@@ -74,7 +75,10 @@ export const state = {
 	account: { status: "signedOut", email: "", name: "", pcs: [], error: "", syncedAt: 0, skipped: false },
 	// Bookmarks of the PCs' browser (read only on the phone).
 	pcBookmarks: [],
-	browser: { tabs: [], active: null, error: null },
+	// The shortcuts of the PCs' new-tab page: sites and groups of sites (account-view.js pickDial); read only here too.
+	pcDial: [],
+	// find: { id, query, active, count, done } while the shown page is being searched
+	browser: { tabs: [], active: null, error: null, find: null },
 	toasts: [],
 	layers: [],
 	composerInsert: null, // { text, nonce }: text another pane hands to the composer
@@ -128,14 +132,16 @@ export function useStore(selector) {
 	const latest = useRef(null);
 	const value = selector(state);
 	latest.current = { selector, value };
-	useEffect(
-		() =>
-			subscribe(() => {
-				const next = latest.current.selector(state);
-				if (!shallowEqual(next, latest.current.value)) force((n) => n + 1);
-			}),
-		[],
-	);
+	useEffect(() => {
+		const check = () => {
+			const next = latest.current.selector(state);
+			if (!shallowEqual(next, latest.current.value)) force((n) => n + 1);
+		};
+		const off = subscribe(check);
+		// What changed between this component's first drawing and this moment was announced before it listened.
+		check();
+		return off;
+	}, []);
 	return value;
 }
 

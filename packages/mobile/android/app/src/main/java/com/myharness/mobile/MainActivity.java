@@ -88,6 +88,8 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 	private String allowedDevOrigin;
 	private boolean pageReady;
 	private JSONObject lastInsets = new JSONObject();
+	/** The keyboard is sliding in or out: its height comes from the frames of that slide, not from the end state. */
+	private boolean keyboardSliding = false;
 	private JSONObject pendingShare;
 	/** Waits for the end of a Google sign-in on the loopback address (see OAuthLoopback). */
 	private final OAuthLoopback oauth = new OAuthLoopback();
@@ -102,6 +104,10 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 	private ActivityResultLauncher<String> notificationPermission;
 	private ActivityResultLauncher<ScanOptions> scanLauncher;
 	private boolean askedNotifications;
+	/** A reply is being written (the page said so): the run service is wanted whenever the app is not on screen. */
+	private boolean runWanted;
+	private String runTitle = "";
+	private boolean onScreen;
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
@@ -282,10 +288,25 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		});
 		ViewCompat.setWindowInsetsAnimationCallback(root, new WindowInsetsAnimationCompat.Callback(WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_STOP) {
 			@Override
+			public void onPrepare(WindowInsetsAnimationCompat animation) {
+				// Android reports the end state of the insets right after this, before the first frame of the slide. Taking
+				// it would make the page jump to the end and back, so the keyboard's height is held until the frames come.
+				if ((animation.getTypeMask() & WindowInsetsCompat.Type.ime()) != 0) keyboardSliding = true;
+			}
+
+			@Override
 			public WindowInsetsCompat onProgress(WindowInsetsCompat insets, List<WindowInsetsAnimationCompat> running) {
 				// The keyboard slides in over several frames: the page follows it frame by frame.
 				publishInsets(insets, true);
 				return insets;
+			}
+
+			@Override
+			public void onEnd(WindowInsetsAnimationCompat animation) {
+				if ((animation.getTypeMask() & WindowInsetsCompat.Type.ime()) == 0) return;
+				keyboardSliding = false;
+				WindowInsetsCompat now = ViewCompat.getRootWindowInsets(root);
+				if (now != null) publishInsets(now, false);
 			}
 		});
 	}
@@ -300,8 +321,12 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 			payload.put("bottom", bars.bottom / density);
 			payload.put("left", bars.left / density);
 			payload.put("right", bars.right / density);
-			payload.put("keyboard", Math.max(0, ime.bottom - bars.bottom) / density);
+			double keyboard = Math.max(0, ime.bottom - bars.bottom) / density;
+			if (keyboardSliding && !animating) keyboard = lastInsets.optDouble("keyboard", keyboard);
+			payload.put("keyboard", keyboard);
 			payload.put("animating", animating);
+			// Nothing changed (the bars are reported again for every frame of some animations): the page is left alone.
+			if (pageReady && payload.toString().equals(lastInsets.toString())) return;
 			lastInsets = payload;
 			if (pageReady) emit("insets", payload);
 		} catch (Exception ignored) {
@@ -566,6 +591,23 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		super.onResume();
 		browser.onResume();
 		emitSimple("lifecycle", "state", "foreground");
+	}
+
+	@Override
+	protected void onStart() {
+		super.onStart();
+		onScreen = true;
+		// On screen nothing has to keep the app alive, and its notification would only be in the way.
+		RunService.stop(this);
+	}
+
+	@Override
+	protected void onStop() {
+		super.onStop();
+		onScreen = false;
+		// The app leaves the screen while a reply is being written: from here on Android may stop it, unless the run
+		// service holds it. Android allows starting the service for a few seconds after the app was on screen.
+		if (runWanted && !isFinishing()) RunService.start(this, runTitle);
 	}
 
 	@Override
@@ -863,17 +905,24 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 			}
 		}
 
-		/** A reply is being generated (or no longer is): keep the app alive meanwhile. */
+		/**
+		 * A reply is being generated (or no longer is): keep the app alive meanwhile. The service and its notification
+		 * exist only while the app is not on screen (onStop starts them, onStart ends them).
+		 */
 		@JavascriptInterface
 		public void runActive(boolean active, String title) {
 			runOnUiThread(() -> {
+				runWanted = active;
+				runTitle = title == null ? "" : title;
 				if (active) {
-					if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotifications
+					if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotifications && onScreen
 							&& checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
 						askedNotifications = true;
 						notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS);
 					}
-					RunService.start(MainActivity.this, title);
+					// Already in the background (a reply began there, or its title changed): Android may refuse, which
+					// RunService.start takes quietly.
+					if (!onScreen) RunService.start(MainActivity.this, runTitle);
 				} else RunService.stop(MainActivity.this);
 			});
 		}

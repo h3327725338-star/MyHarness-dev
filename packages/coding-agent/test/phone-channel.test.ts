@@ -16,12 +16,17 @@ interface PhoneEntry {
 	message: Record<string, unknown>;
 }
 interface PhoneView {
-	settings: { providers: Array<{ id: string; apiKey: string }>; model: unknown };
+	settings: {
+		providers: Array<{ id: string; apiKey: string }>;
+		model: unknown;
+		search?: { engines: string[]; tavilyKeys: string[] };
+	};
 	chats: Array<{ key: string; hash: string; title: string; origin?: string; rank: number }>;
 }
 interface AccountView {
 	mergeViews(views: unknown[]): PhoneView;
 	listPcs(presences: unknown[], now?: number): Array<{ id: string; online: boolean; accepts: boolean }>;
+	pickDial(packs: unknown[]): Array<{ type: string; title: string; url?: string; icon?: string; items?: unknown[] }>;
 	chatFromJsonl(text: string): { entries: PhoneEntry[]; leaf: string | null; title: string };
 	linesForPc(
 		entries: PhoneEntry[],
@@ -73,6 +78,7 @@ describe("phone channel on the PC", () => {
 			],
 			defaults: () => ({ model: { provider: "zai", id: "glm-5" }, thinkingLevel: "medium" }),
 			link: () => ({ accepts: true, lan: null }),
+			search: () => ({ engines: ["google", "tavily"], tavilyKeys: ["test-tavily-not-real"] }),
 			onPhones: (list) => {
 				phones = list;
 			},
@@ -80,7 +86,7 @@ describe("phone channel on the PC", () => {
 			now: () => clock,
 		});
 
-	const readGz = (folder: "views", name: string) =>
+	const readGz = (folder: "views", name: string): any =>
 		JSON.parse(gunzipSync(drive.folders.get(folder)!.get(name)!.data).toString("utf8"));
 
 	beforeEach(() => {
@@ -161,6 +167,58 @@ describe("phone channel on the PC", () => {
 			}),
 		]);
 		expect(drive.folders.get("views")!.has(`${PC.id}.memories.json.gz`)).toBe(true);
+	});
+
+	it("gives the phone the PC's search sources and the tiles of the browser's new-tab page", async () => {
+		const icon = `data:image/png;base64,${"A".repeat(64)}`;
+		mkdirSync(join(agentDir, "desktop-profile"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "desktop-profile", "browser-speed-dial.json"),
+			JSON.stringify({
+				version: 1,
+				items: [
+					{ type: "site", id: "a", title: "", url: "https://drive.google.com/", icon },
+					{
+						type: "group",
+						id: "g",
+						title: "IT",
+						items: [
+							{
+								type: "site",
+								id: "b",
+								title: "GitHub",
+								url: "https://github.com/",
+								icon: `data:image/png;base64,${"B".repeat(400_000)}`,
+							},
+							{ type: "site", id: "c", title: "local", url: "file:///C:/secret.html" },
+						],
+					},
+					{ type: "group", id: "empty", title: "nothing", items: [] },
+				],
+			}),
+		);
+		const pc = channel();
+		await pc.tick();
+		const view = phone.mergeViews([readGz("views", `${PC.id}.json.gz`)]);
+		expect(view.settings.search).toEqual({ engines: ["google", "tavily"], tavilyKeys: ["test-tavily-not-real"] });
+		const pack = readGz("views", `${PC.id}.dial.json.gz`);
+		expect(pack).toEqual(expect.objectContaining({ version: 1, device: PC }));
+		// A site keeps its icon; an icon too large for a phone is left out; what is not a web page, and a group with
+		// nothing in it, are not sent.
+		expect(phone.pickDial([pack])).toEqual([
+			{ id: "a", type: "site", title: "", url: "https://drive.google.com/", icon },
+			{
+				id: "g",
+				type: "group",
+				title: "IT",
+				items: [{ id: "b", type: "site", title: "GitHub", url: "https://github.com/" }],
+			},
+		]);
+		// Nothing changed: the tiles are not uploaded again.
+		const before = drive.folders.get("views")!.get(`${PC.id}.dial.json.gz`)!;
+		clock += 10 * 60_000;
+		await pc.tick();
+		expect(drive.folders.get("views")!.get(`${PC.id}.dial.json.gz`)).toBe(before);
 	});
 
 	it("applies what a phone sent: a continued chat, a new chat and a Provider, once each", async () => {

@@ -28,7 +28,7 @@ function ownsHorizontal(target, root, dx) {
 	return false;
 }
 
-export function createPager(root, { onPane, allowBrowser = () => true } = {}) {
+export function createPager(root, { onPane, onPeek, allowBrowser = () => true } = {}) {
 	const drawer = root.querySelector(".pane-drawer");
 	const chat = root.querySelector(".pane-chat");
 	const browser = root.querySelector(".pane-browser");
@@ -43,6 +43,8 @@ export function createPager(root, { onPane, allowBrowser = () => true } = {}) {
 	let width = root.clientWidth || innerWidth;
 	let drawerWidth = drawer.offsetWidth || Math.min(width * 0.86, 360);
 	let drag = null;
+	let peeking = false;
+	let aside = false;
 
 	function draw() {
 		const p = position;
@@ -51,7 +53,12 @@ export function createPager(root, { onPane, allowBrowser = () => true } = {}) {
 		drawer.style.transform = `translate3d(${-(1 - open) * drawerWidth * 0.28}px,0,0)`;
 		drawer.style.opacity = String(0.55 + 0.45 * open);
 		chat.style.transform = `translate3d(${open * drawerWidth - over * width * 0.22}px,0,0)`;
-		chat.style.borderRadius = open > 0.001 ? `${Math.min(22, open * 40)}px 0 0 ${Math.min(22, open * 40)}px` : "";
+		// The rounded corners beside the drawer are switched on once, not sized per frame (that would paint the whole chat
+		// again for every frame of the slide).
+		if (open > 0.001 !== aside) {
+			aside = open > 0.001;
+			chat.classList.toggle("aside", aside);
+		}
 		const offset = (1 - over) * width;
 		browser.style.transform = `translate3d(${offset}px,0,0)`;
 		browser.style.visibility = over > 0.001 ? "visible" : "hidden";
@@ -59,6 +66,12 @@ export function createPager(root, { onPane, allowBrowser = () => true } = {}) {
 		scrim.style.opacity = String(Math.max(open * 0.42, over * 0.5));
 		scrim.classList.toggle("on", open > 0.5);
 		setBrowserOffset(offset);
+		// Any part of the browser pane is on screen (or no longer is): its web page is shown from the first pixel of a
+		// drag, not only once the pane has arrived.
+		if (over > 0.001 !== peeking) {
+			peeking = over > 0.001;
+			onPeek?.(peeking);
+		}
 	}
 
 	function settle(next) {

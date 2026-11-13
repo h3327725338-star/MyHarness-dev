@@ -2,8 +2,8 @@
 // Results use the shapes of the desktop tools of the same name (details.results / details.pages), so the shared
 // transcript code (turns.js) counts and words them the same way.
 import { Type } from "./core.bundle.js";
-import { activateTab, activeTab, closeTab, navigate, openTab, readPage, screenshotPage, waitForLoad } from "./browser-model.js";
-import { httpFetch, secretGet } from "./native.js";
+import { actOnPage, activateTab, activeTab, closeTab, goBack, goForward, navigate, openTab, readPage, runInHiddenPage, screenshotPage, waitForLoad } from "./browser-model.js";
+import { httpFetch, isNative, secretGet, secretSet } from "./native.js";
 import { searchMemories } from "./account-view.js";
 import { prefs } from "./prefs.js";
 import { state } from "./store.js";
@@ -35,19 +35,165 @@ const squash = (value) => String(value || "").replace(/\s+/g, " ").trim();
 // ---- Search engines ----------------------------------------------------------------------------
 const RECENCY = { day: "day", week: "week", month: "month", year: "year" };
 
+// How the user's PCs search (the account's view, backend-local.js): the sources switched on there and the Tavily keys
+// saved there. The phone's own agent searches the same way without being set up again; the keys stay in the Keystore.
+const PC_TAVILY_SECRET = "search.tavily.pc";
+let pcEngines = [];
+
+/** The PCs' web search settings arrived (or the phone signed out: `null`). */
+export function setPcSearch(search) {
+	pcEngines = Array.isArray(search?.engines) ? search.engines.filter((id) => typeof id === "string") : [];
+	const keys = Array.isArray(search?.tavilyKeys) ? search.tavilyKeys.filter((key) => typeof key === "string" && key.trim()).slice(0, 8) : [];
+	const text = keys.length ? JSON.stringify(keys) : "";
+	if (secretGet(PC_TAVILY_SECRET) !== text) secretSet(PC_TAVILY_SECRET, text);
+}
+
+/** The Tavily keys to try, in order: the one typed on this phone, then the PCs'. */
+export function tavilyKeys() {
+	const own = secretGet("search.tavily");
+	let shared = [];
+	try {
+		shared = JSON.parse(secretGet(PC_TAVILY_SECRET) || "[]");
+	} catch {
+		shared = [];
+	}
+	return [...new Set([own, ...(Array.isArray(shared) ? shared : [])].filter(Boolean))];
+}
+export const pcTavilyKeyCount = () => tavilyKeys().length - (secretGet("search.tavily") ? 1 : 0);
+
 async function searchTavily(query, { signal, recency }) {
-	const key = secretGet("search.tavily");
 	const body = { query, search_depth: "basic", max_results: 10, include_published_date: true };
 	if (recency) body.time_range = recency;
-	const page = await fetchText("https://api.tavily.com/search", {
-		method: "POST",
-		headers: { accept: "application/json", "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : { "x-tavily-access-mode": "keyless" }) },
-		body: JSON.stringify(body),
-		signal,
-	});
-	if (page.status !== 200) throw new Error(key ? `HTTP ${page.status}` : `HTTP ${page.status} (free access; a free Tavily key in Settings lifts the limit)`);
+	const ask = (key) =>
+		fetchText("https://api.tavily.com/search", {
+			method: "POST",
+			headers: { accept: "application/json", "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : { "x-tavily-access-mode": "keyless" }) },
+			body: JSON.stringify(body),
+			signal,
+		});
+	const keys = tavilyKeys();
+	let page = null;
+	// A key that is refused, rate limited or out of credits hands the search to the next one, as on the PC.
+	for (const key of keys) {
+		page = await ask(key);
+		if (page.status === 200) break;
+	}
+	if (!keys.length) page = await ask("");
+	if (page.status !== 200) throw new Error(keys.length ? `HTTP ${page.status}` : `HTTP ${page.status} (free access; a free Tavily key in Settings lifts the limit)`);
 	const data = JSON.parse(page.text);
 	return (data.results || []).map((row) => ({ title: squash(row.title), url: row.url, snippet: squash(row.content).slice(0, 500), date: row.published_date || undefined }));
+}
+
+// Google answers a plain request with a page that needs JavaScript (and its feature-phone layout with HTTP 403), so the
+// real results page is loaded in a web view of the app's browser that is never shown, and read there, the way the PC
+// reads it in a real browser. It shares the browser's cookies: a Google sign-in there counts here too.
+const GOOGLE_READ = `(function () {
+	var sorry = /\\/sorry\\//.test(location.pathname) || !!document.querySelector("#captcha-form, .g-recaptcha, form[action*='sorry']");
+	var consent = /^consent\\./.test(location.hostname);
+	var root = document.querySelector("#rso") || document.querySelector("#search") || document.querySelector("#main") || document.body;
+	var rows = [];
+	var seen = {};
+	if (root) {
+		var heads = root.querySelectorAll("a h3, a [role='heading']");
+		for (var i = 0; i < heads.length && rows.length < 12; i++) {
+			var link = heads[i].closest("a");
+			var title = (heads[i].innerText || heads[i].textContent || "").replace(/\\s+/g, " ").trim();
+			if (!link || !title) continue;
+			var href = link.href || "";
+			try {
+				var parsed = new URL(href, location.href);
+				if (/(^|\\.)google\\.[a-z.]+$/.test(parsed.hostname)) {
+					// A result is linked directly, through /url?q=…, or through an opaque /goto?url=… that only Google can
+					// resolve (that one is kept as it is and followed afterwards).
+					var target = parsed.pathname === "/url" ? parsed.searchParams.get("q") || parsed.searchParams.get("url") : parsed.pathname === "/goto" ? parsed.href : "";
+					if (!target) continue;
+					href = target;
+				}
+			} catch (error) {
+				continue;
+			}
+			if (!/^https?:/i.test(href) || seen[href]) continue;
+			seen[href] = 1;
+			var box = link.closest("[data-hveid]") || link.parentNode || link;
+			var note = box.querySelector("[data-sncf], .VwiC3b");
+			var text = ((note || box).innerText || "").replace(/\\s+/g, " ").trim();
+			if (!note && text.indexOf(title) === 0) text = text.slice(title.length).trim();
+			rows.push([title, href, text.slice(0, 500)]);
+		}
+	}
+	return JSON.stringify({ sorry: sorry, consent: consent, known: !!document.querySelector("#rso, #search, #main, #topstuff, #botstuff, input[name='q'], textarea[name='q']"), rows: rows });
+})()`;
+let googleBusy = Promise.resolve();
+
+async function searchGoogle(query, { signal, recency }) {
+	if (!isNative) throw new Error("only in the app");
+	const tbs = { day: "qdr:d", week: "qdr:w", month: "qdr:m", year: "qdr:y" }[recency];
+	const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&udm=14&hl=${encodeURIComponent((navigator.language || "en").split("-")[0])}${tbs ? `&tbs=${tbs}` : ""}`;
+	// One page at a time: several web views loading Google together are slow on a phone and look like a robot to Google.
+	const read = (value) => (typeof value === "string" ? JSON.parse(value) : value);
+	// The results are filled in a moment after the page loaded: it is read again until they are there (or it is clear
+	// that none will come).
+	const turn = googleBusy.then(() =>
+		runInHiddenPage(url, GOOGLE_READ, {
+			signal,
+			timeoutMs: 15000,
+			userAgent: DESKTOP_AGENT,
+			// The links of a results page can be followed once: a page kept from an earlier search would hold used ones.
+			fresh: true,
+			ready: (value) => {
+				const page = read(value);
+				return !!page && (page.sorry || page.consent || page.rows.length > 0);
+			},
+			readyMs: 6000,
+		}),
+	);
+	googleBusy = turn.catch(() => {});
+	const page = read(await turn);
+	if (!page || typeof page !== "object") throw new Error("the page gave nothing to read");
+	if (page.sorry) throw new Error("the engine asked for a human check");
+	if (page.consent) throw new Error("the engine asked to accept its cookies first (open google.com in the browser pane once)");
+	if (!page.rows.length && !page.known) throw new Error("the results page was not recognized");
+	const rows = page.rows.map(([title, href, snippet]) => ({ title: squash(title), url: href, snippet: squash(snippet) }));
+	await resolveGoogleLinks(rows, signal);
+	// A link Google did not resolve leads to a waiting page, not to the result: such rows are left to the other sources.
+	const usable = rows.filter((row) => !GOTO.test(row.url));
+	if (rows.length && !usable.length) throw new Error("the engine held back the addresses of its results");
+	return usable;
+}
+
+// The results page is asked for the way a desktop browser asks: the phone layout hides part of its text from a reader.
+const DESKTOP_AGENT = (navigator.userAgent || "")
+	.replace("; wv", "")
+	.replace(/Version\/[\d.]+ /, "")
+	.replace(/\(Linux; Android [^)]*\)/, "(X11; Linux x86_64)")
+	.replace("Mobile ", "");
+const GOTO_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0";
+const GOTO_BUDGET_MS = 6000;
+const GOTO = /^https:\/\/www\.google\.[a-z.]+\/goto\?/;
+
+/**
+ * Google links most results through /goto?url=…, which says where it leads only when it is followed. They are followed
+ * one after the other: asked for several at once, Google answers all but the first with a waiting page (seen in the
+ * app, not documented). The address a link ends at replaces it; when the time for this is used up the rest stay as
+ * they are, and the caller leaves those out.
+ */
+async function resolveGoogleLinks(rows, signal) {
+	const until = Date.now() + GOTO_BUDGET_MS;
+	for (const row of rows) {
+		if (!GOTO.test(row.url)) continue;
+		const left = until - Date.now();
+		if (left < 300) break;
+		const timeout = AbortSignal.timeout(Math.min(4000, left));
+		try {
+			// Asked the way the PC asks (packages/coding-agent/src/tools/web-search/engines/google.ts).
+			const response = await httpFetch(row.url, { headers: { "User-Agent": GOTO_AGENT }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+			const landed = response.url || "";
+			response.body?.cancel().catch(() => {});
+			if (/^https?:\/\//i.test(landed) && !/(^|\.)google\.[a-z.]+$/.test(new URL(landed).hostname)) row.url = landed;
+		} catch (error) {
+			if (signal?.aborted) throw error;
+		}
+	}
 }
 
 function decodeBingLink(href) {
@@ -104,29 +250,57 @@ async function searchDuckDuckGo(query, { signal, recency }) {
 	return rows;
 }
 
-const ENGINES = { tavily: ["Tavily", searchTavily], bing: ["Bing", searchBing], duckduckgo: ["DuckDuckGo", searchDuckDuckGo] };
+const ENGINES = { google: ["Google", searchGoogle], tavily: ["Tavily", searchTavily], bing: ["Bing", searchBing], duckduckgo: ["DuckDuckGo", searchDuckDuckGo] };
+export const SEARCH_ENGINE_LABELS = Object.fromEntries(Object.entries(ENGINES).map(([id, [label]]) => [id, label]));
+/** As on the PC, where a new installation searches Google and Tavily together. */
+const DEFAULT_ENGINES = ["google", "tavily"];
 
-function engineOrder() {
-	const chosen = prefs.searchEngine;
-	const all = ["tavily", "bing", "duckduckgo"];
-	return ENGINES[chosen] ? [chosen, ...all.filter((id) => id !== chosen)] : all;
+/**
+ * The sources a search asks, all at once: one picked in Settings; else the ones switched on on the user's PCs; else
+ * Google and Tavily. (A PC source the phone has no reader for, such as Brave, is left out.)
+ */
+export function searchEngines() {
+	if (ENGINES[prefs.searchEngine]) return [prefs.searchEngine];
+	const shared = pcEngines.filter((id) => ENGINES[id]);
+	return shared.length ? shared : DEFAULT_ENGINES;
 }
 
-/** One query through the engines in order: the first that returns results answers; failures are kept for the report. */
+/**
+ * One query: every chosen source is asked at the same time and their results are merged, each source's best first
+ * and a page listed once. When none of them returns anything, the remaining sources are tried one after another.
+ * Failures are kept for the report.
+ */
 async function searchOnce(query, options) {
 	const failures = [];
-	for (const id of engineOrder()) {
+	const ask = async (id) => {
 		const [label, run] = ENGINES[id];
 		try {
 			const rows = await run(query, options);
-			if (rows.length) return { engine: label, rows, failures };
-			failures.push(`${label}: no results`);
+			if (!rows.length) failures.push(`${label}: no results`);
+			return rows.map((row) => ({ ...row, engine: label }));
 		} catch (error) {
 			if (options.signal?.aborted) throw error;
 			failures.push(`${label}: ${error?.message || error}`);
+			return [];
 		}
+	};
+	const chosen = searchEngines();
+	const lists = await Promise.all(chosen.map(ask));
+	const rows = [];
+	const seen = new Set();
+	for (let rank = 0; lists.some((list) => rank < list.length); rank++)
+		for (const list of lists) {
+			const row = list[rank];
+			if (!row || seen.has(row.url)) continue;
+			seen.add(row.url);
+			rows.push(row);
+		}
+	if (rows.length) return { rows, failures };
+	for (const id of Object.keys(ENGINES).filter((entry) => !chosen.includes(entry))) {
+		const found = await ask(id);
+		if (found.length) return { rows: found, failures };
 	}
-	return { engine: "", rows: [], failures };
+	return { rows: [], failures };
 }
 
 const webSearch = {
@@ -157,10 +331,10 @@ const webSearch = {
 		const failed = [];
 		answers.forEach((answer, index) => {
 			const lines = [];
-			for (const row of answer.rows.slice(0, 8)) {
+			for (const row of answer.rows.slice(0, 10)) {
 				if (seen.has(row.url)) continue;
 				seen.add(row.url);
-				results.push({ ...row, query: queries[index], engine: answer.engine });
+				results.push({ ...row, query: queries[index] });
 				lines.push(`[${results.length}] ${row.title}\n${row.url}${row.date ? `\n(${row.date})` : ""}${row.snippet ? `\n${row.snippet}` : ""}`);
 			}
 			if (lines.length) parts.push(`## ${queries[index]}\n\n${lines.join("\n\n")}`);
@@ -170,7 +344,9 @@ const webSearch = {
 			}
 		});
 		if (!results.length) throw new Error(`The search returned nothing.\n${answers.map((answer, index) => `${queries[index]} — ${answer.failures.join("; ")}`).join("\n")}`);
-		return { content: [text(parts.join("\n\n"))], details: { queries, results, pages: [], failed } };
+		// Which sources gave nothing, per query (shown nowhere; it tells a later look at the chat what the search ran on).
+		const notes = answers.flatMap((answer, index) => answer.failures.map((failure) => `${queries[index]} — ${failure}`));
+		return { content: [text(parts.join("\n\n"))], details: { queries, results, pages: [], failed, notes } };
 	},
 };
 
@@ -274,13 +450,29 @@ const browserTool = {
 	name: "browser",
 	label: "Browser",
 	description:
-		"Use the app's built-in browser, which the user can see in the right-hand pane. Actions: open (load a URL in a tab), read (the visible text and links of the current tab), screenshot (a picture of the current tab), tabs (list open tabs), close (close a tab). Pages may hold the user's sign-ins: only look, never submit forms or change anything unless the user asked for exactly that.",
+		"Use the app's built-in browser, which the user can see in the right-hand pane. Actions: open (load a URL in a tab), read (the visible text and links of the current tab), screenshot (a picture of the current tab), click (press a link, button or control named by the words on it), type (fill a field named by its label or placeholder; enter=true submits), scroll (down, up, top or bottom), back, forward, tabs (list open tabs), close (close a tab). After click, type or scroll, read the page again to see what changed. Pages may hold the user's sign-ins: only look, never submit forms or change anything unless the user asked for exactly that.",
 	parameters: Type.Object({
-		action: Type.Union([Type.Literal("open"), Type.Literal("read"), Type.Literal("screenshot"), Type.Literal("tabs"), Type.Literal("close")]),
+		action: Type.Union([
+			Type.Literal("open"),
+			Type.Literal("read"),
+			Type.Literal("screenshot"),
+			Type.Literal("click"),
+			Type.Literal("type"),
+			Type.Literal("scroll"),
+			Type.Literal("back"),
+			Type.Literal("forward"),
+			Type.Literal("tabs"),
+			Type.Literal("close"),
+		]),
 		url: Type.Optional(Type.String({ description: "For open: the address to load." })),
 		newTab: Type.Optional(Type.Boolean({ description: "For open: load in a new tab instead of the current one." })),
-		tab: Type.Optional(Type.String({ description: "For read, screenshot, close: a tab id from the tabs action. Defaults to the current tab." })),
+		tab: Type.Optional(Type.String({ description: "A tab id from the tabs action. Defaults to the current tab." })),
 		maxChars: Type.Optional(Type.Number({ description: "For read: how much text to return at most (default 12000)." })),
+		label: Type.Optional(Type.String({ description: "For click and type: the words on the element (a button's text, a field's label or placeholder)." })),
+		selector: Type.Optional(Type.String({ description: "For click and type: a CSS selector, when the words alone are not enough." })),
+		text: Type.Optional(Type.String({ description: "For type: the text to put into the field (for a list, the option to choose)." })),
+		enter: Type.Optional(Type.Boolean({ description: "For type: press Enter afterwards (submits a search or a form)." })),
+		to: Type.Optional(Type.Union([Type.Literal("down"), Type.Literal("up"), Type.Literal("top"), Type.Literal("bottom")], { description: "For scroll: where to (default down, one screen)." })),
 	}),
 	executionMode: "sequential",
 	async execute(_id, params) {
@@ -311,6 +503,29 @@ const browserTool = {
 				const shot = await screenshotPage(id);
 				const tab = state.browser.tabs.find((entry) => entry.id === id);
 				return { content: [text(`Screenshot of ${tab?.url || "the current tab"}`), { type: "image", data: shot.data, mimeType: shot.mimeType }], details: { tab: id } };
+			}
+			case "click":
+			case "type":
+			case "scroll": {
+				const id = params.tab || state.browser.active;
+				if (params.action === "type" && typeof params.text !== "string") throw new Error("type needs the text to put into the field.");
+				const answer = await actOnPage(id, { action: params.action, label: params.label, selector: params.selector, text: params.text, enter: !!params.enter, to: params.to });
+				// A click or Enter may load another page: wait for it, so the next read sees the new one.
+				if (params.action !== "scroll") await waitForLoad(id, 8000);
+				const tab = state.browser.tabs.find((entry) => entry.id === id);
+				const where = params.action === "scroll" ? ` (at ${answer.at} of ${Math.max(0, answer.height - answer.screen)} px)` : "";
+				return { content: [text(`Done: ${answer.did}${where}.\nNow at: ${tab?.title || ""} ${tab?.url || ""}\nRead the page to see what it shows now.`)], details: { tab: id } };
+			}
+			case "back":
+			case "forward": {
+				const id = params.tab || state.browser.active;
+				const tab = state.browser.tabs.find((entry) => entry.id === id);
+				if (!tab) throw new Error("No browser tab is open");
+				if (params.action === "back" ? !tab.canGoBack : !tab.canGoForward) throw new Error(`This tab has no page to go ${params.action} to.`);
+				await (params.action === "back" ? goBack(id) : goForward(id));
+				await waitForLoad(id, 8000);
+				const now = state.browser.tabs.find((entry) => entry.id === id);
+				return { content: [text(`Went ${params.action}: ${now?.title || ""}\n${now?.url || ""}`)], details: { pages: now?.url ? [{ url: now.url, title: now.title || "" }] : [], tab: id } };
 			}
 			case "tabs": {
 				const tabs = listTabs();

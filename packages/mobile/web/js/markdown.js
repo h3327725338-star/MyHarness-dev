@@ -107,10 +107,23 @@ export class Markdown extends Component {
 
 	paint() {
 		const html = renderMarkdown(this.props.text || "", { breaks: this.props.breaks });
-		if (this.painted !== html) {
-			this.base.innerHTML = html;
-			this.painted = html;
+		if (this.painted === html) return;
+		const base = this.base;
+		if (!this.painted || !base.firstChild) base.innerHTML = html;
+		else {
+			// The paragraphs, lists and code blocks that are already there stay as they are (their pictures do not load
+			// again, a selection in them survives, nothing above the new text is laid out again): only from the first
+			// block that differs on is the reply replaced.
+			const next = document.createElement("template");
+			next.innerHTML = html;
+			const fresh = [...next.content.childNodes];
+			const old = [...base.childNodes];
+			let same = 0;
+			while (same < old.length && same < fresh.length && old[same].isEqualNode(fresh[same])) same++;
+			for (let index = old.length - 1; index >= same; index--) old[index].remove();
+			for (let index = same; index < fresh.length; index++) base.appendChild(fresh[index]);
 		}
+		this.painted = html;
 	}
 
 	onClick = (event) => {

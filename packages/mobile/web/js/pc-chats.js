@@ -7,6 +7,7 @@ import { Spinner, html, useEffect, useMemo, useState } from "/shared/ui.js";
 import { pc } from "./backend-remote.js";
 import { Icon } from "./micons.js";
 import { haptic } from "./native.js";
+import { setShownMode } from "./prefs.js";
 import { buildGroups, chatModeOf } from "./pc-groups.js";
 import { attempt, useStore } from "./store.js";
 
@@ -22,10 +23,17 @@ const MODES = [
 export function ModeTabs() {
 	const mode = useStore((s) => s.pc.listMode);
 	const index = MODES.findIndex((entry) => entry.value === mode);
+	// The other mode's colours spread from the middle of the side that was tapped.
+	const pick = (value, event) => {
+		if (value === mode) return;
+		haptic("tick");
+		const box = event.currentTarget.getBoundingClientRect();
+		setShownMode(value, { origin: { x: box.left + box.width / 2, y: box.top + box.height / 2 }, change: () => pc.setListMode(value) });
+	};
 	return html`<div class="seg seg-sm mode-tabs" role="tablist" aria-label=${t("Chat mode on the PC")}>
-		<span class="seg-thumb" style=${`width:calc((100% - 6px) / 2);transform:translateX(${index * 100}%)`}></span>
+		<span class="seg-thumb" data-mode=${mode} style=${`width:calc((100% - 6px) / 2);transform:translateX(${index * 100}%)`}></span>
 		${MODES.map(
-			(entry) => html`<button key=${entry.value} role="tab" aria-selected=${entry.value === mode ? "true" : "false"} class=${entry.value === mode ? "on" : ""} onClick=${() => (haptic("tick"), pc.setListMode(entry.value))}>${entry.label}</button>`,
+			(entry) => html`<button key=${entry.value} role="tab" data-mode=${entry.value} aria-selected=${entry.value === mode ? "true" : "false"} class=${entry.value === mode ? "on" : ""} onClick=${(event) => pick(entry.value, event)}>${entry.label}</button>`,
 		)}
 	</div>`;
 }

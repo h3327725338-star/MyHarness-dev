@@ -160,7 +160,7 @@ My Drive/
    │  └─ files/<workspace>__<batchId>.json
    └─ phone-v1/          (the account's phones, see “Phones of the account”)
       ├─ pcs/<deviceId>.json
-      ├─ views/<deviceId>.json.gz, <deviceId>.memories.json.gz
+      ├─ views/<deviceId>.json.gz, <deviceId>.memories.json.gz, <deviceId>.dial.json.gz
       ├─ phones/<phoneId>.json
       ├─ outbox/<phoneId>__<time>__<random>.json
       └─ link/…
@@ -206,7 +206,7 @@ computers. Its place is `phone-v1/` beside it (`src/sync/phone/`, the computer's
 | Folder | Written by | Holds |
 | --- | --- | --- |
 | `pcs/` | each computer, every minute | name, version, when it was last on, whether it accepts phones (Settings → Phone), its local-network address when the phone link listens there |
-| `views/` | each computer, when something changed (at most every 20 s) | gzip JSON: its chats (title, preview, the hash of the chat file in `sync-v1/objects/`, a rank), its Providers with their keys and models, the default model and effort, the built-in browser's bookmarks; memories in `<deviceId>.memories.json.gz` (at most every minute) |
+| `views/` | each computer, when something changed (at most every 20 s) | gzip JSON: its chats (title, preview, the hash of the chat file in `sync-v1/objects/`, a rank), its Providers with their keys and models, the default model and effort, the built-in browser's bookmarks; memories in `<deviceId>.memories.json.gz` (at most every minute). The view's settings also carry `search`: the web search engines enabled on this computer and its Tavily keys, so the phone searches with the same sources without a key of its own. `<deviceId>.dial.json.gz` holds the tiles of the built-in browser's new-tab page (`browser-speed-dial.json`: sites and groups with their icons; an icon over 160 KB or past 2 MB in total is left out, at most 120 tiles; the first 12 bookmarks when the page was never arranged), written again only when they changed. The phone shows them read-only |
 | `phones/` | each phone, at sign-in | its id, name and the key its connections are sealed with |
 | `outbox/` | phones | changes a computer applies to its own files and then removes |
 | `link/` | both | connection offers and answers, and the messages of a connection that goes through Drive (phone link, `web-ui.md`); a small one also carries its text in the file's public `properties`, so the other side reads it from the folder listing |

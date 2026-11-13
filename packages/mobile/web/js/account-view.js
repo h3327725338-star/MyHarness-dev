@@ -61,6 +61,30 @@ export function pickMemories(packs) {
 	return best?.entries || [];
 }
 
+/**
+ * The shortcuts of the PC browser's new-tab page (`<deviceId>.dial.json.gz`), from the PC that has seen the most of
+ * them: sites and groups of sites, in the order the desktop draws them.
+ */
+export function pickDial(packs) {
+	let best = null;
+	for (const pack of packs) {
+		if (!pack || pack.version !== 1 || !Array.isArray(pack.items)) continue;
+		if (!best || rankOf(pack) > rankOf(best) || (rankOf(pack) === rankOf(best) && String(pack.writtenAt) > String(best.writtenAt))) best = pack;
+	}
+	const site = (entry) => (entry && typeof entry.url === "string" && /^https?:\/\//i.test(entry.url) ? { id: String(entry.id || entry.url), type: "site", title: String(entry.title || ""), url: entry.url, ...(typeof entry.icon === "string" && entry.icon.startsWith("data:image/") ? { icon: entry.icon } : {}) } : null);
+	const items = [];
+	for (const entry of best?.items || []) {
+		if (entry?.type === "group") {
+			const inside = (Array.isArray(entry.items) ? entry.items : []).map(site).filter(Boolean);
+			if (inside.length) items.push({ id: String(entry.id || `group-${items.length}`), type: "group", title: String(entry.title || ""), items: inside });
+		} else {
+			const one = site(entry);
+			if (one) items.push(one);
+		}
+	}
+	return items;
+}
+
 function cleanContent(content) {
 	if (!Array.isArray(content)) return content;
 	return content.map((part) => {

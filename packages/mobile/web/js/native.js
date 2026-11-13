@@ -49,11 +49,22 @@ export function onInsets(fn) {
 	insetListeners.add(fn);
 	return () => insetListeners.delete(fn);
 }
+const written = {};
 function applyInsets(next) {
 	Object.assign(insets, next);
 	const style = document.documentElement.style;
-	for (const side of ["top", "bottom", "left", "right"]) style.setProperty(`--inset-${side}`, `${Number(insets[side]) || 0}px`);
-	style.setProperty("--kb", `${Math.max(0, Number(insets.keyboard) || 0)}px`);
+	const put = (name, px) => {
+		const value = `${px}px`;
+		if (written[name] === value) return false;
+		written[name] = value;
+		style.setProperty(name, value);
+		return true;
+	};
+	let changed = false;
+	for (const side of ["top", "bottom", "left", "right"]) changed = put(`--inset-${side}`, Number(insets[side]) || 0) || changed;
+	// Whole pixels: a fraction of a pixel per frame would lay the page out again for nothing that can be seen.
+	changed = put("--kb", Math.round(Math.max(0, Number(insets.keyboard) || 0))) || changed;
+	if (!changed) return;
 	document.documentElement.classList.toggle("kb-open", (Number(insets.keyboard) || 0) > 40);
 	for (const fn of [...insetListeners]) fn(insets);
 }
@@ -401,8 +412,13 @@ onNative("browser", (message) => {
 });
 
 /** How far the browser pane is slid to the right, in CSS px (0 = fully shown). Called every frame while a finger moves it. */
+let sentOffset = null;
 export function setBrowserOffset(px) {
-	if (isNative) bridge.browserOffset(px);
+	// The drawer's slide calls this for every frame with the same number: the app is only told when it changed.
+	const next = Math.round(px * 2) / 2;
+	if (next === sentOffset) return;
+	sentOffset = next;
+	if (isNative) bridge.browserOffset(next);
 }
 /** Whether the shown tab went back a page (the back key asks this before the page handles it). */
 export function browserBack() {
@@ -481,8 +497,12 @@ export async function saveFile(name, mimeType, base64) {
 	return name;
 }
 /** While a reply is being written, the app keeps a notification so Android does not stop it in the background. */
-export function runActive(active, title = "") {
-	if (isNative) bridge.runActive(!!active, String(title));
+const runOwners = new Map(); // who has a reply being written (the phone's own agent, the PC side) → its title
+export function runActive(active, title = "", owner = "local") {
+	if (active) runOwners.set(owner, String(title));
+	else if (!runOwners.delete(owner)) return;
+	const titles = [...runOwners.values()];
+	if (isNative) bridge.runActive(titles.length > 0, titles[titles.length - 1] || "");
 }
 export function notifyDone(title, text) {
 	if (isNative) bridge.notifyDone(String(title), String(text));

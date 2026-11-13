@@ -12,9 +12,10 @@ import { storageEstimate } from "./db.js";
 import { AccountPcs, routeLabel } from "./drawer.js";
 import { Icon } from "./micons.js";
 import { canScan, haptic, nativeInfo, onNative, scanQr, secretGet, secretSet } from "./native.js";
-import { prefs, setPrefs } from "./prefs.js";
+import { colorThemes, prefs, setPrefs, shownChatMode } from "./prefs.js";
 import { Page, Row, Sheet, Switch, actionSheet, confirmSheet, openPage, openSheet, pickSheet, promptSheet } from "./sheets.js";
 import { attempt, toast, useStore } from "./store.js";
+import { SEARCH_ENGINE_LABELS, pcTavilyKeyCount, searchEngines } from "./tools.js";
 
 function usePrefs() {
 	const [, force] = useState(0);
@@ -204,27 +205,24 @@ function ModelsPage({ close }) {
 	const providers = getProviders();
 	const [tavily, setTavily] = useState(() => !!secretGet("search.tavily"));
 	const update = usePrefs();
+	// What "Automatic" asks right now ("Google + Tavily").
+	const automatic = (SEARCH_ENGINE_LABELS[prefs.searchEngine] ? ["google", "tavily"] : searchEngines()).map((id) => SEARCH_ENGINE_LABELS[id]).join(" + ");
 	return html`<${Page} title=${t("Models on this phone")} close=${close}>
 		<${Section} title=${t("Providers")} note=${t("The phone's own agent calls these providers directly with your key. Signed in with Google, the providers of your PCs are here too, with their keys; a provider added here goes to the PCs. Chats on the PC side use the PC's models.")}>
 			${providers.map((provider) => html`<${Row} key=${provider.id} icon="cpu" title=${provider.name} sub=${`${t("{n} models", { n: provider.models.length })}${models.providers.find((entry) => entry.id === provider.id)?.hasKey ? "" : ` · ${t("no key")}`}${provider.synced ? ` · ${t("from your PCs")}` : ""}`} chevron onClick=${() => openProvider(provider)} />`)}
 			<${Row} icon="plus" title=${t("Add provider")} onClick=${addProvider} />
 		<//>
-		<${Section} title=${t("Web search")} note=${t("Used when the assistant searches the web. Tavily works without a key (rate limited); a free key lifts the limit. Bing and DuckDuckGo are read as web pages and take over when Tavily fails.")}>
+		<${Section} title=${t("Web search")} note=${t("Used when the assistant searches the web. Automatic asks the sources your PCs use (Google and Tavily unless you changed them there), all at once, and merges what they find; Bing and DuckDuckGo take over when they find nothing. Google is read in the app's browser, without showing it. Tavily keys saved on your PCs are used here too.")}>
 			<${Row}
 				icon="search"
-				title=${t("First choice")}
-				value=${{ auto: t("Automatic"), tavily: "Tavily", bing: "Bing", duckduckgo: "DuckDuckGo" }[prefs.searchEngine] || t("Automatic")}
+				title=${t("Search with")}
+				value=${SEARCH_ENGINE_LABELS[prefs.searchEngine] || automatic}
 				chevron
 				onClick=${async () => {
 					const value = await pickSheet({
 						title: t("Search with"),
-						value: prefs.searchEngine,
-						options: [
-							{ value: "auto", label: t("Automatic"), sub: t("Tavily, then Bing, then DuckDuckGo") },
-							{ value: "tavily", label: "Tavily" },
-							{ value: "bing", label: "Bing" },
-							{ value: "duckduckgo", label: "DuckDuckGo" },
-						],
+						value: SEARCH_ENGINE_LABELS[prefs.searchEngine] ? prefs.searchEngine : "auto",
+						options: [{ value: "auto", label: t("Automatic"), sub: automatic }, ...Object.entries(SEARCH_ENGINE_LABELS).map(([value, label]) => ({ value, label }))],
 					});
 					if (value) update({ searchEngine: value });
 				}}
@@ -232,10 +230,10 @@ function ModelsPage({ close }) {
 			<${Row}
 				icon="key"
 				title=${t("Tavily API key")}
-				value=${tavily ? t("Saved") : t("Not set")}
+				value=${tavily ? t("Saved") : pcTavilyKeyCount() > 0 ? t("From your PCs") : t("Not set")}
 				chevron
 				onClick=${async () => {
-					const value = await promptSheet({ title: t("Tavily API key"), password: true, placeholder: "tvly-…", hint: t("Free at app.tavily.com. Leave empty and save to remove the key.") });
+					const value = await promptSheet({ title: t("Tavily API key"), password: true, placeholder: "tvly-…", hint: t("Free at app.tavily.com. A key typed here is tried before the ones of your PCs. Leave empty and save to remove it.") });
 					if (value !== null) {
 						secretSet("search.tavily", value.trim());
 						setTavily(!!value.trim());
@@ -399,6 +397,9 @@ function SettingsPage({ close }) {
 		storageEstimate().then(setStorage);
 	}, [chats]);
 	const dark = document.documentElement.dataset.theme === "dark";
+	// As on the desktop, each chat mode has its own colour scheme; the one on screen is the one that is changed here.
+	const chatMode = shownChatMode();
+	const schemes = colorThemes();
 	const label = (list, value) => t(list.find((entry) => entry.value === value)?.label || list[0].label);
 	const pick = async (title, list, key) => {
 		const value = await pickSheet({ title, value: prefs[key], options: list.map((entry) => ({ value: entry.value, label: t(entry.label) })) });
@@ -424,9 +425,10 @@ function SettingsPage({ close }) {
 		<//>
 		<div>
 			<div class="rows-title">${t("Appearance")}</div>
-			<div class="swatches" style="margin-bottom:10px">
-				${COLOR_THEMES.map((theme) => html`<button class="swatch ${prefs.colorTheme === theme.value ? "on" : ""}" key=${theme.value} onClick=${() => (haptic("tick"), update({ colorTheme: theme.value }))}><i style=${`background:${dark ? theme.dark : theme.light}`}></i>${t(theme.label)}</button>`)}
+			<div class="swatches">
+				${COLOR_THEMES.map((theme) => html`<button class="swatch ${schemes[chatMode] === theme.value ? "on" : ""}" key=${theme.value} onClick=${() => (haptic("tick"), update({ colorThemes: { ...schemes, [chatMode]: theme.value } }))}><i style=${`background:${dark ? theme.dark : theme.light}`}></i>${t(theme.label)}</button>`)}
 			</div>
+			<div class="rows-note" style="margin-bottom:10px">${chatMode === "coding" ? t("Colours of Coding chats on the PC. General chats and this phone's own chats keep theirs.") : t("Colours of General chats and of this phone's own chats. Coding chats on the PC keep theirs.")}</div>
 			<div class="rows">
 				<${Row} icon=${dark ? "moon" : "sun"} title=${t("Theme")} value=${label(THEMES, prefs.theme)} chevron onClick=${() => pick(t("Theme"), THEMES, "theme")} />
 				<${Row} icon="type" title=${t("Text size")} value=${label(FONT_SCALES, prefs.fontScale)} chevron onClick=${() => pick(t("Text size"), FONT_SCALES, "fontScale")} />
@@ -453,7 +455,7 @@ function SettingsPage({ close }) {
 			<${Row} icon="bell" title=${t("Notify when a reply is ready")} sub=${t("When the app is in the background.")}><${Switch} on=${prefs.notifyDone !== false} onChange=${(on) => update({ notifyDone: on })} label=${t("Notify when a reply is ready")} /><//>
 		<//>
 		<${Section} title=${t("Browser")}>
-			<${Row} icon="search" title=${t("Search engine of the address field")} value=${SEARCH_ENGINES.find((entry) => entry.value === prefs.browserSearch)?.label || "Bing"} chevron onClick=${() => pick(t("Search engine"), SEARCH_ENGINES, "browserSearch")} />
+			<${Row} icon="search" title=${t("Search engine of the address field")} value=${SEARCH_ENGINES.find((entry) => entry.value === prefs.browserSearch)?.label || "Google"} chevron onClick=${() => pick(t("Search engine"), SEARCH_ENGINES, "browserSearch")} />
 			<${Row}
 				icon="trash"
 				title=${t("Clear cookies and site data")}

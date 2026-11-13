@@ -8,7 +8,7 @@
  *
  * | Folder | Written by | Holds |
  * | --- | --- | --- |
- * | `views/` | each computer | `<deviceId>.json.gz`: chats, Providers and keys, memories and bookmarks, as a phone shows them |
+ * | `views/` | each computer | `<deviceId>.json.gz`: chats, Providers and keys, web search sources and keys, bookmarks, as a phone shows them; `<deviceId>.memories.json.gz`: memories; `<deviceId>.dial.json.gz`: the shortcuts of the browser's new-tab page |
  * | `pcs/` | each computer | `<deviceId>.json`: which computer, whether it is on now, how a phone reaches it |
  * | `phones/` | each phone | `<phoneId>.json`: the phone's name and the key its link to a computer is sealed with |
  * | `outbox/` | phones | `<phoneId>__<time base 36>__<random>.json`: changes a computer applies and then removes |

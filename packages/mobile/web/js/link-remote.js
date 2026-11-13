@@ -25,6 +25,7 @@ const RELAY_BUSY_POLL_MS = 250;
 const RELAY_BUSY_MS = 60000;
 const RELAY_LOOKS_AT_ONCE = 2;
 const RELAY_KEEPALIVE_MS = 45000;
+const FLUSH_MS = 20;
 // A link file of up to INLINE_PARTS x INLINE_PART characters also rides in its custom properties (inlineProperties).
 const INLINE_PART = 100;
 const INLINE_PARTS = 25;
@@ -445,15 +446,17 @@ export function openRelay({ drive, pcId, phoneId, now = Date.now, pollMs = RELAY
 			client.close(new RemoteLinkError(`Drive refused a message: ${error?.message || error}`));
 		} finally {
 			writing = false;
-			if (queue.length && !client.closed) flushTimer = setTimeout(flush, 100);
+			if (queue.length && !client.closed) flushTimer = setTimeout(flush, FLUSH_MS);
 		}
 	};
 
+	// Requests made in the same moment (a chat's state, its messages and its model list) share one file; waiting longer
+	// for more only delays every one of them.
 	const client = new PipeClient((message) => {
 		if (message.t !== "k") lastBusy = now();
 		queue.push(message);
 		if (message.t === "bye") flush();
-		else if (!flushTimer && !writing) flushTimer = setTimeout(flush, 100);
+		else if (!flushTimer && !writing) flushTimer = setTimeout(flush, FLUSH_MS);
 	});
 
 	const prefix = `m__${phoneId}__${pcId}__${conn}__`;

@@ -19,7 +19,7 @@ type Model = AnyModel<Api>;
 import type { ModelRuntime } from "../../../providers/runtime/provider-runtime.ts";
 import { ModeStateStore } from "../../../session/mode-state.ts";
 import { PhoneChannel, type PhoneRegistration } from "../../../sync/phone/channel.ts";
-import { PHONE_APIS, type PhoneModel, type PhoneProvider } from "../../../sync/phone/view.ts";
+import { PHONE_APIS, type PhoneModel, type PhoneProvider, type PhoneSearch } from "../../../sync/phone/view.ts";
 import type { SyncService } from "../../../sync/service.ts";
 import type { PhoneLinkGateway } from "./gateway.ts";
 import { PhoneRemoteLink } from "./remote.ts";
@@ -101,6 +101,8 @@ export interface AccountPhonesOptions {
 	gateway: PhoneLinkGateway;
 	runtime: () => ModelRuntime;
 	defaults: () => { provider: string | null; model: string | null; thinkingLevel: string | null };
+	/** The web search sources switched on here and the keys saved for them. */
+	search: () => PhoneSearch;
 	isSessionActive: (workspaceId: string, sessionId: string) => boolean;
 	/** Chats, Providers or settings arrived from a phone. */
 	onImported: (info: { sessionsChanged: boolean; settingsChanged: boolean }) => void;
@@ -137,6 +139,7 @@ export class AccountPhones {
 					(fallback.provider && fallback.model ? { provider: fallback.provider, id: fallback.model } : null);
 				return { model, thinkingLevel: fallback.thinkingLevel };
 			},
+			search: options.search,
 			link: () => ({
 				accepts: store.remote,
 				lan: gateway.listening ? { addresses: gateway.addresses(), port: gateway.port } : null,

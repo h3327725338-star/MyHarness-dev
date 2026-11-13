@@ -10,6 +10,11 @@ import { actionSheet, confirmSheet, promptSheet } from "./sheets.js";
 import { attempt, side, toast, useStore } from "./store.js";
 
 const DAY = 24 * 60 * 60 * 1000;
+/** The middle of the control that was tapped, where a change of colours starts from. */
+const centre = (event) => {
+	const box = event.currentTarget.getBoundingClientRect();
+	return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+};
 
 function dayGroup(ts, now) {
 	if (!ts) return "Earlier";
@@ -107,6 +112,8 @@ export function Drawer() {
 	const activeId = useStore((s) => (s.mode === "pc" ? (side(s).chat.slot ? `slot:${side(s).chat.slot}` : "") : side(s).chat.id));
 	const link = useStore((s) => s.pc.link);
 	const signed = useStore((s) => s.account.status !== "signedOut");
+	// The PC's lists as they were last time are shown while it is being connected (backend-remote.js keeps them).
+	const pcListed = useStore((s) => s.pc.lists.general.loaded || s.pc.lists.coding.loaded);
 	const [query, setQuery] = useState("");
 
 	const groups = useMemo(() => {
@@ -139,7 +146,7 @@ export function Drawer() {
 	const openPcRow = async (row) => {
 		haptic("tick");
 		nav.go("chat");
-		await attempt(() => backend().openChat(row.slot ? `slot:${row.slot}` : `file:${row.path}`));
+		await attempt(() => backend().openChat(row.slot ? `slot:${row.slot}` : `file:${row.path}`, { title: row.name || (row.firstMessage || "").split("\n")[0].slice(0, 60) }));
 	};
 	const newPcChat = async (group) => {
 		haptic("tick");
@@ -169,19 +176,24 @@ export function Drawer() {
 		}
 	};
 
-	const pcBlocked = mode === "pc" && link.status !== "online";
+	const pcDown = mode === "pc" && link.status !== "online";
+	const pcBlocked = pcDown && !pcListed;
+	const pcNote = () => html`${link.status === "connecting" ? html`<${Spinner} size=${pcListed ? 13 : 18} />` : null}
+		<div>${link.status === "connecting" ? t("Connecting to {name}…", { name: link.paired?.name || "PC" }) : link.error || t("The PC cannot be reached.")}</div>
+		${link.status === "connecting" ? html`<${ConnectProgress} link=${link} />` : null}
+		${link.status !== "connecting" && html`<button class="btn ${pcListed ? "sm" : ""}" onClick=${() => backend().reconnect()}>${t("Retry")}</button>`}`;
 
 	return html`<div class="drawer">
 		<div class="drawer-top">
 			<div class="brand"><${Mark} size=${28} /><span class="bname">MyHarness</span></div>
 			<div class="seg" role="tablist">
 				<span class="seg-thumb" style=${`width:calc((100% - 6px) / 2);transform:translateX(${mode === "pc" ? 100 : 0}%)`}></span>
-				<button role="tab" aria-selected=${mode === "local" ? "true" : "false"} class=${mode === "local" ? "on" : ""} onClick=${() => (haptic("tick"), setMode("local"))}><${Icon} name="phone" size=${15} />${t("This phone")}</button>
-				<button role="tab" aria-selected=${mode === "pc" ? "true" : "false"} class=${mode === "pc" ? "on" : ""} onClick=${() => (haptic("tick"), setMode("pc"))}><${Icon} name="desktop" size=${15} />${t("PC")}<${LinkDot} link=${link} /></button>
+				<button role="tab" aria-selected=${mode === "local" ? "true" : "false"} class=${mode === "local" ? "on" : ""} onClick=${(event) => (haptic("tick"), setMode("local", centre(event)))}><${Icon} name="phone" size=${15} />${t("This phone")}</button>
+				<button role="tab" aria-selected=${mode === "pc" ? "true" : "false"} class=${mode === "pc" ? "on" : ""} onClick=${(event) => (haptic("tick"), setMode("pc", centre(event)))}><${Icon} name="desktop" size=${15} />${t("PC")}<${LinkDot} link=${link} /></button>
 			</div>
 			${mode === "pc" && link.paired ? html`<${ModeTabs} />` : null}
 			<label class="search-field"><${Icon} name="search" size=${17} /><input type="search" placeholder=${t("Search chats")} value=${query} onInput=${(event) => setQuery(event.target.value)} enterkeyhint="search" /></label>
-			<button class="new-chat" onClick=${newChat} disabled=${pcBlocked}><span class="plus"><${Icon} name="plus" size=${18} /></span>${t("New chat")}</button>
+			<button class="new-chat" onClick=${newChat} disabled=${pcDown && link.status !== "connecting"}><span class="plus"><${Icon} name="plus" size=${18} /></span>${t("New chat")}</button>
 		</div>
 		<div class="drawer-list">
 			${mode === "pc" && !link.paired && signed
@@ -194,14 +206,9 @@ export function Drawer() {
 						<div><button class="btn primary" onClick=${() => nav.openLink()}><${Icon} name="qr" size=${17} />${t("Connect to a PC")}</button></div>
 					</div>`
 				: pcBlocked
-					? html`<div class="list-note">
-							${link.status === "connecting" ? html`<${Spinner} size=${18} />` : null}
-							<div>${link.status === "connecting" ? t("Connecting to {name}…", { name: link.paired?.name || "PC" }) : link.error || t("The PC cannot be reached.")}</div>
-							${link.status === "connecting" ? html`<${ConnectProgress} link=${link} />` : null}
-							${link.status !== "connecting" && html`<button class="btn" onClick=${() => backend().reconnect()}>${t("Retry")}</button>`}
-						</div>`
+					? html`<div class="list-note">${pcNote()}</div>`
 					: mode === "pc"
-						? html`<${PcChats} query=${query} Row=${ChatRow} onOpen=${openPcRow} onNew=${newPcChat} />`
+						? html`${pcDown ? html`<div class="pc-status">${pcNote()}</div>` : null}<${PcChats} query=${query} Row=${ChatRow} onOpen=${openPcRow} onNew=${newPcChat} />`
 						: !loaded
 						? [0, 1, 2, 3, 4].map((index) => html`<div class="skeleton-row" key=${index} style=${`animation-delay:${index * 80}ms`}></div>`)
 						: groups.length === 0

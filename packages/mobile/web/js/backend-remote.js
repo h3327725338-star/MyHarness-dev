@@ -11,22 +11,41 @@ import { t } from "/shared/i18n.js";
 import { fileToBase64, UPLOAD_MAX_BYTES } from "./attachments.js";
 import { addPending, applyEvent, markDelivered, removePending } from "./live.js";
 import { accountLink, onAccountPcs, onAccountView } from "./account.js";
+import { mirrorPcTab } from "./browser-model.js";
+import { kvGet, kvSet } from "./db.js";
 import { importKey, linkAad, open, parsePairing, seal } from "./link-crypto.js";
 import { openDirect, openRelay } from "./link-remote.js";
-import { httpFetch, nativeInfo, onNative, secretDelete, secretGet, secretSet } from "./native.js";
+import { haptic, httpFetch, nativeInfo, notifyDone, onNative, runActive, secretDelete, secretGet, secretSet } from "./native.js";
 import { chatModeOf, DEFAULT_KEY, emptyLists, isOpen, pathKey } from "./pc-groups.js";
+import { prefs } from "./prefs.js";
 import { emit, emptyChat, emptyModels, FOLDS_KEY, LIST_MODE_KEY, saveJson, state, toast } from "./store.js";
 
 const LINK_KEY = "myharness.mobile.link";
 const SLOT_KEY = "myharness.mobile.link.slot";
 const PAGE = 120;
-const RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
+// A connection that was working and broke (the app was away, the network changed) is opened again almost at once.
+const RETRY_DELAYS = [300, 2000, 4000, 8000, 15000];
 // Faster routes first: a later one that opens is used instead of a slower one already in use.
 const ROUTE_RANK = { lan: 0, direct: 1, relay: 2 };
 // How long the PC may take to answer the first request on a route (the relay goes through Drive twice).
 const OPEN_WAIT_MS = { direct: 15000, relay: 45000 };
 // In the background longer than this, the connection is closed; it opens again when the app comes back.
-const HIDDEN_REST_MS = 60000;
+// Shorter than the PC waits before it closes a quiet relay connection, so a look at another app does not cost a reconnect.
+const HIDDEN_REST_MS = 120000;
+// Back from the background, a connection that looks open is asked one small thing; no answer in this time and it is
+// opened again (a direct connection that died while the app was frozen is otherwise noticed only after its own timeouts).
+const ALIVE_AFTER_HIDDEN_MS = 8000;
+const ALIVE_WAIT_MS = { lan: 5000, direct: 5000, relay: 15000 };
+// What the PC side showed last (its chat lists and the open chat), kept on the phone and shown at once when the app
+// opens or reconnects, while the PC is asked again.
+const CACHE_KEY = "pc.cache";
+const CACHE_ITEMS = 80;
+// A reply the phone waits for keeps the app and the connection alive in the background this long after its last sign of life.
+const WATCH_MAX_MS = 30 * 60000;
+// The end of a run counts as the end of the reply when nothing started again within this time.
+const END_GRACE_MS = 1800;
+// A chat whose state says "nothing runs" while no reply to the phone's message is there yet is believed after this long.
+const QUIET_END_MS = 45000;
 const AUTO_OFF_KEY = "myharness.mobile.link.noAuto";
 // On the relay, the faster routes are tried again this often (and when the phone's network changes).
 const DIRECT_RETRY_MS = 120000;
@@ -45,6 +64,7 @@ let hiddenTimer = 0;
 let directTimer = 0;
 let directTrying = false;
 let generation = 0; // grows with every connect and unpair: late answers of an older link are ignored
+let hiddenAt = 0;
 
 const bags = new Map(); // slot id → chat object (store.js: emptyChat) with { slot, loaded, cursor, cwd }
 let slots = []; // the PC's open chats (SlotStatus)
@@ -433,6 +453,188 @@ function publishChats() {
 	state.pc.slots = slots;
 	state.pc.chatsLoaded = state.pc.lists[state.pc.listMode].loaded;
 	emit();
+	saveCacheSoon();
+}
+
+// ---- What was on screen last ---------------------------------------------------------------------------------
+const cacheOwner = () => (config ? `${config.kind || "qr"}:${config.pcId || config.deviceId}` : "");
+let cacheTimer = 0;
+
+function saveCacheSoon() {
+	if (cacheTimer || !config) return;
+	cacheTimer = setTimeout(() => {
+		cacheTimer = 0;
+		if (!config) return;
+		const bag = state.pc.chat;
+		const chat =
+			bag?.slot && bag.loaded
+				? {
+						slot: bag.slot,
+						title: bag.title,
+						cwd: bag.cwd,
+						mode: bag.mode,
+						place: bag.place,
+						root: bag.root,
+						file: bag.file,
+						snap: bag.snap,
+						modelList: bag.modelList,
+						// Without what is still on its way or being written, and without picture data (fetched again by address).
+						items: bag.items
+							.filter((item) => !item.pending && item.id)
+							.slice(-CACHE_ITEMS)
+							.map((item) => (item.images?.some((image) => image.data && image.src) ? { ...item, images: item.images.map((image) => (image.src ? { src: image.src, mimeType: image.mimeType } : image)) } : item)),
+					}
+				: null;
+		kvSet(CACHE_KEY, { owner: cacheOwner(), lists: state.pc.lists, chat }).catch(() => {});
+	}, 1500);
+}
+
+function dropCache() {
+	clearTimeout(cacheTimer);
+	cacheTimer = 0;
+	kvSet(CACHE_KEY, null).catch(() => {});
+}
+
+/** At start-up: the lists and the chat of last time are on the page before the PC is reached. */
+async function restoreCache() {
+	let cached = null;
+	try {
+		cached = await kvGet(CACHE_KEY);
+	} catch {
+		cached = null;
+	}
+	if (!cached || cached.owner !== cacheOwner() || state.pc.lists.general.loaded || state.pc.lists.coding.loaded) return;
+	// Both modes are from last time: the one shown is read again on connecting, the other when it is shown.
+	if (cached.lists?.general && cached.lists?.coding) state.pc.lists = { general: { ...emptyLists(), ...cached.lists.general, stale: true }, coding: { ...emptyLists(), ...cached.lists.coding, stale: true } };
+	const chat = cached.chat;
+	if (chat?.slot && !activeSlot && !bags.size) {
+		const bag = bagFor(chat.slot);
+		Object.assign(bag, { title: chat.title || "", cwd: chat.cwd, mode: chat.mode, place: chat.place || "", root: chat.root || "", file: chat.file || "", snap: chat.snap, modelList: chat.modelList, items: Array.isArray(chat.items) ? chat.items : [] });
+		activeSlot = chat.slot;
+		state.pc.chat = bag;
+		publishModels(bag);
+	}
+	state.pc.chatsLoaded = state.pc.lists[state.pc.listMode].loaded;
+	emit();
+}
+
+// ---- Replies the phone waits for -------------------------------------------------------------------------------
+// A chat the phone sent a message into, or the one on screen while the PC writes in it: until its reply ends, the
+// connection stays open in the background and the app stays alive there (the shell's run notification, which is only
+// shown while the app is not on screen). The end of the reply is announced once, when it really ended: by a
+// notification when the app is not on screen, by a line on the page when another chat or pane is.
+const watched = new Map(); // slot → { at, sentAt, started, ending }
+const announced = new Set(); // "<slot>:<runId>" of the ends already announced
+
+function watchTitle(slot) {
+	const bag = bags.get(slot);
+	return bag?.title || (bag?.items.find((item) => item.kind === "user")?.text || "").trim().split("\n")[0].slice(0, 60) || "";
+}
+
+function syncWatch() {
+	const now = Date.now();
+	for (const [slot, entry] of watched)
+		if (now - entry.at > WATCH_MAX_MS) {
+			clearTimeout(entry.ending?.timer);
+			watched.delete(slot);
+		}
+	const last = [...watched.keys()].pop();
+	runActive(watched.size > 0, last ? watchTitle(last) || t("MyHarness is working") : "", "pc");
+}
+
+function cancelEnding(entry) {
+	clearTimeout(entry.ending?.timer);
+	entry.ending = null;
+}
+
+/** Wait for the reply in a chat. `sent`: the phone just sent a message into it; `started`: the PC was seen writing. */
+function watch(slot, { sent = false, started = false } = {}) {
+	if (!slot) return;
+	const entry = watched.get(slot);
+	const next = entry || { at: 0, sentAt: 0, started: false, ending: null };
+	next.at = Date.now();
+	if (sent) next.sentAt = Date.now();
+	if (started) next.started = true;
+	// Something started (again): an end seen a moment ago was not the end of the reply.
+	if (sent || started) cancelEnding(next);
+	watched.set(slot, next);
+	if (!entry) syncWatch();
+}
+
+function unwatch(slot) {
+	const entry = watched.get(slot);
+	if (!entry) return;
+	cancelEnding(entry);
+	watched.delete(slot);
+	syncWatch();
+}
+
+/** Something still has to be answered in this chat: a message on its way or queued, or the PC is writing. */
+function stillBusy(bag) {
+	return !!bag && (bag.running || bag.queue.length > 0 || bag.items.some((item) => item.pending));
+}
+
+/** The reply to what the phone sent: the last finished assistant message, with no message of the user after it. */
+function replyAfter(bag) {
+	if (!bag) return null;
+	for (let i = bag.items.length - 1; i >= 0; i--) {
+		const item = bag.items[i];
+		if (item.kind === "user") return null;
+		if (item.kind === "assistant" && (item.final || item.id || item.stopReason)) return item;
+	}
+	return null;
+}
+
+/**
+ * The reply in a watched chat seems to have ended: `outcome` of run_finished, or "" when only the chat's state says
+ * that nothing runs. It counts a moment later, and only if nothing started again meanwhile: a message sent while the
+ * PC was writing is answered by a run of its own right after the one that just ended, and a chat's state read in the
+ * moment between a message and its run says "nothing runs" too.
+ */
+function replyEnding(slot, outcome, runId = "") {
+	const entry = watched.get(slot);
+	if (!entry) return;
+	clearTimeout(entry.ending?.timer);
+	// What a run_finished said is kept when the chat's state confirms it a moment later.
+	const kept = entry.ending && !outcome ? entry.ending : { outcome, runId };
+	entry.ending = { outcome: kept.outcome, runId: kept.runId, timer: setTimeout(() => replyEnded(slot), END_GRACE_MS) };
+}
+
+function replyEnded(slot) {
+	const entry = watched.get(slot);
+	if (!entry?.ending) return;
+	const { outcome, runId } = entry.ending;
+	entry.ending = null;
+	const bag = bags.get(slot);
+	if (stillBusy(bag)) return;
+	const reply = replyAfter(bag);
+	// Only the chat's state says so, and the reply is not there: the run has not started yet (or its events are still on
+	// their way); the chat goes on being watched.
+	if (!outcome && !reply && Date.now() - Math.max(entry.sentAt, entry.at) < QUIET_END_MS) return;
+	watched.delete(slot);
+	syncWatch();
+	if (outcome === "cancelled" || outcome === "redirected" || (!outcome && (!reply || reply.stopReason === "aborted"))) return;
+	// A run number starts again at 1 when the PC's app restarts, so the reply itself is part of what was announced.
+	const key = `${slot}:${runId}:${reply?.ts || reply?.id || ""}`;
+	if (announced.has(key)) return;
+	announced.add(key);
+	if (announced.size > 60) announced.delete(announced.values().next().value);
+	const failed = outcome === "failed" || outcome === "partial" || (!outcome && reply?.stopReason === "error");
+	const said = (reply?.blocks || [])
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join(" ")
+		.replace(/\s+/g, " ")
+		.trim();
+	const title = watchTitle(slot) || config?.name || "MyHarness";
+	if (document.visibilityState === "hidden") {
+		if (prefs.notifyDone !== false) notifyDone(title, failed ? t("The reply stopped with an error.") : said.slice(0, 140) || t("The reply is ready."));
+		return;
+	}
+	// On screen, but not this chat (another chat, the chat list, the browser, the phone's own side): one line says so.
+	if (state.mode === "pc" && state.pc.chat === bag && state.pane === "chat" && state.layers.length === 0) return;
+	haptic("confirm");
+	toast(failed ? t("The reply in “{title}” stopped with an error.", { title }) : t("The reply in “{title}” is ready.", { title }), failed ? "warning" : "ok", 4200);
 }
 
 // ---- The PC's chat lists, grouped as its sidebar groups them ---------------------------------------------------
@@ -481,7 +683,7 @@ async function loadLists(mode = state.pc.listMode) {
 	]);
 	if (mine !== generation) return;
 	const errors = { ...before.errors };
-	const patch = { loaded: true, error: workspaces.failed || "" };
+	const patch = { loaded: true, stale: false, error: workspaces.failed || "" };
 	if (!workspaces.failed) patch.workspaces = (workspaces.workspaces || []).map((entry) => ({ name: entry.name, rootPath: entry.rootPath, missing: !!entry.missing }));
 	if (unbound.failed) errors[DEFAULT_KEY] = unbound.failed;
 	else {
@@ -546,8 +748,8 @@ function refreshListsSoon(delay = 800) {
 	listsTimer = setTimeout(() => {
 		const shown = state.pc.listMode;
 		const other = shown === "general" ? "coding" : "general";
-		// The mode not shown is read again when it is shown.
-		if (state.pc.lists[other].loaded) patchLists(other, { loaded: false });
+		// The mode not shown is read again when it is shown; until the PC answers, its last lists stay on the page.
+		if (state.pc.lists[other].loaded) patchLists(other, { stale: true });
 		loadLists(shown).catch(() => {});
 	}, delay);
 }
@@ -557,6 +759,10 @@ function resetLists() {
 	searching = false;
 	state.pc.lists = { general: emptyLists(), coding: emptyLists() };
 	state.pc.slots = [];
+	for (const entry of watched.values()) cancelEnding(entry);
+	watched.clear();
+	syncWatch();
+	dropCache();
 }
 
 function applySnapshot(bag, snap) {
@@ -632,6 +838,11 @@ async function loadChat(bag, { quiet = false } = {}) {
 		bag.loaded = true;
 		publishModels(bag);
 		hydrateImages(bag);
+		// A reply that ended while no event reached the phone (the connection was down) is noticed here.
+		if (snap.active) {
+			if (watched.has(bag.slot) || (bag.slot === activeSlot && document.visibilityState === "visible")) watch(bag.slot, { started: true });
+		} else if (watched.has(bag.slot)) replyEnding(bag.slot, "");
+		saveCacheSoon();
 	} finally {
 		bag.loading = false;
 		if (state.pc.chat === bag) emit();
@@ -659,9 +870,11 @@ async function showSlot(slot, { reload = false } = {}) {
 	publishModels(bag);
 	publishChats();
 	emit();
-	if (!bag.loaded || reload) await loadChat(bag);
+	// The chat and its model list are asked for together (one round trip, which through Drive is a second or more).
+	const loading = !bag.loaded || reload ? loadChat(bag) : null;
 	loadModels(bag);
 	if (document.visibilityState === "visible") call("POST", "/api/seen", {}, slot).catch(() => {});
+	await loading;
 }
 
 // ---- Events ------------------------------------------------------------------------------------
@@ -713,11 +926,23 @@ function onEvent(name, data) {
 	// A chat that is not on the page yet has nothing to update; its state is read when it is opened.
 	if (!bag.loaded && name !== "run_state" && name !== "run_finished") return;
 	const changed = applyEvent(bag, name, data);
+	if (watched.has(slot)) watch(slot, { started: bag.running });
+	else if (bag.running && slot === activeSlot && (name === "run_state" || name === "agent_start")) watch(slot, { started: true });
+	// A page the agent just opened in the PC's browser (its workspace tool) gets a tab in the phone's browser too.
+	if (name === "tool_end" && data.toolName === "workspace" && !data.isError && (slot === activeSlot || watched.has(slot))) {
+		const details = data.details || {};
+		const url = details.browser?.url;
+		if ((details.operation === "open" || details.operation === "navigate") && typeof url === "string" && details.activeId) mirrorPcTab(`${cacheOwner()}:${details.activeId}`, url, typeof details.browser.title === "string" ? details.browser.title : "");
+	}
 	if (name === "run_finished") {
+		replyEnding(slot, data.outcome || "completed", data.runId ?? "");
 		refreshSoon(slot);
 		refreshListsSoon();
 	}
-	if (name === "prompt_rejected" && state.pc.chat === bag) toast(t("The PC did not take the message. Try again."), "error");
+	if (name === "prompt_rejected") {
+		if (state.pc.chat === bag) toast(t("The PC did not take the message. Try again."), "error");
+		if (!watched.get(slot)?.started && !stillBusy(bag)) unwatch(slot);
+	}
 	if (changed && state.pc.chat === bag) emit();
 }
 
@@ -805,7 +1030,7 @@ async function runStream(mine, { moved = false } = {}) {
 		if (fatal) return;
 		const delay = RETRY_DELAYS[Math.min(retries++, RETRY_DELAYS.length - 1)];
 		clearTimeout(retryTimer);
-		retryTimer = setTimeout(() => mine === generation && document.visibilityState === "visible" && connect(), delay);
+		retryTimer = setTimeout(() => mine === generation && (document.visibilityState === "visible" || watched.size > 0) && connect(), delay);
 	}
 }
 
@@ -818,6 +1043,12 @@ function catchUp() {
 /** The app has been in the background for a while: the connection is closed (no more looking at Drive) until it is back. */
 function rest() {
 	if (document.visibilityState === "visible" || !config) return;
+	// A reply is awaited: the connection stays until it ends (or gives no sign of life for a long while).
+	syncWatch();
+	if (watched.size) {
+		hiddenTimer = setTimeout(rest, HIDDEN_REST_MS);
+		return;
+	}
 	generation++;
 	clearTimeout(retryTimer);
 	clearTimeout(directTimer);
@@ -829,22 +1060,67 @@ function rest() {
 }
 
 async function onConnected(mine) {
-	const answer = await call("GET", "/api/slots", undefined, "");
+	let remembered = activeSlot;
+	try {
+		remembered ||= localStorage.getItem(SLOT_KEY) || "";
+	} catch {
+		// Nothing remembered.
+	}
+	// Everything the page needs is asked for at once: the PC's open chats, the chat that was on screen and the drawer's
+	// lists. One after another, each waited a whole round trip, which through Drive is a second or more.
+	const asked = call("GET", "/api/slots", undefined, "");
+	const early = remembered
+		? showSlot(remembered, { reload: true }).then(
+				() => true,
+				() => false,
+			)
+		: null;
+	loadLists().catch(() => {});
+	const answer = await asked;
 	if (mine !== generation) return;
 	slots = answer.slots || [];
-	let wanted = activeSlot;
-	if (!slots.some((status) => status.slot === wanted)) {
-		let remembered = "";
-		try {
-			remembered = localStorage.getItem(SLOT_KEY) || "";
-		} catch {
-			remembered = "";
-		}
-		wanted = slots.find((status) => status.slot === remembered)?.slot || slots[0]?.slot || "";
-	}
 	publishChats();
+	await early;
+	if (mine !== generation || (remembered && slots.some((status) => status.slot === remembered))) return;
+	// The chat of last time is no longer open on the PC: the first open one instead.
+	if (remembered && activeSlot === remembered) {
+		bags.delete(remembered);
+		activeSlot = "";
+		state.pc.chat = emptyChat();
+		state.pc.models = emptyModels();
+	}
+	const wanted = slots[0]?.slot || "";
 	if (wanted) await showSlot(wanted, { reload: true });
-	loadLists().catch(() => {});
+	else emit();
+}
+
+/** Back on screen after a while: a connection that looks open is checked, and opened again when it does not answer. */
+function checkAlive() {
+	if (state.pc.link.status !== "online" || !session) return;
+	const mine = generation;
+	const waitMs = ALIVE_WAIT_MS[state.pc.link.route] || ALIVE_WAIT_MS.relay;
+	let settled = false;
+	const timer = setTimeout(() => {
+		if (settled || mine !== generation) return;
+		settled = true;
+		pc.reconnect();
+	}, waitMs);
+	call("GET", "/api/slots", undefined, "").then(
+		(answer) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (mine !== generation) return;
+			slots = answer.slots || slots;
+			catchUp();
+		},
+		() => {
+			if (settled || mine !== generation) return;
+			settled = true;
+			clearTimeout(timer);
+			pc.reconnect();
+		},
+	);
 }
 
 function connect() {
@@ -877,8 +1153,9 @@ export const pc = {
 				config = null;
 			}
 		} else config = null;
+		if (config) await restoreCache();
 		onNative("lifecycle", (event) => {
-			if (event.state === "resume" && config && state.pc.link.status !== "online" && state.pc.link.status !== "connecting") connect();
+			if (event.state === "foreground" && config && state.pc.link.status !== "online" && state.pc.link.status !== "connecting") connect();
 		});
 		// The phone moved to another network (Wi-Fi, mobile data): a faster route may exist now.
 		const networkChanged = () => {
@@ -889,8 +1166,14 @@ export const pc = {
 		document.addEventListener("visibilitychange", () => {
 			clearTimeout(hiddenTimer);
 			if (document.visibilityState === "visible") {
+				const away = hiddenAt ? Date.now() - hiddenAt : 0;
+				hiddenAt = 0;
 				if (config && state.pc.link.status === "offline") connect();
-			} else if (config) hiddenTimer = setTimeout(rest, HIDDEN_REST_MS);
+				else if (config && away > ALIVE_AFTER_HIDDEN_MS) checkAlive();
+			} else {
+				hiddenAt = Date.now();
+				if (config) hiddenTimer = setTimeout(rest, HIDDEN_REST_MS);
+			}
 		});
 		// The PC is connected as soon as the app opens, on either side, so that it is there when the PC side is opened.
 		if (config && document.visibilityState === "visible") connect();
@@ -1024,7 +1307,8 @@ export const pc = {
 		state.pc.listMode = next;
 		saveJson(LIST_MODE_KEY, next);
 		publishChats();
-		if (!state.pc.lists[next].loaded && state.pc.link.status === "online") loadLists(next).catch(() => {});
+		const lists = state.pc.lists[next];
+		if ((!lists.loaded || lists.stale) && state.pc.link.status === "online") loadLists(next).catch(() => {});
 	},
 
 	/** Open or fold a group; a Workspace's chats are read when its group is first opened. */
@@ -1056,11 +1340,23 @@ export const pc = {
 	/** Whether this PC starts a chat in a Workspace a phone names (older PCs start it where they would themselves). */
 	canStartInWorkspace: () => state.pc.lists[state.pc.listMode].scheduled !== null,
 
-	async openChat(id) {
+	async openChat(id, { title = "" } = {}) {
 		if (id.startsWith("slot:")) return showSlot(id.slice(5));
-		const answer = await call("POST", "/api/sessions/open", { path: id.slice(5) });
-		if (answer.cwdMissing) toast(t("This chat's folder is gone on the PC; its history can still be read."), "warning");
-		await showSlot(answer.slot, { reload: true });
+		// The chat's name shows at once, with nothing in it yet, while the PC opens it (two round trips through Drive):
+		// the tap is answered, and a message typed meanwhile cannot go into the chat that was open before.
+		const previous = activeSlot;
+		const placeholder = { ...emptyChat(), title, loading: true };
+		state.pc.chat = placeholder;
+		emit();
+		try {
+			const answer = await call("POST", "/api/sessions/open", { path: id.slice(5) });
+			if (answer.cwdMissing) toast(t("This chat's folder is gone on the PC; its history can still be read."), "warning");
+			if (state.pc.chat !== placeholder) return;
+			await showSlot(answer.slot, { reload: true });
+		} catch (error) {
+			if (state.pc.chat === placeholder && previous) await showSlot(previous).catch(() => {});
+			throw error;
+		}
 	},
 
 	/** A new chat of the mode the drawer shows: in "Default", or in the Workspace given (`rootPath`). */
@@ -1082,7 +1378,8 @@ export const pc = {
 	},
 
 	async send({ text, attachments = [] }) {
-		if (state.pc.link.status !== "online") throw new Error(t("The PC is not connected."));
+		// While the connection is being opened the message waits for it (it shows as being sent meanwhile).
+		if (state.pc.link.status !== "online" && state.pc.link.status !== "connecting") throw new Error(t("The PC is not connected."));
 		const bag = state.pc.chat;
 		const slot = bag.slot;
 		if (!slot) throw new Error(t("No chat is open on the PC yet."));
@@ -1094,6 +1391,7 @@ export const pc = {
 		const id = clientMessageId();
 		addPending(bag, { clientMessageId: id, text, images, attachments: files.map((entry) => ({ name: entry.name, size: entry.size })) });
 		emit();
+		watch(slot, { sent: true });
 		try {
 			const uploaded = [];
 			for (const entry of files) {
@@ -1107,6 +1405,7 @@ export const pc = {
 		} catch (error) {
 			removePending(bag, id);
 			emit();
+			if (!watched.get(slot)?.started) unwatch(slot);
 			throw error;
 		}
 	},

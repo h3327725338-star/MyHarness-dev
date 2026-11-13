@@ -4,7 +4,7 @@ import { browserBack, haptic, nativeReady, onNative, openExternal, pushBack } fr
 import { zhCN, zhUnits } from "/shared/locales/zh-CN.js";
 import { html, render, useEffect, useRef } from "/shared/ui.js";
 import { MOBILE_ZH, MOBILE_ZH_UNITS } from "./locale-zh.js";
-import { applyAppearance } from "./prefs.js";
+import { applyAppearance, setShownMode } from "./prefs.js";
 
 // The phone's own words join the desktop's Chinese table before anything is drawn (i18n.js looks them up by the English text).
 Object.assign(zhCN, MOBILE_ZH);
@@ -14,7 +14,7 @@ applyAppearance();
 const { account } = await import("./account.js");
 const { local } = await import("./backend-local.js");
 const { pc } = await import("./backend-remote.js");
-const { nav } = await import("./backends.js");
+const { chatModeOnScreen, nav } = await import("./backends.js");
 const { Browser } = await import("./browser.js");
 const { activeTab, goBack, initBrowser, navigate, openTab } = await import("./browser-model.js");
 const { Chat } = await import("./chat.js");
@@ -25,7 +25,7 @@ const { createPager } = await import("./pager.js");
 const { openLinkPage, openSettings, pairFromLink } = await import("./settings.js");
 const { Layers } = await import("./sheets.js");
 const { SignInGate } = await import("./signin.js");
-const { dismissToast, set, state, useStore } = await import("./store.js");
+const { dismissToast, set, state, subscribe, useStore } = await import("./store.js");
 
 const TOAST_ICON = { error: "alertCircle", warning: "alertTriangle", ok: "checkCircle", info: "info" };
 
@@ -45,7 +45,7 @@ function App() {
 	const root = useRef(null);
 
 	useEffect(() => {
-		const pager = createPager(root.current, { onPane: (pane) => set({ pane }) });
+		const pager = createPager(root.current, { onPane: (pane) => set({ pane }), onPeek: (browserPeek) => set({ browserPeek }) });
 		nav.go = (pane) => pager.go(pane);
 		nav.openSettings = (section) => openSettings(section);
 		nav.openLink = () => openLinkPage();
@@ -114,5 +114,9 @@ render(html`<${App} />`, document.getElementById("app"));
 await account.init().catch((error) => console.error("account start-up failed", error));
 const started = await Promise.allSettled([local.init(), pc.init(), initBrowser()]);
 for (const result of started) if (result.status === "rejected") console.error("start-up step failed", result.reason);
+// The page wears the colours of the chat mode on screen. The switches change them themselves, with their animation;
+// this follows every other way the mode changes (a PC paired or forgotten, the side restored at start-up).
+setShownMode(chatModeOnScreen());
+subscribe(() => setShownMode(chatModeOnScreen()));
 set({ booted: true });
 globalThis.__mhState = state;
