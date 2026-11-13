@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+	<string name="app_name">MyHarness</string>
+	<string name="run_channel">Replies in progress</string>
+	<string name="run_title">MyHarness is answering</string>
+	<string name="done_channel">Finished replies</string>
+	<string name="scan_prompt">Scan the code shown on your computer</string>
+	<string name="signin_channel">Google sign-in</string>
+	<string name="signin_title">Waiting for Google sign-in</string>
+	<string name="signin_text">Finish signing in in the browser; MyHarness opens again by itself.</string>
+</resources>

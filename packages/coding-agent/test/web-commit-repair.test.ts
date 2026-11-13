@@ -118,6 +118,9 @@ it.each([
 			expect(entry.customType).toBe("git-commit-repair");
 			expect(entry.content).toContain("Do not bypass");
 			expect(entry.content).toContain("up to three repair rounds total");
+			// A check that waits for the user's own approval is asked in the first round, not reported round after round.
+			expect(entry.content).toContain("ask the user in this same round with ask_user_question");
+			expect(entry.content).toContain("a round that changed no files ends the repair");
 			expect(entry.content).toContain("type error");
 			expect(options).toEqual({ triggerTurn: true });
 		} else expect(sendCustomMessage).not.toHaveBeenCalled();

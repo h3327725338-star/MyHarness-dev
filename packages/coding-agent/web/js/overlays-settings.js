@@ -21,6 +21,7 @@ import { SearchableMultiSelect } from "./settings-multiselect.js";
 import { Select } from "./select.js";
 import { SyncPage } from "./sync-page.js";
 import { ConnectPage } from "./connect-page.js";
+import { PhoneLinkPage } from "./phone-link-page.js";
 import { AppZoomControl } from "./app-zoom.js";
 
 export { ProviderEditorHost, deleteCustomProvider } from "./providers-page.js";
@@ -34,6 +35,7 @@ export const NAV = [
 	{ id: "providers", label: N_("Providers"), icon: "key" },
 	{ id: "connect", label: N_("Connections"), icon: "plug" },
 	{ id: "sync", label: N_("Google Drive"), icon: "drive" },
+	{ id: "phone", label: N_("Phone"), icon: "phone" },
 	{ id: "search", label: N_("Web search"), icon: "globe" },
 	{ id: "code", label: N_("Code Intelligence"), icon: "wrench" },
 	{ id: "files", label: N_("Files & Office"), icon: "file" },
@@ -61,7 +63,8 @@ const PAGE_NOTE = {
 	git: N_("How Commit and Push run, and the instructions they follow."),
 	providers: N_("The services MyHarness talks to, their API keys and models."),
 	connect: N_("Accounts the agent works with on your behalf: GitHub and your Gmail or Outlook mailboxes."),
-	sync: N_("Keep chats, memories and attachments in sync through your own Google Drive."),
+	sync: N_("Keep chats, memories and settings the same on your computers, through your own Google Drive."),
+	phone: N_("Use the MyHarness Android app to send messages to this PC and read its replies."),
 	files: N_("How the workspace opens and edits Office documents."),
 	network: N_("Connections to providers and the shell the agent runs commands in."),
 	safety: N_("What MyHarness may load and run, and how it notifies you."),
@@ -1089,6 +1092,8 @@ function ModelPrompts() {
 	const [busy, setBusy] = useState(false);
 	const [picking, setPicking] = useState(false);
 	const [fullscreen, setFullscreen] = useState(false);
+	// "Check that it arrives": null, { busy: true }, { outcome, answer } or { error }, for the model and text it was made for.
+	const [check, setCheck] = useState(null);
 	const anchor = useRef(null);
 	const box = useRef(null);
 	const expander = useRef(null);
@@ -1121,6 +1126,20 @@ function ModelPrompts() {
 	}, [nonce]);
 	const savedText = promptOf(saved, selected);
 	const dirty = !!selected && saved !== null && text !== savedText;
+	// A result belongs to one model and one saved text: another model, or the text saved again, clears it.
+	const checkKey = selected ? `${selected.provider}\n${selected.model}\n${savedText}` : "";
+	useEffect(() => setCheck(null), [checkKey]);
+	const runCheck = async () => {
+		const key = checkKey;
+		const still = () => edits.current.selected && `${edits.current.selected.provider}\n${edits.current.selected.model}\n${promptOf(edits.current.saved, edits.current.selected)}` === key;
+		setCheck({ busy: true });
+		try {
+			const result = await post("/api/model-prompts/check", { provider: selected.provider, model: selected.model });
+			if (still()) setCheck(result);
+		} catch (e) {
+			if (still()) setCheck({ error: serverText(e.message, t("The operation failed.")) });
+		}
+	};
 	const nameOf = (ref) => findModel(models, ref.provider, ref.model)?.name || ref.model;
 	const choose = async (ref) => {
 		setPicking(false);
@@ -1194,8 +1213,23 @@ function ModelPrompts() {
 								<span class="dim grow">${t("Applies from the next request on. A box saved empty removes the prompt.")}</span>
 								${savedText ? html`<button class="btn danger" disabled=${busy} onClick=${remove}>${t("Remove")}</button>` : null}
 								${dirty ? html`<button class="btn" disabled=${busy} onClick=${() => setText(savedText)}>${t("Discard changes")}</button>` : null}
+								${savedText ? html`<button class="btn model-prompt-check-btn" disabled=${busy || dirty || check?.busy} title=${dirty ? t("Save the prompt first; the check asks about the saved one.") : t("Sends one short request to this model and asks it to repeat the prompt it received.")} onClick=${runCheck}>${check?.busy ? t("Asking the model…") : t("Check that it arrives")}</button>` : null}
 								<button class="btn primary" disabled=${busy || !dirty} onClick=${save}>${t("Save")}</button>
-							</div>`
+							</div>
+							${check && !check.busy
+								? html`<div class=${`notice model-prompt-check ${check.error ? "danger" : check.outcome === "received" ? "ok" : "warn"}`} role="status">
+										<div class="model-prompt-check-title">
+											${check.error
+												? t("The check could not be made: {error}", { error: check.error })
+												: check.outcome === "received"
+													? t("{model} received your prompt. This is what it repeated back:", { model: nameOf(selected) })
+													: check.outcome === "missing"
+														? t("{model} answered that it received no prompt of its own. Try again; if it stays so, this way of reaching the model does not pass the prompt on.", { model: nameOf(selected) })
+														: t("{model} answered, but did not repeat your prompt word for word. Some models refuse to repeat their instructions; that alone does not mean the prompt is missing. Its answer:", { model: nameOf(selected) })}
+										</div>
+										${!check.error && check.answer && check.outcome !== "missing" ? html`<div class="model-prompt-check-answer">${check.answer}</div>` : null}
+									</div>`
+								: null}`
 						: null}
 					${saved?.length
 						? html`<div class="col model-prompt-list">
@@ -1408,13 +1442,19 @@ const SEARCH_ROWS = [
 	["git", N_("Commit instructions")],
 	["git", N_("Push instructions")],
 	["providers", N_("API keys")],
-	["sync", N_("Sync with Google Drive")],
-	["sync", N_("Cloud folder")],
+	["phone", N_("Phone link"), N_("Lets the MyHarness app on your Android phone send messages to this PC and show its replies, over your local network.")],
+	["phone", N_("Pair a phone")],
+	["phone", N_("Paired phones")],
+	["phone", N_("Phones of your Google account"), N_("A phone signed in to the MyHarness app with this PC's Google account connects from any network, without a QR code: directly over the internet when it can, otherwise through files in your Google Drive (slower).")],
 	["sync", N_("Automatic sync")],
-	["sync", N_("What syncs")],
-	["sync", N_("Bookmarks, shortcuts and site settings")],
-	["sync", N_("File conflicts")],
-	["sync", N_("Advanced: your own Google OAuth client")],
+	["sync", N_("Sync now")],
+	["sync", N_("What travels")],
+	["sync", N_("Settings and keys")],
+	["sync", N_("Built-in browser")],
+	["sync", N_("Website sign-ins and saved passwords")],
+	["sync", N_("Folder in Google Drive")],
+	["sync", N_("This computer's name")],
+	["sync", N_("Your own Google OAuth client")],
 	["code", N_("Language modules")],
 	["about", N_("Version")],
 	["about", N_("Quit MyHarness")],
@@ -1506,8 +1546,8 @@ export function SettingsModal() {
 		setQuery("");
 		setView({ settingsSection: id });
 	};
-	// The provider page edits a tree (provider → key → model): it gets a wider dialog.
-	return html`<${Modal} title=${t("Settings")} onClose=${close} width=${section === "providers" && !searching ? 1180 : 900} class="settings-modal" focusInput=${false}>
+	// Every page has the same dialog width: going from page to page nothing but the content changes.
+	return html`<${Modal} title=${t("Settings")} onClose=${close} width=${900} class="settings-modal" focusInput=${false}>
 		<div class="settings">
 			<nav class="settings-nav" aria-label=${t("Settings sections")}>
 				<label class="settings-search">
@@ -1521,7 +1561,7 @@ export function SettingsModal() {
 			</nav>
 			<div class=${`settings-body ${section === "providers" && !searching ? "wide" : ""}`}>
 				${searching ? html`<${SearchResults} results=${results} query=${query.trim()} onPick=${pick} />` : html`<div class="settings-title"><h2>${t(current.label)}</h2>${PAGE_NOTE[current.id] ? html`<span class="set-desc">${t(PAGE_NOTE[current.id])}</span>` : null}</div>
-				${section === "appearance" ? html`<${Appearance} />` : section === "conversation" ? html`<${Appearance} conversation=${true} /><${SettingsList} items=${items} models=${models} />` : section === "providers" ? html`<${ProvidersPage} />` : section === "sync" ? html`<${SyncPage} />` : section === "connect" ? html`<${ConnectPage} />` : section === "code" ? html`<${CodeIntelligence} items=${items} />` : section === "shortcuts" ? html`<${Shortcuts} />` : section === "personal" ? html`<${Personalization} />` : section === "git" ? html`<${GitPreferences} />` : section === "about" ? html`<${About} />` : !settings ? html`<${Spinner} />` : section === "safety" ? html`<${Safety} items=${items} models=${models} />` : html`<${SettingsList} items=${items} models=${models} />`}`}
+				${section === "appearance" ? html`<${Appearance} />` : section === "conversation" ? html`<${Appearance} conversation=${true} /><${SettingsList} items=${items} models=${models} />` : section === "providers" ? html`<${ProvidersPage} />` : section === "sync" ? html`<${SyncPage} />` : section === "connect" ? html`<${ConnectPage} />` : section === "phone" ? html`<${PhoneLinkPage} />` : section === "code" ? html`<${CodeIntelligence} items=${items} />` : section === "shortcuts" ? html`<${Shortcuts} />` : section === "personal" ? html`<${Personalization} />` : section === "git" ? html`<${GitPreferences} />` : section === "about" ? html`<${About} />` : !settings ? html`<${Spinner} />` : section === "safety" ? html`<${Safety} items=${items} models=${models} />` : html`<${SettingsList} items=${items} models=${models} />`}`}
 				${settings?.errors?.length ? html`<div class="notice danger">${settings.errors.map((e) => `${e.scope}: ${e.message}`).join("\n")}</div>` : null}
 			</div>
 		</div>

@@ -68,6 +68,7 @@
 		"sharp": "0.35.5",
 		"typebox": "1.1.38",
 		"undici": "8.12.3",
+		"werift": "0.25.2",
 		"yaml": "2.9.0"
 	},
 	"overrides": {

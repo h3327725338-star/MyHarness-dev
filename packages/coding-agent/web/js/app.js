@@ -27,6 +27,7 @@ import { AppZoomBadge } from "./app-zoom.js";
 import { AttentionCards } from "./attention-cards.js";
 import { ScheduleCards, SchedulesPageHost } from "./schedules.js";
 import { SourcesPageHost } from "./sources-page.js";
+import { SignInScreen, useSignInGate } from "./sign-in-page.js";
 import { clip, fmtBytes, plural } from "./util.js";
 import { count, t, N_, serverText } from "./i18n.js";
 
@@ -566,6 +567,7 @@ export function App() {
 	const everConnected = useStore((s) => s.everConnected);
 	const restarting = useStore((s) => s.restarting);
 	const shutdown = useStore((s) => s.shutdown);
+	const signInGate = useSignInGate();
 	useShortcuts();
 	// The panel stays mounted while it slides out, and only turns "open" a frame after it is mounted, so both directions animate.
 	const panel = usePresence(panelOpen, 320);
@@ -615,6 +617,8 @@ export function App() {
 			${bootPhase === "error" ? html`<${Icon} name="alertCircle" size=${28} class="c-danger" /><h2>${t("MyHarness could not start")}</h2><div class="dim">${bootDetail}</div>` : html`<${Spinner} /><div>${bootPhase === "connecting" ? t("Connecting to the local MyHarness server…") : t("Starting MyHarness…")}</div>`}
 		</div><${BootDialogHost} /><${WindowControls} bare /></div>`;
 	}
+	// The desktop app is used signed in with Google: until an account is connected, the sign-in screen is the app.
+	if (signInGate) return html`<${SignInScreen} />`;
 	// Inside a mode reveal the panel is drawn open at once: the reveal is the motion, the new mode appears as it stays.
 	const panelShown = panel.shown || (panelOpen && modeRevealActive());
 	const browserFull = browserFullOn && fullAllowed && panel.mounted;

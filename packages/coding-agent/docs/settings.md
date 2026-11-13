@@ -103,7 +103,7 @@ Gmail 的 `text/*` 正文会解码成 `body.text`；Outlook 请求带 `Prefer: o
 
 Google 云端硬盘同步、Gmail 和 Outlook 的 API 访问都要经过一个注册过的 OAuth 应用。`src/providers/credentials/oauth-apps.ts` 记录 MyHarness 自己注册的应用，每个应用写明用途（`uses`：`sync` 同步、`mail` 邮箱），`builtInOAuthApp(provider, use)` 只返回登记了该用途的应用。当前：
 
-- Google：已填入 MyHarness 的桌面客户端“MyHarness Desktop”，同意屏幕已发布为正式版，只用于同步。用户在设置 → Google 云端硬盘点**连接 Google 云端硬盘**、在浏览器里登录即可，不用创建或粘贴任何东西。
+- Google：已填入 MyHarness 的桌面客户端“MyHarness Desktop”，同意屏幕已发布为正式版，只用于同步。用户在设置 → Google 云端硬盘点**连接 Google 云端硬盘**、在浏览器里登录即可，不用创建或粘贴任何东西。安卓 App 也用这个客户端登录（`packages/mobile/build.mjs` 构建时从这个文件取出 client id 和 secret，写进页面的 `js/oauth.generated.js`，环境变量 `MYHARNESS_GOOGLE_CLIENT_ID`/`_SECRET` 可以覆盖）：`drive.file` 只让同一个应用看到它创建的文件，手机和电脑用同一个客户端才能看到同一个 `MyHarness` 文件夹。这是在安卓上使用“桌面应用”类型的客户端，Google 不保证长期接受这种用法。
 - Gmail 暂不使用这个应用（见下文受限 scope），仍在桌面应用里走网页版，或在**高级：使用自己的 OAuth 应用**里配置。
 - Microsoft：还没有注册，Outlook 同 Gmail。
 
@@ -131,6 +131,8 @@ Google 云端硬盘同步、Gmail 和 Outlook 的 API 访问都要经过一个�
 - **Vision Assistant** 只会选择来自 enabled Provider 且已确认支持 image input 的 model。
 
 每个支持 API Key 的 Provider credential screen 都会列出已保存的 keys 和**添加新的 API Key**；OAuth-only Provider（由 Extension 注册）显示其官方登录入口，不要求输入 API Key。
+
+连接了 Google Drive 时，Provider 配置（`models.json`，包括每个模型的上下文长度）、API keys、各类助手与子智能体所用的模型等偏好会同步到其他电脑；OAuth 登录、代理、路径这类只属于一台电脑的设置不同步。API keys 以 `auth.json` 里同样的明文形式存进用户自己的 Drive 文件夹。规则见 google-drive-sync.md 的 “Settings and keys”。
 
 Provider credentials 保存在 `~/.myharness/agent/auth.json` 中。文件以 plain text 保存 key values，依赖本地 filesystem permissions 保护，并不是 encrypted vault。输入 key 时会隐藏内容，Settings UI 只显示用户定义的 label，以及可用时的末四位字符。
 
@@ -183,10 +185,12 @@ Custom Providers 会出现在与其他 configured/extension services 相同的 *
 
 设置 → 个性化 → **模型专属提示词**：先选一个模型，再写只给它的指令，点“保存”生效；清空后保存（或点“删除”）即删除。下面列出所有已设置提示词的模型，点一行打开它的内容；已从模型列表里消失的模型（例如 Provider 被删或停用）仍会列出，可以编辑或删除。
 
-- 保存在 `~/.myharness/agent/model-prompts.json`（全局，只在这台电脑；不进项目配置，不经 Google Drive 同步），格式为 `{ "version": 1, "prompts": { "<Provider ID>": { "<Model ID>": "<提示词>" } } }`，按 Provider ID + Model ID 精确匹配。
+- 保存在 `~/.myharness/agent/model-prompts.json`（全局，不进项目配置；连接了 Google Drive 时随“设置和密钥”同步到其他电脑，见 google-drive-sync.md），格式为 `{ "version": 1, "prompts": { "<Provider ID>": { "<Model ID>": "<提示词>" } }, "savedAt": { "<Provider ID>": { "<Model ID>": "<ISO 时间>" } } }`，按 Provider ID + Model ID 精确匹配。`savedAt` 是这条提示词的文字最后一次改动的时间（同样的文字再保存一次不变；旧版本写的文件没有它，视为一直存在），只属于这台电脑，不随同步发布：从别的电脑同步来的提示词，文字没变的保留本机时间，新的或改过的记为到达本机的时间。
 - 优先级最高：作为 system prompt 的最后一块发送，写明与其他内容冲突时以它为准（内置规则、Coding/General 全局个性提示词、工作区说明、`AGENTS.md`/`CLAUDE.md`、`SYSTEM.md`/`APPEND_SYSTEM.md`、技能和召回记忆）。它不改变工具名称、参数和调用格式，也不改变程序要读的输出格式（例如 JSON）。
 - 只要请求用的是这个模型就带上：主聊天、子智能体、上下文压缩、记忆提取与回想、标题生成、交接摘要、只读委派的 shell 审查等都算；其他模型的请求一律不带。所以给辅助任务所用的模型写了强势要求（例如“只用英文回答”）时，压缩摘要和提取出的记忆也会照做。
+- 除了放在 system prompt 最后，还会在用户说的话后面再放一遍（`<model_instructions_reminder>`，规则文字在 `system-prompts/common/session/model-instructions-reminder.md`）：只加在提示词保存之后的用户消息上（每一轮用户消息里的最后一条），提示词不超过 800 字时放全文，更长时放开头 800 字并以“…”结尾（全文始终在 system prompt 里）。原因是实测：对话里已经有不按提示词写的回复时，较弱的模型会照着之前的回复继续写，只在 system prompt 末尾放一块没有效果（GLM 5.3 flash，对话中途保存提示词后 8 次请求 0 次照做）；在问题旁边再放一遍、且只从保存那一刻起放，同样的测试 8 次全部照做。只放一句“请看 system prompt 里的指令”而不带原文没有效果（0/8）；超过 800 字的提示词只重复开头，同样的测试 8 次里 4 次照做，所以最重要的要求应写在最前面。带上提醒的消息在之后每次请求里都带着同样的文字，所以对话前面的部分逐次请求保持不变，不影响 Provider 的缓存；提醒只在请求里，不写进 Session，界面上看到的仍是用户原话。
 - 从下一次请求起生效，不用重启；正在进行的请求不变。聊天中途换模型，从下一轮起用新模型的提示词。
+- **验证是否生效**：保存后点这个按钮（`POST /api/model-prompts/check`，`src/providers/models/model-prompt-check.ts`），MyHarness 向这个模型发一次很短的真实请求，走与聊天相同的发送路径，让它复述自己收到的专属提示词（最多前 300 字），再与保存的内容比对：复述出来（60% 以上吻合）显示“已收到”和它复述的原文；模型回答没有收到则显示没有收到；模型有回答但没有复述（有些模型拒绝复述自己的指令）如实显示它的回答，不当作已收到，也不当作没收到；请求失败显示失败原因。有未保存的修改时按钮不可用，因为验证的是已保存的那份。
 - 文件损坏时不覆盖它，页面显示错误，请求照常发送但不带提示词（服务日志打印一次 warning）。
 
 ## Project Trust
@@ -516,7 +520,7 @@ Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆�
 
 两个都是 global 设置，在 设置 → Git 修改，`/git` 面板可以临时用另一种模式运行一次（不改设置）。
 
-- `mode: "instructions"`（默认）：按 `instructions` 工作。Commit 用 Commit Description 模型写说明（提示词只影响写法），同时按提示词检查改动，要求停下就不提交；按提示词模式下仍保留提交前 hook 失败的自动修复（最多 3 轮）。Push 先按提示词检查待推送的提交，要求停下就不推送；推送后在后台跟进这个 commit 的 CI，提示词要求 CI 通过时自动修复、只提交修复改到的文件并重新 Push，最多 3 轮。
+- `mode: "instructions"`（默认）：按 `instructions` 工作。Commit 用 Commit Description 模型写说明（提示词只影响写法），同时按提示词检查改动，要求停下就不提交；按提示词模式下仍保留提交前 hook 失败的自动修复（最多 3 轮；需要用户批准的检查在第一轮就询问，某轮修复没改任何文件即停止）。Push 先按提示词检查待推送的提交，要求停下就不推送；推送后在后台跟进这个 commit 的 CI，提示词要求 CI 通过时自动修复、只提交修复改到的文件并重新 Push，最多 3 轮。
 - `mode: "direct"`：Commit 不调用模型，用文件清单生成说明后立即提交，不检查、不修复；`skipHooks: true` 时带 `--no-verify`。Push 只推送，不查 CI。
 - `instructions`：没有这个字段时使用内置默认提示词（`system-prompts/common/tasks/git-commit-default-instructions.md`、`git-push-default-instructions.md`）；空字符串表示不检查，Commit 说明按内置规则写。Web UI 的提示词框只显示这里保存的文字，没有时为空，并提示留空就用内置提示词；清空后保存会删除这个字段（`POST /api/git/preferences` 里的 `instructions: null`），回到内置默认。
 - 无论提示词怎么写，都不会绕过检查、强制 Push、改写已 Push 的提交或改 Git 配置；这些限制写在代码里，不由提示词决定。

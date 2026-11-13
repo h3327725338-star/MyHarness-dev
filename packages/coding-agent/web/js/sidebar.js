@@ -15,6 +15,7 @@ import { WorkspaceSettings } from "./workspace-settings.js";
 import { openSourcesPage } from "./sources-page.js";
 import { preloadSchedules, toggleSchedulesPage } from "./schedules.js";
 import { peekSidebarEnter, peekSidebarLeave } from "./sidebar-peek.js";
+import { deriveSync, summaryLine, syncSummary } from "./sync-status.js";
 
 // The chat lists look a key up for every chat several times on every render (a mode switch renders a group of 500
 // chats a few times over), so each path is lowered once and kept: a few thousand short strings, and the cache starts
@@ -562,6 +563,27 @@ function AddWorkspaceDialog({ onClose }) {
 		}} />`;
 }
 
+/**
+ * Google Drive sync at a glance, beside Settings: the Drive mark with a dot in the state's color (green up to date,
+ * pulsing while something moves, amber when something needs the user, red when sync cannot go on). Hovering says it in
+ * words; a click opens the sync page. Not shown until Drive is connected, so it never nags about a feature not in use.
+ */
+function SyncIndicator() {
+	const status = useStore((s) => s.syncStatus);
+	// "2 min ago" in the tooltip must not stand still while nothing else redraws the sidebar.
+	const [, tick] = useState(0);
+	useEffect(() => {
+		const timer = setInterval(() => tick((value) => value + 1), 30_000);
+		return () => clearInterval(timer);
+	}, []);
+	if (!status?.connected) return null;
+	const summary = syncSummary(status, deriveSync(status));
+	const line = summaryLine(summary);
+	return html`<button class=${`sync-ind tone-${summary.tone}`} title=${`${t("Google Drive sync")}: ${line}`} aria-label=${`${t("Google Drive sync")}: ${line}`} onClick=${() => setView({ settingsOpen: true, settingsSection: "sync" })}>
+		<${Icon} name="drive" size=${15} /><i />
+	</button>`;
+}
+
 export function Sidebar() {
 	const ws = useStore((s) => s.workspaces);
 	const shortcuts = useStore((s) => s.view.shortcuts);
@@ -733,6 +755,7 @@ export function Sidebar() {
 		${exportReadOnly() ? html`<${ExportSidebarFoot} />` : null}
 		<div class="sidebar-foot">
 			${exportReadOnly() ? null : html`<button class="nav-btn grow" onClick=${() => setView({ settingsOpen: true })}><${Icon} name="gear" size=${16} />${t("Settings")}</button>`}
+			${exportReadOnly() ? null : html`<${SyncIndicator} />`}
 			<span class=${`conn ${connected ? "on" : "off"}`} title=${connected ? t("Connected to the local MyHarness server") : gaveUp ? t("Disconnected — retrying") : t("Reconnecting…")}><span class=${`dot ${connTone}`} /></span>
 		</div>
 		<${Resizer} side="right" min=${200} max=${460} getValue=${() => state.view.sidebarW} onChange=${onWidth} onEnd=${() => setView({ sidebarW: state.view.sidebarW })} />

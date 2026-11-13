@@ -21,8 +21,6 @@
 /* Settings: one design language for every page. A page is a title, a one-line note and cards; a card holds rows with
    the text on the left and the control in a fixed-width column on the right. */
 .settings-modal .modal-body { padding: 0; }
-/* Settings → Providers needs the room of a wider dialog; going to and from that page the width glides. */
-.settings-modal { transition: width var(--t-slow) var(--ease); }
 .language-progress { width: 160px; height: 5px; accent-color: var(--accent); border: 0; border-radius: var(--r-md); overflow: hidden; background: var(--bg-panel); }
 .language-progress::-webkit-progress-bar { background: var(--border); }
 .language-progress::-webkit-progress-value { background: var(--accent); }
@@ -230,7 +228,7 @@
 .settings-body.wide { display: flex; flex-direction: column; padding-right: 10px; padding-bottom: 0; }
 .settings-body.wide > .settings-title { flex: none; }
 .prov-page { flex: 1 0 auto; }
-.prov { flex: 1 0 auto; display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 16px; align-items: start; }
+.prov { flex: 1 0 auto; display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 12px; align-items: start; }
 .prov-detail { align-self: stretch; }
 .prov-fill { flex: 1 0 auto; }
 .prov-list { position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); max-height: calc(100vh - 260px); overflow-y: auto; }
@@ -318,7 +316,8 @@
 .prov-group-label { flex: none; margin-right: 4px; font-weight: 600; }
 .prov-group-sum { display: grid; flex: 1 1 auto; min-width: 0; align-items: center; }
 .prov-group-chips, .prov-group-hint { grid-area: 1 / 1; min-width: 0; transition: opacity var(--t-base) var(--ease), transform var(--t-slow) var(--ease); }
-.prov-group-chips { display: flex; gap: 6px; overflow: hidden; }
+/* The dialog is as wide as on every other page: chips that do not fit on one line go to a second one, whole. */
+.prov-group-chips { display: flex; flex-wrap: wrap; gap: 4px 6px; overflow: hidden; }
 .prov-group-hint { font-size: var(--fs-xs); opacity: 0; transform: translateY(4px); }
 .prov-group-row[aria-expanded="true"] .prov-group-chips { opacity: 0; transform: translateY(-4px); }
 .prov-group-row[aria-expanded="true"] .prov-group-hint { opacity: 1; transform: none; }
@@ -536,6 +535,9 @@
 .model-prompt-name { font-weight: 550; overflow-wrap: anywhere; }
 .model-prompt-sub { overflow-wrap: anywhere; }
 .model-prompt-snippet { grid-column: 1 / -1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* The result of "Check that it arrives": the verdict, then what the model repeated, as a quote. */
+.notice.model-prompt-check { flex-direction: column; gap: 6px; margin: 0; white-space: normal; }
+.model-prompt-check-answer { max-height: 9.5em; overflow: auto; padding: 6px 8px; border-radius: var(--r-sm); background: var(--bg); border: 1px solid var(--border); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Workspace settings (workspace-settings.js): two quiet groups told apart by spacing and a small heading; the
    instructions box reuses the personal prompt's maximize corner and keeps its own row count. */
 .ws-set { gap: 18px; }
@@ -543,22 +545,29 @@
 .ws-set-title { font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); }
 .ws-set-instructions { min-height: 0; }
 
-/* Image lightbox (ImageLightboxHost in lightbox.js): a fullscreen dark scrim above every other overlay, the image
-   centered inside 90% of the viewport, a round close button pinned to the image's top-right corner. The ".open" class
-   follows usePresence: the scrim fades in while the image settles from a slight scale, and both linger for the exit
-   transition before the host unmounts. Local variables only: shared tokens stay in tokens.css. */
-.lightbox-scrim { --lightbox-scrim: rgba(0, 0, 0, 0.82); --lightbox-frame: rgba(255, 255, 255, 0.14); position: fixed; inset: 0; z-index: 600; display: grid; place-items: center; padding: 5vh 5vw; background: var(--lightbox-scrim); opacity: 0; transition: opacity 170ms ease-out; overflow: hidden; }
+/* Image viewer (ImageLightboxHost in lightbox.js): a fullscreen dark scrim above every other overlay. The picture sits
+   on the window's center, sized in its own pixels times the zoom and moved by a transform (the script sets both); a
+   pill of zoom controls sits at the bottom and a round close button in the corner. The dialog itself lets clicks
+   through, so a press on the empty dark area reaches the scrim and closes the viewer. The ".open" class follows
+   usePresence: the scrim fades in and lingers for the exit before the host unmounts. Local variables only. */
+.lightbox-scrim { --lightbox-scrim: rgba(0, 0, 0, 0.86); --lightbox-frame: rgba(255, 255, 255, 0.14); position: fixed; inset: 0; z-index: 600; background: var(--lightbox-scrim); opacity: 0; transition: opacity 170ms ease-out; overflow: hidden; touch-action: none; overscroll-behavior: contain; }
 .lightbox-scrim.open { opacity: 1; }
-.lightbox-dialog { position: relative; max-width: 90vw; max-height: 90vh; display: grid; place-items: center; }
-.lightbox-img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: var(--r-lg); border: 1px solid var(--lightbox-frame); box-shadow: var(--shadow-pop), 0 24px 80px rgba(0, 0, 0, 0.55); background: rgba(255, 255, 255, 0.03); transform: scale(0.96); transition: transform 170ms ease-out; }
-.lightbox-scrim.open .lightbox-img { transform: none; }
-.lightbox-close { position: absolute; top: -18px; right: -18px; width: 36px; height: 36px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; background: rgba(28, 29, 29, 0.88); border: 1px solid var(--lightbox-frame); color: var(--text); box-shadow: var(--shadow-pop); backdrop-filter: blur(6px); transition: background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
+.lightbox-dialog { position: absolute; inset: 0; pointer-events: none; }
+.lightbox-dialog > * { pointer-events: auto; }
+.lightbox-img { position: absolute; left: 50%; top: 50%; max-width: none; max-height: none; border-radius: var(--r-sm); box-shadow: 0 0 0 1px var(--lightbox-frame), 0 24px 80px rgba(0, 0, 0, 0.55); background: rgba(255, 255, 255, 0.03); cursor: grab; user-select: none; -webkit-user-select: none; -webkit-user-drag: none; will-change: transform; }
+.lightbox-img.dragging { cursor: grabbing; }
+.lightbox-bar { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); display: flex; align-items: center; gap: 2px; padding: 4px 6px; border-radius: var(--r-pill); background: rgba(28, 29, 29, 0.9); border: 1px solid var(--lightbox-frame); box-shadow: var(--shadow-pop); backdrop-filter: blur(6px); white-space: nowrap; }
+.lightbox-tool { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 30px; height: 30px; padding: 0 8px; border-radius: var(--r-pill); color: rgba(255, 255, 255, 0.92); font-size: var(--fs-sm); transition: background var(--t-fast) var(--ease); }
+.lightbox-tool:hover:not(:disabled) { background: rgba(255, 255, 255, 0.14); }
+.lightbox-tool:disabled { opacity: 0.35; }
+.lightbox-tool:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+.lightbox-percent { min-width: 56px; font-variant-numeric: tabular-nums; }
+.lightbox-sep { width: 1px; height: 16px; margin: 0 4px; background: rgba(255, 255, 255, 0.18); }
+.lightbox-size { padding: 0 8px 0 6px; color: rgba(255, 255, 255, 0.55); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.lightbox-close { position: absolute; top: 16px; right: 16px; width: 36px; height: 36px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; background: rgba(28, 29, 29, 0.88); border: 1px solid var(--lightbox-frame); color: #fff; box-shadow: var(--shadow-pop); backdrop-filter: blur(6px); transition: background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); }
 .lightbox-close:hover { background: rgba(58, 60, 60, 0.95); transform: scale(1.06); }
 .lightbox-close:active { transform: scale(0.96); }
 .lightbox-close:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; border-radius: 50%; }
-@media (prefers-reduced-motion: reduce) {
-	.lightbox-img { transform: none; }
-}
 
 /* Personal prompt fullscreen editor (PersonalFullscreen in overlays-settings.js): a scrim above the settings dialog
    and the quote card (z-index 220: under the popover menu's 500 and the image lightbox's 600) with one dialog that
@@ -625,6 +634,26 @@
 .svc-adv-item .svc-setup { border-top: 0; padding-top: 10px; }
 .svc-adv-item .svc-app { border-top: 0; }
 .svc-foot { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: var(--fs-sm); color: var(--text-3); }
+/* Phone link (PhoneLinkPage in phone-link-page.js): the same cards; the pairing code is a white tile so a camera reads
+   it in every theme. */
+.phone-pair { display: flex; align-items: center; gap: 20px; padding: 16px; border-top: 1px solid var(--border); }
+.phone-qr { flex: none; width: 208px; height: 208px; border-radius: var(--r-md); background: #fff; box-shadow: 0 0 0 1px var(--border); animation: phone-qr-in 220ms var(--ease-out, ease-out) both; }
+@keyframes phone-qr-in { from { opacity: 0; transform: scale(0.96); } }
+:root[data-motion="off"] .phone-qr { animation: none; }
+.phone-pair-text { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.phone-pair-title { font-size: var(--fs-body); font-weight: 650; }
+.phone-pair-copy { display: flex; align-items: center; gap: 6px; }
+.phone-addresses { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; color: var(--text-2); }
+.phone-addresses.warn, .svc-note.warn { color: var(--warn); }
+.phone-addresses code { padding: 1px 6px; border-radius: var(--r-sm); background: var(--bg-inset); font-family: var(--font-mono); font-size: var(--fs-sm); user-select: all; }
+.phone-port { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.phone-port .field { width: 96px; }
+.phone-port .set-desc { flex: 1 1 220px; min-width: 0; }
+.phone-empty { padding: 14px 16px; font-size: var(--fs-sm); color: var(--text-3); }
+.phone-foot { align-items: flex-start; line-height: 1.5; }
+.phone-foot svg { flex: none; margin-top: 3px; }
+.svc-card > .svc-account:first-child { border-top: 0; }
+@media (max-width: 640px) { .phone-pair { flex-direction: column; align-items: flex-start; } }
 @media (max-width: 760px) {
 	/* Too narrow for the action beside the name: it goes under the card head; account buttons go under the address. */
 	.svc-head { flex-wrap: wrap; }
@@ -634,32 +663,54 @@
 	.svc-fields { padding-left: 0; }
 }
 
-/* Google Drive sync (SyncPage in sync-page.js): the page reuses .set-card/.set-row; only the field pairs, the
-   review list and the footer need their own layout. Values come from the shared tokens, never a local palette. */
+/* Google Drive sync (SyncPage in sync-page.js). The page reuses .set-card/.set-row; its own pieces are the status at
+   the top, the check-marked "what travels" lines and the field pairs. Values come from the shared tokens. */
 .sync-field { width: 100%; gap: 8px; align-items: center; min-width: 0; }
 .sync-field .field { min-width: 0; flex: 1 1 auto; }
 .sync-paths { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; max-width: 100%; min-width: 0; }
 .sync-paths .mono { max-width: 100%; }
 /* A path is shown whole, broken wherever it has to, never cut off with an ellipsis. */
 .sync-path { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-.sync-list { display: grid; gap: 6px; padding: 4px 0 12px; line-height: 1.5; }
-.sync-foot { display: flex; align-items: center; gap: 10px; padding: 10px 0 12px; }
-.sync-foot .btn { flex: 0 0 auto; }
-/* The "Show details" row of the What-syncs card: a button is as wide as its text unless it is told otherwise, so the
-   whole row - not just the two words - is the hit area, with a tint that says it is clickable. The negative margins undo
-   the card body's padding, so the row spans the card and its label lines up with the card head above it. */
+.sync-note { padding: 10px 0 12px; max-width: none; border-top: 1px solid var(--border); }
+/* The status: a round mark in the state's color, one title and one line under it, the one button that fits the state,
+   and a bar across the bottom edge while something moves. */
+.sync-top { overflow: hidden; }
+.sync-hero { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px 14px; padding: 16px; }
+.sync-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 50%; background: var(--surface-active); color: var(--text-2); }
+.sync-hero.tone-ok .sync-mark { background: var(--ok-soft); color: var(--ok); }
+.sync-hero.tone-busy .sync-mark { background: var(--accent-soft); color: var(--accent); }
+.sync-hero.tone-warn .sync-mark { background: var(--warn-soft); color: var(--warn); }
+.sync-hero.tone-danger .sync-mark { background: var(--danger-soft); color: var(--danger); }
+.sync-hero-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sync-hero-title { font-size: var(--fs-read); font-weight: 650; line-height: 22px; color: var(--text); }
+.sync-hero-detail { font-size: var(--fs-sm); line-height: 17px; color: var(--text-2); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.sync-bar { grid-column: 1 / -1; display: block; height: 4px; border-radius: 2px; background: var(--bg-inset); overflow: hidden; }
+.sync-bar > i { display: block; height: 100%; background: var(--accent); border-radius: inherit; transition: width var(--t-base) var(--ease); }
+/* Moving, but nothing to count yet (checking Drive): a short piece that travels along the bar. */
+.sync-bar.moving > i { width: 28%; animation: sync-slide 1.3s ease-in-out infinite; }
+@keyframes sync-slide { from { transform: translateX(-100%); } to { transform: translateX(360%); } }
+@media (prefers-reduced-motion: reduce) { .sync-bar.moving > i { animation: none; width: 100%; opacity: 0.5; } }
+.sync-top > .set-card-body { border-top: 1px solid var(--border); }
+.sync-inset { margin: 0 16px 14px; }
+/* "What travels": a check mark (or a dash for what does not), the name and what it covers, and a button only where
+   there is something to switch. */
+.set-row.sync-travels { grid-template-columns: 20px minmax(0, 1fr) auto; column-gap: 12px; align-items: start; padding: 10px 0; }
+.set-row.sync-travels .set-control { width: auto; align-self: center; }
+.set-row.sync-travels.wide { grid-template-columns: 20px minmax(0, 1fr); }
+.set-row.sync-travels.wide .set-control { grid-column: 2; width: 100%; margin-top: 8px; justify-content: stretch; }
+/* A row that is only words (nothing to switch or press): the words take the whole width. */
+.set-row.sync-full { grid-template-columns: minmax(0, 1fr); }
+.sync-tick { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--surface-active); color: var(--text-3); }
+.sync-tick.on { background: var(--ok-soft); color: var(--ok); }
+/* The folded Advanced card: the whole head is the button. */
+.set-card-head.sync-advanced { width: 100%; border-radius: var(--r-lg); cursor: pointer; }
+.set-card-head.sync-advanced:hover { background: var(--surface-hover); }
+.set-card-head.sync-advanced[aria-expanded="true"] { border-radius: var(--r-lg) var(--r-lg) 0 0; }
+/* A toggle row inside a card body: a button is as wide as its text unless it is told otherwise, so the whole row - not
+   just the words - is the hit area, with a tint that says it is clickable. The negative margins undo the card body's
+   padding, so the row spans the card and its label lines up with the card head above it. */
 .set-card-body > .set-card-toggle { width: calc(100% + 32px); margin: 0 -16px; padding: 0 16px; min-height: 40px; border-radius: var(--r-md); }
 .set-card-body > .set-card-toggle:hover { background: var(--surface-hover); }
-/* Where a jump button landed. The page is often already scrolled as far as it goes, so the outline - not the scroll -
-   is what shows the click did something; sync-page.js removes the class after a moment. */
-.sync-hit { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* The manual-run message on its own line under the buttons: full width and readable, with the Review jump kept beside it. */
-.sync-runline { display: flex; align-items: center; gap: 8px; padding: 2px 0 12px; color: var(--text-2); }
-.sync-runline .btn { flex: none; }
-/* A waiting count while its stage moves: "done / total" over a thin bar that fills as the pass goes. */
-.sync-count { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 4px; min-width: 120px; }
-.sync-meter { display: block; width: 100%; height: 4px; border-radius: 2px; background: var(--bg-inset); overflow: hidden; }
-.sync-meter > i { display: block; height: 100%; background: var(--accent); border-radius: inherit; transition: width var(--t-base) var(--ease); }
 /* The desktop window's close question (app.js CloseAppModal): two large choices, the safe one first. */
 .close-choices { display: flex; flex-direction: column; gap: 8px; }
 .close-choice { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 12px 12px 14px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-raised); color: var(--text); font: inherit; text-align: left; cursor: pointer; transition: border-color var(--t-fast), background var(--t-fast); }

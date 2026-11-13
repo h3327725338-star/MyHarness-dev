@@ -10,7 +10,8 @@
 /**
  * `prompt` is the General personal prompt; `saved-prompts` is the Web UI's list of saved prompts (My prompts);
  * `browser` is one file of the built-in browser's desktop profile (browser-data.ts); `schedules` is the list of
- * scheduled tasks (schedules/store.ts).
+ * scheduled tasks (schedules/store.ts); `settings` is one part of the configuration that travels (settings-data.ts):
+ * Providers and models, saved API keys, model and agent settings, model prompts, web search keys.
  */
 export type SyncEntityKind =
 	| "memory"
@@ -21,7 +22,8 @@ export type SyncEntityKind =
 	| "prompt"
 	| "saved-prompts"
 	| "browser"
-	| "schedules";
+	| "schedules"
+	| "settings";
 
 /** Per-device logical clock. A record is newer when its vector dominates the other one. */
 export type VersionVector = Record<string, number>;
@@ -55,6 +57,11 @@ export interface SyncBatch {
 	deviceName: string;
 	createdAt: string;
 	operations: SyncOperation[];
+	/**
+	 * Content of this batch's small records by hash, base64, so the receiver does not download each one. Optional: a
+	 * version that does not know it downloads the objects, which are uploaded all the same.
+	 */
+	inline?: Record<string, string>;
 }
 
 export interface SyncSpaceIdentity {
@@ -279,6 +286,11 @@ export interface SyncStatusSnapshot {
 	files?: import("./files/types.ts").WorkspaceFileSyncStatus;
 	/** Set by the service: MyHarness ships its own Google OAuth app, so signing in needs no client of the user's. */
 	builtInClient?: boolean;
+	/**
+	 * Set by the service: this MyHarness is used signed in with Google (the desktop app). While `connected` is false the
+	 * page shows the sign-in screen instead of the app.
+	 */
+	signInRequired?: boolean;
 }
 
 /** What the scanner found locally. Content is read lazily; unchanged files are not hashed twice. */
@@ -303,7 +315,15 @@ export interface SyncEngineOptions {
 	deviceName: string;
 	isSessionActive?: (workspaceId: string, sessionId: string) => boolean;
 	onStatus?: (status: SyncStatusSnapshot) => void;
-	onApplied?: (info: { workspacesChanged: boolean; sessionsChanged: boolean }) => void;
+	onApplied?: (info: SyncAppliedInfo) => void;
+}
+
+/** What a round of applied changes touched, for the page and the running chats. */
+export interface SyncAppliedInfo {
+	workspacesChanged: boolean;
+	sessionsChanged: boolean;
+	/** Providers, keys or settings arrived from another computer: running chats reload them. */
+	settingsChanged?: boolean;
 }
 
 export interface RemoteFile {
@@ -314,6 +334,8 @@ export interface RemoteFile {
 	modifiedTime?: string;
 	/** Drive's own clock: what an incremental listing continues from. */
 	createdTime?: string;
+	/** The file's custom properties, when the listing asked for them (the phone link's small files ride in them, remote.ts). */
+	properties?: Record<string, string>;
 }
 
 export type RemoteFolder = "root" | "batches" | "objects" | "snapshots" | "files";

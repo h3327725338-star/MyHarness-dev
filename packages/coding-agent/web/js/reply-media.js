@@ -119,7 +119,36 @@ function draw(figure, entry) {
 	figure.dataset.mediaState = "ready";
 	// Side by side, pictures share the row's width by their shapes, so they come out at one height.
 	figure.style.setProperty("--fig-ratio", String(entry.width / Math.max(1, entry.height)));
+	// A picture is never drawn larger than its own pixels: enlarged it only gets blurred. The large view is for that.
+	figure.style.setProperty("--fig-natural", `${entry.width}px`);
 	frame.replaceChildren(image);
+}
+
+/**
+ * Numbers the figures of one reply in the order they stand in it, the way a paper does: "Figure 1", "Figure 2"..., and
+ * (a), (b)... for the parts of a figure made of several pictures. Counted on the page rather than while the Markdown
+ * is turned into HTML, because that happens piece by piece and from a cache. Pictures inside a line of text, video and
+ * sound are not figures and get no number.
+ */
+export function numberFigures(root) {
+	let number = 0;
+	const write = (element, text) => {
+		if (element && element.textContent !== text) element.textContent = text;
+	};
+	for (const element of root.querySelectorAll(".md-fig-group, .md-fig")) {
+		if (element.classList.contains("md-fig-group")) {
+			number += 1;
+			write(element.querySelector(":scope > .md-fig-group-cap > .md-fig-no"), t("Figure {n}", { n: number }));
+			[...element.querySelectorAll(":scope > .md-fig-row > .md-fig")].forEach((part, index) => {
+				write(part.querySelector(".md-fig-no"), `(${String.fromCharCode(97 + (index % 26))})`);
+			});
+			continue;
+		}
+		if (element.closest(".md-fig-group")) continue;
+		if (element.dataset.mediaKind !== "image" || element.dataset.layout === "inline") continue;
+		number += 1;
+		write(element.querySelector(".md-fig-no"), t("Figure {n}", { n: number }));
+	}
 }
 
 function player(figure, slot) {
@@ -146,6 +175,7 @@ function fitWrap(root) {
  * browser paints: a picture loaded before is in place in the same frame its element appears.
  */
 export function showReplyMedia(root, slot) {
+	numberFigures(root);
 	const figures = root.querySelectorAll(".md-fig[data-media-src]:not([data-media-state])");
 	const wraps = root.querySelector('.md-fig[data-layout="left"], .md-fig[data-layout="right"]');
 	if (wraps) {

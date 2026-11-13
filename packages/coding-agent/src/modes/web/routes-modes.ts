@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+import { checkModelPrompt } from "../../providers/models/model-prompt-check.ts";
 import { ModelPromptStore } from "../../providers/models/model-prompts.ts";
+import { mergeProviderAttributionHeaders } from "../../providers/runtime/attribution.ts";
 import { SessionManager } from "../../session/manager/index.ts";
 import { type ChatDraft, ModeStateStore } from "../../session/mode-state.ts";
 import type { ChatMode } from "../../session/types.ts";
@@ -136,5 +138,36 @@ export function registerModeRoutes(server: WebHttpServer, host: WebHost, hub: We
 		store.set(provider, model, prompt);
 		host.broadcast("model_prompts_changed", {});
 		return { prompts: store.list() };
+	});
+	// "Check that it arrives": one real request to the model, which is asked to quote the instructions it was given for
+	// itself (providers/models/model-prompt-check.ts). It checks the saved prompt, the one requests carry.
+	server.route("POST", "/api/model-prompts/check", async ({ body, res }) => {
+		const input = object(body);
+		const { provider, model: modelId } = input;
+		if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "A Provider ID is required");
+		if (typeof modelId !== "string" || !modelId.trim()) throw new HttpError(400, "A Model ID is required");
+		const prompt = modelPrompts().get(provider, modelId);
+		if (!prompt) throw new HttpError(400, "This model has no saved prompt to check.");
+		const runtime = host.session.modelRuntime;
+		const model = runtime.isProviderEnabled(provider) ? runtime.getModel(provider, modelId) : undefined;
+		if (!model) throw new HttpError(400, `This model is not available now: ${provider}/${modelId}`);
+		// A closed settings page stops the request.
+		const controller = new AbortController();
+		res.once("close", () => {
+			if (!res.writableEnded) controller.abort();
+		});
+		const sessionId = host.session.sessionId;
+		try {
+			return await checkModelPrompt({
+				runtime,
+				model,
+				prompt,
+				signal: controller.signal,
+				sessionId,
+				headers: mergeProviderAttributionHeaders(model, host.session.settingsManager, sessionId),
+			});
+		} catch (error) {
+			throw new HttpError(502, error instanceof Error ? error.message : String(error));
+		}
 	});
 }

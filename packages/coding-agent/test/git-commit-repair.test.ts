@@ -64,27 +64,83 @@ it.each(["exit", "timeout", "spawn"] as const)("does not repair or retry a %s fa
 	expect(createGitCommitForPathsAsync).toHaveBeenCalledTimes(1);
 	expect(phase.mock.calls.map(([name]) => name)).toEqual(["checking", "generating", "submitting"]);
 });
+/** The working tree as the mocked Git reads it; a repair round that edits files changes it. */
+let workingTree = context.diff;
+/** A repair round that edits files (a new delta each round) and then finishes normally. */
+const editingRepair = () =>
+	vi.fn(async () => {
+		workingTree = `${workingTree} + repair`;
+		return true;
+	});
+beforeEach(() => {
+	workingTree = context.diff;
+	vi.mocked(readCommitMessageContext).mockImplementation(async () => ({ ...context, diff: workingTree }));
+});
 it("repairs an explicitly failed pre-commit hook once and regenerates from the repaired diff", async () => {
-	const repairCode = vi.fn().mockResolvedValue(true);
+	const repairCode = editingRepair();
 	vi.mocked(createGitCommitForPathsAsync)
 		.mockResolvedValueOnce({ ...failed, stderr: "husky - pre-commit script failed (code 1)" })
 		.mockResolvedValueOnce({ ...failed, ok: true });
-	const repaired = { ...context, diff: "repaired changes" };
-	vi.mocked(readCommitMessageContext)
-		.mockResolvedValueOnce(context)
-		.mockResolvedValueOnce(context)
-		.mockResolvedValue(repaired);
 	const result = await new GitCommitUseCase({ updatePhase: vi.fn(), generateMessage, repairCode }).execute({
 		repositoryRoot: "repo",
 	});
 	expect(result.status).toBe("committed");
 	expect(repairCode).toHaveBeenCalledTimes(1);
 	expect(generateMessage).toHaveBeenCalledTimes(2);
-	expect(generateMessage).toHaveBeenLastCalledWith(repaired);
+	expect(generateMessage).toHaveBeenLastCalledWith({ ...context, diff: `${context.diff} + repair` });
 	expect(createGitCommitForPathsAsync).toHaveBeenCalledTimes(2);
 });
-it("stops after three repair rounds and reports the limit with the latest hook failure", async () => {
+it("stops after a repair round that changed no files instead of running the same checks again", async () => {
 	const repairCode = vi.fn().mockResolvedValue(true);
+	vi.mocked(createGitCommitForPathsAsync).mockResolvedValue({
+		...failed,
+		stderr: "husky - pre-commit script failed (code 1)",
+	});
+	const result = await new GitCommitUseCase({ updatePhase: vi.fn(), generateMessage, repairCode }).execute({
+		repositoryRoot: "repo",
+	});
+	expect(result.status).toBe("failed");
+	expect(repairCode).toHaveBeenCalledTimes(1);
+	expect(generateMessage).toHaveBeenCalledTimes(1);
+	expect(createGitCommitForPathsAsync).toHaveBeenCalledTimes(1);
+	if (result.status !== "failed") throw new Error("Expected failure");
+	expect(result.failure.stderr).toContain("husky - pre-commit script failed");
+	expect(result.failure.stderr).toContain("the repair round changed no files");
+});
+it("compares the whole working tree, not only the files this commit is limited to", async () => {
+	// The round edited a file outside `only` (an approvals list the check reads): that is a change, so it retries.
+	let outside = "approvals: old";
+	const repairCode = vi.fn(async () => {
+		outside = "approvals: new";
+		return true;
+	});
+	vi.mocked(readCommitMessageContext).mockImplementation(async (_root, paths) => ({
+		...context,
+		paths,
+		diff: paths.includes("approvals.json") ? `${context.diff} | ${outside}` : context.diff,
+	}));
+	vi.mocked(getGitWorkingTreePathsAsync).mockResolvedValue({ paths: ["approvals.json", "source.ts"] });
+	vi.mocked(createGitCommitForPathsAsync)
+		.mockResolvedValueOnce({ ...failed, stderr: "pre-commit hook failed" })
+		.mockResolvedValueOnce({ ...failed, ok: true, commitHash: "approved" });
+	const result = await new GitCommitUseCase({ updatePhase: vi.fn(), generateMessage, repairCode }).execute({
+		repositoryRoot: "repo",
+		only: ["source.ts"],
+	});
+	expect(result.status).toBe("committed");
+	expect(repairCode).toHaveBeenCalledTimes(1);
+	expect(createGitCommitForPathsAsync).toHaveBeenCalledTimes(2);
+	expect(createGitCommitForPathsAsync).toHaveBeenLastCalledWith(
+		"repo",
+		["source.ts"],
+		message.full,
+		undefined,
+		undefined,
+		{ noVerify: false },
+	);
+});
+it("stops after three repair rounds and reports the limit with the latest hook failure", async () => {
+	const repairCode = editingRepair();
 	vi.mocked(createGitCommitForPathsAsync).mockResolvedValue({
 		...failed,
 		stderr: "husky - pre-commit script failed (code 1)",
@@ -101,7 +157,7 @@ it("stops after three repair rounds and reports the limit with the latest hook f
 	expect(result.failure.stderr).toContain("stopped after 3 rounds");
 });
 it.each([2, 3])("can commit after repair round %s", async (rounds) => {
-	const repairCode = vi.fn().mockResolvedValue(true);
+	const repairCode = editingRepair();
 	const submit = vi.mocked(createGitCommitForPathsAsync);
 	for (let round = 0; round < rounds; round++) {
 		submit.mockResolvedValueOnce({ ...failed, stderr: "pre-commit hook failed" });

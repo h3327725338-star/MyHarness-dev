@@ -1,0 +1,65 @@
+plugins {
+	id "com.android.application"
+}
+
+// The release key lives outside the repository (see ../../README.md). build.mjs creates it once and passes its
+// location here; without it a release build is signed with the debug key so that it still installs.
+def signingFile = providers.gradleProperty("myharnessSigningProperties").orNull
+def signing = new Properties()
+if (signingFile && file(signingFile).exists()) {
+	file(signingFile).withInputStream { signing.load(it) }
+}
+
+android {
+	namespace "com.myharness.mobile"
+	compileSdk 37
+
+	defaultConfig {
+		applicationId "com.myharness.mobile"
+		minSdk 26
+		targetSdk 36
+		versionCode((providers.gradleProperty("myharnessVersionCode").orNull ?: "1") as Integer)
+		versionName(providers.gradleProperty("myharnessVersionName").orNull ?: "0.0.0")
+	}
+
+	signingConfigs {
+		release {
+			if (signing.getProperty("storeFile")) {
+				storeFile file(signing.getProperty("storeFile"))
+				storePassword signing.getProperty("storePassword")
+				keyAlias signing.getProperty("keyAlias")
+				keyPassword signing.getProperty("keyPassword")
+			}
+		}
+	}
+
+	buildTypes {
+		release {
+			minifyEnabled false
+			signingConfig signing.getProperty("storeFile") ? signingConfigs.release : signingConfigs.debug
+		}
+	}
+
+	compileOptions {
+		sourceCompatibility JavaVersion.VERSION_17
+		targetCompatibility JavaVersion.VERSION_17
+	}
+
+	buildFeatures {
+		buildConfig true
+	}
+
+	packaging {
+		resources {
+			excludes += ["META-INF/*.kotlin_module", "META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
+		}
+	}
+}
+
+dependencies {
+	implementation "androidx.core:core:1.19.1"
+	implementation "androidx.activity:activity:1.13.0"
+	implementation "androidx.webkit:webkit:1.18.0"
+	implementation "com.squareup.okhttp3:okhttp:5.5.1"
+	implementation "com.journeyapps:zxing-android-embedded:4.3.0"
+}

@@ -25,7 +25,8 @@ Web UI 的服务端（`main()` 启动后进入的就是它，不需要 `--web` �
 | `generation-speed.ts`、`request-cache.ts` | 输出速度和每次请求的缓存命中率，只用 Provider 报告的真实数据 |
 | `terminal.ts` | Terminal 面板的真实 Shell（伪终端） |
 | `folder-dialog.ts` | 调用系统的文件夹选择窗口 |
-| `routes-core.ts`、`routes-sessions.ts`、`routes-files.ts`、`routes-git.ts`、`routes-settings.ts`、`routes-providers.ts`、`routes-accounts.ts`、`routes-mail.ts`、`routes-terminal.ts`、`routes-modes.ts` | 各组 API 路由 |
+| `routes-core.ts`、`routes-sessions.ts`、`routes-files.ts`、`routes-git.ts`、`routes-settings.ts`、`routes-providers.ts`、`routes-accounts.ts`、`routes-mail.ts`、`routes-terminal.ts`、`routes-modes.ts`、`routes-phone-link.ts` | 各组 API 路由 |
+| `phone-link/` | 手机连接（安卓 App 遥控本机，默认关闭）：`crypto.ts` 消息加密与防重放，`store.ts` 开关、端口和已配对手机（`phone-link.json`），`gateway.ts` 局域网网关——只转发固定清单里的接口和事件 |
 | `git-ci-follow-up.ts`、`git-records.ts` | Push 之后的后台 CI 跟进（不占用 Chat 和 Git 任务；Push 提示词要求 CI 通过时在 Chat 里修复、只提交修复改到的文件、再 Push，最多 3 轮）与服务端自己写入的结果卡片 |
 | `session-changes.ts` | 从会话条目收集文件差异（供变更展示用） |
 | `session-ownership.ts` | 未提交文件归哪个对话：最新一次改动说了算（谁最后改的谁提交） |
@@ -46,5 +47,7 @@ Web UI 的服务端（`main()` 启动后进入的就是它，不需要 `--web` �
 - `wire.ts` 只投影已有数据，不发明字段；前端不伪造后端没有返回的状态。
 - 新增 SSE 事件：在 `host.ts` 转发，在 `web/js/store.js` 消费。
 - 服务只接受回环连接并检查请求来源；凭证不离开服务端，浏览器只拿到标签和末四位。改 `http-server.ts` 或 Provider 路由时保持这些限制。
+- 手机连接是唯一监听局域网的入口。给手机开放新接口只能在 `phone-link/gateway.ts` 的 `ROUTES` 里加一条，并且自己列出允许的字段；不要做成“按前缀放行”。设置、文件、Git、终端、Provider 与凭证、手机连接自己的管理接口不得出现在清单里。改协议（消息格式、附加数据、二维码内容）时必须同时改 `packages/mobile/web/js/link-crypto.js` 和 `backend-remote.js`，并保持 `packages/mobile/test/link-crypto.test.mjs` 通过。
+- 手机的事件来自 `WebHttpServer.tap()`，不是一个 SSE 页面：不要把手机算进 `clientCount`（它决定通知和服务退出）。
 - `host.ts` 是唯一的会话宿主：任务收尾（变更检测、检查点结算、Auto Memory）只在这里与 `AgentSession` 衔接，改收尾语义时同时检查 `AgentSession` 的事件顺序（`agent_end` → 收尾 → `agent_settled`）与扩展事件。
-- 相关测试：`web-*.test.ts`（HTTP 安全、wire/changes/dialogs、前端纯逻辑、真实 runtime 的 HTTP/SSE 集成、终端、生命周期）。浏览器里的渲染与交互需要实际运行验证。
+- 相关测试：`phone-link.test.ts`（加密、存储、网关的配对 / 转发 / 清单 / 重放 / 限速）、`web-*.test.ts`（HTTP 安全、wire/changes/dialogs、前端纯逻辑、真实 runtime 的 HTTP/SSE 集成、终端、生命周期）。浏览器里的渲染与交互需要实际运行验证。

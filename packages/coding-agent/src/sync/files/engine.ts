@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, type FSWatcher, mkdirSync, watch } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, type FSWatcher, mkdirSync, rmSync, statSync, watch } from "node:fs";
+import { basename, join } from "node:path";
 import type { Workspace, WorkspaceStore } from "../../data/workspace-store.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
 import { nowIso, sha256 } from "../util.ts";
@@ -23,6 +23,7 @@ import { WorkspaceFileStateStore } from "./state.ts";
 import type {
 	WorkspaceFileConflict,
 	WorkspaceFileDescriptor,
+	WorkspaceFileEntry,
 	WorkspaceFileIssueReason,
 	WorkspaceFileManifest,
 	WorkspaceFileOperation,
@@ -524,6 +525,9 @@ export class WorkspaceFileSync {
 			this.options.onWorkspaceLocated?.(workspaceId);
 		}
 		this.phases.set(workspaceId, "scanning");
+		// Entries an older version left for the user to decide: both versions are already files in the folder, so they
+		// simply stay, and the question goes away.
+		if (this.settleConflicts(state, undefined)) this.stateStore.save(state);
 		let scan = await this.scan(state, workspace.rootPath);
 		let appliedAny = false;
 		for (const name of names.slice(0, MAX_MANIFESTS_PER_PASS)) {
@@ -576,6 +580,7 @@ export class WorkspaceFileSync {
 				state.applied.push(name);
 				continue;
 			}
+			const knownConflicts = new Set(state.conflicts.map((conflict) => conflict.id));
 			const applied = await applyWorkspaceFileManifest(
 				{
 					root: workspace.rootPath,
@@ -592,6 +597,8 @@ export class WorkspaceFileSync {
 				scan.incomplete,
 			);
 			for (const issue of applied.issues) this.addIssue(state, "apply-failed", issue);
+			// What both computers did to one file is settled at once, by the later change; nobody is asked.
+			const settled = this.settleConflicts(state, knownConflicts);
 			const deferrals = state.deferred ?? {};
 			state.deferred = deferrals;
 			if (applied.failed > 0) {
@@ -624,7 +631,7 @@ export class WorkspaceFileSync {
 			}
 			state.applied.push(name);
 			if (state.applied.length > MAX_APPLIED_MANIFESTS) state.applied = state.applied.slice(-MAX_APPLIED_MANIFESTS);
-			if (applied.applied > 0 || applied.downloaded > 0) {
+			if (applied.applied > 0 || applied.downloaded > 0 || settled > 0) {
 				appliedAny = true;
 				state.lastDownloadAt = nowIso();
 				// A later manifest in this same pass must see the files that just arrived.
@@ -658,14 +665,18 @@ export class WorkspaceFileSync {
 		}
 		const conflictPaths = new Set(state.conflicts.map((conflict) => conflict.path));
 		const puts: WorkspaceFileOperation[] = [];
+		const put = (path: string, entry: WorkspaceFileEntry): WorkspaceFileOperation => {
+			const mtime = entry.type === "file" ? scan.mtimes.get(path) : undefined;
+			return { ...entry, op: "put", ...(mtime ? { modifiedAt: new Date(mtime).toISOString() } : {}) };
+		};
 		for (const [path, entry] of scan.entries) {
 			if (conflictPaths.has(path)) continue;
 			const base = state.base[path];
 			if (!base || base.type !== entry.type) {
-				puts.push({ ...entry, op: "put" });
+				puts.push(put(path, entry));
 				continue;
 			}
-			if (entry.type === "file" && entry.hash !== base.hash) puts.push({ ...entry, op: "put" });
+			if (entry.type === "file" && entry.hash !== base.hash) puts.push(put(path, entry));
 		}
 		const unstablePaths = new Set(scan.unstable);
 		let deletes: WorkspaceFileOperation[] = [];
@@ -892,6 +903,52 @@ export class WorkspaceFileSync {
 			}
 		}
 		return accepted;
+	}
+
+	/**
+	 * Settle what two computers did differently to one file without asking the user. `known` are the entries that were
+	 * there before the change now being applied; without it only entries an older version left are cleared.
+	 *
+	 * - Both changed the file: the later change wins, by the files' own times. The other version is kept with the
+	 *   backups, not in the folder. A version whose time is not known (published by an older version) does not win.
+	 * - Deleted here, changed there: the changed file comes back (a change is never thrown away for a deletion).
+	 * - Deleted there, changed here: the file here stays and is published again.
+	 * - Entries from before (an older version asked the user): both files stay as they are.
+	 *
+	 * Every outcome is a normal file change here, so the next pass publishes it and the computers end up equal.
+	 */
+	private settleConflicts(state: WorkspaceFileState, known: ReadonlySet<string> | undefined): number {
+		let settled = 0;
+		const keep = (key: string, name: string, source: string) => this.backup(key, name, source);
+		for (const conflict of [...state.conflicts]) {
+			const fresh = known !== undefined && !known.has(conflict.id);
+			if (known !== undefined && !fresh) continue;
+			const copy =
+				conflict.remoteCopyPath && existsSync(conflict.remoteCopyPath) ? conflict.remoteCopyPath : undefined;
+			let choice: ConflictChoice = "keep-local";
+			if (fresh && copy) {
+				if (conflict.reason === "deleted-locally") choice = "take-remote";
+				else if (
+					conflict.reason === "both-modified" &&
+					changedAfterFile(conflict.remote?.modifiedAt, conflict.localPath)
+				)
+					choice = "take-remote";
+			}
+			if (fresh && copy && choice === "keep-local") {
+				// This computer's version is the later one: the other version leaves the folder for the backups.
+				try {
+					this.backup("workspace-file", basename(copy), copy);
+					rmSync(copy, { force: true });
+				} catch {
+					// Without a backup the other version stays in the folder as a file of its own.
+				}
+			}
+			if (!resolveFileConflict(state, conflict.id, choice, keep).ok) {
+				resolveFileConflict(state, conflict.id, "keep-local", keep);
+			}
+			settled += 1;
+		}
+		return settled;
 	}
 
 	private backup(key: string, name: string, source: string): string {
@@ -1231,4 +1288,15 @@ function isReservedRoot(dataRoot: string, agentDir: string, root: string): boole
 	const insideData = isPathInside(dataRoot, root) && !isManagedCopy(dataRoot, root);
 	const insideAgent = isPathInside(agentDir, root);
 	return insideData || insideAgent;
+}
+
+/** True when `at` is later than the file's last change; a file that is gone has no later change. */
+function changedAfterFile(at: string | undefined, path: string): boolean {
+	const time = Date.parse(at ?? "");
+	if (!Number.isFinite(time)) return false;
+	try {
+		return time > statSync(path).mtimeMs;
+	} catch {
+		return true;
+	}
 }

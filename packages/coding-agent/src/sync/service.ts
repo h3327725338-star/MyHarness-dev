@@ -8,8 +8,9 @@ import { WorkspaceFileSync } from "./files/engine.ts";
 import { GoogleWorkspaceFilePort } from "./files/google-port.ts";
 import type { WorkspaceFileSource } from "./files/types.ts";
 import { beginGoogleAuthorization, GoogleDriveClient } from "./google.ts";
+import type { PhoneDrivePort } from "./phone/port.ts";
 import { SyncLocalStore } from "./store.ts";
-import type { StoredGoogleCredentials, SyncStatusSnapshot } from "./types.ts";
+import type { StoredGoogleCredentials, SyncAppliedInfo, SyncRecord, SyncStatusSnapshot } from "./types.ts";
 import { sha256 } from "./util.ts";
 import {
 	detectFolderOwner,
@@ -25,7 +26,7 @@ export interface SyncServiceOptions {
 	dataRoot: string;
 	isSessionActive?: (workspaceId: string, sessionId: string) => boolean;
 	onStatus?: (status: SyncStatusSnapshot) => void;
-	onApplied?: (info: { workspacesChanged: boolean; sessionsChanged: boolean }) => void;
+	onApplied?: (info: SyncAppliedInfo) => void;
 	/**
 	 * Close every open chat on these conversation files before they move (a Workspace merge). Throws when one of them
 	 * is running; the merge then does not start.
@@ -34,6 +35,18 @@ export interface SyncServiceOptions {
 	openExternal?: (url: string) => void;
 	/** MyHarness's own Google OAuth app; tests replace it. Defaults to the one this build ships, if any. */
 	builtInApp?: () => OAuthAppIdentity | undefined;
+	/** The app is used signed in with Google: without an account the page shows the sign-in screen (status field). */
+	signInRequired?: boolean;
+}
+
+/**
+ * Whether this process asks for a Google sign-in before the app can be used: the desktop app does, a server started
+ * from a shell or a test does not. `MYHARNESS_REQUIRE_SIGN_IN` (`1` or `0`) decides either way.
+ */
+export function signInRequiredByEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (env.MYHARNESS_REQUIRE_SIGN_IN === "0") return false;
+	if (env.MYHARNESS_REQUIRE_SIGN_IN === "1") return true;
+	return env.MYHARNESS_DESKTOP_HOST === "1";
 }
 
 /**
@@ -51,6 +64,10 @@ export class SyncService {
 	/** Bumped by connect/disconnect so a late OAuth callback from an earlier attempt is ignored. */
 	private authAttempt = 0;
 	private disposed = false;
+	/** The Drive client of the signed-in account (also the phone channel's way to Drive). */
+	private drive: GoogleDriveClient | undefined;
+	/** A test's Drive for the phone channel, used instead of the real client. */
+	private phonePortOverride: PhoneDrivePort | undefined;
 
 	private constructor(options: SyncServiceOptions) {
 		this.options = options;
@@ -104,6 +121,7 @@ export class SyncService {
 			...(this.options.onApplied ? { onApplied: this.options.onApplied } : {}),
 		});
 		let drive: GoogleDriveClient | undefined;
+		this.drive = undefined;
 		if (credentials) {
 			drive = new GoogleDriveClient({
 				credentials,
@@ -114,6 +132,7 @@ export class SyncService {
 				deviceName: config.deviceName,
 			});
 			engine.setDrive(drive);
+			this.drive = drive;
 		}
 		const fileSync = new WorkspaceFileSync({
 			agentDir: this.options.agentDir,
@@ -141,7 +160,60 @@ export class SyncService {
 			lastError: this.phase === "authorizing" ? this.authError : base.lastError,
 			clientConfigured: Boolean(this.store.config().clientId),
 			builtInClient: Boolean(this.builtInApp()),
+			signInRequired: this.options.signInRequired === true,
 			files: this.fileSync.status(),
+		};
+	}
+
+	/** What the boot route tells the page before anything else: whether it must show the sign-in screen. */
+	signInState(): { required: boolean; connected: boolean; authorizing: boolean } {
+		return {
+			required: this.options.signInRequired === true,
+			connected: Boolean(this.store.credentials()),
+			authorizing: this.phase === "authorizing",
+		};
+	}
+
+	/**
+	 * The phone channel's Drive (sync/phone/): the signed-in account's, while sync is on and not paused. Pause means
+	 * nothing is uploaded or applied, and that includes what phones send.
+	 */
+	phonePort(): PhoneDrivePort | null {
+		if (!this.store.credentials()) return null;
+		const config = this.store.config();
+		if (!config.enabled || config.paused) return null;
+		return this.phonePortOverride ?? this.drive ?? null;
+	}
+
+	/** What this computer has committed with the sync space, by key (the phone channel lists chats from it). */
+	committedRecords(): Readonly<Record<string, SyncRecord>> {
+		return this.engine.committedRecords();
+	}
+
+	/** Whether the last pass left nothing to download. */
+	caughtUp(): boolean {
+		return this.engine.caughtUp();
+	}
+
+	/** This computer's id and name in the sync space. */
+	device(): { id: string; name: string } {
+		const config = this.store.config();
+		return { id: config.deviceId, name: config.deviceName };
+	}
+
+	/** Test hook: the phone channel's Drive. */
+	setPhonePortForTesting(port: PhoneDrivePort | undefined): void {
+		this.phonePortOverride = port;
+	}
+
+	/** The Google account this computer is signed in with (Drive's own id and email), for the phone channel. */
+	account(): { sub?: string; email?: string; name?: string } | null {
+		const credentials = this.store.credentials();
+		if (!credentials) return null;
+		return {
+			...(credentials.accountSub ? { sub: credentials.accountSub } : {}),
+			...(credentials.accountEmail ? { email: credentials.accountEmail } : {}),
+			...(credentials.accountName ? { name: credentials.accountName } : {}),
 		};
 	}
 
@@ -291,6 +363,12 @@ export class SyncService {
 		this.phase = null;
 		this.emit();
 		return this.status();
+	}
+
+	/** The user came back to the app: check Drive now rather than at the next poll (see SyncEngine.checkSoon). */
+	attention(): void {
+		if (!this.store.credentials()) return;
+		this.engine.checkSoon();
 	}
 
 	async runNow(): Promise<void> {

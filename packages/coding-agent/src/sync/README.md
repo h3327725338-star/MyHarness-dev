@@ -16,10 +16,15 @@
 | `scope.ts` | 扫描同步范围：全部记忆（含归档、pending）、通用模式工作区/会话/附件/产物/资料/工具结果（含不属于任何工作区的“默认”分组 `workspaces/unbound` 里的通用聊天，它不作为工作区记录发布）、通用个人指令与草稿、Web UI 常用提示词列表（`saved-prompts.ts`，只同步 `web-ui-prefs.json` 里的 `savedPrompts`）、内置浏览器的文件（`browser-data.ts`）、定时任务列表（`schedules.json`，见下文“定时任务”）；聊天的 `metadata/session.json` 去掉本机路径（`cwd`、`conversationPath`）后作为记录内容，聊天的搜索索引 `metadata/history-index.json` 只留本机 |
 | `record-merge.ts` | 记忆和浏览器以外的并发修改合并：个人指令与草稿正文按行合并，常用提示词与草稿附件逐项合并，定时任务按任务合并（`src/schedules/store.ts` 的 `mergeScheduleLists`），`session.json` 逐字段合并并保留本机路径，交接摘要取覆盖更多的一份，纯文本文件按行合并，其他文件两版都留（新的一版用原名，另一版在旁边命名为 `<名称> (conflicted copy <哈希>)`）；结果与哪边是本机无关 |
 | `browser-data.ts` | 内置浏览器数据（种类 `browser`）：`<agentDir>/desktop-profile/` 里的书签、新标签页快捷方式、缩放、深色、网站语言、网站权限文件，以及每台电脑一个、由桌面端用同步口令加密的 `browser-vault-<id>.json`；记录 id 与文件名的白名单映射，以及两台电脑同时改动时的对称合并 |
+| `settings-data.ts` | 配置的同步（种类 `settings`，九条记录）：`models`（`models.json`）、`keys`（`auth.json` 里的 API keys，不含 OAuth 登录）、`preferences`（`settings.json` 里白名单内的键 `PORTABLE_SETTINGS_KEYS`，包括代理 `httpProxy` 和请求时限 `network`；`LOCAL_ONLY_SETTINGS_KEYS` 里只属于一台电脑的键不读不写）、`model-prompts`、`search-keys`、`mode-models`（`chat-mode-state.json` 里每种聊天模式选的模型，草稿和上次的聊天留在本机）、文件夹记录 `skills`/`prompts`/`themes`（逐个文件，文本原样、其他文件 base64；跳过 `.git`、`node_modules`、`*.tmp` 和链接，单文件 2 MB、总共 16 MB，超出时标 `partial`，部分记录不删除任何文件，写入不出文件夹，删除前备份）；读成稳定 JSON、三方合并（`mergeSettingsText`）、按各文件所属模块的规则写回并先备份到 `<agentDir>/sync/settings-backup/`（每个文件留 5 份） |
 | `apply.ts` | 应用远端内容：记忆写入（memory 锁）、会话 JSONL 按 entry id 合并、文件原子写（聊天的 `session.json` 只取对方的可同步字段，路径保留本机的）、工作区身份导入与本机绑定、草稿/指令写入、显式删除 |
 | `engine.ts` | 同步引擎：拉取→推送、批次发布、对象上传/校验、版本向量判定、墓碑、冲突保留、活动会话延期、后台定时与文件监听、引擎锁 |
 | `google.ts` | Google OAuth（桌面应用 + PKCE + loopback）与 Drive v3 客户端（可见 `MyHarness` 文件夹、`sync-v1` 布局、multipart 上传、媒体下载） |
 | `service.ts` | Web 进程内的同步服务：配置、账号切换、OAuth 流程（这台设备的客户端优先，没有时用 `providers/credentials/oauth-apps.ts` 里 MyHarness 自带的 Google 应用）、引擎重建与生命周期 |
+| `phone/port.ts` | 手机通道在 Drive 里的位置 `MyHarness/phone-v1/`（`pcs/`、`views/`、`phones/`、`outbox/`、`link/`）与窄接口 `PhoneDrivePort`，以及测试用的内存实现 `MemoryPhonePort` |
+| `phone/channel.ts` | 电脑一侧：每分钟写 `pcs/<deviceId>.json`（在线、是否接受手机、局域网地址）；有变化时写 `views/`（对话、带 Key 的 Provider、默认模型、书签；记忆单独一份）；每轮列出 `phones/`，只重新下载变了的登记文件，交给手机连接；在线电脑里 ID 最小的一台应用 `outbox/` 并删掉文件；等不到的对话 6 小时后另起一个对话 |
+| `phone/view.ts` | 手机看到的内容怎么从本机文件生成：对话列表（标题、预览、`sync-v1/objects` 里的哈希、rank）、手机能调用的 API 类型 `PHONE_APIS`、书签、记忆包 |
+| `phone/importer.ts` | 手机发来的改动写进本机文件：`chat.append`（续写电脑的对话或新建 `phone-<chatId>`，按行 id 幂等）、`provider.save`、`provider.remove`；运行中的对话等它空闲 |
 | `workspace-merge.ts` | 把恢复的工作区合并进本机占用同一文件夹的工作区：聊天整目录移过去（`session/storage/jsonl` 的 `moveSessionToWorkspace`）、工作区记忆移过去后重建目录，合并掉的工作区从本机列表移除 |
 
 ### 云端布局
@@ -27,12 +32,16 @@
 ```text
 MyHarness/
 ├─ README.txt
-└─ sync-v1/
-   ├─ identity.json
-   ├─ batches/<batchId>.json
-   ├─ objects/<sha256>
-   └─ snapshots/<deviceId>.json.gz
+├─ sync-v1/
+│  ├─ identity.json
+│  ├─ batches/<batchId>.json
+│  ├─ objects/<sha256>
+│  └─ snapshots/<deviceId>.json.gz
+└─ phone-v1/        （同一账号的手机，见 phone/ 与 docs/google-drive-sync.md 的 “Phones of the account”）
+   ├─ pcs/  views/  phones/  outbox/  link/
 ```
+
+手机从不写 `sync-v1/`；它读 `views/` 和 `sync-v1/objects/`，把自己的改动放进 `outbox/`，由电脑写进本机文件后再由普通同步带到其他电脑。
 
 `batches/` 是只追加的提交日志；每个批次先上传所有对象，再发布清单。`objects/` 按内容哈希去重。删除是批次中的显式操作，附版本向量与删除时间，不靠“这轮没列出”推断。`identity.json` 的 `syncId` 标识同步空间；文件夹改名后仍按 Drive 文件 ID 跟随，不按名字重新建库。`snapshots/<deviceId>.json.gz` 是某台设备已提交的全部记录（gzip JSON：记录、墓碑、64 KB 以内的内容，内联总量最多 32 MB）加 `upTo`（它代表的该设备最新批次时间）；首个成功轮次就写一份，之后本机有比快照更新的批次时重写，最多每 10 分钟一次。某台设备未处理的批次有 20 个及以上时，接收端读它的快照而不逐个读清单，应用后把该设备 `upTo` 以内的批次全部记为已处理。快照只覆盖它自己设备的批次，只是加速手段：批次仍留在云端、仍是事实来源，快照缺失或读不了就照常读批次；快照里的内容超过延期次数仍未到时，本次运行内改读该设备的批次，缺对象按批次报告、可由手动运行重试。
 
@@ -61,7 +70,7 @@ MyHarness/
 ### 依赖
 
 - 依赖：`config/paths`、`config/web-prefs.ts`（常用提示词所在的 Web UI 偏好文件）、`data/workspace-store.ts`（工作区身份导入与绑定）、`session/mode-state.ts`（通用指令与草稿）、`session/memory/store.ts`（记忆锁、归档与索引）、`schedules/store.ts`（定时任务列表的读写与合并）、`session/storage/jsonl`（会话头与条目解析）、`utils/atomic-write`、`utils/open-browser`。
-- 被依赖：`modes/web/web-mode.ts`（创建服务、注册路由、关闭时释放）、`modes/web/routes-sync.ts`。
+- 被依赖：`modes/web/web-mode.ts`（创建服务、注册路由、关闭时释放）、`modes/web/routes-sync.ts`、`modes/web/phone-link/account.ts`（手机通道与远程连接用 `phonePort()`、`committedRecords()`、`device()`）。
 - 不依赖：Agent runtime、模型调用、工具执行。应用远端内容只写文件与状态，不触发模型、记忆提取或命令执行。
 
 ### 内置浏览器
@@ -77,7 +86,13 @@ MyHarness/
 - 只同步数据含义，不整目录复制：新增数据类型时先判断它属于记忆、会话、文件、工作区、草稿还是指令，再改 `scope.ts` 的扫描与 `apply.ts` 的应用；不要并入“全部文件”。
 - 编程模式聊天不上传；编程模式记忆通过记忆扫描上传。改动扫描门槛时必须保持这个边界。
 - 删除必须是显式批次操作；墓碑永远保留“已删除”事实，旧设备重新上线不能把内容带回来。并发删除与编辑两侧都保留，不能静默丢一边。
-- 冲突不阻塞同步：会话合并分支；记忆、浏览器文件、个人指令、草稿、常用提示词、定时任务和文件都自动合并（`memory-merge.ts`、`browser-data.ts`、`record-merge.ts`），不能合并的文件两版都作为文件保留，不进冲突列表；两边都改了的聊天条目或标题按时间取较新的一次修改（另一台的记录时间晚于本机文件时间就用另一台的，否则留本机的并悄悄存一份另一版的副本），不问用户、不进冲突列表，旧版本留下的这类冲突项会被清掉；只有工作区身份、删除与修改冲突仍是本机版本 + 另一版副本 + 冲突列表。旧版本留下的个人指令、草稿、常用提示词和文件的冲突项，每次启动后第一轮按同样规则从副本合并，本机已删掉的保留冲突项、不复活。新增合并规则必须对称（交换本机与远端结果逐字节相同），否则两台电脑会来回发布；合并结果发布时带上压过两边的版本向量。不要在“无法判断”时自动选一个版本删掉另一个。
+- 配置（`settings`）：两台电脑改了不同的项都保留，同一项以后改的为准（对方记录时间与本机文件时间比较）；只有对方版本的向量覆盖本机版本时才信任共同祖先，否则按并集合并、不把任何一项当作“被删掉”，所以新电脑或空文件不会清掉其他电脑的 Provider 和密钥，两台各有配置的电脑第一次相遇时同一项以云端已有的为准。配置记录从不整条删除：文件缺失或读不了时不发布，收到整条删除时保留本机并重新发布。应用后 `SyncAppliedInfo.settingsChanged` 让 Web 层重新加载配置（`hub.reloadConfigFromDisk`）并广播 `settings_changed`。API keys 以明文进入用户自己的 Drive；OAuth 令牌不得进入任何记录。测试在 `test/sync-settings.test.ts`。
+- 手机通道（`phone/`）：手机只碰 `phone-v1/`，不能写 `sync-v1/`；导入必须幂等（两台电脑可能都应用了同一个文件），不能授予信任、不能改 Provider 文件以外的设置、不能直接执行命令。视图只放 `PHONE_APIS` 里的 API 类型、只放存在 `auth.json`/`models.json` 里的 Key；环境变量和命令给的 Key、订阅/OAuth 登录、Claude Code shell 的状态都不进视图。测试在 `test/phone-channel.test.ts`（用手机自己的 `account-view.js` 读写）。
+- 小内容随批次走：64 KB 以内的内容除了上传对象，还直接放在发布它的批次里（每个批次最多 4 MB），接收端从已经读到的清单直接写入，不再为每条记录多下载一次；旧版本接收端忽略这个字段、照常取对象。对象上传 8 个并行。
+- “以最后一次操作为准”：没有合并规则的并发修改（工作区身份等）取较晚的一次，输掉的一版悄悄存一份到 `recovered/`；一边删除一边修改也取较晚的一次——删除的时间是“这条记录消失前最后一次被看到”的时间（上一次生成上传计划的时间，启动后第一轮用记录自己的时间，见 `deletionTime`），所以别处之后做的修改更晚、会把它带回来。两个例外：仍有内容的记忆不会被另一台的删除删掉；被删聊天的文件跟随聊天。不再生成冲突列表项，旧版本留下的项每次启动后第一轮清掉（`dropReviewEntries`）。批量删除保护不变。
+- 回到应用时立即检查：页面重新获得焦点时调用 `POST /api/sync/attention` → `SyncService.attention()` → 引擎 `checkSoon()`（正在跑、刚跑完 8 秒内、已暂停或未连接时不做），不用等空闲时 45 秒一次的轮询。配置文件变化也会唤醒引擎。
+- 工作区文件通道（`files/`）：两边都改了的文件按文件自身的修改时间取较晚的一版（发布的变更带 `modifiedAt`），输掉的一版先备份到 `backups/workspace-file/`；本机删除而对方修改取对方版本，对方删除而本机修改保留本机并重新发布；不再列出冲突等用户选择（`settleConflicts`）。
+- 冲突不阻塞同步：会话合并分支；记忆、浏览器文件、个人指令、草稿、常用提示词、定时任务和文件都自动合并（`memory-merge.ts`、`browser-data.ts`、`record-merge.ts`），不能合并的文件两版都作为文件保留，不进冲突列表；两边都改了的聊天条目或标题按时间取较新的一次修改（另一台的记录时间晚于本机文件时间就用另一台的，否则留本机的并悄悄存一份另一版的副本），不问用户、不进冲突列表，旧版本留下的这类冲突项会被清掉；工作区身份、删除与修改冲突也按时间取较晚的一次（见上一条“以最后一次操作为准”），不进冲突列表。旧版本留下的个人指令、草稿、常用提示词和文件的冲突项，每次启动后第一轮按同样规则从副本合并，本机已删掉的保留冲突项、不复活。新增合并规则必须对称（交换本机与远端结果逐字节相同），否则两台电脑会来回发布；合并结果发布时带上压过两边的版本向量。不要在“无法判断”时自动选一个版本删掉另一个。
 - 云端对象先到、批次后到；缺对象的变更等待，同批其他记录照常按版本向量写入（每条记录各自收敛），批次要等全部变更都有着落才记为已处理，下一轮从缓存的清单重试。应用前校验 SHA-256。只有云端确实没有的内容计入延期次数（`MAX_DEFERRALS`），超过后在 `<agentDir>/sync/state-*.json` 的 `issues` 中报告并停止重试，不能无限循环；本机正在运行的会话和请求失败只等待、不计次数，不能因此跳过批次。损坏批次、超大文件、非法记录同理，一条坏数据不能拖住其他同步。
 - Data root 若位于 Google Drive/OneDrive 等同步目录，引擎拒绝启动并提示迁移，避免双重管理。
 - 工作区恢复只创建受管理占位目录并标记待绑定；不得因为远端记录里的绝对路径在本机存在就自动写进去。扫描以工作区注册表为准：被用户从所有列表移除的工作区不再上传，重新加入后才继续同步。这样的工作区（本机移除，或另一台电脑删除后同步过来）也不再列为“等你选文件夹”（`engine.ts` 的 `waitingBindings()`，记录保留，重新加入后再列出）。一个文件夹在一台设备上只属于一个工作区：恢复的工作区要用的文件夹被列表里的工作区占用时，只能合并进去（`workspace-merge.ts`），不能两个工作区共用一个文件夹；合并只搬不删，同名的聊天或记忆原地保留并报告，必须等进行中的同步轮次结束、拒绝运行中的聊天、先关闭打开的聊天。

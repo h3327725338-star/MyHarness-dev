@@ -230,7 +230,9 @@ export async function listMemoryFilesAsync(dataRoot: string, options: MemoryList
 		for (const item of await entries(directory)) {
 			if (!item.isFile() || !item.name.endsWith(".md")) continue;
 			const file = path.join(directory, item.name);
-			assertDirectPath(file, checked);
+			// `item` is a regular file (a link reports itself as one, not as a file) inside a folder checked above, so
+			// the file needs no two more filesystem calls of its own: with thousands of memories they added up to a
+			// visible pause in every sync pass.
 			seen.add(file);
 			const stat = options.metadataCache ? await fs.promises.stat(file) : undefined;
 			const signature = stat ? `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}` : "";

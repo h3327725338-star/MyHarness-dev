@@ -28,19 +28,20 @@ export function mediaKind(target) {
 }
 
 /**
- * How a picture sits in the text, the way a word processor offers it:
- * - block: on a line of its own, at the left (the default);
- * - center: on a line of its own, centred;
- * - wide: across the whole width of the reply;
- * - left / right: at that side with the text flowing around it;
- * - inline: inside the line of text, at the height of the text.
- * Several pictures written in one paragraph stand side by side (see the paragraph renderer in markdown.js).
+ * How a picture sits in the text, the four ways a paper sets its figures, plus one for symbols:
+ * - figure: on a line of its own, centered, with a numbered caption under it (the default);
+ * - wide: the same, but allowed to be as tall as it needs, for a large picture worth the whole width;
+ * - right / left: a small figure at that side with the text flowing around it;
+ * - inline: inside the line of text, at the height of the text, without number or caption.
+ * Several pictures at the start of one paragraph stand side by side as the lettered parts of one figure (see the
+ * paragraph renderer in markdown.js). `block` and `center` are the earlier names of `figure`.
  */
 const LAYOUTS = new Map(
 	Object.entries({
-		block: "block",
-		center: "center",
-		centre: "center",
+		figure: "figure",
+		block: "figure",
+		center: "figure",
+		centre: "figure",
 		wide: "wide",
 		full: "wide",
 		left: "left",
@@ -66,9 +67,9 @@ export function parseMediaLayout(title) {
 		if (LAYOUTS.has(word) && !layout) layout = LAYOUTS.get(word);
 		else if (percent && width === undefined) width = Math.min(100, Math.max(10, Number(percent[1])));
 		else if (SIZES.has(word) && width === undefined) width = SIZES.get(word);
-		else return { layout: "block", width: undefined, title: String(title ?? "").trim() };
+		else return { layout: "figure", width: undefined, title: String(title ?? "").trim() };
 	}
-	return { layout: layout || "block", width, title: "" };
+	return { layout: layout || "figure", width, title: "" };
 }
 
 const unescapeLabel = (text) => text.replace(/\\([\\[\]!])/g, "$1");

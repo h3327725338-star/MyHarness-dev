@@ -4,7 +4,7 @@
 
 ## 产品与平台
 
-MyHarness 是 npm / TypeScript / ESM monorepo，面向 Windows 桌面 x64。用户交互使用同一份 Web UI，可通过本机浏览器或独立 Electron Windows 桌面宿主打开；桌面入口与边界见 `packages/desktop/README.md`。旧终端聊天、print、JSON 输出、RPC、TUI 包和终端组件 API 均不属于当前产品。
+MyHarness 是 npm / TypeScript / ESM monorepo，面向 Windows 桌面 x64。另有一个安卓 App（`packages/mobile`）：可以在手机上独立对话，也可以经局域网遥控桌面端，入口与边界见 `packages/mobile/README.md`。用户交互使用同一份 Web UI，可通过本机浏览器或独立 Electron Windows 桌面宿主打开；桌面入口与边界见 `packages/desktop/README.md`。旧终端聊天、print、JSON 输出、RPC、TUI 包和终端组件 API 均不属于当前产品。
 
 正式 GitHub CI 只使用 `windows-2025`。它是 CI runner，不是最终用户桌面支持矩阵，不代表逐一验证 Windows 10/11 的每个版本。
 
@@ -18,9 +18,10 @@ MyHarness 是 npm / TypeScript / ESM monorepo，面向 Windows 桌面 x64。用�
 | `packages/agent` | Provider 无关的 Agent loop、工具队列、通用 Session 与 Harness contract | `packages/agent/src/index.ts`、`./node` |
 | `packages/storage/sqlite-node` | 通用存储 contract 的 Node SQLite backend 和 migration | `packages/storage/sqlite-node/src/index.ts` |
 | `packages/desktop` | 私有 Electron Windows 宿主、服务进程所有权、原生第三方浏览器视图与分发 | `main.cjs`；`build.mjs` |
+| `packages/mobile` | 私有安卓 App：手机页面（复用桌面 Web UI 的基础模块）、手机本机 Agent、内置浏览器、遥控桌面端的手机连接客户端；Java 原生壳 | `build.mjs`；`web/js/main.js`；`src/core.ts` |
 | `packages/coding-agent` | 产品编排、Web、Session、Settings、Trust、资源、Provider runtime、工具、Git、扩展 | `packages/coding-agent/src/index.ts`；进程入口 `packages/coding-agent/src/web.ts` |
 
-依赖方向：`coding-agent → agent → ai`；产品层也直接依赖 ai。`packages/storage/sqlite-node` 提供通用存储 contract 的独立 Node backend，不是产品层直接依赖。不存在 `packages/tui` workspace。底层业务不得依赖浏览器页面或终端展示组件。
+依赖方向：`coding-agent → agent → ai`；产品层也直接依赖 ai。`packages/mobile` 只在构建时取用：`src/core.ts` 把 `agent` 的 Agent loop 和 `ai` 的四个 API adapter 打包进手机页面，页面文件按 `shared-files.mjs` 的清单从 `coding-agent/web` 原样复制；它不依赖 `coding-agent/src`，运行时与桌面端只通过手机连接协议（`coding-agent/src/modes/web/phone-link/`）和用户云端硬盘里的手机通道（`MyHarness/phone-v1/`，电脑一侧在 `coding-agent/src/sync/phone/`）通信，其他包不得依赖它；唯一的例外是测试：`coding-agent/test/phone-channel.test.ts` 和 `phone-remote-link.test.ts` 直接加载手机端的 `account-view.js`、`link-remote.js`，用来确认两端的格式一致。`packages/storage/sqlite-node` 提供通用存储 contract 的独立 Node backend，不是产品层直接依赖。不存在 `packages/tui` workspace。底层业务不得依赖浏览器页面或终端展示组件。
 
 ## 启动与运行时
 

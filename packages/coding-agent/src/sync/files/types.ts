@@ -39,6 +39,11 @@ export interface WorkspaceFileEntry {
 	/** SHA-256 of the file content. Absent for directories. */
 	hash?: string;
 	size?: number;
+	/**
+	 * When the file last changed on the publishing device (ISO). Lets a receiver that changed the same file settle it
+	 * by the later change. Absent from versions that did not publish it.
+	 */
+	modifiedAt?: string;
 }
 
 export interface WorkspaceFileOperation extends WorkspaceFileEntry {

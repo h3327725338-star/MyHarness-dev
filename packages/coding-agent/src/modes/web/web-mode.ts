@@ -10,6 +10,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { isIPv4 } from "node:net";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { ImageContent } from "@myharness/ai";
@@ -19,11 +21,14 @@ import { getAgentDir, getExportTemplateDir, getWebUiDir, VERSION } from "../../c
 import type { ProjectTrustContext } from "../../extensions/compat/types.ts";
 import { WorktreeDisplayNames } from "../../git/worktrees/display-name.ts";
 import { setMirrorSessionsAllowed } from "../../session/manager/index.ts";
-import { SyncService } from "../../sync/service.ts";
+import { SyncService, signInRequiredByEnvironment } from "../../sync/service.ts";
 import { WebDialogBridge } from "./dialogs.ts";
 import { WebHttpServer } from "./http-server.ts";
 import { WebHostHub } from "./hub.ts";
 import { WebLifecycle } from "./lifecycle.ts";
+import { AccountPhones } from "./phone-link/account.ts";
+import { PhoneLinkGateway } from "./phone-link/gateway.ts";
+import { PhoneLinkStore } from "./phone-link/store.ts";
 import { registerAccountRoutes } from "./routes-accounts.ts";
 import { registerBookmarkRoutes } from "./routes-bookmarks.ts";
 import { registerCoreRoutes } from "./routes-core.ts";
@@ -31,6 +36,7 @@ import { registerFileRoutes, registerFolderBrowser } from "./routes-files.ts";
 import { registerGitRoutes } from "./routes-git.ts";
 import { registerMailRoutes } from "./routes-mail.ts";
 import { registerModeRoutes } from "./routes-modes.ts";
+import { registerPhoneLinkRoutes } from "./routes-phone-link.ts";
 import { registerProviderRoutes } from "./routes-providers.ts";
 import { registerScheduleRoutes } from "./routes-schedules.ts";
 import { registerSessionRoutes } from "./routes-sessions.ts";
@@ -55,6 +61,8 @@ export interface WebBootstrap {
 	/** Lets dialogs owned by other sessions be answered through the same /api/ui/respond route. */
 	addDialogResponder(responder: (id: string, value: string | boolean | undefined) => boolean): void;
 	setPhase(phase: "starting" | "ready" | "error", detail?: string): void;
+	/** Where the boot route reads whether the page must show the Google sign-in screen (set once sync exists). */
+	setSignInState(read: () => { required: boolean; connected: boolean; authorizing: boolean }): void;
 }
 
 export interface WebModeOptions {
@@ -74,6 +82,7 @@ export async function startWebBootstrap(options: { port?: number }): Promise<Web
 	let phase: "starting" | "ready" | "error" = "starting";
 	let detail: string | undefined;
 	const dialogResponders: Array<(id: string, value: string | boolean | undefined) => boolean> = [];
+	let signInState: (() => { required: boolean; connected: boolean; authorizing: boolean }) | undefined;
 
 	server.mount({ prefix: "/assets/", directory: getWebUiDir() });
 	server.mount({ prefix: "/vendor/", directory: join(getWebUiDir(), "vendor") });
@@ -115,6 +124,7 @@ export async function startWebBootstrap(options: { port?: number }): Promise<Web
 		version: VERSION,
 		dialogs: dialogs.requests,
 		startedAtMs,
+		signIn: signInState?.() ?? null,
 	}));
 	server.route("POST", "/api/ui/respond", ({ body }) => {
 		const payload = (body ?? {}) as { id?: unknown; value?: unknown };
@@ -167,6 +177,9 @@ export async function startWebBootstrap(options: { port?: number }): Promise<Web
 		},
 		addDialogResponder(responder) {
 			dialogResponders.push(responder);
+		},
+		setSignInState(read) {
+			signInState = read;
 		},
 		setPhase(next, nextDetail) {
 			phase = next;
@@ -227,18 +240,22 @@ export async function runWebMode(
 	registerMailRoutes(server);
 	registerBookmarkRoutes(server, host);
 	// Google Drive sync: the engine polls in the background; the routes only expose status and configuration.
+	const isSessionActive = (_workspaceId: string, sessionId: string) =>
+		hub
+			.all()
+			.some(
+				(slot) =>
+					slot.session.sessionManager.getSessionId() === sessionId &&
+					slot.session.sessionManager.getDataRoot() === runtimeHost.session.sessionManager.getDataRoot() &&
+					(!slot.session.isIdle || slot.completionActive),
+			);
+	// Set below, once the phone link exists; sync may report before that.
+	let accountPhones: AccountPhones | undefined;
+	let syncConnected = false;
 	const syncService = SyncService.create({
 		agentDir: runtimeHost.services.agentDir,
 		dataRoot: runtimeHost.session.sessionManager.getDataRoot() ?? getDataDir(),
-		isSessionActive: (_workspaceId, sessionId) =>
-			hub
-				.all()
-				.some(
-					(slot) =>
-						slot.session.sessionManager.getSessionId() === sessionId &&
-						slot.session.sessionManager.getDataRoot() === runtimeHost.session.sessionManager.getDataRoot() &&
-						(!slot.session.isIdle || slot.completionActive),
-				),
+		isSessionActive,
 		// A Workspace merge moves chat files on disk: no slot may keep one of them open and go on writing to the old path.
 		releaseSessions: async (files) => {
 			const slots = files.flatMap((file) => hub.slotsShowing(file));
@@ -250,17 +267,35 @@ export async function runWebMode(
 				else if ((await slot.runtimeHost.newSession()).cancelled) throw new Error("Cancelled.");
 			}
 		},
-		onStatus: (status) => server.broadcast("sync_status", status),
-		onApplied: () => {
+		// The desktop app is used signed in with Google; a launch copy belongs to its source and never asks.
+		signInRequired: !copyIdentity && signInRequiredByEnvironment(),
+		onStatus: (status) => {
+			server.broadcast("sync_status", status);
+			// Signing in (or out) starts or stops what the account's phones see.
+			if (status.connected !== syncConnected) {
+				syncConnected = status.connected;
+				accountPhones?.poke();
+			}
+		},
+		onApplied: (info) => {
+			accountPhones?.poke();
 			// Sync writes the Workspace registry through its own store; the hub must re-read it before anyone saves
 			// the old copy, and open chats move onto a folder that was just bound on this device.
 			void hub.reloadWorkspaces().catch(() => undefined);
 			server.broadcast("sync_applied", {});
 			server.broadcast("workspaces_changed", {});
 			server.broadcast("mode_preferences_changed", {});
+			if (info.settingsChanged) {
+				// Providers, keys or settings came from another computer: open chats use them from their next request,
+				// and an open settings page shows them without a reload.
+				hub.reloadConfigFromDisk();
+				server.broadcast("settings_changed", {});
+				server.broadcast("model_prompts_changed", {});
+			}
 		},
 	});
 	registerSyncRoutes(server, syncService);
+	bootstrap.setSignInState(() => syncService.signInState());
 	void syncService.start();
 	// Scheduled tasks: reminders and Agent tasks at set times, synced like the rest. A launch copy shows them but never
 	// fires them; the source instance does.
@@ -272,6 +307,56 @@ export async function runWebMode(
 	// The Terminal panel's shells belong to the server, not to a chat: they outlive the chats that show them.
 	const terminals = new WebTerminals((event, data) => server.broadcast(event, data));
 	registerTerminalRoutes(server, host, terminals);
+	// The phone link (off until turned on in Settings): paired phones reach a fixed list of routes through it. A launch
+	// copy never opens it: the phones belong to the source instance, and two servers cannot share its port.
+	const phoneLinkStore = new PhoneLinkStore(copyIdentity?.metadataAgentDir ?? runtimeHost.services.agentDir);
+	const phoneLink = new PhoneLinkGateway({
+		store: phoneLinkStore,
+		upstream: () => `http://127.0.0.1:${bootstrap.port}`,
+		tap: (listener) => server.tap(listener),
+		info: () => ({ name: hostname(), version: VERSION }),
+		onChange: () => server.broadcast("phone_link_changed", {}),
+		// One address of this PC instead of every interface (for a PC on several networks).
+		bindHost: isIPv4(process.env.MYHARNESS_PHONE_LINK_BIND ?? "") ? process.env.MYHARNESS_PHONE_LINK_BIND : undefined,
+	});
+	if (!copyIdentity) {
+		// Phones signed in with the same Google account: what they read and send through Drive, and their connections
+		// from any network (phone-link/account.ts).
+		accountPhones = new AccountPhones({
+			agentDir: runtimeHost.services.agentDir,
+			dataRoot: runtimeHost.session.sessionManager.getDataRoot() ?? getDataDir(),
+			appVersion: VERSION,
+			sync: syncService,
+			store: phoneLinkStore,
+			gateway: phoneLink,
+			runtime: () => host.session.modelRuntime,
+			defaults: () => {
+				const settings = runtimeHost.services.settingsManager;
+				return {
+					provider: settings.getDefaultProvider() ?? null,
+					model: settings.getDefaultModel() ?? null,
+					thinkingLevel: settings.getDefaultThinkingLevel() ?? null,
+				};
+			},
+			isSessionActive,
+			onImported: (info) => {
+				// A phone continued a chat or saved a Provider: the files changed on disk; sync carries them on.
+				syncService.attention();
+				if (info.sessionsChanged) {
+					server.broadcast("sync_applied", {});
+					server.broadcast("workspaces_changed", {});
+				}
+				if (info.settingsChanged) {
+					hub.reloadConfigFromDisk();
+					server.broadcast("settings_changed", {});
+				}
+			},
+			onChange: () => server.broadcast("phone_link_changed", {}),
+		});
+		registerPhoneLinkRoutes(server, phoneLinkStore, phoneLink, accountPhones);
+		void phoneLink.apply();
+		accountPhones.start();
+	}
 
 	// The server belongs to its browser pages: once the last one is gone for the grace period, it exits — but never
 	// in the middle of running work; the countdown waits for the task to settle before it fires.
@@ -302,6 +387,8 @@ export async function runWebMode(
 		server.broadcast(restarting ? "restarting" : "shutdown", {});
 		try {
 			scheduleService.dispose();
+			await accountPhones?.stop();
+			await phoneLink.stop();
 			dialogs.dismissAll();
 			terminals.dispose();
 			await hub.dispose();

@@ -54,10 +54,10 @@ describe("media syntax in a reply", () => {
 		expect(parseMediaLayout("small LEFT")).toEqual({ layout: "left", width: 30, title: "" });
 		expect(parseMediaLayout("full")).toEqual({ layout: "wide", width: undefined, title: "" });
 		expect(parseMediaLayout("500%").width).toBe(100);
-		expect(parseMediaLayout("")).toEqual({ layout: "block", width: undefined, title: "" });
+		expect(parseMediaLayout("")).toEqual({ layout: "figure", width: undefined, title: "" });
 		// Any other word makes it an ordinary title.
 		expect(parseMediaLayout("Figure 1 right")).toEqual({
-			layout: "block",
+			layout: "figure",
 			width: undefined,
 			title: "Figure 1 right",
 		});
@@ -89,15 +89,56 @@ describe("media in rendered Markdown", () => {
 		expect(html).toContain('data-media-src="C:/Users/user/My Drive/s23.jpeg"');
 		expect(html).toContain('data-local-path="C:/Users/user/My Drive/s23.jpeg"');
 		expect(html).toContain('style="--fig-w:35%"');
-		expect(html).toContain('<span class="md-fig-cap">Slide 23</span>');
+		// The caption line: an empty place for the number (written on the page, in order) and the words.
+		expect(html).toContain(
+			'<span class="md-fig-cap"><span class="md-fig-no"></span><span class="md-fig-text">Slide 23</span></span>',
+		);
 		expect(html).toContain("<p>Text after.</p>");
+	});
+
+	it("centers a figure by default, and takes a number the model wrote itself off the caption", () => {
+		const render = renderer();
+		const plain = render("![Loss over time](C:/t/loss.png)");
+		expect(plain).toContain('data-layout="figure"');
+		// The earlier names mean the same.
+		expect(render('![x](C:/t/a.png "center")')).toContain('data-layout="figure"');
+		expect(render('![x](C:/t/a.png "block")')).toContain('data-layout="figure"');
+		for (const written of [
+			"Figure 3: Loss over time",
+			"Fig. 3. Loss over time",
+			"\u56fe 3\uff1aLoss over time",
+			"\u56fe3 Loss over time",
+		]) {
+			const html = render(`![${written}](C:/t/loss.png)`);
+			expect(html).toContain('<span class="md-fig-text">Loss over time</span>');
+			expect(html).toContain('data-media-alt="Loss over time"');
+		}
+		// A figure without words still has its caption line, for the number.
+		expect(render("![](C:/t/loss.png)")).toContain(
+			'<span class="md-fig-no"></span><span class="md-fig-text"></span>',
+		);
 	});
 
 	it("puts pictures written in one paragraph side by side, and keeps a picture inside a sentence in its line", () => {
 		const render = renderer();
 		const row = render("![a](C:/t/a.png)\n![b](C:/t/b.png)");
-		expect(row).toContain('<p class="md-fig-row">');
+		expect(row).toContain('<div class="md-fig-group"><p class="md-fig-row">');
 		expect(row.match(/class="md-fig"/g)).toHaveLength(2);
+		// The group has one caption line of its own, empty here but for the number.
+		expect(row).toContain(
+			'<p class="md-fig-cap md-fig-group-cap"><span class="md-fig-no"></span><span class="md-fig-text"></span></p>',
+		);
+		// Text after the last picture, in the same paragraph, is the caption of the whole figure; letters and a
+		// number the model wrote are taken off, since the page writes them.
+		const captioned = render(
+			"![(a) Training](C:/t/a.png) ![(b) Validation](C:/t/b.png)\nFigure 2: Loss on **both** sets",
+		);
+		expect(captioned).toContain('<span class="md-fig-text">Training</span>');
+		expect(captioned).toContain('<span class="md-fig-text">Validation</span>');
+		expect(captioned).toContain('<span class="md-fig-text">Loss on <strong>both</strong> sets</span></p></div>');
+		expect(captioned).not.toContain("Figure 2");
+		// One picture followed by text is a figure inside its paragraph, not a group.
+		expect(render("![a](C:/t/a.png)\nSome text.")).not.toContain("md-fig-group");
 		// A picture the text flows around is not part of a row.
 		expect(render('![a](C:/t/a.png "left")\n![b](C:/t/b.png)')).not.toContain("md-fig-row");
 		const inline = render('Press ![](C:/t/key.png "inline") to go on.');
@@ -109,7 +150,9 @@ describe("media in rendered Markdown", () => {
 	it("plays video and sound, and gives sound no layout", () => {
 		const html = renderer()('![demo](C:/t/demo.mp4 "center")\n\n![voice](C:/t/voice.mp3 "right")');
 		expect(html).toContain('data-media-kind="video"');
-		expect(html).toMatch(/data-layout="block" data-media-kind="audio"/);
+		expect(html).toMatch(/data-layout="figure" data-media-kind="audio"/);
+		// Video and sound are not figures: they keep their words as a caption, and get no number on the page.
+		expect(renderer()("![](C:/t/demo.mp4)")).not.toContain("md-fig-cap");
 	});
 
 	it("escapes the caption and the path, keeps a web image a link, and leaves code alone", () => {

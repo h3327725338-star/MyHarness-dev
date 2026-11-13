@@ -1,6 +1,7 @@
 # Google Drive sync
 
-MyHarness can keep memories and General-mode chat data in sync through a folder in the user's own Google Drive. It
+MyHarness can keep memories, General-mode chat data and the configuration (Providers, API keys, model assignments) in
+sync through a folder in the user's own Google Drive. It
 talks to the Drive API directly; the Google Drive desktop client is not required for application data, and a workspace
 that already lives inside Drive stays managed by the Drive client.
 
@@ -25,11 +26,14 @@ reading the 5,660 change lists. Since then the maintainer has run sync for real 
 | Coding-mode repository files, worktrees and build output | No |
 | General-mode drafts and the General personal prompt | Yes |
 | Saved prompts of the Web UI (Session panel → My prompts) | Yes, only that list; other Web UI preferences stay on each device |
-| Model prompts (Settings → Personalization, `model-prompts.json`) | No, they stay on each device like the other settings |
+| Provider configuration (`models.json`), API keys, the preferences that mean the same on every computer (including the proxy and network time limits), model prompts, web search keys, the model of each chat mode, the skills, prompt templates and themes folders | Yes, see “Settings and keys” below |
+| What the Android app of the same Google account sees and sends: chats, Providers with their keys, the default model, memories, bookmarks, its own chat lines and Provider edits | Yes, through `phone-v1/` beside the sync space, see “Phones of the account” below |
 | Built-in browser (desktop app): bookmarks, new-tab shortcuts, site zoom, dark mode, website language, site permissions | Yes, as the desktop profile's own files |
 | Built-in browser: sign-ins (persistent cookies) and saved passwords | Only after the user sets a sync passphrase; sealed on the computer before upload |
 | Coding-mode chats, repositories, worktrees | No |
-| API keys, OAuth tokens, trust decisions, tool permissions, locks, running tasks | No |
+| OAuth sign-ins (Provider accounts and subscriptions, Google, GitHub, mail), trust decisions, tool permissions, locks, running tasks | No |
+| The Claude Code shell Provider (an extension) and the `claude` program's own sign-in | No, each computer signs in there itself |
+| Settings that describe one computer: shell and editor paths, the session folder, installed extensions and packages | No |
 | Memory catalogs (`memory/index.json`, `memory/state.json`, `maintenance.*`), bridge descriptors and write locks | No |
 
 Images a chat stores as files (`conversation/images/<sha256>.<ext>`, see `session-format.md`) travel as ordinary
@@ -58,6 +62,53 @@ scanned. Sign-ins and saved passwords travel only in `browser-vault-<id>.json`, 
 seals with AES-256-GCM under a key derived from the user's sync passphrase (Settings → Google Drive → Built-in browser); this
 side never sees the passphrase or anything inside the vault. How the desktop seals, imports and merges vaults is in
 `packages/desktop/README.md` ("Sync between computers"). Devices running an older version ignore these records.
+
+## Settings and keys
+
+Nine records of kind `settings` (`src/sync/settings-data.ts`) carry the configuration, so a second computer is ready to
+use after its first sync instead of being set up again:
+
+| Record | File in `<agentDir>` | What travels |
+| --- | --- | --- |
+| `settings:models` | `models.json` | Providers, their models and every per-model value (context window, limits, names) |
+| `settings:keys` | `auth.json` | API keys only: per Provider the key ring and which key is selected. OAuth sign-ins never leave the computer |
+| `settings:preferences` | `settings.json` | An allow-list of keys (`PORTABLE_SETTINGS_KEYS`): default model and effort, enabled and disabled Providers, the helper models of sub-agents, memory, titles, translation, vision, scheduled tasks, compaction, retry, web search, Git commit and push modes, notifications, the proxy (`httpProxy`) and request time limits (`network`). Machine settings (`LOCAL_ONLY_SETTINGS_KEYS`: shell, editor, session folder, extensions, packages, trust) are neither read nor written |
+| `settings:model-prompts` | `model-prompts.json` | The prompts per model. The time a prompt was saved is each computer's own and is not published |
+| `settings:search-keys` | `web-search-keys.json` | Keys of the search services |
+| `settings:mode-models` | `chat-mode-state.json` | Only the model chosen for each chat mode (Coding, General). The last chat and the drafts in the same file stay on this computer; a mode the other computer has no model for keeps this one's |
+| `settings:skills` | `skills/` | The folder file by file (text as text, other files as base64) |
+| `settings:prompts` | `prompts/` | The same, for prompt templates |
+| `settings:themes` | `themes/` | The same, for themes |
+
+A folder record leaves out `.git`, `node_modules`, `*.tmp`, `Thumbs.db`, `desktop.ini`, `.DS_Store` and links, and
+stops at 2 MB per file and 16 MB in all; a folder over the limit is published with `partial: true`. Writing a record
+creates and changes files inside the folder only (a path that would leave it is refused) and removes a file the record
+no longer lists, after copying it to `sync/settings-backup/<id>/`; a partial record removes nothing.
+
+API keys are stored in the user's own Drive folder in the same form as in `auth.json` on disk: plain text, protected by
+the Google account, not encrypted by MyHarness. The sync page says so in its "Settings and keys" row.
+
+Rules:
+
+- Two computers that changed different things both keep their change: the JSON is merged key by key (lists of items
+  with an `id` item by item) against the last version both had. Where both changed the same value, the later change
+  wins (record time against this computer's file time).
+- The common version is trusted only when the other computer's version descends from this computer's. A computer that
+  joins with its own configuration is therefore combined with the others (nothing counts as removed); on a value both
+  set differently, the version already in Drive wins that first time.
+- A settings record is never deleted as a whole. A missing or unreadable file publishes nothing, so a new or broken
+  computer cannot take the Providers or keys of the others away; a Provider or key removed in Settings is an edit of the
+  file and does travel.
+- Before a file is replaced it is copied to `<agentDir>/sync/settings-backup/` (the last 5 per file).
+- A key of `settings.json` this version does not know is left alone here and travels on unchanged when another
+  computer publishes it (`sync/settings-extra-keys.json` remembers such keys).
+- After an arriving change the server reloads the configuration for every idle chat (`hub.reloadConfigFromDisk`; a
+  running chat follows when it is idle) and tells the pages (`settings_changed`).
+
+Devices running a version without settings records ignore them. A version that knows settings records but not one of
+them (for example the four added after the first five) notes once per batch that a record "has an unusable identity
+and was ignored", and leaves it untaken on purpose: once that computer is updated it meets the record for the first
+time, so what is on Drive wins instead of its own files overwriting the others'.
 
 ## Setup
 
@@ -101,12 +152,18 @@ non-sensitive scopes, so a published app shows no unverified-app warning and has
 My Drive/
 └─ MyHarness/
    ├─ README.txt
-   └─ sync-v1/
-      ├─ identity.json
-      ├─ batches/<batchId>.json
-      ├─ objects/<sha256>
-      ├─ snapshots/<deviceId>.json.gz
-      └─ files/<workspace>__<batchId>.json
+   ├─ sync-v1/
+   │  ├─ identity.json
+   │  ├─ batches/<batchId>.json
+   │  ├─ objects/<sha256>
+   │  ├─ snapshots/<deviceId>.json.gz
+   │  └─ files/<workspace>__<batchId>.json
+   └─ phone-v1/          (the account's phones, see “Phones of the account”)
+      ├─ pcs/<deviceId>.json
+      ├─ views/<deviceId>.json.gz, <deviceId>.memories.json.gz
+      ├─ phones/<phoneId>.json
+      ├─ outbox/<phoneId>__<time>__<random>.json
+      └─ link/…
 ```
 
 - `identity.json` contains the sync space id. A renamed folder is still found by its Drive file id; a second folder with
@@ -117,6 +174,9 @@ My Drive/
 - `objects/` is content-addressed, so identical attachments are stored once.
 - A large first upload is published as several batches of at most 500 operations, never as one batch a receiver would
   refuse.
+- Content of up to 64 KB also travels inside the batch that publishes it (at most 4 MB per batch), besides its object:
+  a receiver writes such a change from the change list it has already read, without one more download per record. A
+  receiver on an older version ignores the field and fetches the object as before.
 - A batch from the same device is recognised by its file name and marked as seen without being read or applied: the
   local state already contains it.
 - Writer locks, their owner markers (`*.jsonl.lock.owner`), bridges and temporary files never leave a computer. Older
@@ -136,6 +196,46 @@ My Drive/
 - A damaged batch, a batch over 5000 operations, or a batch whose object never arrives is reported once in Settings and
   then skipped, so one bad file cannot keep the sync loop busy forever. A damaged or oversized batch is also remembered
   by name, so a full issue list cannot make it readable again.
+
+## Phones of the account
+
+The Android app (`packages/mobile`) signs in with the same Google account and the same built-in client, so `drive.file`
+shows it the `MyHarness` folder. It never writes into `sync-v1/`: batches, version vectors and snapshots belong to the
+computers. Its place is `phone-v1/` beside it (`src/sync/phone/`, the computer's side in `channel.ts`):
+
+| Folder | Written by | Holds |
+| --- | --- | --- |
+| `pcs/` | each computer, every minute | name, version, when it was last on, whether it accepts phones (Settings → Phone), its local-network address when the phone link listens there |
+| `views/` | each computer, when something changed (at most every 20 s) | gzip JSON: its chats (title, preview, the hash of the chat file in `sync-v1/objects/`, a rank), its Providers with their keys and models, the default model and effort, the built-in browser's bookmarks; memories in `<deviceId>.memories.json.gz` (at most every minute) |
+| `phones/` | each phone, at sign-in | its id, name and the key its connections are sealed with |
+| `outbox/` | phones | changes a computer applies to its own files and then removes |
+| `link/` | both | connection offers and answers, and the messages of a connection that goes through Drive (phone link, `web-ui.md`); a small one also carries its text in the file's public `properties`, so the other side reads it from the folder listing |
+
+What a view shares: only Providers of the API kinds the phone's agent can call (OpenAI Completions and Responses,
+Anthropic Messages, Google Generative AI), and only with a key saved in MyHarness (`auth.json` or `models.json`). A key
+from an environment variable or a command, and every subscription or OAuth login, never leaves the computer; neither
+does anything of the Claude Code shell Provider. Ranks are the sum of a record's version vector, so the phone takes,
+for each chat, setting and bookmark list, the version of the computer with the largest rank.
+
+The outbox (`src/sync/phone/importer.ts`):
+
+- `chat.append` `{ chatId, key?, createdAt, entries }`: lines for a chat. With `key` they continue a computer's chat
+  (`session:<workspaceId>/<sessionId>`), hanging on its last line; without it they are a chat the phone started, which
+  becomes `phone-<chatId>` in the default group. Lines keep the ids the phone gave them, so applying a file twice (two
+  computers that both thought it their turn) changes nothing the second time.
+- `provider.save` `{ provider, apiKey? }` and `provider.remove` `{ id }`: a Provider the user added, changed or removed
+  on the phone, written into `models.json` and `auth.json`.
+- Of the computers that are on, the one with the smallest device id applies the files. A file for a chat that is
+  running here waits until it is idle; one for a chat this computer does not have yet waits for sync to bring it, and
+  after 6 hours becomes a chat of its own (the chat was removed elsewhere). A line whose parent the chat does not have
+  starts the chat instead of pointing nowhere.
+- After an import the configuration is reloaded and the pages are told, as after a sync pass; the ordinary sync then
+  carries the change to the other computers.
+
+The computer lists `phones/` every few seconds, and at once when a phone it does not know yet starts to connect (it signed in a moment ago), and downloads a registration again only when it changed; of the
+account's phones, the phone link accepts those listed there (a phone removed in Settings → Phone stays refused until it signs in
+again with a new key). Nothing a phone sends can grant trust, change a setting outside the Provider files, or start a
+command by itself: a message a phone sends to a computer's chat runs the same way as one typed here.
 
 ## Local polling cost
 
@@ -188,13 +288,21 @@ Each record has a stable key (`kind:id`) and a per-device version vector.
   other beside it as `<name> (conflicted copy <first 8 hex of its SHA-256>)<extension>`, which also travels. Every merge
   gives the same result whichever computer runs it, and the merged version is published past both, so the two
   computers converge and stop.
-- Concurrent edits of a Workspace identity: the local version stays in use and the other version is saved under
-  `<agentDir>/sync/recovered/…`; the conflict is listed in Settings. Review entries an older version left for the
-  prompt, drafts, saved prompts or files are merged from their saved copy on the first pass after a start, the same way;
-  an item deleted here since keeps its entry instead of coming back.
-- Delete vs edit: the deletion is not silently undone, but the edited content is kept as a recoverable copy.
+- Whatever has no merge rule (a Workspace identity both devices changed, content that is not what its kind expects)
+  goes to the later change: the other device's version when its record time is later than this computer's change, else
+  this computer's, which is then published past the other. The version that lost is saved once, quietly, under
+  `<agentDir>/sync/recovered/…`.
+- Deleted on one device and changed on the other: the later of the two wins, without asking. A deletion carries the
+  time the item was last seen before it disappeared (the previous upload plan, or the item's own time right after a
+  start), so an edit made afterwards elsewhere is the later one and brings the item back; a deletion made after the
+  edit stays, and the edited version is kept as a recoverable copy. Two exceptions: a memory that still has content
+  anywhere is never removed by another device's deletion, and a file of a chat that is deleted follows its chat.
 - Re-creating a record after the deletion has been seen is a newer version and is applied; an old offline copy that
   predates the deletion is not resurrected.
+- No review entries are made any more, and Settings has no list of them. Entries an older version left are merged from
+  their saved copy where a merge rule exists and dropped on the first pass after a start; the copies stay in
+  `<agentDir>/sync/recovered/…`. The guard against a mass deletion (see “Limits”) is the one thing that still waits for
+  the user.
 
 Nothing in the applied data triggers a model call, memory extraction or command execution. A remote record cannot grant
 Project Trust or run tools.
@@ -302,12 +410,11 @@ batch channel:
 
 - only the other side changed: apply it;
 - only this side changed: upload it;
-- both changed: the local file keeps its path, the other version is saved as
-  `<name> (conflict <device> <time>)<ext>` beside it, and Settings lists the conflict with the choices *keep this
-  computer's version*, *use the other version* and *keep both*;
-- remote delete and local edit: the local file is kept and the conflict is listed;
-- local delete and remote edit: the deletion stays on this device, the other version is saved as a copy, and no delete
-  is published for a path this device no longer tracks;
+- both changed: the later change wins, by the files' own modification times (a published change carries its file's
+  `modifiedAt`); the version that lost is copied to `<agentDir>/sync/backups/workspace-file/…` first. Nothing is listed
+  and nothing waits for a choice;
+- remote delete and local edit: the local file is kept and published again;
+- local delete and remote edit: the other version is taken;
 - a path that is a file on one side and a directory on the other is refused, not overwritten.
 
 **Deletion guard.** A pass that would publish 100 or more deletions, or at least 20 and at least 20% of the tracked
@@ -389,7 +496,11 @@ end-to-end encrypted: Google stores the data under the account's normal Drive pr
 ## Scheduling
 
 - Local file changes are watched and debounced (~0.8 s), then pushed.
-- While the app is connected it checks for remote batches every ~10 s; idle every ~45 s.
+- While the app is connected it checks for remote batches every ~10 s; idle every ~45 s. Coming back to the app (the
+  page gains focus, at most every 10 s) asks for a check at once (`POST /api/sync/attention`; skipped while a pass runs
+  or one ended less than 8 s ago), so a change made on the other computer does not wait for the idle poll.
+- A change of a settings file (`models.json`, `auth.json`, `settings.json`, `model-prompts.json`, the search keys) wakes
+  the engine like a change in the data root.
 - Every Drive request has a deadline: 30 s for metadata, 3 min for reading an object, 5 min for a write. A request that
   never answers fails that pass instead of leaving it `running` forever, so the manual buttons come back and the next
   retry is scheduled by itself. A timeout is not retried inside the same request.
@@ -460,21 +571,34 @@ end-to-end encrypted: Google stores the data under the account's normal Drive pr
 | Remote record with an unusable identity | Refused before any path is built; reported once |
 | Remote chat timestamp that is not a plain timestamp | Sanitised into the generated file name; it cannot choose a folder |
 
-## Manual buttons
+## The sync page
 
-Settings → Google Drive has three buttons in one row:
+Settings → Google Drive (`web/js/sync-page.js`; what it says is worked out in `web/js/sync-status.js`):
 
-- **Check now** — one ordinary pass (download, then upload), the same pass the timer runs.
+- One card at the top says the state in one line (not connected, up to date with "last synced … ago", syncing with a
+  progress bar, "x / y" and the time left estimated from the rate of the last seconds, sign in again, turned off,
+  something needs you) and has one button for it (connect, cancel, sign in again, turn on, sync now), the "Sync
+  automatically" switch (off pauses) and the Google account with "Disconnect".
+- A "needs you" card appears only when something does: a restored Workspace waiting for its folder, a held mass
+  deletion, an item that cannot be uploaded.
+- "What is synced" lists chats and memories, settings and keys (with the note that keys are stored unencrypted in the
+  user's own Drive), the built-in browser's data, and file sync per Workspace.
+- "Advanced" is folded: this computer's name, the Drive folder, the last activity with "Download only", background
+  retries and the user's own OAuth client.
+- The sidebar's foot shows a small sync mark while Drive is connected (a dot: up to date, moving, needs attention,
+  failing); a click opens this page.
+
+**Sync now** is one ordinary pass (download, then upload), the same pass the timer runs.
 
 Every pass, automatic or manual, keeps listing the batches folder until nothing new is left (at most 20 rounds), uploads
-up to four file contents at a time, and reports what it moves in the status's `progress = { stage: download|upload,
+up to eight file contents at a time, and reports what it moves in the status's `progress = { stage: download|upload,
 done, total, step? }` (null between passes). A download has two steps: `read` counts the change lists read from Drive,
 `apply` counts the records fetched and written. Settings shows it as "x / y" with a bar next to "Waiting to download" /
 "Waiting to upload" (with "Reading changes" in front during the first step) and in the line under the buttons ("Reading
 changes from Drive… x / y", then "Downloading… x / y"), updated at most four times a second. A pass that downloaded or
 uploaded something is followed by the next one after 1.5 s instead of the normal poll, so a backlog keeps flowing; automatic
 passes also retry batches skipped for a missing object or a failed apply every 10 minutes.
-- **Download now** — download only. It waits for a pass that is already running, then keeps listing the batches folder
+- **Download only** (under Advanced) — download only. It waits for a pass that is already running, then keeps listing the batches folder
   until nothing new is left (bounded to 20 rounds), so batches that arrive during a long download are fetched too. It
   also gives batches skipped earlier for a missing object or a failed apply another chance. Nothing is uploaded.
 - **Sync now** — the same complete download followed by the upload of everything waiting on this computer.
@@ -499,6 +623,7 @@ All routes are local-only and use the same origin checks as the rest of the Web 
 | `POST /api/sync/connect` | Start OAuth with this device's client, else MyHarness's own app (status `builtInClient`); answers `{ authUrl }`, completion continues in the background. While connected it signs in again and keeps the space for the same account |
 | `POST /api/sync/disconnect` | Stop syncing and forget the token on this device |
 | `POST /api/sync/check` | Run one push + pull pass now |
+| `POST /api/sync/attention` | The user is back at the app: check soon, unless a pass runs or just ended |
 | `POST /api/sync/download` | Start "Download now" in the background; progress in the status's `manual` |
 | `POST /api/sync/sync` | Start "Sync now" in the background; progress in the status's `manual` |
 | `POST /api/sync/bind` | `{ workspaceId, rootPath }` bind a restored workspace folder |
@@ -526,11 +651,14 @@ All routes are local-only and use the same origin checks as the rest of the Web 
   (at most every 30 minutes while browsing), and Drive keeps every uploaded version as an object; old versions are not
   cleaned up.
 - Batches over 5000 operations written by another client are refused; this daemon never writes such a batch itself.
-- Review entries remain only for a Workspace identity both devices changed and delete-vs-edit (a chat entry or title
-  both changed goes to the later change); there is no “apply the other version” button yet, and the local path and the copy path are shown in
-  full. Memories, the prompt, drafts, the saved prompts and files no longer create review entries: they merge
-  automatically. Besides the two-device tests on the in-memory Drive, the maintainer has run these merges through a real
-  Drive across at least four PCs (October 2026).
+- "The later change wins" compares clocks of two computers. A computer whose clock is wrong by more than the time
+  between the two changes can win or lose wrongly; the version that lost is kept as a copy (see “Merge rules”), and
+  texts, lists and settings are merged rather than chosen wherever a merge rule exists.
+- API keys travel unencrypted inside the user's own Drive folder (see “Settings and keys”). Every computer needs this
+  version for settings to arrive; an older one ignores the records.
+- The transfer times quoted for this version come from a benchmark with simulated Drive latency (2,400 files), not from
+  the maintainer's real folder: first upload 291 s → 159 s, a new computer's full download 41 s → 24 s (object downloads
+  2,406 → 388), an evening's changes 7.5 s → 4.5 s up and 3.7 s → 2.7 s down.
 - A snapshot stands for its device's own batches by batch time. A device whose clock jumped backwards could publish a
   batch with an earlier time than its last snapshot; the same exposure already exists for the per-device watermark.
 - Old batches and objects are never removed from Drive (no garbage collection yet), so the folder keeps growing; the
@@ -577,7 +705,20 @@ All routes are local-only and use the same origin checks as the rest of the Web 
 npm.cmd --workspace packages/coding-agent run test -- test/google-drive-sync.test.ts
 npm.cmd --workspace packages/coding-agent run test -- test/google-drive-sync-catchup.test.ts
 npm.cmd --workspace packages/coding-agent run test -- test/workspace-file-sync.test.ts
+npm.cmd --workspace packages/coding-agent run test -- test/sync-settings.test.ts
+npm.cmd --workspace packages/coding-agent run test -- test/phone-channel.test.ts test/phone-remote-link.test.ts
 ```
+
+`phone-channel.test.ts` reads what the computer wrote with the phone's own code (`packages/mobile/web/js/account-view.js`):
+the presence and the view (chats, a Provider with its key, the default model), a continued chat, a new phone chat
+and a Provider applied once each (a second copy of the file changes nothing), lines for a chat that never arrives
+kept as a chat of their own after the wait, and a new or re-registered phone picked up within one pass without
+downloading unchanged registrations again. `phone-remote-link.test.ts` covers the connections (`web-ui.md`).
+
+`sync-settings.test.ts` covers the settings records: the merge rules, API keys without OAuth sign-ins, the allow-list of
+preferences, a new computer receiving everything, two computers keeping each other's changes with the later one winning
+a shared value, a removed Provider travelling while a missing file removes nothing, and small contents arriving inside
+the batch with no object download. `web-sync-status.test.ts` covers what the page and the sidebar mark say.
 
 `test/google-drive-sync.test.ts` also covers the built-in browser: bookmarks both computers had are joined (a page
 saved on both stays once), concurrent edits on both sides survive and both computers end with one file, site settings
@@ -601,7 +742,7 @@ ahead of their downloads (at most four queries at once, no second query for a do
 
 `test/workspace-file-sync.test.ts` covers the file channel: first snapshot and reconstruction on a second device with
 its own folder and the same workspace id, add/edit/delete in both directions, an interrupted download that resumes and
-publishes no false deletion, both-modified conflicts with a saved copy and convergence after `keep-local`, a subtree
+publishes no false deletion, a file both computers edited settled by the later change with the other version backed up, a subtree
 that cannot be scanned never producing deletes while healthy paths still sync, the bulk-deletion guard and its
 confirmation, a Windows case-only rename, an unknown manifest version kept read-only, the first-upload preflight, Drive
 relative-path location with an ambiguous-root refusal, hidden-occupant release that keeps its chats, and Drive-root

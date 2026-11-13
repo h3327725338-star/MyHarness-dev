@@ -18,33 +18,76 @@ const SAFE_LINK = /^(https?:|mailto:|#|\/(?!\/)|\.{0,2}\/)/i;
 
 /**
  * One picture, video or sound of a reply (`![caption](path "layout")`, reply-media-model.js): an empty figure that
- * reply-media.js fills once it is on the page. Spans, because it stands inside a paragraph. The caption is the text in
- * the square brackets; a picture inside a line of text has none.
+ * reply-media.js fills once it is on the page. Spans, because it stands inside a paragraph.
+ *
+ * Pictures are set the way a paper sets its figures: on a line of their own they are centered with a numbered caption
+ * under them ("Figure 1  caption"); the number is written by reply-media.js, which counts the figures of the reply in
+ * the order they appear. The caption is the text in the square brackets. A number or a letter the model wrote itself at
+ * its start ("Figure 2:", "(a)") is taken off, so it never shows twice. A picture inside a line of text has no caption.
  */
-function figureHtml(token) {
+function figureHtml(token, sub = false) {
 	const name = mediaName(token.target);
 	// A read-only export copy has no server to load the file from: it keeps the caption, as before.
 	if (exportReadOnly()) return esc(token.alt || name);
 	const { layout, width, title } = parseMediaLayout(token.title);
 	// Sound has no shape to place: it is always a player on a line of its own.
-	const placed = token.kind === "audio" ? "block" : layout;
+	const placed = token.kind === "audio" ? "figure" : layout;
+	const text = captionText(token.alt, sub);
 	const attributes = [
 		'class="md-fig"',
 		`data-layout="${placed}"`,
 		`data-media-kind="${token.kind}"`,
 		`data-media-src="${esc(token.target)}"`,
 		`data-media-name="${esc(name)}"`,
-		`data-media-alt="${esc(token.alt)}"`,
+		`data-media-alt="${esc(text)}"`,
 		`data-local-path="${esc(token.target)}"`,
 		width ? `style="--fig-w:${width}%"` : "",
 		title ? `title="${esc(title)}"` : "",
 	];
-	const caption = token.alt && placed !== "inline" ? `<span class="md-fig-cap">${esc(token.alt)}</span>` : "";
-	return `<span ${attributes.filter(Boolean).join(" ")}><span class="md-fig-frame"><span class="md-fig-wait">${esc(token.alt || name)}</span></span>${caption}</span>`;
+	// A numbered figure always has its caption line (the number alone when there are no words); video and sound only
+	// when they have words.
+	const numbered = token.kind === "image" && placed !== "inline";
+	const caption =
+		placed !== "inline" && (numbered || text)
+			? `<span class="md-fig-cap"><span class="md-fig-no"></span><span class="md-fig-text">${esc(text)}</span></span>`
+			: "";
+	return `<span ${attributes.filter(Boolean).join(" ")}><span class="md-fig-frame"><span class="md-fig-wait">${esc(text || name)}</span></span>${caption}</span>`;
+}
+
+/** A caption without the number ("Figure 2:", "Fig. 2.", the Chinese form) or sub-figure letter ("(a)") written into it. */
+const WRITTEN_NUMBER = /^\s*(?:figure|fig\.?|\u56fe)\s*\d+\s*[:\uff1a.\u3001\uff0e]?\s*/iu;
+const WRITTEN_LETTER = /^\s*[(\uff08][a-z][)\uff09]\s*/iu;
+function captionText(alt, sub) {
+	const text = String(alt ?? "");
+	return (sub ? text.replace(WRITTEN_LETTER, "") : text.replace(WRITTEN_NUMBER, "")).trim();
 }
 
 /** Layouts in which a figure takes a line of its own, so several of them in one paragraph can stand side by side. */
-const ROW_LAYOUTS = new Set(["block", "center", "wide"]);
+const ROW_LAYOUTS = new Set(["figure", "wide"]);
+
+/**
+ * Two or more pictures at the start of one paragraph stand side by side as the parts of one figure: each gets its
+ * letter, (a), (b)..., and the figure one number. Text after the last picture in that paragraph is the caption of the
+ * whole figure. Returns the two halves, or null when the paragraph is not such a group.
+ */
+function figureGroup(tokens) {
+	const blank = (token) => token.type === "br" || (token.type === "text" && !token.raw.trim());
+	const pictures = [];
+	let at = 0;
+	for (; at < tokens.length; at++) {
+		const token = tokens[at];
+		if (blank(token)) continue;
+		if (token.type !== "replyMedia" || token.kind === "audio" || !ROW_LAYOUTS.has(parseMediaLayout(token.title).layout)) break;
+		pictures.push(token);
+	}
+	if (pictures.length < 2) return null;
+	const rest = tokens.slice(at);
+	if (rest.some((token) => token.type === "replyMedia")) return null;
+	// The caption starts on the line after the pictures: the line break itself is not part of it.
+	while (rest.length && blank(rest[0])) rest.shift();
+	if (rest[0]?.type === "text") rest[0] = { ...rest[0], raw: rest[0].raw.replace(/^\s+/, ""), text: rest[0].text.replace(/^\s+/, "") };
+	return { pictures, caption: rest };
+}
 
 let engine;
 function getEngine() {
@@ -65,7 +108,7 @@ function getEngine() {
 					const found = scanMedia(src);
 					return found ? { type: "replyMedia", ...found } : undefined;
 				},
-				renderer: figureHtml,
+				renderer: (token) => figureHtml(token),
 			},
 		],
 		renderer: {
@@ -73,14 +116,16 @@ function getEngine() {
 				return esc(text);
 			},
 			paragraph({ tokens }) {
-				// Two or more pictures written in one paragraph, with nothing else in it, stand side by side.
-				const parts = tokens.filter((token) => !(token.type === "br" || (token.type === "text" && !token.raw.trim())));
-				const row =
-					parts.length > 1 &&
-					parts.every((token) => token.type === "replyMedia" && token.kind !== "audio" && ROW_LAYOUTS.has(parseMediaLayout(token.title).layout)) &&
-					!exportReadOnly();
-				return row ? `<p class="md-fig-row">${parts.map(figureHtml).join("")}</p>
-` : false;
+				const group = figureGroup(tokens);
+				if (!group || exportReadOnly()) return false;
+				let caption = this.parser.parseInline(group.caption).trim();
+				// The number is written for it; one the model wrote itself is taken off the start.
+				if (group.caption[0]?.type === "text") {
+					const first = { ...group.caption[0], raw: group.caption[0].raw.replace(WRITTEN_NUMBER, ""), text: group.caption[0].text.replace(WRITTEN_NUMBER, "") };
+					caption = this.parser.parseInline([first, ...group.caption.slice(1)]).trim();
+				}
+				return `<div class="md-fig-group"><p class="md-fig-row">${group.pictures.map((token) => figureHtml(token, true)).join("")}</p><p class="md-fig-cap md-fig-group-cap"><span class="md-fig-no"></span><span class="md-fig-text">${caption}</span></p></div>
+`;
 			},
 			code({ text, lang }) {
 				const language = (lang || "").trim().split(/\s+/)[0];

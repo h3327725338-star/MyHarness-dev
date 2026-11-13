@@ -441,6 +441,18 @@ export class WebHostHub implements WebHostHubLink {
 	}
 
 	/**
+	 * Providers, keys or settings were written to disk by something that is not a chat (Google Drive sync brought them
+	 * from another computer). Every open chat reloads them like a change saved in another chat; a busy one waits
+	 * until its work has settled, so no model is swapped in the middle of a run.
+	 */
+	reloadConfigFromDisk(): void {
+		for (const host of this.slots.values()) {
+			if (host.session.isIdle) this.reconcileSlot(host, "models_changed");
+			else this.deferredModelsReconcile.add(host.slotId);
+		}
+	}
+
+	/**
 	 * Google Drive sync changed the Workspace registry through its own store (a restored Workspace, or a folder the
 	 * user just bound). Re-read it, so the shared store does not save its old copy over the new one, and move every
 	 * idle open chat whose folder is not usable here onto its Workspace's folder, so the panels show it at once.

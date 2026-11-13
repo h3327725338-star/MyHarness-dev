@@ -275,6 +275,8 @@ export const state = {
 	modePreferencesNonce: 0,
 	/** Changes when a model prompt was saved somewhere (`model_prompts_changed`). */
 	modelPromptsNonce: 0,
+	/** Bumped when the phone link changed on the server (`phone_link_changed`): switch, pairing, a phone coming or going. */
+	phoneLinkNonce: 0,
 	models: null,
 	settings: null,
 	providers: null,
@@ -2054,6 +2056,11 @@ export async function boot() {
 				await initialLoad();
 				booted = true;
 				loadModels();
+				// The sidebar's sync indicator needs the state before the first status event arrives.
+				void attempt(async () => {
+					const data = await api("/api/sync/state", { timeoutMs: 10_000 });
+					if (data?.status && !state.syncStatus) set({ syncStatus: data.status });
+				}, { quiet: true });
 				connectEvents();
 				prefetchOtherMode();
 				return;
@@ -2452,6 +2459,10 @@ function connectEvents() {
 	});
 	on("model_prompts_changed", () => {
 		state.modelPromptsNonce += 1;
+		emit(true);
+	});
+	on("phone_link_changed", () => {
+		state.phoneLinkNonce += 1;
 		emit(true);
 	});
 	on("login_event", (d) => set({ loginEvent: d.type === "done" ? null : d }));

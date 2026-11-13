@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-const { connectionBadge, deriveSync, footLine, progressText, reviewTarget, reviewTitle, stateLine } = await import(
+const { agoText, deriveSync, etaText, massDeleteText, progressText, summaryLine, syncSummary } = await import(
 	new URL("../web/js/sync-status.js", import.meta.url).href
 );
+
+const NOW = Date.parse("2026-11-12T12:00:00.000Z");
 
 function status(patch: Record<string, unknown> = {}) {
 	return {
@@ -11,151 +13,171 @@ function status(patch: Record<string, unknown> = {}) {
 		paused: false,
 		phase: "idle",
 		lastError: null,
+		lastCheckAt: "2026-11-12T11:58:00.000Z",
 		pendingUploads: 0,
 		pendingDownloads: 0,
 		conflicts: [],
 		issues: [],
 		pendingBindings: [],
 		manual: null,
+		progress: null,
 		files: { workspaces: [], conflicts: [], issues: [] },
 		...patch,
 	};
 }
 
-describe("Google Drive settings status", () => {
-	it("stays green and says up to date when every count is zero", () => {
-		const view = deriveSync(status());
-		expect(view.decisions).toBe(0);
-		expect(view.unresolved).toBe(0);
-		expect(connectionBadge(status(), view)).toEqual({ cls: "ok", text: "Syncing" });
-		expect(stateLine(status(), view)).toBe("Up to date");
-		expect(footLine({ kind: "sync", state: "done", stage: "upload", done: 1, total: 1 }, status(), view)).toEqual({
-			text: "Sync finished.",
+const summary = (patch: Record<string, unknown> = {}) => {
+	const value = status(patch);
+	return syncSummary(value, deriveSync(value), NOW);
+};
+
+describe("Google Drive sync summary", () => {
+	it("says up to date and when, with nothing to do", () => {
+		const view = summary();
+		expect(view).toMatchObject({ tone: "ok", title: "Up to date", detail: "Last synced 2 min ago", action: "sync" });
+		expect(summaryLine(view)).toBe("Up to date · Last synced 2 min ago");
+	});
+
+	it("offers to connect before anything else", () => {
+		expect(summary({ connected: false })).toMatchObject({ tone: "off", title: "Not connected", action: "connect" });
+		expect(summary({ connected: false, phase: "authorizing" })).toMatchObject({ tone: "busy", action: "cancel" });
+	});
+
+	it("shows how far a pass got, with numbers for the bar", () => {
+		const view = summary({
+			phase: "downloading",
+			pendingDownloads: 240,
+			progress: { stage: "download", step: "write", done: 12, total: 240 },
+		});
+		expect(view.tone).toBe("busy");
+		expect(view.title).toBe("Syncing…");
+		expect(view.detail).toBe("Downloading 12 / 240");
+		expect(view.progress).toEqual({ done: 12, total: 240, percent: 5, stage: "download" });
+		// Reading the change lists is its own step and says so.
+		expect(summary({ progress: { stage: "download", step: "read", done: 3, total: 9 } }).detail).toBe(
+			"Reading changes from Drive 3 / 9",
+		);
+		expect(summary({ progress: { stage: "upload", done: 4, total: 8 } }).detail).toBe("Uploading 4 / 8");
+	});
+
+	it("says what is waiting while a pass has not counted its work yet", () => {
+		const view = summary({ phase: "uploading", pendingUploads: 3, pendingDownloads: 2 });
+		expect(view).toMatchObject({ tone: "busy", title: "Syncing…", detail: "3 to upload · 2 to download" });
+		expect(view.progress).toBeUndefined();
+	});
+
+	it("turns an expired sign-in into one clear action, and other failures into a retry", () => {
+		expect(summary({ phase: "error", lastError: "Google sign-in expired. Sign in again." })).toMatchObject({
+			tone: "danger",
+			title: "Sign in to Google again",
+			action: "signin",
+		});
+		expect(summary({ phase: "error", lastError: "Network is unreachable" })).toMatchObject({
+			tone: "danger",
+			title: "Sync could not finish",
+			detail: "Network is unreachable",
+			action: "sync",
 		});
 	});
 
-	it("names a kept copy in the footer instead of claiming everything finished", () => {
-		const withCopy = status({
+	it("treats paused and switched off as one state with one way back", () => {
+		expect(summary({ paused: true, pendingUploads: 4 })).toMatchObject({
+			tone: "off",
+			title: "Sync is off",
+			detail: "4 changes are waiting. Turn sync on to continue.",
+			action: "resume",
+		});
+		expect(summary({ enabled: false })).toMatchObject({ tone: "off", action: "resume" });
+	});
+
+	it("asks the user only for what it cannot decide: a folder, a large deletion, waiting file deletions", () => {
+		const value = status({
+			pendingBindings: [{ workspaceId: "ws1", name: "Study", path: "D:/x" }],
+			issues: [
+				{
+					key: "mass-delete:memory",
+					reason: "mass-delete",
+					detail:
+						"60 of 80 synced memory records are missing from this computer, so their deletion was not published.",
+					at: "2026-11-12T11:00:00.000Z",
+				},
+				{ key: "missing:abc", reason: "missing-object", detail: "object abc", at: "2026-11-12T11:00:00.000Z" },
+			],
+			files: {
+				workspaces: [
+					{
+						workspaceId: "ws2",
+						name: "Notes",
+						managed: true,
+						state: "blocked",
+						pendingUploads: 0,
+						pendingDownloads: 0,
+					},
+				],
+				conflicts: [],
+				issues: [],
+			},
+		});
+		const view = deriveSync(value);
+		expect(view.needsYou).toBe(3);
+		// Background retries are not the user's job and do not change the summary.
+		expect(view.retrying.map((issue: { key: string }) => issue.key)).toEqual(["missing:abc"]);
+		expect(syncSummary(value, view, NOW)).toMatchObject({ tone: "warn", title: "3 things need you" });
+		expect(massDeleteText(view.massDeletes[0])).toContain("60 of 80 synced memories are missing");
+	});
+
+	it("never asks about two versions of something: entries an older version left are ignored", () => {
+		const value = status({
 			conflicts: [{ id: "c1", key: "memory:memory/profile.md", kind: "memory", reason: "both-modified" }],
+			files: { workspaces: [], conflicts: [{ id: "f1", workspaceId: "ws1", path: "a.html" }], issues: [] },
 		});
-		const view = deriveSync(withCopy);
-		expect(view.decisions).toBe(0);
-		expect(connectionBadge(withCopy, view).text).toBe("Review needed");
-		expect(stateLine(withCopy, view)).toBe("Finished, but open items: 1.");
-		const foot = footLine({ kind: "sync", state: "done", stage: "upload", done: 1, total: 1 }, withCopy, view);
-		expect(foot.text).toBe("Kept for review: 1");
-		expect(foot.target).toBe("sync-review");
-		expect(foot.review).toBe(true);
+		const view = deriveSync(value);
+		expect(view.needsYou).toBe(0);
+		expect(syncSummary(value, view, NOW).tone).toBe("ok");
 	});
 
-	it("separates a decision from ordinary transfer counts", () => {
-		const conflict = status({
+	it("does not count a restored workspace that already has its managed folder", () => {
+		const value = status({
+			pendingBindings: [{ workspaceId: "ws1", name: "Study", path: "D:/x" }],
 			files: {
-				workspaces: [],
-				conflicts: [{ id: "f1", workspaceId: "ws1", path: "a.html" }],
-				issues: [],
-			},
-		});
-		const view = deriveSync(conflict);
-		expect(view.decisions).toBe(1);
-		expect(connectionBadge(conflict, view).text).toBe("Needs your decision");
-		const foot = footLine({ kind: "sync", state: "done", stage: "upload", done: 0, total: 0 }, conflict, view);
-		expect(foot.text).toBe("Waiting for your decision: 1");
-		expect(foot.target).toBe("sync-conflicts");
-	});
-
-	it("shows a blocked folder as a problem even without a file conflict", () => {
-		const blocked = status({
-			files: {
-				workspaces: [{ workspaceId: "ws1", state: "blocked", pendingUploads: 0, pendingDownloads: 0 }],
+				workspaces: [
+					{
+						workspaceId: "ws1",
+						name: "Study",
+						managed: true,
+						state: "idle",
+						pendingUploads: 0,
+						pendingDownloads: 0,
+					},
+				],
 				conflicts: [],
 				issues: [],
 			},
 		});
-		const view = deriveSync(blocked);
-		expect(view.blocked).toHaveLength(1);
-		expect(connectionBadge(blocked, view).text).toBe("Needs attention");
-		expect(stateLine(blocked, view)).toBe("Needs attention");
-		expect(reviewTarget(view)).toBe("sync-files");
+		expect(deriveSync(value).needsYou).toBe(0);
+	});
+});
+
+describe("Google Drive sync small texts", () => {
+	it("tells how long ago in words", () => {
+		expect(agoText("2026-11-12T11:59:40.000Z", NOW)).toBe("just now");
+		expect(agoText("2026-11-12T11:30:00.000Z", NOW)).toBe("30 min ago");
+		expect(agoText("2026-11-12T07:00:00.000Z", NOW)).toBe("5 h ago");
+		expect(agoText(null, NOW)).toBe("");
 	});
 
-	it("points the footer button at a section that exists", () => {
-		const bindings = deriveSync(status({ pendingBindings: [{ workspaceId: "ws2", name: "OS", path: "C:/x" }] }));
-		expect(reviewTarget(bindings)).toBe("sync-bindings");
-		expect(footLine({ kind: "sync", state: "done" }, status(), bindings).target).toBe("sync-bindings");
-
-		// Copies kept for review have their own card; background issues have a notice inside the status card, never a
-		// card of their own, so the button must not point at one that is not rendered.
-		const copies = deriveSync(status({ conflicts: [{ id: "c1", kind: "memory", reason: "both-modified" }] }));
-		expect(reviewTarget(copies)).toBe("sync-review");
-		const issueOnly = status({ issues: [{ key: "issue:1", reason: "stuck", detail: "skipped" }] });
-		expect(reviewTarget(deriveSync(issueOnly))).toBe("sync-issues");
-		expect(footLine({ kind: "sync", state: "done" }, issueOnly, deriveSync(issueOnly)).target).toBe("sync-issues");
+	it("estimates the time left only when there is a rate", () => {
+		expect(etaText(100, undefined)).toBe("");
+		expect(etaText(0, 5)).toBe("");
+		expect(etaText(20, 5)).toBe("a few seconds left");
+		expect(etaText(100, 5)).toBe("about 20 s left");
+		expect(etaText(3000, 5)).toBe("about 10 min left");
 	});
 
-	it("never shows a warning badge for a pause or a plain transfer", () => {
-		const transfer = status({ phase: "uploading", pendingUploads: 2, pendingDownloads: 1 });
-		const view = deriveSync(transfer);
-		expect(connectionBadge(transfer, view)).toEqual({ cls: "ok", text: "Syncing" });
-		expect(stateLine(transfer, view)).toBe("Syncing");
-		expect(footLine(null, transfer, view).text).toBe("Syncing: 2 waiting to upload, 1 waiting to download.");
-		const paused = status({ paused: true });
-		expect(connectionBadge(paused, deriveSync(paused)).text).toBe("Paused");
-	});
-
-	it("drops a binding the managed copy already covers", () => {
-		const managed = status({
-			pendingBindings: [{ workspaceId: "ws1", name: "OS", path: "C:/placeholder" }],
-			files: {
-				workspaces: [{ workspaceId: "ws1", managed: true, state: "waiting" }],
-				conflicts: [],
-				issues: [],
-			},
-		});
-		expect(deriveSync(managed).pendingBindings).toHaveLength(0);
-	});
-
-	it("titles a review entry by kind and reason", () => {
-		expect(reviewTitle({ kind: "memory", reason: "both-modified" })).toBe("Memories · Changed on both computers");
-		expect(reviewTitle({ kind: "session", reason: "deleted-remotely" })).toBe(
-			"Session · Deleted elsewhere, changed here",
-		);
-	});
-
-	it("counts an automatic pass live, and a manual run waiting for it shows the same count", () => {
-		const moving = status({
-			phase: "downloading",
-			pendingDownloads: 212,
-			progress: { stage: "download", done: 37, total: 212 },
-		});
-		expect(progressText(moving, "download")).toBe("37 / 212");
-		expect(progressText(moving, "upload")).toBe("");
-		expect(footLine(null, moving, deriveSync(moving))).toEqual({ text: "Downloading… 37 / 212", spinning: true });
-		const waiting = footLine(
-			{ kind: "download", state: "running", stage: "waiting", done: 0, total: 0 },
-			moving,
-			deriveSync(moving),
-		);
-		expect(waiting).toEqual({ text: "Downloading… 37 / 212", spinning: true });
-	});
-
-	it("names the download step: reading the change lists first, then downloading what they name", () => {
-		const reading = status({
-			phase: "downloading",
-			progress: { stage: "download", step: "read", done: 120, total: 5534 },
-		});
-		expect(footLine(null, reading, deriveSync(reading))).toEqual({
-			text: "Reading changes from Drive… 120 / 5534",
-			spinning: true,
-		});
-		const applying = status({
-			phase: "downloading",
-			progress: { stage: "download", step: "apply", done: 3, total: 900 },
-		});
-		const manual = { kind: "download", state: "running", stage: "download", done: 3, total: 900 };
-		expect(footLine(manual, applying, deriveSync(applying))).toEqual({
-			text: "Downloading… 3 / 900",
-			spinning: true,
-		});
+	it("gives the count of one stage only while that stage moves", () => {
+		const moving = status({ progress: { stage: "upload", done: 300, total: 240 } });
+		expect(progressText(moving, "upload")).toBe("240 / 240");
+		expect(progressText(moving, "download")).toBe("");
+		expect(progressText(status(), "upload")).toBe("");
 	});
 });

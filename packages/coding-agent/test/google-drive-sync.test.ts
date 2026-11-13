@@ -464,7 +464,7 @@ describe("Google Drive sync engine", () => {
 		}
 	});
 
-	it("does not let an empty draft erase a non-empty local draft without a review copy", async () => {
+	it("keeps a draft typed after the other computer deleted it, without asking", async () => {
 		const drive = new FakeDrive();
 		const a = device(drive, "desktop", "device-a");
 		const b = device(drive, "laptop", "device-b");
@@ -478,8 +478,34 @@ describe("Google Drive sync engine", () => {
 		new ModeStateStore(b.agentDir).setDraft("general", "s1", { text: "typed on laptop", attachments: [] });
 		await sync(a, b);
 
+		// The later of the two wins: the draft was typed after the deletion, so it stays and goes back to the desktop.
 		expect(new ModeStateStore(b.agentDir).get("general").drafts.s1?.text).toBe("typed on laptop");
-		expect(b.engine.status().conflicts.some((conflict) => conflict.key === "draft:s1")).toBe(true);
+		expect(b.engine.status().conflicts).toHaveLength(0);
+		await sync(a, b);
+		expect(new ModeStateStore(a.agentDir).get("general").drafts.s1?.text).toBe("typed on laptop");
+		expect(a.engine.status().conflicts).toHaveLength(0);
+	});
+
+	it("lets a deletion made after the other computer's edit win, without asking", async () => {
+		const drive = new FakeDrive();
+		const a = device(drive, "desktop", "device-a");
+		const b = device(drive, "laptop", "device-b");
+		writeSession(a.dataRoot);
+		const aState = new ModeStateStore(a.agentDir);
+		aState.setDraft("general", "s1", { text: "shared draft", attachments: [] });
+		await sync(a, b);
+
+		new ModeStateStore(b.agentDir).setDraft("general", "s1", { text: "typed on laptop", attachments: [] });
+		// The desktop still had the draft when it looked after that edit, so its deletion is the later of the two.
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		await a.engine.runOnce();
+		aState.setDraft("general", "s1", null);
+		await sync(a, b, a);
+
+		expect(new ModeStateStore(b.agentDir).get("general").drafts.s1).toBeUndefined();
+		expect(new ModeStateStore(a.agentDir).get("general").drafts.s1).toBeUndefined();
+		expect(a.engine.status().conflicts).toHaveLength(0);
+		expect(b.engine.status().conflicts).toHaveLength(0);
 	});
 
 	it("keeps a forced publish across a restart so a merged memory is not left only on this computer", async () => {
@@ -551,7 +577,8 @@ describe("Google Drive sync engine", () => {
 		await a.engine.runOnce();
 		expect(drive.batchNames()).toHaveLength(batches);
 
-		writeMemory(a.dataRoot, "two");
+		// Larger than what a batch carries inside itself, so its content has to come from the object store.
+		writeMemory(a.dataRoot, `two ${"detail ".repeat(12_000)}`);
 		await a.engine.runOnce();
 		const objectHashes = [...drive.folders.get("objects")!.keys()];
 		const newest = objectHashes.at(-1)!;

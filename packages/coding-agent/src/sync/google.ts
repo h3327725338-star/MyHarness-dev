@@ -5,6 +5,7 @@ import { createServer, type Server } from "node:http";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { WorkspaceUploadResume } from "./files/types.ts";
+import { PHONE_FOLDERS, type PhoneDrivePort, type PhoneFolder } from "./phone/port.ts";
 import type { DrivePort, RemoteFile, RemoteFolder, StoredGoogleCredentials } from "./types.ts";
 import { fromUtf8 } from "./util.ts";
 
@@ -339,7 +340,7 @@ interface GoogleDriveOptions {
  * Minimal Drive v3 client for the sync layout. Folder contents are polled instead of using `changes.list`, because
  * `drive.file` grants access only to app-created files and the batches folder is a small explicit inbox.
  */
-export class GoogleDriveClient implements DrivePort {
+export class GoogleDriveClient implements DrivePort, PhoneDrivePort {
 	private readonly options: GoogleDriveOptions;
 	private readonly fetchImpl: typeof fetch;
 	private credentials: StoredGoogleCredentials;
@@ -387,7 +388,7 @@ export class GoogleDriveClient implements DrivePort {
 		return this.credentials.accessToken;
 	}
 
-	private fileKey(folder: RemoteFolder, name: string): string {
+	private fileKey(folder: RemoteFolder | `phone:${PhoneFolder}`, name: string): string {
 		return `${folder}\u0000${name}`;
 	}
 
@@ -763,9 +764,15 @@ export class GoogleDriveClient implements DrivePort {
 		return created;
 	}
 
-	private async createFile(name: string, parent: string, data: Uint8Array, mime: string): Promise<RemoteFile> {
+	private async createFile(
+		name: string,
+		parent: string,
+		data: Uint8Array,
+		mime: string,
+		properties?: Record<string, string>,
+	): Promise<RemoteFile> {
 		const boundary = `myharness-${randomUUID()}`;
-		const metadata = JSON.stringify({ name, parents: [parent] });
+		const metadata = JSON.stringify({ name, parents: [parent], ...(properties ? { properties } : {}) });
 		const head = new TextEncoder().encode(
 			`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`,
 		);
@@ -789,6 +796,131 @@ export class GoogleDriveClient implements DrivePort {
 			throw new GoogleDriveError(response.status, payload.error?.message ?? `Creating ${name} failed.`);
 		}
 		return payload;
+	}
+
+	// ---- phone channel (`MyHarness/phone-v1/…`, sync/phone/) ------------------------------------------------------
+
+	private phoneFolders: Partial<Record<PhoneFolder, string>> = {};
+	private phoneRootId: string | undefined;
+
+	/** The phone channel's folders beside `sync-v1`, created on first use. The sync space itself must exist. */
+	async ensurePhoneSpace(): Promise<void> {
+		if (!this.rootId || !this.syncFolderId) await this.ensureSpace();
+		const root = this.rootId!;
+		this.phoneRootId = await this.ensureFolder("phone-v1", root, this.phoneRootId);
+		for (const folder of PHONE_FOLDERS) {
+			this.phoneFolders[folder] = await this.ensureFolder(folder, this.phoneRootId, this.phoneFolders[folder]);
+		}
+	}
+
+	/** The sync space's object folder id (phones read chat content from it by hash). */
+	objectsFolderId(): string {
+		return this.folderId("objects");
+	}
+
+	private phoneFolderId(folder: PhoneFolder): string {
+		const id = this.phoneFolders[folder];
+		if (!id) throw new GoogleDriveError(503, "The phone folder is not available yet.");
+		return id;
+	}
+
+	async phoneList(folder: PhoneFolder, options: { createdAfter?: string } = {}): Promise<RemoteFile[]> {
+		const parent = this.phoneFolderId(folder);
+		const files: RemoteFile[] = [];
+		let pageToken: string | undefined;
+		const after =
+			options.createdAfter && Number.isFinite(Date.parse(options.createdAfter))
+				? new Date(options.createdAfter).toISOString()
+				: undefined;
+		for (;;) {
+			const params = new URLSearchParams({
+				q: `'${parent}' in parents and trashed=false${after ? ` and createdTime > '${after}'` : ""}`,
+				fields: "nextPageToken,files(id,name,size,mimeType,modifiedTime,createdTime,properties)",
+				orderBy: "name",
+				pageSize: "1000",
+				spaces: "drive",
+			});
+			if (pageToken) params.set("pageToken", pageToken);
+			const payload = await this.json<{ files?: RemoteFile[]; nextPageToken?: string }>(
+				`${DRIVE_API}/files?${params.toString()}`,
+			);
+			for (const file of payload.files ?? []) this.fileIds.set(this.fileKey(`phone:${folder}`, file.name), file.id);
+			files.push(...(payload.files ?? []));
+			if (!payload.nextPageToken) break;
+			pageToken = payload.nextPageToken;
+		}
+		return files;
+	}
+
+	async phoneRead(folder: PhoneFolder, name: string): Promise<Uint8Array | undefined> {
+		const parent = this.phoneFolderId(folder);
+		const key = this.fileKey(`phone:${folder}`, name);
+		let id = this.fileIds.get(key);
+		if (!id) {
+			const file = await this.find(name, parent);
+			if (!file || file.mimeType === FOLDER_MIME) return undefined;
+			id = file.id;
+			this.fileIds.set(key, id);
+		}
+		const response = await this.request(
+			`${DRIVE_API}/files/${encodeURIComponent(id)}?alt=media`,
+			{},
+			true,
+			MEDIA_TIMEOUT_MS,
+		);
+		if (response.status === 404) {
+			this.fileIds.delete(key);
+			await response.arrayBuffer().catch(() => undefined);
+			return undefined;
+		}
+		if (!response.ok) throw new GoogleDriveError(response.status, `Reading ${name} from Drive failed.`);
+		return new Uint8Array(await response.arrayBuffer());
+	}
+
+	/** Create the file, or replace the content of the one with that name. */
+	async phoneWrite(folder: PhoneFolder, name: string, data: Uint8Array): Promise<void> {
+		const parent = this.phoneFolderId(folder);
+		const key = this.fileKey(`phone:${folder}`, name);
+		const existing = this.fileIds.get(key) ?? (await this.find(name, parent))?.id;
+		if (existing) {
+			const response = await this.request(
+				`${UPLOAD_API}/${encodeURIComponent(existing)}?uploadType=media&fields=id`,
+				{ method: "PATCH", headers: { "content-type": "application/octet-stream" }, body: data },
+				true,
+				WRITE_TIMEOUT_MS,
+			);
+			if (response.ok) {
+				await response.arrayBuffer().catch(() => undefined);
+				this.fileIds.set(key, existing);
+				return;
+			}
+			if (response.status !== 404) throw new GoogleDriveError(response.status, `Writing ${name} failed.`);
+			this.fileIds.delete(key);
+		}
+		const created = await this.createFile(name, parent, data, "application/octet-stream");
+		this.fileIds.set(key, created.id);
+	}
+
+	async phoneCreate(
+		folder: PhoneFolder,
+		name: string,
+		data: Uint8Array,
+		options: { properties?: Record<string, string> } = {},
+	): Promise<void> {
+		// Not remembered by name: such files are read and removed by the other side.
+		await this.createFile(name, this.phoneFolderId(folder), data, "application/octet-stream", options.properties);
+	}
+
+	async phoneDelete(folder: PhoneFolder, name: string): Promise<void> {
+		const parent = this.phoneFolderId(folder);
+		const key = this.fileKey(`phone:${folder}`, name);
+		const id = this.fileIds.get(key) ?? (await this.find(name, parent))?.id;
+		if (!id) return;
+		const response = await this.request(`${DRIVE_API}/files/${encodeURIComponent(id)}`, { method: "DELETE" });
+		await response.arrayBuffer().catch(() => undefined);
+		this.fileIds.delete(key);
+		if (!response.ok && response.status !== 404)
+			throw new GoogleDriveError(response.status, `Removing ${name} failed.`);
 	}
 
 	async uploadObject(hash: string, data: Uint8Array): Promise<void> {

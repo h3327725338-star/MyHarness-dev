@@ -68,22 +68,32 @@ try {
  await waitFor(()=>figures().length===6&&figures().every(f=>f.dataset.mediaState==='ready'||f.dataset.mediaState==='missing'),'figures filled');
  const [block,side,rowA,rowB,inline,gone]=figures();
  const width=box(document.querySelector('.md')).width;
- // On a line of its own: natural size, never wider than the reply; the caption under it at the picture's width.
- if(block.dataset.layout!=='block'||!near(box(block.querySelector('img')).width,300)) throw Error('block picture is not at its natural size: '+box(block.querySelector('img')).width);
- if(block.querySelector('.md-fig-cap')?.textContent!=='Wide chart'||!near(box(block.querySelector('.md-fig-cap')).width,box(block.querySelector('.md-fig-frame')).width,2.5)) throw Error('caption is not under the picture at its width');
+ // On a line of its own, as a paper sets a figure: natural size, never wider than the reply, in the middle of it,
+ // with its number and caption centered under it.
+ const mid=el=>box(el).left+box(el).width/2;
+ if(block.dataset.layout!=='figure'||!near(box(block.querySelector('img')).width,300)) throw Error('figure is not at its natural size: '+box(block.querySelector('img')).width);
+ if(!near(mid(block.querySelector('.md-fig-frame')),mid(document.querySelector('.md')))) throw Error('figure is not centered');
+ if(block.querySelector('.md-fig-no')?.textContent!=='Figure 1'||block.querySelector('.md-fig-text')?.textContent!=='Wide chart'||!near(mid(block.querySelector('.md-fig-cap')),mid(block.querySelector('.md-fig-frame')),2.5)||box(block.querySelector('.md-fig-cap')).top<box(block.querySelector('.md-fig-frame')).bottom) throw Error('number and caption are not centered under the figure');
+ if(side.querySelector('.md-fig-no')?.textContent!=='Figure 2'||gone.querySelector('.md-fig-no')?.textContent!=='Figure 4') throw Error('figures are not numbered in their order');
  // At the right with the text flowing around it, at the width the reply asked for.
- if(getComputedStyle(side).float!=='right'||!near(box(side).width,width*0.4,2)) throw Error('wrapped picture: float '+getComputedStyle(side).float+', width '+box(side).width+' of '+width);
+ // The picture has only 100 pixels: the figure keeps the least width a caption needs, and the picture stays at its own size.
+ if(getComputedStyle(side).float!=='right'||!near(box(side).width,180,2)||box(side.querySelector('img')).width>100.5||!near(box(side.querySelector('.md-fig-frame')).left+box(side.querySelector('.md-fig-frame')).width/2,box(side).left+box(side).width/2)) throw Error('wrapped picture: float '+getComputedStyle(side).float+', width '+box(side).width+' of '+width+', picture '+box(side.querySelector('img')).width);
  const flowing=[...document.querySelectorAll('.md > p')].find(p=>p.textContent.startsWith('Text that flows'));
  if(!(box(flowing).top<box(side).bottom&&box(flowing).bottom>box(side).bottom)) throw Error('text does not flow around the picture');
  const range=document.createRange();range.selectNodeContents(flowing);
  const lines=[...range.getClientRects()];
  if(!lines.some(r=>r.right<=box(side).left+1&&r.top<box(side).bottom)||!lines.some(r=>r.top>=box(side).bottom&&r.right>box(side).left+20)) throw Error('lines beside the picture are not shortened, or lines below it are not full width');
  if(box(document.querySelector('.md h2')).top<box(side).bottom) throw Error('a heading did not start below the wrapped picture');
- // Two pictures of one paragraph: side by side, at one height, filling the row.
+ // Two pictures of one paragraph: the parts (a) and (b) of one figure, side by side at one height, in the middle,
+ // neither drawn larger than its own pixels, with the figure's number under both.
  if(!rowA.parentElement.classList.contains('md-fig-row')||rowB.parentElement!==rowA.parentElement) throw Error('pictures of one paragraph are not a row');
  const ia=box(rowA.querySelector('img')),ib=box(rowB.querySelector('img'));
  if(!near(ia.top,ib.top)||!near(ia.height,ib.height,2)||ib.left<ia.right) throw Error('row pictures: tops '+ia.top+'/'+ib.top+', heights '+ia.height+'/'+ib.height);
- if(!near(box(rowB).right,box(rowA.parentElement).right,1.5)) throw Error('row does not fill the width');
+ if(ia.width>300.5||ib.width>100.5) throw Error('a part is drawn larger than its own pixels: '+ia.width+'/'+ib.width);
+ if(!near((ia.left+ib.right)/2,mid(document.querySelector('.md')),2)) throw Error('the parts are not in the middle of the reply');
+ if(rowA.querySelector('.md-fig-no')?.textContent!=='(a)'||rowB.querySelector('.md-fig-no')?.textContent!=='(b)') throw Error('parts are not lettered');
+ const groupCap=rowA.closest('.md-fig-group').querySelector('.md-fig-group-cap');
+ if(groupCap?.querySelector('.md-fig-no')?.textContent!=='Figure 3'||box(groupCap).top<Math.max(box(rowA).bottom,box(rowB).bottom)-1) throw Error('the figure number is not under its parts');
  // Inside a line of text, at text height, with no caption and no preview.
  const lineHeight=parseFloat(getComputedStyle(inline.parentElement).fontSize)*1.5;
  if(getComputedStyle(inline).display!=='inline-block'||!near(box(inline.querySelector('img')).height,lineHeight,1)||inline.querySelector('.md-fig-cap')||inline.querySelector('img').getAttribute('role')) throw Error('inline picture');

@@ -642,3 +642,96 @@ export function readStoredCredential(
 		return undefined;
 	}
 }
+
+/** One saved API key in the form that travels between computers (Google Drive sync). */
+export interface PortableApiKey {
+	id: string;
+	label: string;
+	credential: ApiKeyCredential;
+	/** Absent for a key saved before keys had names: its time was never stored. */
+	createdAt?: string;
+}
+
+/**
+ * The saved API keys of auth.json by Provider ID, without anything that belongs to one computer: sign-ins (OAuth
+ * tokens) are never part of it, and whether a Provider currently uses a key or a sign-in stays each computer's choice.
+ */
+export type PortableApiKeys = Record<string, { activeId?: string; keys: PortableApiKey[] }>;
+
+/** Marks a key whose creation time was never stored, so reading it back gives the same portable form. */
+const UNKNOWN_CREATED_AT = "1970-01-01T00:00:00.000Z";
+
+function parseAuthFile(content: string | undefined): AuthStorageData {
+	if (!content?.trim()) return {};
+	const value: unknown = JSON.parse(content);
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("auth.json is not an object.");
+	return value as AuthStorageData;
+}
+
+/** The saved API keys in `content` (the text of auth.json). Throws when the file cannot be read as JSON. */
+export function portableApiKeysOf(content: string | undefined): PortableApiKeys {
+	const data = parseAuthFile(content);
+	const portable: PortableApiKeys = {};
+	for (const provider of Object.keys(data).sort()) {
+		const stored = data[provider];
+		if (!stored || typeof stored !== "object") continue;
+		const legacy = !stored[API_KEY_RING_FIELD];
+		const ring = getApiKeyRing(stored);
+		if (ring.entries.length === 0) continue;
+		portable[provider] = {
+			...(ring.activeId ? { activeId: ring.activeId } : {}),
+			keys: ring.entries.map((entry) => ({
+				id: entry.id,
+				label: entry.label,
+				credential: sanitizeApiKeyCredential(entry.credential),
+				...(legacy || entry.createdAt === UNKNOWN_CREATED_AT ? {} : { createdAt: entry.createdAt }),
+			})),
+		};
+	}
+	return portable;
+}
+
+function portableKeysEqual(a: PortableApiKeys[string] | undefined, b: PortableApiKeys[string] | undefined): boolean {
+	return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
+/**
+ * auth.json with its saved API keys replaced by `portable`, or undefined when they already are that. A Provider that
+ * is signed in on this computer stays signed in and only gets the keys added to choose from; a Provider whose keys are
+ * all gone keeps its sign-in, or leaves the file when it has none.
+ */
+export function withPortableApiKeys(content: string | undefined, portable: PortableApiKeys): string | undefined {
+	const data = parseAuthFile(content);
+	const current = portableApiKeysOf(content);
+	let changed = false;
+	for (const provider of new Set([...Object.keys(current), ...Object.keys(portable)])) {
+		const wanted = portable[provider];
+		if (portableKeysEqual(current[provider], wanted)) continue;
+		changed = true;
+		const stored = data[provider];
+		const oauth = getSavedOAuth(stored);
+		const entries: StoredApiKeyEntry[] = [];
+		for (const key of wanted?.keys ?? []) {
+			if (!key || typeof key.id !== "string" || typeof key.label !== "string" || !key.label.trim()) continue;
+			if (key.credential?.type !== "api_key") continue;
+			entries.push(
+				createApiKeyEntry(key.label, key.credential, {
+					id: key.id,
+					createdAt: key.createdAt ?? UNKNOWN_CREATED_AT,
+				}),
+			);
+		}
+		if (entries.length === 0) {
+			if (oauth) data[provider] = sanitizeOAuthCredential(oauth);
+			else delete data[provider];
+			continue;
+		}
+		const activeId = entries.some((entry) => entry.id === wanted?.activeId) ? wanted?.activeId : entries[0]?.id;
+		const ring: StoredApiKeyRing = { ...(activeId ? { activeId } : {}), entries };
+		data[provider] =
+			stored?.type === "oauth" && oauth
+				? storeWithActiveOAuth(ring, oauth)
+				: storeWithActiveApiKey(stored, ring, activeId as string);
+	}
+	return changed ? JSON.stringify(data, null, 2) : undefined;
+}

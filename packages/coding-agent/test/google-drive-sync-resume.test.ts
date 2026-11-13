@@ -328,7 +328,8 @@ describe("manual Download now / Sync now", () => {
 		const drive = new FakeDrive();
 		const a = device(drive, "device-a");
 		const b = device(drive, "device-b");
-		writeMemory(b.dataRoot, "remote", "from b");
+		// Larger than what a batch carries inside itself, so its content has to come from the object store.
+		writeMemory(b.dataRoot, "remote", `from b ${"detail ".repeat(12_000)}`);
 		await b.engine.runOnce();
 		const objects = drive.folders.get("objects")!;
 		const [hash, data] = [...objects.entries()][0]!;

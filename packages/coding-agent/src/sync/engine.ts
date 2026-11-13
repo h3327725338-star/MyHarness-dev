@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { gunzip, gzip } from "node:zlib";
 import lockfile from "proper-lockfile";
-import { getSessionConversationDir, getWorkspaceMetadataPath } from "../config/paths/index.ts";
+import { getSessionConversationDir } from "../config/paths/index.ts";
 import { WEB_PREFS_FILE } from "../config/web-prefs.ts";
 import { WorkspaceStore } from "../data/workspace-store.ts";
 import { SCHEDULES_FILE } from "../schedules/store.ts";
@@ -23,6 +23,7 @@ import {
 	applySavedPrompts,
 	applySchedules,
 	applySession,
+	applySettings,
 	applyWorkspace,
 	DeferredSessionError,
 	readMemoryText,
@@ -54,6 +55,7 @@ import {
 	type SessionMetadataCacheEntry,
 	scanLocalEntitiesAsync,
 } from "./scope.ts";
+import { isSettingsRecordId, mergeSettingsText, SETTINGS_FILE_NAMES } from "./settings-data.ts";
 import type { HashCacheEntry, SyncLocalStore } from "./store.ts";
 import type {
 	DrivePort,
@@ -152,8 +154,22 @@ const gunzipAsync = promisify(gunzip);
 
 /** A manual download keeps listing until Drive has nothing new; this bounds it when another device keeps writing. */
 const MAX_DRAIN_ROUNDS = 20;
-/** Uploads of file contents running at the same time within one published batch. */
-const UPLOAD_CONCURRENCY = 4;
+/**
+ * Uploads of file contents running at the same time within one published batch. A call takes about a second whatever
+ * the number in flight, so an evening of changes went up four per second at best; eight halves that wait and is still
+ * well under what the downloads keep open (a throttled call is retried with a backoff by the client).
+ */
+const UPLOAD_CONCURRENCY = 8;
+/** A pass asked for because the user came back starts at most this often. */
+const ATTENTION_MIN_GAP_MS = 8_000;
+/**
+ * Content up to BATCH_INLINE_BYTES also travels inside the batch that publishes it (up to BATCH_INLINE_TOTAL_BYTES per
+ * batch), so the receiver gets a batch of small changes with the one read of its change list instead of one download
+ * per change. The object is uploaded all the same: older versions, snapshots and re-reads of a cached change list
+ * fetch it by hash.
+ */
+const BATCH_INLINE_BYTES = 64 * 1024;
+const BATCH_INLINE_TOTAL_BYTES = 4 * 1024 * 1024;
 /** The next pass after one that moved something: the backlog keeps flowing instead of waiting for the next poll. */
 const FOLLOW_UP_MS = 1500;
 /** How often automatic passes retry batches they skipped (manual runs always do). */
@@ -311,6 +327,9 @@ export class SyncEngine {
 	private lastPassEndedAt = 0;
 	private memoryMetadataCache = new Map<string, { signature: string; id: string; name: string }>();
 	private currentScan = new Map<string, ScannedEntity>();
+	/** When the previous upload queue was built, and the time each waiting deletion was given (see deletionTime). */
+	private lastPlanAt = 0;
+	private readonly deletionTimes = new Map<string, string>();
 	/** Content hash per entity for the size and modification time it was taken at; kept across restarts (hashes-*.json). */
 	private fileCache = new Map<string, HashCacheEntry>();
 	private fileCacheDirty = false;
@@ -359,7 +378,7 @@ export class SyncEngine {
 	/** When the write chain last let other work run (see yieldWrites). */
 	private writeSliceAt = 0;
 	/** What written changes touched since the page was last told (see announceApplied). */
-	private appliedNotice = { workspaces: false, sessions: false, memories: false, at: 0 };
+	private appliedNotice = { workspaces: false, sessions: false, memories: false, settings: false, at: 0 };
 	/** The batch names Drive listed, kept between passes so a pass can list only what is new (see listBatches). */
 	private batchListing: { names: Set<string>; newest?: string; fullAt: number } | undefined;
 	/**
@@ -399,6 +418,19 @@ export class SyncEngine {
 
 	get deviceId(): string {
 		return this.options.deviceId;
+	}
+
+	/**
+	 * The records this computer has committed with the sync space, by key: each one's content is in Drive under its
+	 * hash. The phone channel (sync/phone/) lists chats from these, so a phone never asks for content that is not there.
+	 */
+	committedRecords(): Readonly<Record<string, SyncRecord>> {
+		return this.state.entities;
+	}
+
+	/** Whether the last pass left nothing to download: what this computer describes to a phone is then up to date. */
+	caughtUp(): boolean {
+		return this.lastPassEndedAt > 0 && this.pendingDownloads === 0 && !this.running;
 	}
 
 	/** Persisted work is the difference between the last committed state and the files on disk. */
@@ -542,6 +574,7 @@ export class SyncEngine {
 			this.lockRetry = undefined;
 		}
 		this.saveHashCache();
+		this.bases.flush();
 		if (this.lockRelease) {
 			try {
 				await this.lockRelease();
@@ -560,6 +593,16 @@ export class SyncEngine {
 	async runOnce(): Promise<void> {
 		if (this.running) return;
 		await this.runPass("auto");
+	}
+
+	/**
+	 * The user came back to the app (the window got the focus, the page became visible): look at Drive now instead of
+	 * waiting for the next poll, which can be most of a minute away. Skipped when a pass is running or just ended.
+	 */
+	checkSoon(): void {
+		if (this.stopped || this.running || !this.drive || !this.config.enabled || this.config.paused) return;
+		if (Date.now() - this.lastPassEndedAt < ATTENTION_MIN_GAP_MS) return;
+		void this.runOnce();
 	}
 
 	/** Resolves once no pass is in flight, for a local change that must not land in the middle of a scan. */
@@ -625,6 +668,7 @@ export class SyncEngine {
 			this.adoptSpace(space);
 			await this.resolveMemoryConflictsFromCopies();
 			await this.resolveRecordConflictsFromCopies();
+			this.dropReviewEntries();
 			await this.resolvePendingPublish();
 			this.phase = mode === "auto" ? "scanning" : "downloading";
 			this.emitStatus();
@@ -671,6 +715,7 @@ export class SyncEngine {
 			this.running = false;
 			this.lastPassEndedAt = Date.now();
 			this.saveHashCache();
+			this.bases.flush();
 			this.progress = null;
 			this.emitStatus();
 			if (!this.stopped)
@@ -867,7 +912,8 @@ export class SyncEngine {
 					!filename ||
 					filename === "chat-mode-state.json" ||
 					filename === WEB_PREFS_FILE ||
-					filename === SCHEDULES_FILE
+					filename === SCHEDULES_FILE ||
+					SETTINGS_FILE_NAMES.has(filename)
 				)
 					this.scheduleSoon();
 			});
@@ -1040,10 +1086,28 @@ export class SyncEngine {
 	}
 
 	/**
+	 * The time a deletion found now is given. The item was still there when the previous queue was built, so that
+	 * moment, not "now", is used: where two computers disagree the later change wins, and a change another computer made
+	 * in between must not lose to a deletion only because this computer noticed or uploaded it late. Right after a
+	 * start nothing says when it happened; the item's own last change is the earliest it can have been. The time found
+	 * first stays for as long as the deletion waits to be uploaded.
+	 */
+	private deletionTime(key: string, previous: SyncRecord, lastPlanAt: number): string {
+		const known = this.deletionTimes.get(key);
+		if (known) return known;
+		const seen = lastPlanAt > 0 ? new Date(lastPlanAt).toISOString() : previous.updatedAt;
+		const time = laterThan(previous.updatedAt, seen) ? previous.updatedAt : seen;
+		this.deletionTimes.set(key, time);
+		return time;
+	}
+
+	/**
 	 * The upload queue: everything on disk that differs from the last committed state. Needs no network, so the
 	 * count stays visible while offline and is rebuilt the same way after a restart.
 	 */
 	private async planUploads(): Promise<SyncOperation[]> {
+		const lastPlanAt = this.lastPlanAt;
+		this.lastPlanAt = Date.now();
 		const scan = await this.scanLocal();
 		this.currentScan = scan;
 		const operations: SyncOperation[] = [];
@@ -1097,7 +1161,9 @@ export class SyncEngine {
 			if (this.keepUnscannedEntity(previous)) continue;
 			// A writer lock or bridge an older version published is never scanned again; it is not deleted anywhere either.
 			if (isLocalOnlyOperation(previous)) continue;
-			const now = nowIso();
+			// A part of the configuration is never deleted as a whole: a file that is missing or unreadable here must
+			// not take the Providers or keys of the other computers away. It comes back with the next change.
+			if (previous.kind === "settings") continue;
 			operations.push({
 				op: "delete",
 				key,
@@ -1107,8 +1173,11 @@ export class SyncEngine {
 				size: 0,
 				vector: bumpVector(previous.vector, this.options.deviceId),
 				updatedAt: previous.updatedAt,
-				deletedAt: now,
+				deletedAt: this.deletionTime(key, previous, lastPlanAt),
 			});
+		}
+		for (const key of this.deletionTimes.keys()) {
+			if (scan.has(key) || !this.state.entities[key]) this.deletionTimes.delete(key);
 		}
 		const planned = this.holdMassDeletions(operations);
 		this.pendingUploads = planned.length;
@@ -1158,12 +1227,13 @@ export class SyncEngine {
 		// Contents go up a few at a time; the manifest keeps the planned order, whatever order the uploads finish in.
 		const kept: (SyncOperation | undefined)[] = new Array(planned.length);
 		const uploading = new Map<string, Promise<void>>();
+		const small = new Map<string, Uint8Array>();
 		let next = 0;
 		const worker = async (): Promise<void> => {
 			while (next < planned.length) {
 				const index = next++;
 				const operation = planned[index]!;
-				kept[index] = await this.prepareOperation(drive, operation, uploading);
+				kept[index] = await this.prepareOperation(drive, operation, uploading, small);
 				onEach?.(operation);
 			}
 		};
@@ -1181,6 +1251,16 @@ export class SyncEngine {
 			createdAt: nowIso(),
 			operations,
 		};
+		const inline: Record<string, string> = {};
+		let inlineBytes = 0;
+		for (const operation of operations) {
+			const data = operation.op === "put" ? small.get(operation.hash) : undefined;
+			if (!data || inline[operation.hash] !== undefined) continue;
+			if (inlineBytes + data.byteLength > BATCH_INLINE_TOTAL_BYTES) continue;
+			inline[operation.hash] = Buffer.from(data).toString("base64");
+			inlineBytes += data.byteLength;
+		}
+		if (inlineBytes > 0) batch.inline = inline;
 		const batchFile = `${batchId}.json`;
 		// Journal first: if the process dies after Drive accepted the manifest, the next start commits it instead of
 		// publishing the same changes a second time.
@@ -1201,6 +1281,7 @@ export class SyncEngine {
 		drive: DrivePort,
 		operation: SyncOperation,
 		uploading: Map<string, Promise<void>>,
+		small?: Map<string, Uint8Array>,
 	): Promise<SyncOperation | undefined> {
 		if (operation.op !== "put" || this.uploadedObjects.has(operation.hash)) return operation;
 		const running = uploading.get(operation.hash);
@@ -1221,6 +1302,7 @@ export class SyncEngine {
 			return undefined;
 		}
 		const content = data;
+		if (content.byteLength <= BATCH_INLINE_BYTES) small?.set(operation.hash, content);
 		const upload = drive.uploadObject(operation.hash, content).then(() => {
 			this.uploadedObjects.add(operation.hash);
 		});
@@ -1463,6 +1545,7 @@ export class SyncEngine {
 		await this.mapLimit(names, MANIFEST_CONCURRENCY, async (name) => {
 			try {
 				let batch = this.manifestCache.get(name);
+				let inline: Map<string, Uint8Array> | undefined;
 				if (!batch) {
 					let data: Uint8Array | undefined;
 					try {
@@ -1497,7 +1580,10 @@ export class SyncEngine {
 						round.handled += 1;
 						return;
 					}
-					// Kept until the batch is handled, so a pass that stops halfway does not read it from Drive again.
+					// Kept until the batch is handled, so a pass that stops halfway does not read it from Drive again. The
+					// contents it carried are used by this round only: a later pass downloads what is still open by hash.
+					inline = inlineContents(batch.inline);
+					if (batch.inline) batch = { ...batch, inline: undefined };
 					this.cacheManifest(name, batch);
 				}
 				if (batch.deviceId === this.options.deviceId) {
@@ -1506,7 +1592,15 @@ export class SyncEngine {
 					round.handled += 1;
 					return;
 				}
-				loaded.push({ name, batch, operations: batch.operations, open: 0, missing: false, waiting: false });
+				loaded.push({
+					name,
+					batch,
+					operations: batch.operations,
+					open: 0,
+					missing: false,
+					waiting: false,
+					...(inline?.size ? { inline } : {}),
+				});
 			} finally {
 				this.advanceManual(1);
 			}
@@ -1779,11 +1873,12 @@ export class SyncEngine {
 		this.appliedNotice.workspaces ||= outcome.workspacesChanged;
 		this.appliedNotice.sessions ||= outcome.sessionsChanged;
 		this.appliedNotice.memories ||= outcome.memoriesChanged;
+		this.appliedNotice.settings ||= outcome.settingsChanged === true;
 	}
 
 	private async announceApplied(force: boolean): Promise<void> {
 		const notice = this.appliedNotice;
-		if (!notice.workspaces && !notice.sessions && !notice.memories) return;
+		if (!notice.workspaces && !notice.sessions && !notice.memories && !notice.settings) return;
 		if (!force && Date.now() - notice.at < NOTIFY_EVERY_MS) return;
 		notice.at = Date.now();
 		if (notice.memories) {
@@ -1794,9 +1889,14 @@ export class SyncEngine {
 				// The catalog is derived from the files; the next announcement refreshes it again.
 			}
 		}
-		const info = { workspacesChanged: notice.workspaces, sessionsChanged: notice.sessions };
+		const info = {
+			workspacesChanged: notice.workspaces,
+			sessionsChanged: notice.sessions,
+			settingsChanged: notice.settings,
+		};
 		notice.workspaces = false;
 		notice.sessions = false;
+		notice.settings = false;
 		try {
 			this.options.onApplied?.(info);
 		} catch {
@@ -2016,13 +2116,15 @@ export class SyncEngine {
 			);
 			return undefined;
 		}
-		if (operation.op === "delete") return this.applyDeleteOperation(operation, batch);
-		return this.applyPutOperation(operation, batch);
+		if (operation.op === "delete") return this.applyDeleteOperation(operation);
+		return this.applyPutOperation(operation);
 	}
 
-	private async applyPutOperation(operation: SyncOperation, batch: SyncBatch): Promise<ApplyOutcome | undefined> {
+	private async applyPutOperation(operation: SyncOperation): Promise<ApplyOutcome | undefined> {
 		const local = this.state.entities[operation.key];
 		const tombstone = this.state.tombstones[operation.key];
+		// The deletion this version comes back from (see below): its vector goes into the record written here.
+		let revived: VersionVector | undefined;
 		if (tombstone) {
 			if (covers(tombstone.vector, operation.vector)) {
 				const merged = mergeVectors(tombstone.vector, operation.vector);
@@ -2050,13 +2152,19 @@ export class SyncEngine {
 					this.saveState();
 					return outcome;
 				}
-				// Concurrent delete-vs-edit: keep both, never silently resurrect and never throw the edit away.
-				const copy = this.store.recoverCopy(operation.kind, operation.key, displayName(operation), data);
-				this.store.addConflict(this.state, this.conflictFor(operation, batch, "deleted-locally", copy));
-				tombstone.vector = mergeVectors(tombstone.vector, operation.vector);
-				this.hadChanges = true;
-				this.saveState();
-				return undefined;
+				// Deleted here, changed on the other computer at the same time: the later of the two wins, without asking.
+				// A file of a chat that is deleted here follows its chat whatever the times say.
+				if (this.followsDeletedChat(operation) || !laterThan(operation.updatedAt, tombstone.deletedAt)) {
+					// The deletion stays. The other version is kept once as a recoverable copy, quietly.
+					this.store.recoverCopy(operation.kind, operation.key, displayName(operation), data);
+					tombstone.vector = mergeVectors(tombstone.vector, operation.vector);
+					this.hadChanges = true;
+					this.saveState();
+					return undefined;
+				}
+				// The change is the later one: the record comes back below like any newer version.
+				revived = tombstone.vector;
+				delete this.state.tombstones[operation.key];
 			}
 			// The record was created again after seeing the deletion (for example a draft cleared and retyped here).
 		}
@@ -2079,7 +2187,7 @@ export class SyncEngine {
 		if (operation.kind !== "workspace" && this.scannedHash(operation.key) === operation.hash) {
 			this.state.entities[operation.key] = recordFrom({
 				...operation,
-				vector: mergeVectors(operation.vector, local?.vector ?? {}),
+				vector: mergeVectors(operation.vector, local?.vector ?? revived ?? {}),
 			});
 			delete this.state.tombstones[operation.key];
 			this.clearForceUpload(operation.key);
@@ -2100,18 +2208,17 @@ export class SyncEngine {
 			operation.hash !== local?.hash && Boolean(local) && (drifted || !covers(operation.vector, local!.vector));
 		if (concurrent) {
 			// Concurrent edits: sessions merge entry by entry, memories, prompts, drafts and files merge (or, for a file
-			// that cannot be merged, keep both versions as files). Only a Workspace identity still keeps a review entry.
+			// that cannot be merged, keep both versions as files). What cannot be merged goes to the later change.
 			if (operation.kind === "memory" && data) {
 				if (await this.mergeRemoteMemory(operation, data, local)) return undefined;
-				this.recordConflict(operation, batch, "both-modified", data);
+				if (this.keepLocalVersion(operation, data, local)) return undefined;
+			} else if (operation.kind === "browser" && data && (await this.mergeRemoteBrowser(operation, data, local))) {
 				return undefined;
-			}
-			if (operation.kind === "browser" && data && (await this.mergeRemoteBrowser(operation, data, local)))
-				return undefined;
-			if (operation.kind !== "session") {
+			} else if (operation.kind !== "session") {
 				if (data && (await this.mergeRemoteRecord(operation, data, local))) return undefined;
-				this.recordConflict(operation, batch, "both-modified", data);
-				return undefined;
+				// Nothing to merge (a Workspace identity, content that is not what its kind expects): the later version
+				// wins. When that is the other computer's, it is written below like any newer version.
+				if (this.keepLocalVersion(operation, data, local)) return undefined;
 			}
 		} else if (!local && drifted && operation.kind !== "session") {
 			// A local file exists that was never synced (first connection on a device with data): merge a memory instead
@@ -2123,8 +2230,7 @@ export class SyncEngine {
 			if (operation.kind === "browser" && data && (await this.mergeRemoteBrowser(operation, data, undefined)))
 				return undefined;
 			if (data && (await this.mergeRemoteRecord(operation, data, undefined))) return undefined;
-			this.recordConflict(operation, batch, "both-modified", data);
-			return undefined;
+			if (this.keepLocalVersion(operation, data, undefined)) return undefined;
 		}
 		const outcome = await this.applyPut(operation, data);
 		if (!outcome.applied) {
@@ -2132,7 +2238,7 @@ export class SyncEngine {
 				// Merge produced no change; still remember the remote record so the next pass does not re-download it.
 				this.state.entities[operation.key] = recordFrom({
 					...operation,
-					vector: mergeVectors(operation.vector, local?.vector ?? {}),
+					vector: mergeVectors(operation.vector, local?.vector ?? revived ?? {}),
 				});
 				// The version arrived here, so a leftover deletion marker must not turn the next edit into a conflict.
 				delete this.state.tombstones[operation.key];
@@ -2146,7 +2252,7 @@ export class SyncEngine {
 		}
 		this.state.entities[operation.key] = recordFrom({
 			...operation,
-			vector: mergeVectors(operation.vector, local?.vector ?? {}),
+			vector: mergeVectors(operation.vector, local?.vector ?? revived ?? {}),
 		});
 		delete this.state.tombstones[operation.key];
 		this.currentScan.delete(operation.key);
@@ -2218,35 +2324,50 @@ export class SyncEngine {
 			case "schedules":
 				if (!data) throw new DeferredBatchError(`Waiting for ${operation.key}`);
 				return applySchedules(context, data);
+			case "settings":
+				if (!data) throw new DeferredBatchError(`Waiting for ${operation.key}`);
+				return applySettings(context, operation, data);
 			default:
 				return { applied: false, workspacesChanged: false, sessionsChanged: false, memoriesChanged: false };
 		}
 	}
 
-	private recordConflict(
+	/**
+	 * Two versions of a record that cannot be merged: the later change wins, without asking. True when that is this
+	 * computer's: its version stays and is published past the other one, whose content is kept once as a recoverable
+	 * copy. False when the other computer's is the later one: the caller writes it like any newer version (the adapters
+	 * back up what they replace).
+	 */
+	private keepLocalVersion(
 		operation: SyncOperation,
-		batch: SyncBatch,
-		reason: SyncConflict["reason"],
-		data?: Uint8Array,
-	): void {
-		const copy = this.store.recoverCopy(operation.kind, operation.key, displayName(operation), data ?? utf8(""));
-		this.store.addConflict(this.state, this.conflictFor(operation, batch, reason, copy));
-		// Learn the remote history even though its content was not applied; otherwise every later local edit would be
-		// reported as a fresh conflict with the same already-seen version.
-		const local = this.state.entities[operation.key];
-		if (local) {
-			this.state.entities[operation.key] = { ...local, vector: mergeVectors(local.vector, operation.vector) };
-		} else {
-			// Nothing local was applied, so the remote version is recorded against a marker instead. A later edit here
-			// still wins because it bumps past this vector, and the next batch from that device is not a new conflict.
-			this.state.tombstones[operation.key] = {
-				vector: mergeVectors(this.state.tombstones[operation.key]?.vector ?? {}, operation.vector),
-				deletedAt: nowIso(),
-				kind: operation.kind,
-			};
-		}
-		this.hadChanges = true;
-		this.saveState();
+		data: Uint8Array | undefined,
+		local: SyncRecord | undefined,
+	): boolean {
+		const scanned = this.currentScan.get(operation.key);
+		if (!scanned && !local) return false;
+		const hereHash = scanned ? this.hashEntity(scanned).hash : (local?.hash ?? "");
+		// What the other computer knows of this version: the published record, unless the content changed here since.
+		const hereAt = (local?.hash === hereHash ? local.updatedAt : scanned?.updatedAt) ?? local?.updatedAt ?? "";
+		const newer = newerFileVersion(
+			{ updatedAt: hereAt, hash: hereHash },
+			{ updatedAt: operation.updatedAt, hash: operation.hash },
+		);
+		if (newer === "remote" && data) return false;
+		if (data) this.store.recoverCopy(operation.kind, operation.key, displayName(operation), data);
+		this.publishMerged(operation, local);
+		return true;
+	}
+
+	/**
+	 * A file inside a chat's folder whose chat is deleted on this computer: it follows the chat. Without this a
+	 * `session.json` the other computer rewrote after the deletion would bring an empty chat folder back.
+	 */
+	private followsDeletedChat(operation: SyncOperation): boolean {
+		if (operation.kind !== "file") return false;
+		const parts = operation.id.split("/");
+		if (parts[0] !== "workspaces" || parts[2] !== "sessions" || !parts[1] || !parts[3]) return false;
+		if (!this.state.tombstones[`session:${parts[1]}/${parts[3]}`]) return false;
+		return !conversationExists(this.options.dataRoot, parts[1], parts[3]);
 	}
 
 	/** A Session whose conversation exists but no longer looks General is left alone instead of being tombstoned. */
@@ -2277,7 +2398,7 @@ export class SyncEngine {
 		return this.hashEntity(scanned).hash !== local.hash;
 	}
 
-	private async applyDeleteOperation(operation: SyncOperation, batch: SyncBatch): Promise<ApplyOutcome | undefined> {
+	private async applyDeleteOperation(operation: SyncOperation): Promise<ApplyOutcome | undefined> {
 		const local = this.state.entities[operation.key];
 		const tombstone = this.state.tombstones[operation.key];
 		if (tombstone && covers(tombstone.vector, operation.vector)) return undefined;
@@ -2292,11 +2413,12 @@ export class SyncEngine {
 			};
 			return undefined;
 		}
-		if (operation.kind === "browser" || operation.kind === "schedules") {
+		if (operation.kind === "browser" || operation.kind === "schedules" || operation.kind === "settings") {
 			// A browser file is never removed by another computer: bookmarks or settings missing there (a reset profile,
 			// a desktop host that never ran) are no reason to empty them here. This file is published again past the
 			// deletion and the other computer gets it back. The scheduled tasks delete task by task inside their list
-			// (tombstones), so a deletion of the whole list is treated the same way.
+			// (tombstones), so a deletion of the whole list is treated the same way. So is a part of the configuration:
+			// a computer whose file is gone must not take the Providers or keys of the others away.
 			this.markForceUpload(operation.key);
 			this.state.entities[operation.key] = { ...local, vector: mergeVectors(local.vector, operation.vector) };
 			this.hadChanges = true;
@@ -2318,19 +2440,25 @@ export class SyncEngine {
 				return undefined;
 			}
 		}
-		if (this.localDrift(operation.key, local)) {
-			// The local item changed after the last sync: deleting it would silently lose that edit. A deletion is not a
-			// version this device accepts, so the local record keeps its own vector and the user decides.
-			this.store.addConflict(this.state, this.conflictFor(operation, batch, "deleted-remotely"));
-			this.hadChanges = true;
-			this.saveState();
-			return undefined;
-		}
-		if (!covers(operation.vector, local.vector)) {
-			this.store.addConflict(this.state, this.conflictFor(operation, batch, "deleted-remotely"));
-			this.hadChanges = true;
-			this.saveState();
-			return undefined;
+		if (this.localDrift(operation.key, local) || !covers(operation.vector, local.vector)) {
+			// Changed here while the other computer deleted it: the later of the two wins, without asking. A file of a
+			// chat that is deleted here follows its chat whatever the times say.
+			const scanned = this.currentScan.get(operation.key);
+			const changedHere =
+				scanned && this.hashEntity(scanned).hash !== local.hash ? scanned.updatedAt : local.updatedAt;
+			if (
+				!this.followsDeletedChat(operation) &&
+				!laterThan(operation.deletedAt ?? operation.updatedAt, changedHere)
+			) {
+				// The change here is the later one: it stays and is published past the deletion, so the other computer
+				// gets the item back.
+				this.markForceUpload(operation.key);
+				this.state.entities[operation.key] = { ...local, vector: mergeVectors(local.vector, operation.vector) };
+				this.hadChanges = true;
+				this.saveState();
+				return undefined;
+			}
+			// The deletion is the later one: it is applied below; the adapter backs up what it removes.
 		}
 		const outcome = await applyDelete(this.context(), operation);
 		delete this.state.entities[operation.key];
@@ -2473,6 +2601,20 @@ export class SyncEngine {
 				return this.mergeRemoteInline(operation, data, local, mergeSavedPrompts);
 			case "schedules":
 				return this.mergeRemoteInline(operation, data, local, mergeSchedules);
+			case "settings": {
+				// The remembered text is a common ancestor only when the other computer made its version after seeing
+				// this computer's last one. Otherwise the two are simply combined, and nothing counts as removed.
+				const descends = local !== undefined && covers(operation.vector, local.vector);
+				// The first time this computer meets the record, what is on Drive wins where both differ: a computer
+				// that joins takes over the configuration instead of putting its fresh defaults over it. After that
+				// the later change wins.
+				const thereWins =
+					local === undefined ||
+					laterThan(operation.updatedAt, this.currentScan.get(operation.key)?.updatedAt ?? local.updatedAt);
+				return this.mergeRemoteInline(operation, data, local, (base, here, there) =>
+					mergeSettingsText(descends ? base : undefined, here, there, thereWins),
+				);
+			}
 			case "file":
 				return this.mergeRemoteFile(operation, data, local);
 			default:
@@ -2694,57 +2836,16 @@ export class SyncEngine {
 		}
 	}
 
-	private conflictFor(
-		operation: SyncOperation,
-		batch: SyncBatch,
-		reason: SyncConflict["reason"],
-		remoteCopyPath?: string,
-	): SyncConflict {
-		const conflict: SyncConflict = {
-			id: sha256(`${operation.key}:${reason}:${operation.hash}:${batch.batchId}`).slice(0, 16),
-			key: operation.key,
-			kind: operation.kind,
-			reason,
-			at: nowIso(),
-			deviceName: batch.deviceName || batch.deviceId,
-			message:
-				reason === "both-modified"
-					? "Both devices changed this item. The local version is shown; the other version was kept as a copy."
-					: reason === "deleted-locally"
-						? "Another device re-created an item deleted here. It was kept as a recoverable copy."
-						: "Another device deleted this item, but it changed here. The local version was kept.",
-		};
-		if (remoteCopyPath) conflict.remoteCopyPath = remoteCopyPath;
-		const localPath = this.localPathOf(operation);
-		if (localPath) conflict.localPath = localPath;
-		return conflict;
-	}
-
-	/** Where the local version of a record is, so a review entry names it next to the copy. */
-	private localPathOf(operation: SyncOperation): string | undefined {
-		switch (operation.kind) {
-			case "session":
-				return conversationPath(this.options.dataRoot, operation);
-			case "memory":
-			case "file":
-				return resolveInsideRoot(this.options.dataRoot, operation.id);
-			case "browser": {
-				const file = browserFileOf(operation.id);
-				return file ? join(browserProfileDir(this.options.agentDir), file) : undefined;
-			}
-			case "workspace":
-				return getWorkspaceMetadataPath(this.options.dataRoot, operation.id);
-			case "prompt":
-			case "draft":
-				// The personal prompt and the drafts live in the chat mode state of the agent directory.
-				return join(this.options.agentDir, "chat-mode-state.json");
-			case "saved-prompts":
-				return join(this.options.agentDir, WEB_PREFS_FILE);
-			case "schedules":
-				return join(this.options.agentDir, SCHEDULES_FILE);
-			default:
-				return undefined;
-		}
+	/**
+	 * Nothing is left for the user to review: what two computers did differently now goes to the later change. Entries an
+	 * older version left are dropped once per start, after the merges above had their turn; the copies they point at
+	 * stay in `<agentDir>/sync/recovered`.
+	 */
+	private dropReviewEntries(): void {
+		if (this.state.conflicts.length === 0) return;
+		this.state.conflicts = [];
+		this.hadChanges = true;
+		this.saveState();
 	}
 
 	/**
@@ -2907,6 +3008,15 @@ function isLocalEnvironmentError(error: unknown): boolean {
 	return typeof code === "string" && LOCAL_ENVIRONMENT_CODES.has(code);
 }
 
+/** True when `a` is a later time than `b`. A time that cannot be read is never the later one; equal is not later. */
+function laterThan(a: string | undefined, b: string | undefined): boolean {
+	const first = Date.parse(a ?? "");
+	const second = Date.parse(b ?? "");
+	if (!Number.isFinite(first)) return false;
+	if (!Number.isFinite(second)) return true;
+	return first > second;
+}
+
 function describeError(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	return String(error);
@@ -2915,18 +3025,6 @@ function describeError(error: unknown): string {
 function displayName(operation: SyncOperation): string {
 	const id = operation.id.split("/").pop() || operation.kind;
 	return id.replace(/[^A-Za-z0-9._-]+/g, "_").slice(-80) || operation.kind;
-}
-
-function conversationPath(dataRoot: string, operation: SyncOperation): string | undefined {
-	if (operation.kind !== "session") return undefined;
-	const [workspaceId, sessionId] = operation.id.split("/");
-	if (!workspaceId || !sessionId) return undefined;
-	const directory = getSessionConversationDir(dataRoot, workspaceId, sessionId);
-	if (!existsSync(directory)) return undefined;
-	const files = readdirSync(directory)
-		.filter((name) => name.endsWith(".jsonl"))
-		.sort();
-	return files.length ? join(directory, files[files.length - 1]!) : undefined;
 }
 
 function conversationExists(dataRoot: string, workspaceId: string, sessionId: string): boolean {
@@ -2950,6 +3048,7 @@ function isSafeRecordIdentity(operation: SyncOperation): boolean {
 		operation.kind === "schedules"
 	)
 		return part.test(operation.id);
+	if (operation.kind === "settings") return isSettingsRecordId(operation.id);
 	if (operation.kind === "browser") return browserFileOf(operation.id) !== undefined;
 	return true;
 }
@@ -2966,7 +3065,7 @@ interface PullSource {
 	missing: boolean;
 	/** A change waits for something that passes by itself (a running chat, a failed request): never counted. */
 	waiting: boolean;
-	/** Contents a snapshot carried, by hash, checked against it. */
+	/** Contents a snapshot or a batch carried, by hash, checked against it. */
 	inline?: Map<string, Uint8Array>;
 	snapshot?: { device: string; upTo: string; covered: string[] };
 }
@@ -3006,7 +3105,7 @@ function isLocalOnlyOperation(record: { kind: SyncEntityKind; id: string }): boo
 
 /** Kinds whose last common content is kept for a three-way merge (memory-bases.ts); files merge without one. */
 function tracksBase(kind: SyncEntityKind): boolean {
-	return kind === "memory" || kind === "prompt" || kind === "draft" || kind === "saved-prompts";
+	return kind === "memory" || kind === "prompt" || kind === "draft" || kind === "saved-prompts" || kind === "settings";
 }
 
 /** Kinds that merge in mergeRemoteRecord, so an older version's review entry for them is merged from its copy. */
@@ -3034,6 +3133,7 @@ const KIND_RANK: Record<SyncEntityKind, number> = {
 	"saved-prompts": 1,
 	browser: 1,
 	schedules: 1,
+	settings: 1,
 	memory: 2,
 	draft: 3,
 	session: 4,
@@ -3086,7 +3186,21 @@ const ENTITY_KINDS = new Set<SyncEntityKind>([
 	"saved-prompts",
 	"browser",
 	"schedules",
+	"settings",
 ]);
+
+/** Contents a snapshot or a batch carries (base64 by hash), each checked against its hash. */
+function inlineContents(encoded: Record<string, string> | undefined): Map<string, Uint8Array> {
+	const inline = new Map<string, Uint8Array>();
+	if (!encoded || typeof encoded !== "object") return inline;
+	for (const [hash, text] of Object.entries(encoded)) {
+		if (typeof text !== "string") continue;
+		const bytes = new Uint8Array(Buffer.from(text, "base64"));
+		// A damaged entry is downloaded like any other content instead.
+		if (sha256(bytes) === hash) inline.set(hash, bytes);
+	}
+	return inline;
+}
 
 /** The changes a snapshot stands for: each record as a put, each deletion as a delete, small contents attached. */
 function snapshotSource(device: string, snapshot: SyncSnapshot, covered: string[]): PullSource {
@@ -3119,13 +3233,7 @@ function snapshotSource(device: string, snapshot: SyncSnapshot, covered: string[
 			deletedAt: tombstone.deletedAt,
 		});
 	}
-	const inline = new Map<string, Uint8Array>();
-	for (const [hash, encoded] of Object.entries(snapshot.inline ?? {})) {
-		if (typeof encoded !== "string") continue;
-		const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
-		// A damaged entry is downloaded like any other content instead.
-		if (sha256(bytes) === hash) inline.set(hash, bytes);
-	}
+	const inline = inlineContents(snapshot.inline);
 	const batch: SyncBatch = {
 		version: 1,
 		batchId: `snapshot-${device}-${snapshot.upTo}`,

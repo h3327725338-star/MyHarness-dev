@@ -21,6 +21,7 @@
 | System Prompt | `system-prompts/README.md`、`system-prompts/maintenance.md` |
 | Coding Agent | `packages/coding-agent/docs/index.md`、`development.md`、`maintenance.md`、`settings.md` |
 | Web UI | `packages/coding-agent/docs/web-ui.md` |
+| 安卓 App / 手机连接 | `packages/mobile/README.md`；电脑端网关和远程连接见 `packages/coding-agent/docs/web-ui.md` 的“手机连接”；手机经云端硬盘拿到的内容和发回的改动见 `packages/coding-agent/docs/google-drive-sync.md` 的 “Phones of the account” |
 | Agent Core / AI | 各自 `packages/<package>/docs/index.md` 和 `maintenance.md` |
 | 项目配置 / Project Trust | `.myharness/README.md`、`.myharness/maintenance.md`、Coding Agent `settings.md` |
 
@@ -41,6 +42,7 @@
 | --- | --- | --- | --- | --- |
 | 整个仓库 | [README](README.md)、[中文 README](README.zh-CN.md)、[架构与开发维护手册](ARCHITECTURE_AND_DEVELOPMENT.md)、[存储与数据边界](docs/STORAGE.md)、[隐私政策](docs/PRIVACY.md) | [根维护手册](MAINTENANCE.md) | [开发路线与边界](DEVELOPMENT_ROADMAP.md)（[中文版](DEVELOPMENT_ROADMAP.zh-CN.md)）、[项目状态](PROJECT_STATUS.md)、[ADR](docs/decisions/) | monorepo、脚本、CI、发布、数据生命周期 |
 | Coding Agent 产品层 | [产品文档索引](packages/coding-agent/docs/index.md)、[中文索引](packages/coding-agent/docs/index.zh-CN.md)、[Web UI](packages/coding-agent/docs/web-ui.md) | [产品维护手册](packages/coding-agent/docs/maintenance.md) | [产品后续开发](packages/coding-agent/docs/roadmap.md) | Web UI、AgentSession、Session、Provider runtime |
+| 安卓 App | [安卓版说明](packages/mobile/README.md)（功能、安装、连接电脑、构建、权限、已知限制） | 同一份 README 的“构建”“开发”两节 | — | `packages/mobile`：手机页面、本机 Agent、安卓壳；电脑端的手机连接网关属于 Coding Agent 的 Web UI |
 | Coding Agent 源码模块 | [源码模块地图](packages/coding-agent/docs/source-modules.md)；每个一级目录的 `packages/coding-agent/src/<目录>/README.md`（“说明”一节） | 同一份 `README.md` 的“维护”一节 | 同左 | `packages/coding-agent/src` 的一级目录（含各自子目录）和顶层入口 |
 | 其他包的源码目录 | [agent](packages/agent/src/README.md)、[ai](packages/ai/src/README.md)、[sqlite-node](packages/storage/sqlite-node/src/README.md) 的 `src/README.md` | 同一份 `README.md` 的“维护”一节 | 各包 `docs/roadmap.md` | 各包 `src` 下的每个子目录 |
 | Agent Core | [Agent Core 文档索引](packages/agent/docs/index.md)、[README](packages/agent/README.md) | [Agent Core 维护](packages/agent/docs/maintenance.md) | [Agent Core 后续开发](packages/agent/docs/roadmap.md) | Agent、agent loop、harness、session contract |

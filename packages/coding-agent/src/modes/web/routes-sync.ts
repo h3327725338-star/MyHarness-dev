@@ -63,6 +63,12 @@ export function registerSyncRoutes(server: WebHttpServer, sync: SyncService): vo
 		return { status: sync.status() };
 	});
 
+	// The page became visible or got the focus again: what another computer uploaded meanwhile is fetched now.
+	server.route("POST", "/api/sync/attention", () => {
+		sync.attention();
+		return { ok: true };
+	});
+
 	// Manual runs answer immediately; the page follows progress through the status (`manual`).
 	for (const kind of ["download", "sync"] as const) {
 		server.route("POST", `/api/sync/${kind}`, () => {

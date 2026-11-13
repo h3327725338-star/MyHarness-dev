@@ -9,6 +9,7 @@ import {
 	renameSync,
 	rmSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -263,31 +264,50 @@ describe("Workspace file sync channel", () => {
 		expect(port.manifestWrites).toBe(writesAfterBaseline);
 	});
 
-	it("keeps both versions when both computers edit the same file", async () => {
+	it("settles a file both computers edited by the later change, without asking", async () => {
 		const port = new FakePort();
 		const a = device(port, "desktop", "device-a");
 		const b = device(port, "laptop", "device-b");
 		writeFileSync(join(a.workspaceRoot, "shared.txt"), "base");
+		writeFileSync(join(a.workspaceRoot, "notes.txt"), "base");
 		await enable(a);
 		await b.engine.runOnce();
 
+		const earlier = new Date(Date.now() - 120_000);
+		const later = new Date(Date.now() - 60_000);
+		// shared.txt: the laptop's change is the later one. notes.txt: the desktop's is.
 		writeFileSync(join(a.workspaceRoot, "shared.txt"), "desktop version");
+		utimesSync(join(a.workspaceRoot, "shared.txt"), earlier, earlier);
 		writeFileSync(join(b.workspaceRoot, "shared.txt"), "laptop version");
+		utimesSync(join(b.workspaceRoot, "shared.txt"), later, later);
+		writeFileSync(join(a.workspaceRoot, "notes.txt"), "desktop notes");
+		utimesSync(join(a.workspaceRoot, "notes.txt"), later, later);
+		writeFileSync(join(b.workspaceRoot, "notes.txt"), "laptop notes");
+		utimesSync(join(b.workspaceRoot, "notes.txt"), earlier, earlier);
 		await a.engine.runOnce();
 		await b.engine.runOnce();
 
 		expect(readFileSync(join(b.workspaceRoot, "shared.txt"), "utf8")).toBe("laptop version");
-		const conflicts = b.engine.status().conflicts;
-		expect(conflicts).toHaveLength(1);
-		expect(conflicts[0]!.reason).toBe("both-modified");
-		expect(readFileSync(conflicts[0]!.remoteCopyPath!, "utf8")).toBe("desktop version");
-		expect(b.engine.status().workspaces.find((item) => item.workspaceId === "ws1")?.upToDate).toBe(false);
-
-		const result = await b.engine.resolveConflict("ws1", conflicts[0]!.id, "keep-local");
-		expect(result.ok).toBe(true);
-		await a.engine.runOnce();
-		expect(readFileSync(join(a.workspaceRoot, "shared.txt"), "utf8")).toBe("laptop version");
+		expect(readFileSync(join(b.workspaceRoot, "notes.txt"), "utf8")).toBe("desktop notes");
+		// Nothing is left to decide, and no "(conflict …)" file is left in the folder.
 		expect(b.engine.status().conflicts).toHaveLength(0);
+		expect(readdirSync(b.workspaceRoot).sort()).toEqual(["notes.txt", "shared.txt"]);
+		// The version that lost is kept with the backups.
+		const backups = readdirSync(join(b.agentDir, "sync", "backups", "workspace-file"), { recursive: true }).map(
+			String,
+		);
+		const kept = backups
+			.filter((name) => /\.txt$/u.test(name))
+			.map((name) => readFileSync(join(b.agentDir, "sync", "backups", "workspace-file", name), "utf8"));
+		expect(kept.sort()).toEqual(["desktop version", "laptop notes"]);
+
+		await a.engine.runOnce();
+		await b.engine.runOnce();
+		for (const item of [a, b]) {
+			expect(readFileSync(join(item.workspaceRoot, "shared.txt"), "utf8")).toBe("laptop version");
+			expect(readFileSync(join(item.workspaceRoot, "notes.txt"), "utf8")).toBe("desktop notes");
+			expect(item.engine.status().conflicts).toHaveLength(0);
+		}
 	});
 
 	it("never derives deletions from a subtree the scan could not read", async () => {

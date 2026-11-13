@@ -8,11 +8,15 @@
 
 共享正文位于 `common/`，两个模式的身份分别位于 `coding/identity.md` 和 `general/identity.md`。以下表格保留 loader 的逻辑资源名；实际共享路径加 `common/` 前缀。loader 兼容旧布局的替代目录，但只在同一指定目录内查找，不回退安装目录。共用资源按原条件注入，不遍历目录。各模式可追加各自的用户个性化内容，Project Context、工具、设置和长期记忆继续沿用现有机制。后端接口和前端接入边界见 [双模式后端约定](../packages/coding-agent/docs/chat-modes-backend.md)。
 
+## 安卓 App
+
+`mobile/identity.md` 是安卓 App（`packages/mobile`）本机助手的身份与工具规则：运行在手机上，没有命令行和文件系统，只有 `web_search`、`web_fetch` 和 `browser` 三个工具。它不经过 Coding Agent 的 loader：`packages/mobile/build.mjs` 在构建时把它和 `common/global/output-language.md`、`common/tasks/conversation-title.md` 一起嵌进 App 的页面（清单在 `packages/mobile/shared-files.mjs` 的 `promptFiles()`），所以改动要重新构建 App 才生效。桌面产品不加载它。
+
 ## 文件与作用域
 
 | 文件（相对本目录） | 职责与生效条件 |
 | --- | --- |
-| `global/core.md` | 编程会话的通用行为、证据、工作方式和沟通规则；含“回复里的图片”：用 `![说明](本机绝对路径 "版式")` 把本机图片、视频、音频显示在回复里，由模型自己选版式（单独一行、`center`、`wide`、`left` / `right` 文字环绕、`inline`、同段多图并排）和宽度，只展示本机文件，文件要写到会保留的位置 |
+| `global/core.md` | 编程会话的通用行为、证据、工作方式和沟通规则；含“回复里的图片”：用 `![说明](本机绝对路径 "版式")` 把本机图片、视频、音频显示在回复里，按论文插图的方式排（MyHarness 自动编号“图 1、图 2…”，模型只写图注、在正文里按编号引用），由模型按图片情况在四种形式里选（标准居中、`wide` 通栏、`left` / `right` 一侧小图文字环绕、同段多图作为 (a)(b) 分图并排加总图注），另有 `inline` 行内小图标；图片不会放大超过自身像素，用户点击可看原图并缩放；只展示本机文件，文件要写到会保留的位置 |
 | `global/output-language.md` | 编程会话的用户回复语言策略 |
 | `roles/main.md` | Main 授权边界，以及“回复结束即停止工作”：除非自己启动的东西真的会把它带回来（后台 shell 命令或后台子智能体派发结束时回报、定时 Agent 任务），不承诺稍后回来查看或汇报；保留现有 `reviewer` 同样使用此文本的行为 |
 | `roles/delegated.md` | 只读委派会话的执行边界 |
@@ -28,6 +32,7 @@
 | `session/workspace-instructions.md` | 仅 General 模式且工作区设置了说明时，放在 `<workspace_context>` 内说明前：工作区说明与 `<user_personalization>` 同时生效，冲突时以工作区说明为准；由 `_getTurnSystemPrompt` 追加 |
 | `session/model-identity.md` | 当前模型已知时使用，变量 `name`、`provider` |
 | `session/model-instructions.md` | 用户给某个模型写了专属提示词（设置 → 个性化 → 模型专属提示词，`<agentDir>/model-prompts.json`）时，放在 `<model_instructions priority="highest">` 内、用户原文之前：这段指令高于本请求里的其他一切（内置规则、`<user_personalization>`、工作区说明、项目上下文、自定义 Prompt、技能、召回记忆），但不改变工具名称、参数、调用格式和程序要读的输出格式；由 `ModelRuntime.stream` / `streamSimple` 追加在 system prompt 最后，只发给那一个模型 |
+| `session/model-instructions-reminder.md` | 同一条模型专属提示词在用户消息后面再放一遍时（`<model_instructions_reminder>`），放在用户原文之前的三句话：指令在 system prompt 末尾的 `<model_instructions>` 里、优先级最高；本次回复要完整照做，即使对话里之前的回复没有照做；后面的文字是指令原文，以“…”结尾时只是开头。由 `providers/models/model-prompts.ts` 的 `withModelInstructionsReminder` 只加在提示词保存之后的用户消息上，只发给那一个模型 |
 | `skills/coding-agent.md` | 编程会话的技能读取规则；仅启用 read 且存在可见技能时有正文 |
 | `skills/harness.md` | 通用 AgentHarness 的技能说明；原文不同，独立维护 |
 | `harness/default.md` | 通用 AgentHarness 未提供自定义 systemPrompt 时的默认身份 |

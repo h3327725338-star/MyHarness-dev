@@ -1,0 +1,11 @@
+.gradle/
+build/
+app/build/
+local.properties
+# The web assets are generated from ../web and the shared desktop Web UI files by ../build.mjs.
+app/src/main/assets/www/
+*.apk
+*.aab
+*.jks
+*.keystore
+signing.properties

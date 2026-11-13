@@ -173,6 +173,29 @@ export class WebHttpServer {
 	/** Whether any browser page has connected since the server started (it may already be gone again). */
 	hadClient = false;
 
+	/**
+	 * Receivers of every broadcast that are not browser tabs: the phone link (phone-link/gateway.ts) passes events on
+	 * to paired phones through this. A tap is not a client: it does not count in `clientCount`, so a phone never
+	 * makes the PC behave as if one of its own pages were open.
+	 */
+	private readonly taps = new Set<(event: string, data: unknown) => void>();
+
+	/** Receive every broadcast event. Returns the function that stops it. */
+	tap(listener: (event: string, data: unknown) => void): () => void {
+		this.taps.add(listener);
+		return () => {
+			this.taps.delete(listener);
+		};
+	}
+
+	private notifyTap(listener: (event: string, data: unknown) => void, event: string, data: unknown): void {
+		try {
+			listener(event, data);
+		} catch {
+			// A failing receiver must never break what the pages get.
+		}
+	}
+
 	/** Broadcast an event to every connected browser tab.
 	 *
 	 * Slow-tab policy: when a socket's buffer is full (`write` returns false or throws), intermediate progress
@@ -181,6 +204,7 @@ export class WebHttpServer {
 	 * sockets so it adds no pressure.
 	 */
 	broadcast(event: string, data: unknown): void {
+		for (const listener of this.taps) this.notifyTap(listener, event, data);
 		if (this.sseClients.size === 0) return;
 		const frame = this.frame(event, data);
 		const droppable = DROPPABLE_SSE_EVENTS.has(event);
@@ -193,6 +217,7 @@ export class WebHttpServer {
 	 * batch is kept), while a batch containing a final frame falls back to per-frame handling so finals are kept.
 	 */
 	broadcastBatch(events: Array<{ event: string; data: unknown }>): void {
+		for (const listener of this.taps) for (const { event, data } of events) this.notifyTap(listener, event, data);
 		if (events.length === 0 || this.sseClients.size === 0) return;
 		const framed = events.map(({ event, data }) => ({
 			frame: this.frame(event, data),

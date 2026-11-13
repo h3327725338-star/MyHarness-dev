@@ -10,6 +10,9 @@ const HEARTBEAT_MS = 60_000;
 let desktopFocused = false;
 let slotOf = () => "";
 let lastKey = "";
+let wasFocused = false;
+let lastAttentionAt = 0;
+const ATTENTION_EVERY_MS = 10_000;
 
 /** The user is in this app's window (this document, or a website tab of the desktop app). */
 export function appFocused() {
@@ -32,9 +35,28 @@ export function reportPresence(force = false) {
 	const slot = String(slotOf() || "");
 	const focused = appFocused() && document.visibilityState === "visible";
 	const key = `${slot}|${focused}`;
+	if (focused && !wasFocused) syncAttention();
+	wasFocused = focused;
 	if (!force && key === lastKey) return;
 	lastKey = key;
 	send({ slot, focused });
+}
+
+/**
+ * The user came back to the app: Google Drive sync looks for what another computer uploaded now instead of at its
+ * next poll, which can be most of a minute away. The server ignores it when Drive is not connected or a pass just ran.
+ */
+function syncAttention() {
+	if (exportReadOnly()) return;
+	const now = Date.now();
+	if (now - lastAttentionAt < ATTENTION_EVERY_MS) return;
+	lastAttentionAt = now;
+	fetch("/api/sync/attention", {
+		method: "POST",
+		headers: { "x-myharness-web": "1", "content-type": "application/json" },
+		body: "{}",
+		keepalive: true,
+	}).catch(() => undefined);
 }
 
 export function installPagePresence(getSlot) {

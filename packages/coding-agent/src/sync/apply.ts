@@ -10,6 +10,7 @@ import { writeFileAtomically, writeFileAtomicallySync } from "../utils/atomic-wr
 import { browserFileOf, browserProfileDir } from "./browser-data.ts";
 import { isSessionMetadataId, sessionMetadataFile } from "./record-merge.ts";
 import { savedPromptsOf, writeSavedPrompts } from "./saved-prompts.ts";
+import { writeSettingsRecord } from "./settings-data.ts";
 import type { SyncLocalStore } from "./store.ts";
 import type { SyncRecord } from "./types.ts";
 import { ensureDir, fromUtf8, stableJson } from "./util.ts";
@@ -40,6 +41,8 @@ export interface ApplyOutcome {
 	workspacesChanged: boolean;
 	sessionsChanged: boolean;
 	memoriesChanged: boolean;
+	/** Providers, keys or settings were written: the running chats reload them. */
+	settingsChanged?: boolean;
 	/** Set when a Workspace had to be restored to a managed folder on this device. */
 	binding?: { workspaceId: string; path: string; name: string; hint?: string; pending: boolean };
 	/** Entries both devices changed differently; the later change is kept (see `remoteWon`), without asking. */
@@ -495,6 +498,15 @@ export async function applySchedules(ctx: ApplyContext, data: Uint8Array): Promi
 	const remote = scheduleListOf(JSON.parse(fromUtf8(data)) as unknown);
 	updateScheduleList(ctx.agentDir, (local) => mergeScheduleLists(local, remote));
 	return { ...emptyOutcome(), applied: true };
+}
+
+/**
+ * Write one part of the configuration another computer published (settings-data.ts), already merged with what this
+ * computer has. The version counts as taken even when the files already said the same.
+ */
+export async function applySettings(ctx: ApplyContext, record: SyncRecord, data: Uint8Array): Promise<ApplyOutcome> {
+	const changed = await writeSettingsRecord(ctx.agentDir, record.id, fromUtf8(data));
+	return { ...emptyOutcome(), applied: true, settingsChanged: changed };
 }
 
 /**

@@ -36,6 +36,15 @@ activeTokens >= floor(effectiveContextWindow * 0.9)
 (`contextWindow.main` / `contextWindow.subagent` in settings, or a CLI
 `--context-window` override) and the model metadata `contextWindow`.
 
+The context window set for a model (its `contextWindow` in `models.json`, the value edited on the Providers page) also
+binds every request that is not a chat turn. The main chat and sub-agents compact before they reach it; helper requests
+(the compaction summary on another model, memory extraction and recall, titles, handoff summaries, commit messages,
+translation) are built from whatever the caller holds, which may be a conversation sized for a much larger model.
+`ModelRuntime.stream` / `streamSimple` pass every request through `fitContextToModelWindow`
+(`src/providers/runtime/context-fit.ts`): a request that would not fit is cut down before it is sent, long tool outputs
+and long pasted texts losing their middle first and then the oldest messages going, with room kept for the answer. A
+request that already fits is sent unchanged.
+
 The runtime reserve is derived from the effective window (`reserveTokens =
 ceil(effectiveContextWindow * 0.05)`); the configured `compaction.reserveTokens`
 base and the model `maxTokens` are not part of this computation. The normal automatic trigger remains 90%; the provider budget guard

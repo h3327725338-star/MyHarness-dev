@@ -13,6 +13,31 @@ in particular with data from your Google Account.
   and has no access to them. The source build sends no telemetry.
 - MyHarness does not sell your data, use it for advertising or use it to train AI models.
 
+## Phone link and the Android app
+
+A phone reaches MyHarness on your PC in one of two ways:
+
+- **On your local network**, after you turn the phone link on in Settings → Phone and pair the phone by scanning the
+  QR code it shows. Phone and PC talk to each other directly, and every message is encrypted with a key that only the
+  QR code carried.
+- **From any network**, when the phone is signed in to the MyHarness app with the same Google account as the PC (on by
+  default once the PC is signed in; Settings → Phone turns it off). The phone and the PC exchange connection details
+  as encrypted files in your own Google Drive. They then connect directly over the internet; to find a way through,
+  both ask Google's public STUN servers (`stun.l.google.com`) for their own public address, so those servers see the
+  two devices' IP addresses but no content. When no direct path exists, the encrypted messages themselves travel as
+  files in your Drive. Every message is encrypted with a key the phone made and left in your Drive.
+
+A connected phone can read the chats on that PC and have the agent act there, so connect only your own phones; you can
+remove a phone or turn either way off at any time. Anyone who can sign in to your Google account can add a phone of
+their own this way.
+
+The Android app keeps its chats and settings in its private storage on the phone and encrypts the API keys and its
+Google sign-in with a key held by the Android Keystore; Android does not back them up, and they are removed with the
+app. Signed in with Google, the app reads from your Drive what your PCs prepared for it (their chats, the model
+providers with their API keys, the default model, memories and browser bookmarks) and leaves its own chats and the
+providers you add on the phone there for your PCs to take in. Requests from the app's own assistant go from the phone
+straight to the model provider, to the web search it uses (Tavily, Bing or DuckDuckGo) and to the pages it reads.
+
 ## Google Drive sync
 
 Sync starts only when you press **Connect Google Drive** and sign in. MyHarness asks Google for:
@@ -22,11 +47,14 @@ Sync starts only when you press **Connect Google Drive** and sign in. MyHarness 
 | `openid`, `email`, `profile` | To show which Google account is connected and to keep two accounts apart. |
 | `https://www.googleapis.com/auth/drive.file` | To create and update the `MyHarness` folder in your Drive. This permission covers only the files MyHarness created or that you opened with it; MyHarness cannot see the rest of your Drive. |
 
-The `MyHarness` folder holds your MyHarness data so that your computers can share it: chats, memories, attachments,
-generated files, drafts, prompts, and the built-in browser's bookmarks, shortcuts and site settings. The browser's
-sign-ins and saved passwords are uploaded only if you set a sync passphrase, and only after they were encrypted with it
-on your computer. A workspace's files are uploaded only if you turn that on for the workspace. API keys and sign-in
-tokens are never uploaded.
+The `MyHarness` folder holds your MyHarness data so that your computers and phones can share it: chats, memories,
+attachments, generated files, drafts, prompts, the configuration (model providers and their settings, API keys, the
+preferences that are the same on every computer, skills, prompt templates and themes), and the built-in browser's
+bookmarks, shortcuts and site settings. API keys are stored there as plain text, as they are in MyHarness's settings
+folder on your computer, protected by your Google account. The browser's sign-ins and saved passwords are uploaded only
+if you set a sync passphrase, and only after they were encrypted with it on your computer. A workspace's files are
+uploaded only if you turn that on for the workspace. Sign-in tokens (Google, Microsoft, GitHub, mail, and model
+providers you use through a subscription or account login) are never uploaded.
 
 ## Mailboxes (Gmail and Outlook)
 
@@ -38,7 +66,8 @@ agent uses this access only for what you ask it to do in a conversation. Mail it
 ## Sign-in tokens
 
 The tokens Google, Microsoft or GitHub issue to MyHarness are stored only in files on your computer, in the MyHarness
-settings folder. They are not uploaded, not synced and not shared.
+settings folder, and the Android app's Google sign-in only on the phone. They are not uploaded, not synced and not
+shared.
 
 ## AI model providers
 

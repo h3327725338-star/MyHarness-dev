@@ -143,6 +143,17 @@
 
 .sidebar-foot { padding: 8px var(--pad-side) 10px; border-top: 1px solid var(--border); display: flex; align-items: center; }
 /* The connection to the local server: a dot in the column of the row-end icons above it. */
+/* Google Drive sync at a glance (sidebar.js SyncIndicator): the Drive mark with a small dot in the state's color; the
+   dot pulses while something is moving. A click opens the sync page. Absent until Drive is connected. */
+.sync-ind { position: relative; display: grid; place-items: center; width: var(--h-icon-sm); height: var(--h-icon-sm); margin-right: 2px; flex: none; border-radius: var(--r-md); color: var(--text-3); transition: background var(--t-fast) var(--ease), color var(--t-fast); }
+.sync-ind:hover { background: var(--surface-hover); color: var(--text); }
+.sync-ind > i { position: absolute; right: 2px; bottom: 2px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--bg-app); background: var(--text-3); }
+.sync-ind.tone-ok > i { background: var(--ok); }
+.sync-ind.tone-busy > i { background: var(--accent); animation: sync-pulse 1.2s ease-in-out infinite; }
+.sync-ind.tone-warn > i { background: var(--warn); }
+.sync-ind.tone-danger > i { background: var(--danger); }
+@keyframes sync-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .sync-ind.tone-busy > i { animation: none; } }
 .conn { display: grid; place-items: center; width: var(--h-icon-sm); height: var(--h-icon-sm); margin-right: 4px; flex: none; }
 /* Export pages only: the read-only area between the scrolling list and the settings foot. A fixed block (it never
    scrolls away), stacked vertically: badge, full-width download button, two ellipsized lines — so even at the 200px
@@ -273,6 +284,20 @@
 
 .splash { height: 100%; display: grid; place-items: center; color: var(--text-3); }
 .splash-card { width: 420px; max-width: calc(100% - 32px); display: flex; flex-direction: column; gap: 12px; align-items: center; text-align: center; }
+/* The desktop app's first screen while no Google account is connected (sign-in-page.js). */
+.sign-in-card { color: var(--text-2); gap: 14px; }
+.sign-in-card h2 { margin: 0; color: var(--text); font-size: 20px; font-weight: 650; }
+.sign-in-mark { width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.sign-in-text { line-height: 1.55; }
+.sign-in-actions { justify-content: center; gap: 8px; margin-top: 4px; }
+.sign-in-google { min-width: 220px; justify-content: center; height: 38px; font-size: 14px; }
+.sign-in-google .google-g { width: 18px; height: 18px; border-radius: 50%; display: inline-grid; place-items: center; background: #fff; color: #4285f4; font-weight: 700; font-size: 12px; line-height: 1; }
+.sign-in-wait { display: flex; gap: 10px; align-items: center; justify-content: center; color: var(--text); }
+.sign-in-note { font-size: 12px; line-height: 1.5; }
+.sign-in-error { display: flex; gap: 6px; align-items: flex-start; color: var(--danger); font-size: 13px; text-align: left; }
+.sign-in-advanced { font-size: 12px; gap: 4px; }
+.sign-in-client { gap: 8px; width: 100%; text-align: left; font-size: 12px; }
+.sign-in-client .btn { align-self: flex-end; }
 .conn-banner { flex: 0 0 auto; padding: 6px 12px; text-align: center; font-size: var(--fs-sm); background: var(--warn-soft); color: var(--warn); border-bottom: 1px solid var(--border); }
 
 .panel[data-w="xs"] .tab-label, .panel[data-w="s"] .tab-label { max-width: 0; opacity: 0; }

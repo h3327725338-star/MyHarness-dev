@@ -30,6 +30,8 @@ The project root contains the project configuration and runtime data:
 | `%USERPROFILE%\.myharness\agent\settings.json` | Global Settings | User configuration; do not commit or delete as cleanup |
 | `%USERPROFILE%\.myharness\agent\auth.json` | Provider credentials | Sensitive user data; never print, commit, or attach unredacted |
 | `%USERPROFILE%\.myharness\agent\models.json` and `models-store.json` | Provider/model configuration and cached catalog metadata | Configuration/cache; catalog data is not a secret, credentials are |
+| `%USERPROFILE%\.myharness\agent\phone-link.json` | Phone link: switch, port and the paired phones with their keys | Sensitive, this PC only; never synced, printed or committed. Deleting it unpairs every phone |
+| `%USERPROFILE%\.myharness\android-signing\` | Key that signs the Android app's release builds (created by `packages/mobile/build.mjs --apk`) | Keep and back up: an update installs only over an app signed with the same key; never commit |
 | `%USERPROFILE%\.myharness\agent\trust.json` | Project trust decisions | User security state; preserve unless the user explicitly asks to reset it |
 | `%USERPROFILE%\.myharness\agent\sessions\` | Legacy flat Session location | Compatibility/migration source only; do not treat it as the current default |
 | `%USERPROFILE%\.myharness\agent\traces\` | Runtime traces | Potentially sensitive diagnostics; redact before sharing |

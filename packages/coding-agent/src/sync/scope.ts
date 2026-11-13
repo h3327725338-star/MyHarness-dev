@@ -17,6 +17,7 @@ import { readSessionHeader } from "../session/storage/jsonl/index.ts";
 import { listBrowserFiles } from "./browser-data.ts";
 import { portableSessionMetadata } from "./record-merge.ts";
 import { readSavedPrompts } from "./saved-prompts.ts";
+import { readSettingsRecords } from "./settings-data.ts";
 import type { ScannedEntity } from "./types.ts";
 import { stableJson } from "./util.ts";
 
@@ -461,6 +462,21 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 			mtimeMs: schedulesMtime,
 			size: Buffer.byteLength(content),
 			meta: { name: "Scheduled tasks" },
+		});
+	}
+
+	// 8. The configuration that travels (settings-data.ts): Providers and models, saved API keys, model and agent
+	// settings, model prompts and web search keys, each one record of normalized text.
+	for (const record of readSettingsRecords(agentDir)) {
+		entities.set(`settings:${record.id}`, {
+			key: `settings:${record.id}`,
+			kind: "settings",
+			id: record.id,
+			inline: record.text,
+			updatedAt: new Date(record.mtimeMs).toISOString(),
+			mtimeMs: record.mtimeMs,
+			size: Buffer.byteLength(record.text),
+			meta: { name: record.name },
 		});
 	}
 }

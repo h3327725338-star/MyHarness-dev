@@ -3,7 +3,7 @@
 ## 项目事实
 
 - 这是一个 npm/TypeScript/ESM monorepo。
-- 产品层在 packages/coding-agent/；Agent Core 在 packages/agent/；Provider/AI API 在 packages/ai/；浏览器界面在 packages/coding-agent/web/，服务端在 packages/coding-agent/src/modes/web/。终端 CLI/TUI 已移出本仓库。
+- 产品层在 packages/coding-agent/；Agent Core 在 packages/agent/；Provider/AI API 在 packages/ai/；浏览器界面在 packages/coding-agent/web/，服务端在 packages/coding-agent/src/modes/web/。终端 CLI/TUI 已移出本仓库。安卓 App 在 packages/mobile/（手机页面、本机 Agent、Java 原生壳）；它遥控桌面端用的网关和远程连接在 packages/coding-agent/src/modes/web/phone-link/，经 Google 云端硬盘交换对话与配置的电脑一侧在 packages/coding-agent/src/sync/phone/。
 - 当前整体架构和模块归属见 ARCHITECTURE_AND_DEVELOPMENT.md。
 - 当前源码没有 packages/coding-agent/src/core/、frontend/、shared/ 或 application/bootstrap/。
 
@@ -34,6 +34,7 @@
 | System Prompt 资源、加载和维护 | `system-prompts/README.md`、`system-prompts/maintenance.md` |
 | Coding Agent 产品层 | `packages/coding-agent/docs/index.md` 及其 `development.md`、`maintenance.md`、`settings.md` |
 | Web UI（`modes/web/`、`packages/coding-agent/web/`） | `packages/coding-agent/docs/web-ui.md` |
+| 安卓 App（`packages/mobile/`）与手机连接 | `packages/mobile/README.md`；网关与协议见 `packages/coding-agent/docs/web-ui.md` 的“手机连接”；云端硬盘里的手机通道见 `packages/coding-agent/docs/google-drive-sync.md` 的 “Phones of the account” |
 | Agent Core | `packages/agent/docs/index.md`、`packages/agent/docs/maintenance.md` |
 | Provider / AI API | `packages/ai/docs/index.md`、`packages/ai/docs/maintenance.md` |
 | 项目配置和 Project Trust | `.myharness/README.md`、`.myharness/maintenance.md`、Coding Agent `settings.md` |

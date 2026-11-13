@@ -1,9 +1,11 @@
-// Google Drive sync settings: connection, background status, restored-workspace bindings and versions kept for review.
-// Every row uses the same pieces as the rest of Settings: cards for groups, one compact line per setting.
-import { html, useEffect, useState, Collapse, Icon, Spinner, Toggle } from "./ui.js";
+// Google Drive sync settings. The page answers three questions in this order: is everything in sync (one line and one
+// button at the top), does anything need me (a card that only exists when something does), and what travels. Things
+// used once or never (this computer's name, the Drive folder, an OAuth client of one's own) are folded under Advanced.
+// Nothing here asks the user to pick between two versions: the later change wins, in the background.
+import { html, useEffect, useRef, useState, Collapse, Icon, Spinner, Toggle } from "./ui.js";
 import { api, post, set, toast, useStore } from "./store.js";
 import { t } from "./i18n.js";
-import { connectionBadge, deriveSync, footLine, progressText, reviewTitle, stateLine } from "./sync-status.js";
+import { agoText, deriveSync, etaText, massDeleteText, syncSummary } from "./sync-status.js";
 import { confirmDialog } from "./actions.js";
 
 function Card({ title, description, action, children, id }) {
@@ -26,47 +28,61 @@ function formatBytes(value) {
 	return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function timeText(value) {
-	if (!value) return t("Not yet");
-	try {
-		return new Date(value).toLocaleString();
-	} catch {
-		return value;
+/**
+ * How fast the pass in flight moves, in items per second, measured from when this stage was first seen. Undefined for
+ * the first two seconds: a rate from one or two items says nothing.
+ */
+function useRate(progress) {
+	const start = useRef(null);
+	if (!progress) {
+		start.current = null;
+		return undefined;
 	}
+	const now = Date.now();
+	const key = `${progress.stage}:${progress.step ?? ""}:${progress.total}`;
+	if (!start.current || start.current.key !== key || progress.done < start.current.done) {
+		start.current = { key, at: now, done: progress.done };
+	}
+	const seconds = (now - start.current.at) / 1000;
+	const moved = progress.done - start.current.done;
+	return seconds >= 2 && moved > 0 ? moved / seconds : undefined;
 }
 
-let jumpTimer = 0;
-function jumpTo(id) {
-	const el = (id && document.getElementById(id)) || null;
-	if (!el) return;
-	el.scrollIntoView({ block: "start", behavior: "smooth" });
-	// The settings page is often already scrolled as far as it goes, so the jump itself can look like nothing happened.
-	// Outlining the section for a moment shows where the click went even then.
-	clearTimeout(jumpTimer);
-	for (const node of document.querySelectorAll(".sync-hit")) node.classList.remove("sync-hit");
-	el.classList.add("sync-hit");
-	jumpTimer = setTimeout(() => el.classList.remove("sync-hit"), 1600);
+/** The status at the top: a mark in the state's color, what is going on in one line, and the bar while it moves. */
+function SyncHero({ summary, action, rate }) {
+	const progress = summary.progress;
+	const eta = progress ? etaText(progress.total - progress.done, rate) : "";
+	const icon =
+		summary.tone === "ok" ? "checkCircle" : summary.tone === "danger" ? "alertCircle" : summary.tone === "warn" ? "alertTriangle" : "drive";
+	return html`<div class=${`sync-hero tone-${summary.tone}`}>
+		<span class="sync-mark" aria-hidden="true">${summary.tone === "busy" ? html`<${Spinner} size=${18} />` : html`<${Icon} name=${icon} size=${20} />`}</span>
+		<div class="sync-hero-text" role="status">
+			<strong class="sync-hero-title">${summary.title}</strong>
+			${summary.detail ? html`<span class="sync-hero-detail">${summary.detail}${eta ? ` · ${eta}` : ""}</span>` : null}
+		</div>
+		${action || null}
+		${progress
+			? html`<span class="sync-bar" role="progressbar" aria-valuemin="0" aria-valuemax=${progress.total} aria-valuenow=${progress.done}><i style=${{ width: `${progress.percent}%` }} /></span>`
+			: summary.tone === "busy"
+				? html`<span class="sync-bar moving" role="progressbar"><i /></span>`
+				: null}
+	</div>`;
 }
 
-/** A waiting count; while that stage moves it shows how far the pass got, with a bar that follows it. */
-function SyncCount({ status, stage, text }) {
-	const progress = progressText(status, stage);
-	if (!progress) return html`<span class="mono">${text}</span>`;
-	const { done, total, step } = status.progress;
-	const percent = Math.round((Math.min(done, total) / total) * 100);
-	// Change lists are read before anything is downloaded; without the word the count looks like files arriving.
-	const label = step === "read" ? t("Reading changes") : "";
-	return html`<span class="sync-count" role="status" title=${label ? `${label} ${progress}` : progress}>
-		<span>${label ? html`<span class="dim">${label} </span>` : null}<span class="mono">${progress}</span></span>
-		<span class="sync-meter" role="progressbar" aria-valuemin="0" aria-valuemax=${total} aria-valuenow=${Math.min(done, total)}><i style=${{ width: `${percent}%` }} /></span>
-	</span>`;
+/** One line of "what travels": a check mark, what it is, and the few words that say what that covers. */
+function Travels({ label, description, on = true, children }) {
+	return html`<div class="set-row sync-travels">
+		<span class=${`sync-tick ${on ? "on" : ""}`} aria-hidden="true"><${Icon} name=${on ? "check" : "minus"} size=${13} /></span>
+		<div class="set-text"><span class="set-label">${label}</span>${description ? html`<span class="set-desc">${description}</span>` : null}</div>
+		${children ? html`<div class="set-control">${children}</div>` : null}
+	</div>`;
 }
 
 /**
  * The built-in browser (desktop app only). Bookmarks, shortcuts and site settings ride on the normal sync; sign-ins and
  * saved passwords only once a sync passphrase seals them on this computer (packages/desktop/browser-sync.cjs).
  */
-function BrowserSyncCard({ syncing }) {
+function BrowserRows({ syncing }) {
 	const host = globalThis.myHarnessDesktop;
 	const [state, setState] = useState(null);
 	const [phrase, setPhrase] = useState("");
@@ -109,46 +125,46 @@ function BrowserSyncCard({ syncing }) {
 						: sealedAt.toLocaleDateString(),
 			})
 		: t("Not sealed yet");
-	return html`<${Card} title=${t("Built-in browser")} description=${t("Your browser data follows you to your other computers.")}>
-		<${Row} label=${t("Bookmarks, shortcuts and site settings")} description=${t("Zoom, dark mode, website language and site permissions too. Nothing to set up.")}>
-			<span class="dim">${syncing ? t("On") : t("Off")}</span>
-		<//>
-		<${Row}
-			label=${t("Sign-ins and saved passwords")}
-			description=${on
-				? t("Sealed with your sync passphrase before upload. Some sites, such as Google, may ask you to sign in again.")
-				: t("Encrypted on this computer with a sync passphrase before upload; use the same one on each computer. Some sites, such as Google, may ask you to sign in again.")}
-			wide=${!on}
-		>
-			${on
-				? html`<div class="row sync-field">
-						<span class="dim truncate grow" role="status" title=${state?.others ? t("{count} other computers have sealed theirs", { count: state.others }) : ""}>${sealed}</span>
-						<button class="btn" disabled=${busy === "off"} onClick=${() => run("off", { action: "syncOff" }, "Sign-in sync is off on this computer.")}>${t("Turn off")}</button>
-					</div>`
-				: html`<form
-						class="row sync-field"
-						onSubmit=${async (event) => {
-							event.preventDefault();
-							if (await run("on", { action: "syncPassphrase", passphrase: phrase }, "Sign-in sync is on.")) setPhrase("");
-						}}
-					>
-						<input
-							class="field grow"
-							type="password"
-							value=${phrase}
-							minlength="8"
-							placeholder=${t("Sync passphrase, at least 8 characters")}
-							autocomplete="new-password"
-							disabled=${state && !state.available}
-							onInput=${(event) => setPhrase(event.target.value)}
-						/>
-						<button class="btn primary" type="submit" disabled=${busy === "on" || phrase.length < 8 || (state && !state.available)}>${busy === "on" ? t("Verifying…") : t("Turn on")}</button>
-					</form>`}
-		<//>
+	return html`
+		<${Travels} on=${syncing} label=${t("Built-in browser")} description=${t("Bookmarks, new-tab shortcuts and site settings such as zoom, dark mode and permissions.")} />
+		<div class=${`set-row sync-travels ${on ? "" : "wide"}`}>
+			<span class=${`sync-tick ${on && syncing ? "on" : ""}`} aria-hidden="true"><${Icon} name=${on && syncing ? "check" : "minus"} size=${13} /></span>
+			<div class="set-text">
+				<span class="set-label">${t("Website sign-ins and saved passwords")}</span>
+				<span class="set-desc">${on
+					? t("Sealed with your sync passphrase before upload. Some sites, such as Google, may ask you to sign in again.")
+					: t("Off until you set a sync passphrase. They are encrypted with it on this computer before upload; use the same one on each computer.")}</span>
+			</div>
+			<div class="set-control">
+				${on
+					? html`<div class="row sync-field">
+							<span class="dim truncate grow" role="status" title=${state?.others ? t("{count} other computers have sealed theirs", { count: state.others }) : ""}>${sealed}</span>
+							<button class="btn" disabled=${busy === "off"} onClick=${() => run("off", { action: "syncOff" }, "Sign-in sync is off on this computer.")}>${t("Turn off")}</button>
+						</div>`
+					: html`<form
+							class="row sync-field"
+							onSubmit=${async (event) => {
+								event.preventDefault();
+								if (await run("on", { action: "syncPassphrase", passphrase: phrase }, "Sign-in sync is on.")) setPhrase("");
+							}}
+						>
+							<input
+								class="field grow"
+								type="password"
+								value=${phrase}
+								minlength="8"
+								placeholder=${t("Sync passphrase, at least 8 characters")}
+								autocomplete="new-password"
+								disabled=${state && !state.available}
+								onInput=${(event) => setPhrase(event.target.value)}
+							/>
+							<button class="btn primary" type="submit" disabled=${busy === "on" || phrase.length < 8 || (state && !state.available)}>${busy === "on" ? t("Verifying…") : t("Turn on")}</button>
+						</form>`}
+			</div>
+		</div>
 		${state?.unreadable?.length
 			? html`<div class="notice warn">${t("This passphrase does not open the sign-ins from {names}. Enter the same passphrase on every computer.", { names: state.unreadable.join(", ") })}</div>`
-			: null}
-	<//>`;
+			: null}`;
 }
 
 export function SyncPage() {
@@ -159,9 +175,9 @@ export function SyncPage() {
 	const [deviceName, setDeviceName] = useState("");
 	const [clientTouched, setClientTouched] = useState(false);
 	const [deviceTouched, setDeviceTouched] = useState(false);
-	const [detailsOpen, setDetailsOpen] = useState(false);
-	// null until the user toggles it: the client fields then show only when nothing else can sign in.
-	const [clientOpen, setClientOpen] = useState(null);
+	// null until the user toggles it: Advanced then opens by itself only when nothing else can sign in.
+	const [advancedOpen, setAdvancedOpen] = useState(null);
+	const rate = useRate(status?.progress && status.progress.total > 0 ? status.progress : null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -205,22 +221,20 @@ export function SyncPage() {
 	if (!status) return html`<div class="row"><${Spinner} /></div>`;
 
 	const sync = deriveSync(status);
-	const badge = connectionBadge(status, sync);
-	const state = stateLine(status, sync);
+	const summary = syncSummary(status, sync);
 	const folder = status.folder;
 	const account = status.account;
 	// With MyHarness's own Google app a sign-in is all it takes; a client of the user's own is needed only without one.
 	const canSignIn = (status.clientConfigured && status.clientSecretConfigured) || !!status.builtInClient;
-	const clientShown = clientOpen ?? (!status.connected && !canSignIn);
+	const advancedShown = advancedOpen ?? (!status.connected && !canSignIn);
 	const risk = status.externalRisk ?? { detected: false };
 	const files = sync.files;
 	const fileWorkspaces = sync.workspaces;
-	const fileConflicts = sync.fileConflicts;
 	const pendingBindings = sync.pendingBindings;
-	const conflicts = sync.review;
+	const syncing = status.connected && status.enabled && !status.paused;
 
 	const manual = status.manual ?? null;
-	// Pause means nothing is uploaded or applied; the manual runs respect it instead of overriding it.
+	// Off means nothing is uploaded or applied; the manual runs respect it instead of overriding it.
 	const manualBlocked = !status.connected || status.paused || manual?.state === "running";
 
 	const saveConfig = (patch) => run("config", () => post("/api/sync/config", patch));
@@ -239,7 +253,9 @@ export function SyncPage() {
 	const disconnect = async () => {
 		const ok = await confirmDialog({
 			title: t("Disconnect Google Drive?"),
-			message: t("Sync stops on this computer. Local chats and memories stay; the cloud copy is not deleted."),
+			message: status.signInRequired
+				? t("Sync stops on this computer and MyHarness shows the sign-in screen until you sign in again. Local chats and memories stay; the cloud copy is not deleted.")
+				: t("Sync stops on this computer. Local chats and memories stay; the cloud copy is not deleted."),
 			confirmLabel: t("Disconnect"),
 			danger: true,
 		});
@@ -399,23 +415,6 @@ export function SyncPage() {
 		}
 	};
 
-	const resolveFileConflict = async (conflict, choice) => {
-		setBusy(`conflict:${conflict.id}`);
-		try {
-			const result = await post("/api/sync/files/resolve", {
-				workspaceId: conflict.workspaceId,
-				conflictId: conflict.id,
-				choice,
-			});
-			if (result?.status) set({ syncStatus: result.status });
-			toast(t("The choice is saved. This computer publishes it as a new version."), "success");
-		} catch (error) {
-			toast(error?.message || t("The operation failed."), "error", 7000);
-		} finally {
-			setBusy("");
-		}
-	};
-
 	const confirmFileDeletes = async (workspaceId) => {
 		const ok = await confirmDialog({
 			title: t("Confirm the waiting deletions?"),
@@ -436,282 +435,215 @@ export function SyncPage() {
 		}
 	};
 
-	const foot = footLine(manual, status, sync);
+	const syncNow = () =>
+		run("sync", async () => {
+			// The built-in browser seals its sign-ins first, so this pass uploads them too.
+			await globalThis.myHarnessDesktop?.browser?.({ action: "syncNow" }).catch(() => {});
+			return post("/api/sync/sync");
+		});
+	const turnOn = () => saveConfig({ enabled: true, paused: false });
+
+	const heroAction =
+		summary.action === "connect"
+			? html`<button class="btn primary" disabled=${busy === "connect" || !canSignIn} onClick=${connect}>${busy === "connect" ? t("Opening…") : t("Connect Google Drive")}</button>`
+			: summary.action === "cancel"
+				? html`<button class="btn" disabled=${busy === "disconnect"} onClick=${cancelWait}>${t("Cancel waiting")}</button>`
+				: summary.action === "signin"
+					? html`<button class="btn primary" disabled=${busy === "connect"} onClick=${connect}>${busy === "connect" ? t("Opening…") : t("Sign in again")}</button>`
+					: summary.action === "resume"
+						? html`<button class="btn primary" disabled=${busy === "config"} onClick=${turnOn}>${t("Turn sync on")}</button>`
+						: html`<button class="btn" disabled=${manualBlocked || busy === "sync"} onClick=${syncNow}><${Icon} name="refresh" size=${14} />${t("Sync now")}</button>`;
+
+	const filesOn = (item) => item.managed || item.source === "drive";
 
 	return html`
 		${risk.detected ? html`<div class="notice danger">${t(risk.message ?? "The operation failed.")}</div>` : null}
-		<${Card}
-			title=${t("Status")}
-			description=${t("What is moving, what is stuck, and what needs you.")}
-			action=${html`<span class=${`badge ${badge.cls}`}>${badge.text}</span>`}
-		>
-			<${Row}
-				label=${t("Current state")}
-				description=${t("{up} to upload · {down} to download · {count} to review", { up: sync.up, down: sync.down, count: sync.unresolved })}
-			>
-				<strong>${state}</strong>
-			<//>
-		<//>
-		<${Card}
-			title=${t("Google Drive")}
-			description=${t("Chats, memories and attachments sync through MyHarness's own folder in your Drive.")}
-		>
-			<${Row}
-				label=${t("Account")}
-				description=${account?.email ||
-					(canSignIn
-						? t("No Google account is connected on this computer.")
-						: t("Paste the client id and secret of a Google Cloud desktop OAuth client first."))}
-			>
-				${status.connected
-					? html`${status.lastError && status.phase !== "authorizing"
-								? html`<button class="btn" disabled=${busy === "connect"} onClick=${connect}>${busy === "connect" ? t("Opening…") : t("Sign in again")}</button>`
-								: null}
-							<button class="btn" disabled=${busy === "disconnect"} onClick=${disconnect}>${t("Disconnect")}</button>`
-					: html`<button class="btn primary" disabled=${busy === "connect" || !canSignIn} onClick=${connect}>${busy === "connect" ? t("Opening…") : t("Connect Google Drive")}</button>`}
-				${status.phase === "authorizing" && !status.connected
-					? html`<button class="btn" disabled=${busy === "disconnect"} onClick=${cancelWait}>${t("Cancel waiting")}</button>`
-					: null}
-			<//>
-			${folder
-				? html`<${Row} label=${t("Cloud folder")} description=${t("Renaming it in Drive does not break the connection.")}>
-						<a class="btn" href=${folder.url} target="_blank" rel="noreferrer" data-link-system><${Icon} name="drive" size=${14} />${folder.name}</a>
-					<//>`
+		<section class="set-card sync-top">
+			<${SyncHero} summary=${summary} action=${heroAction} rate=${rate} />
+			${!status.connected && !canSignIn
+				? html`<div class="notice warn sync-inset">${t("Signing in needs a Google OAuth client first. Open Advanced below and paste its client ID and secret.")}</div>`
 				: null}
-			<${Row} label=${t("This device")} description=${t("Shown on the other computers when they report progress.")}>
-				<div class="row sync-field">
-					<input
-						class="field"
-						value=${deviceName}
-						maxlength="80"
-						spellcheck="false"
-						onInput=${(event) => {
-							setDeviceTouched(true);
-							setDeviceName(event.target.value);
-						}}
-					/>
-					<button
-						class="btn"
-						disabled=${busy === "device" || !deviceName.trim() || deviceName.trim() === status.deviceName}
-						onClick=${async () => {
-							setDeviceTouched(false);
-							await run("device", () => post("/api/sync/config", { deviceName: deviceName.trim() }));
-						}}
-					>${t("Save")}</button>
-				</div>
-			<//>
-			<button class="set-card-toggle" aria-expanded=${clientShown} onClick=${() => setClientOpen(!clientShown)}>
-				<${Icon} name="chevronRight" size=${13} class="disclose" /><span class="set-label">${t("Advanced: your own Google OAuth client")}</span>
-			</button>
-			<${Collapse} open=${clientShown}>
-				<${Row}
-					label=${t("OAuth client id")}
-					description=${t("Paste the client ID of a Google Cloud desktop OAuth client. It replaces MyHarness's own app for the browser sign-in.")}
-					wide=${true}
-				>
-					<div class="row sync-field">
-						<input
-							class="field grow"
-							value=${clientId}
-							placeholder="1234567890-…apps.googleusercontent.com"
-							spellcheck="false"
-							autocomplete="off"
-							onInput=${(event) => {
-								setClientTouched(true);
-								setClientId(event.target.value);
-							}}
-						/>
-						<button
-							class="btn"
-							disabled=${busy === "client" || !clientId.trim() || clientId.trim() === (status.clientId ?? "")}
-							onClick=${async () => {
-								setClientTouched(false);
-								await run("client", () => post("/api/sync/config", { clientId: clientId.trim() }));
-							}}
-						>${t("Save")}</button>
-					</div>
-				<//>
-				<${Row}
-					label=${t("OAuth client secret")}
-					description=${status.clientSecretConfigured
-						? t("A secret is saved on this computer. Paste a new one only to replace it.")
-						: t("Google rejects the token exchange without it, even with PKCE.")}
-					wide=${true}
-				>
-					<div class="row sync-field">
-						<input
-							class="field grow"
-							type="password"
-							value=${clientSecret}
-							placeholder=${status.clientSecretConfigured ? "••••••••" : "GOCSPX-…"}
-							spellcheck="false"
-							autocomplete="off"
-							onInput=${(event) => setClientSecret(event.target.value)}
-						/>
-						<button
-							class="btn"
-							disabled=${busy === "secret" || !clientSecret.trim()}
-							onClick=${async () => {
-								const result = await run(
-									"secret",
-									() => post("/api/sync/config", { clientSecret: clientSecret.trim() }),
-									"Client secret saved.",
-								);
-								if (result) setClientSecret("");
-							}}
-						>${t("Save")}</button>
-					</div>
-				<//>
-			<//>
-		<//>
-		<${Card} title=${t("Automatic sync")} description=${t("Changes upload after a short pause; other computers are checked in the background.")}>
-			<${Row} label=${t("Sync with Google Drive")} description=${t("Off keeps every local change on this computer only.")}>
-				<${Toggle}
-					checked=${status.enabled}
-					disabled=${!status.connected || busy === "config"}
-					label=${t("Sync with Google Drive")}
-					onChange=${(value) => saveConfig({ enabled: value })}
-				/>
-			<//>
-			<${Row} label=${t("Pause")} description=${t("Keeps the connection and the waiting work; nothing is uploaded or applied while paused.")}>
-				<${Toggle}
-					checked=${status.paused}
-					disabled=${!status.enabled || busy === "config"}
-					label=${t("Pause sync")}
-					onChange=${(value) => saveConfig({ paused: value })}
-				/>
-			<//>
-			<${Row} label=${t("Waiting to upload")} description=${t("Saved on this computer, not uploaded yet.")}>
-				<${SyncCount} status=${status} stage="upload" text=${sync.up > 0 ? `${sync.up} · ${formatBytes(status.pendingBytes)}` : t("Nothing waiting")} />
-			<//>
-			<${Row} label=${t("Waiting to download")} description=${t("Changes from other computers, not applied here yet.")}>
-				<${SyncCount} status=${status} stage="download" text=${sync.down > 0 ? `${sync.down}` : t("Nothing waiting")} />
-			<//>
-			<${Row} label=${t("Last check")}>
-				<span class="dim">${timeText(status.lastCheckAt)}</span>
-			<//>
-			<${Row} label=${t("Last upload")} description=${t("Uploaded is not the same as received by another computer.")}>
-				<span class="dim">${timeText(status.lastUploadAt)}</span>
-			<//>
-			<${Row} label=${t("Last download")}>
-				<span class="dim">${timeText(status.lastDownloadAt)}</span>
-			<//>
-			${status.lastError ? html`<div class="notice danger">${t(status.lastError)}</div>` : null}
-			${(status.issues ?? []).length > 0
-				? html`<div class="notice warn sync-list" id="sync-issues">
-						<strong>${t("Some changes are waiting for a manual look")}</strong>
-						${sync.issues.slice(-5).map((issue) => html`<div key=${issue.key}>${issue.detail || issue.reason} <span class="dim">· ${timeText(issue.at)}</span></div>`)}
+			${status.connected
+				? html`<div class="set-card-body">
+						<${Row} label=${t("Automatic sync")} description=${t("Changes upload a moment after you make them; what your other computers did arrives by itself.")}>
+							<${Toggle}
+								checked=${syncing}
+								disabled=${busy === "config"}
+								label=${t("Automatic sync")}
+								onChange=${(value) => (value ? turnOn() : saveConfig({ paused: true }))}
+							/>
+						<//>
+						<${Row} label=${t("Google account")} description=${account?.email || t("Connected")}>
+							<button class="btn" disabled=${busy === "disconnect"} onClick=${disconnect}>${t("Disconnect")}</button>
+						<//>
 					</div>`
 				: null}
-			<div class="row sync-foot">
-				<button class="btn" disabled=${!status.connected || busy === "check"} onClick=${() => run("check", () => post("/api/sync/check"))}>
-					<${Icon} name="refresh" size=${14} />${t("Check now")}
-				</button>
-				<button class="btn" disabled=${manualBlocked || busy === "download"} title=${status.paused ? t("Sync is paused. Turn Pause off first.") : ""} onClick=${() => run("download", () => post("/api/sync/download"))}>
-					<${Icon} name="download" size=${14} />${t("Download now")}
-				</button>
-				<button
-					class="btn"
-					disabled=${manualBlocked || busy === "sync"}
-					title=${status.paused ? t("Sync is paused. Turn Pause off first.") : ""}
-					onClick=${() =>
-						run("sync", async () => {
-							// The built-in browser seals its sign-ins first, so this pass uploads them too.
-							await globalThis.myHarnessDesktop?.browser?.({ action: "syncNow" }).catch(() => {});
-							return post("/api/sync/sync");
-						})}
-				>
-					<${Icon} name="drive" size=${14} />${t("Sync now")}
-				</button>
-			</div>
-				${foot
-					? html`<div class="sync-runline" role="status" title=${foot.text}>
-							${foot.spinning ? html`<${Spinner} />` : null}<span class=${`grow truncate ${foot.tone === "danger" ? "c-danger" : foot.tone === "warn" ? "c-warn" : ""}`}>${foot.text}</span>
-							${foot.review ? html`<button class="btn sm" onClick=${() => jumpTo(foot.target)}>${t("Review")}</button>` : null}
-						</div>`
-					: html`<div class="sync-runline dim" role="status">${t("Everything also runs by itself; this button is for troubleshooting.")}</div>`}
-		<//>
-		${fileWorkspaces.length
-			? html`<${Card} title=${t("Workspace files")} id="sync-files" description=${t("Each workspace records who syncs its files. A finished chat upload never proves that its folder is fully uploaded.")}>
-					${fileWorkspaces.map(
-						(item) => html`<${Row} key=${item.workspaceId} label=${item.name} description=${item.path || ""} stack=${true}>
-							<div class="row sync-field">
-								<span class="dim grow truncate" role="status" title=${item.message}>${item.message}</span>
-								${item.managed
-									? html`<button class="btn" disabled=${busy === `files:${item.workspaceId}`} onClick=${() => disableFiles(item.workspaceId)}>${t("Stop syncing files")}</button>`
-									: item.source === "drive"
-										? null
-										: html`<button class="btn" disabled=${busy === `files:${item.workspaceId}`} onClick=${() => enableFiles(item.workspaceId)}>${t("Sync files")}</button>`}
-							</div>
-							${item.receiving
-								? html`<span class="dim">${t("Receiving {done} of {total} files ({size} so far).", { done: item.receiving.done, total: item.receiving.total, size: formatBytes(item.receiving.bytes) })}</span>`
-								: null}
-							${item.state === "blocked"
-								? html`<button class="btn danger" disabled=${busy === `deletes:${item.workspaceId}`} onClick=${() => confirmFileDeletes(item.workspaceId)}>${t("Confirm the waiting deletions")}</button>`
-								: null}
-						<//>`,
-					)}
-					${files?.historyNote ? html`<div class="set-desc">${t(files.historyNote)}</div>` : null}
-				<//>`
-			: null}
-		${fileConflicts.length
-			? html`<${Card} title=${t("File conflicts")} id="sync-conflicts" description=${t("Nothing was overwritten. Choose what becomes the new version; the other computers then receive it.")}>
-					${fileConflicts.slice(0, 20).map(
-						(conflict) => html`<div class="set-row stack" key=${conflict.id}>
-							<div class="set-text">
-								<span class="set-label">${conflict.path}</span>
-								<span class="set-desc">${t(conflict.message)}</span>
-								${conflict.remoteCopyPath ? html`<span class="dim mono sync-path">${conflict.remoteCopyPath}</span>` : null}
-								<span class="dim">${conflict.deviceName} · ${timeText(conflict.at)}</span>
-							</div>
-							<div class="set-control row">
-								<button class="btn" disabled=${busy === `conflict:${conflict.id}`} onClick=${() => resolveFileConflict(conflict, "keep-local")}>${t("Keep this computer's version")}</button>
-								<button class="btn" disabled=${!conflict.remoteCopyPath || busy === `conflict:${conflict.id}`} onClick=${() => resolveFileConflict(conflict, "take-remote")}>${t("Use the other version")}</button>
-								<button class="btn" disabled=${busy === `conflict:${conflict.id}`} onClick=${() => resolveFileConflict(conflict, "keep-both")}>${t("Keep both")}</button>
-							</div>
+		</section>
+		${sync.needsYou > 0
+			? html`<${Card} title=${t("Needs you")} id="sync-needs" description=${t("Sync goes on meanwhile. These are the only things it cannot decide for you.")}>
+					${sync.massDeletes.map(
+						(issue) => html`<div class="set-row sync-full" key=${issue.key} title=${issue.detail}>
+							<div class="set-text"><span class="set-label">${t("A large deletion was held back")}</span><span class="set-desc">${massDeleteText(issue)} ${t("If the data folder was moved, put it back. If you really deleted them, nothing else is needed here.")}</span></div>
 						</div>`,
 					)}
-				<//>`
-			: null}
-		${pendingBindings.length
-			? html`<${Card} title=${t("Workspaces restored to a managed folder")} id="sync-bindings" description=${t("Pick the folder this computer should use. Chats and memories already work; file tools wait for the binding.")}>
 					${pendingBindings.map(
-						(item) => html`<${Row} key=${item.workspaceId} label=${item.name} description=${item.hint || item.path} stack=${true}>
-							<div class="row sync-field"><span class="dim mono truncate grow" title=${item.path}>${item.path}</span>
-								<button class="btn" disabled=${busy === `bind:${item.workspaceId}`} onClick=${() => chooseFolder(item.workspaceId)}>${t("Choose folder")}</button>
+						(item) => html`<${Row} key=${item.workspaceId} label=${t("Pick a folder for {name}", { name: item.name })} description=${t("This workspace came from another computer. Its chats and memories already work; its files need a folder on this one.")} stack=${true}>
+							<div class="row sync-field"><span class="dim mono truncate grow" title=${item.hint || item.path}>${item.hint || item.path}</span>
+								<button class="btn primary" disabled=${busy === `bind:${item.workspaceId}`} onClick=${() => chooseFolder(item.workspaceId)}>${t("Choose folder")}</button>
+							</div>
+						<//>`,
+					)}
+					${sync.blocked.map(
+						(item) => html`<${Row} key=${item.workspaceId} label=${t("Confirm deleting files in {name}", { name: item.name })} description=${item.message} stack=${true}>
+							<div class="row sync-field"><span class="grow" />
+								<button class="btn danger" disabled=${busy === `deletes:${item.workspaceId}`} onClick=${() => confirmFileDeletes(item.workspaceId)}>${t("Delete on every computer")}</button>
 							</div>
 						<//>`,
 					)}
 				<//>`
 			: null}
-		${conflicts.length
-			? html`<${Card} title=${t("Kept for review")} id="sync-review" description=${t("Nothing was overwritten. The local version is in use; the other version is saved beside the agent data.")}>
-					${conflicts.slice(0, 20).map(
-						(conflict) => html`<div class="set-row wide" key=${conflict.id}>
-							<div class="set-text"><span class="set-label">${reviewTitle(conflict)}</span><span class="set-desc">${t(conflict.message)}</span></div>
-							<div class="set-control sync-paths">
-								${conflict.localPath ? html`<span class="dim sync-path">${t("On this computer:")} <span class="mono">${conflict.localPath}</span></span>` : null}
-								${conflict.remoteCopyPath ? html`<span class="dim sync-path">${t("Copy of the other version:")} <span class="mono">${conflict.remoteCopyPath}</span></span>` : null}
-								<span class="dim">${conflict.deviceName} · ${timeText(conflict.at)}</span>
-							</div>
-						</div>`,
-					)}
-				<//>`
-			: null}
-		${typeof globalThis.myHarnessDesktop?.browser === "function" ? html`<${BrowserSyncCard} syncing=${status.connected && status.enabled && !status.paused} />` : null}
-		<${Card} title=${t("What syncs")} description=${t("Scanned by meaning, never by copying the whole Data folder.")}>
-			<button class="set-card-toggle" aria-expanded=${detailsOpen} onClick=${() => setDetailsOpen(!detailsOpen)}>
-				<${Icon} name="chevronRight" size=${13} class="disclose" /><span class="set-label">${detailsOpen ? t("Hide details") : t("Show details")}</span>
+		<${Card} title=${t("What travels")} description=${t("Kept the same on every computer you connect. When two computers change the same thing, the later change wins.")}>
+			<${Travels} on=${syncing} label=${t("Chats and memories")} description=${t("General-mode chats with their attachments and files, every memory, drafts, your prompts and scheduled tasks.")} />
+			<${Travels} on=${syncing} label=${t("Settings and keys")} description=${t("Providers and their models, which model does which job, model prompts, and API keys. Keys are stored in your own Google Drive, not encrypted separately.")} />
+			${typeof globalThis.myHarnessDesktop?.browser === "function" ? html`<${BrowserRows} syncing=${syncing} />` : null}
+			${fileWorkspaces.map(
+				(item) => html`<${Travels}
+					key=${item.workspaceId}
+					on=${filesOn(item) && syncing}
+					label=${t("Files of {name}", { name: item.name })}
+					description=${item.receiving
+						? t("Receiving {done} of {total} files ({size} so far).", { done: item.receiving.done, total: item.receiving.total, size: formatBytes(item.receiving.bytes) })
+						: filesOn(item)
+							? item.message
+							: item.path || t("Not synced. Turn it on to keep this folder the same on your computers.")}
+				>
+					${item.managed
+						? html`<button class="btn" disabled=${busy === `files:${item.workspaceId}`} onClick=${() => disableFiles(item.workspaceId)}>${t("Stop")}</button>`
+						: item.source === "drive"
+							? null
+							: html`<button class="btn" disabled=${!status.connected || busy === `files:${item.workspaceId}`} onClick=${() => enableFiles(item.workspaceId)}>${t("Sync files")}</button>`}
+				<//>`,
+			)}
+			<${Travels} on=${false} label=${t("Stays on this computer")} description=${t("Coding-mode chats and repositories, sign-ins to model providers, and settings that belong to one computer such as proxies and folders.")} />
+		<//>
+		<section class="set-card collapsible">
+			<button class="set-card-head set-card-toggle sync-advanced" aria-expanded=${advancedShown} onClick=${() => setAdvancedOpen(!advancedShown)}>
+				<${Icon} name="chevronRight" size=${13} class="disclose" /><strong class="grow">${t("Advanced")}</strong>
+				<span class="dim">${t("Name, Drive folder, details")}</span>
 			</button>
-			<${Collapse} open=${detailsOpen}>
-				<div class="set-desc sync-list">
-					<div>${t("All memories: global, workspace, session, archived, pending and the profile.")}</div>
-					<div>${t("General mode: workspaces, chats and branches, attachments, artifacts, library files, drafts and the general personal prompt.")}</div>
-					<div>${t("Built-in browser: bookmarks, new-tab shortcuts and site settings; sign-ins and saved passwords only with a sync passphrase, sealed on this computer first.")}</div>
-					<div>${t("Coding-mode chats and repositories are not uploaded; their memories are.")}</div>
-					<div>${t("API keys, Google tokens, trust decisions, locks and running tasks never leave this computer.")}</div>
-					<div>${t("The Google token is kept in an owner-only file (Windows user permissions). It is not OS-encrypted or end-to-end encrypted.")}</div>
+			<${Collapse} open=${advancedShown}>
+				<div class="set-card-body">
+					<${Row} label=${t("This computer's name")} description=${t("How your other computers call this one.")}>
+						<div class="row sync-field">
+							<input
+								class="field"
+								value=${deviceName}
+								maxlength="80"
+								spellcheck="false"
+								onInput=${(event) => {
+									setDeviceTouched(true);
+									setDeviceName(event.target.value);
+								}}
+							/>
+							<button
+								class="btn"
+								disabled=${busy === "device" || !deviceName.trim() || deviceName.trim() === status.deviceName}
+								onClick=${async () => {
+									setDeviceTouched(false);
+									await run("device", () => post("/api/sync/config", { deviceName: deviceName.trim() }));
+								}}
+							>${t("Save")}</button>
+						</div>
+					<//>
+					${folder
+						? html`<${Row} label=${t("Folder in Google Drive")} description=${t("Everything is kept in this one folder. Renaming it in Drive is fine.")}>
+								<a class="btn" href=${folder.url} target="_blank" rel="noreferrer" data-link-system><${Icon} name="drive" size=${14} />${folder.name}</a>
+							<//>`
+						: null}
+					${status.connected
+						? html`<${Row}
+								label=${t("Last activity")}
+								description=${t("Checked {check} · uploaded {up} · downloaded {down}", {
+									check: agoText(status.lastCheckAt) || t("not yet"),
+									up: agoText(status.lastUploadAt) || t("not yet"),
+									down: agoText(status.lastDownloadAt) || t("not yet"),
+								})}
+							>
+								<button class="btn" disabled=${manualBlocked || busy === "download"} title=${t("Fetches what your other computers did without uploading anything from this one.")} onClick=${() => run("download", () => post("/api/sync/download"))}>
+									<${Icon} name="download" size=${14} />${t("Download only")}
+								</button>
+							<//>`
+						: null}
+					${sync.retrying.length > 0 || sync.failing.length > 0
+						? html`<div class="set-row wide">
+								<div class="set-text"><span class="set-label">${t("Being retried in the background")}</span><span class="set-desc">${t("Nothing to do: these are tried again by themselves.")}</span></div>
+								<div class="set-control sync-paths">
+									${sync.retrying.slice(-5).map((issue) => html`<span class="dim sync-path" key=${issue.key}>${issue.detail || issue.reason} · ${agoText(issue.at)}</span>`)}
+									${sync.failing.map((item) => html`<span class="dim sync-path" key=${item.workspaceId}>${item.name}: ${item.message}</span>`)}
+								</div>
+							</div>`
+						: null}
+					${files?.historyNote ? html`<div class="set-desc sync-note">${t(files.historyNote)}</div>` : null}
+					<${Row}
+						label=${t("Your own Google OAuth client")}
+						description=${t("Only if you do not want to sign in through MyHarness's own Google app: paste the client ID of a Google Cloud desktop OAuth client.")}
+						wide=${true}
+					>
+						<div class="row sync-field">
+							<input
+								class="field grow"
+								value=${clientId}
+								placeholder="1234567890-…apps.googleusercontent.com"
+								spellcheck="false"
+								autocomplete="off"
+								onInput=${(event) => {
+									setClientTouched(true);
+									setClientId(event.target.value);
+								}}
+							/>
+							<button
+								class="btn"
+								disabled=${busy === "client" || !clientId.trim() || clientId.trim() === (status.clientId ?? "")}
+								onClick=${async () => {
+									setClientTouched(false);
+									await run("client", () => post("/api/sync/config", { clientId: clientId.trim() }));
+								}}
+							>${t("Save")}</button>
+						</div>
+					<//>
+					<${Row}
+						label=${t("OAuth client secret")}
+						description=${status.clientSecretConfigured
+							? t("A secret is saved on this computer. Paste a new one only to replace it.")
+							: t("Google rejects the token exchange without it, even with PKCE.")}
+						wide=${true}
+					>
+						<div class="row sync-field">
+							<input
+								class="field grow"
+								type="password"
+								value=${clientSecret}
+								placeholder=${status.clientSecretConfigured ? "••••••••" : "GOCSPX-…"}
+								spellcheck="false"
+								autocomplete="off"
+								onInput=${(event) => setClientSecret(event.target.value)}
+							/>
+							<button
+								class="btn"
+								disabled=${busy === "secret" || !clientSecret.trim()}
+								onClick=${async () => {
+									const result = await run(
+										"secret",
+										() => post("/api/sync/config", { clientSecret: clientSecret.trim() }),
+										"Client secret saved.",
+									);
+									if (result) setClientSecret("");
+								}}
+							>${t("Save")}</button>
+						</div>
+					<//>
+					<div class="set-desc sync-note">${t("The Google sign-in of this page is kept in a file only your Windows user can read. It is not encrypted separately, and neither is what is stored in Drive.")}</div>
 				</div>
 			<//>
-		<//>`;
+		</section>`;
 }

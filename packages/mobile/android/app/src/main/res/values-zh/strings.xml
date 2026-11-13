@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+	<string name="app_name">MyHarness</string>
+	<string name="run_channel">正在回复</string>
+	<string name="run_title">MyHarness 正在回复</string>
+	<string name="done_channel">回复完成</string>
+	<string name="scan_prompt">扫描电脑上显示的二维码</string>
+	<string name="signin_channel">Google 登录</string>
+	<string name="signin_title">正在等待 Google 登录</string>
+	<string name="signin_text">在浏览器里完成登录后，会自动回到 MyHarness。</string>
+</resources>

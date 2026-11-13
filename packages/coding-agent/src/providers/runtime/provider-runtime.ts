@@ -60,6 +60,7 @@ import { DisabledProviderPolicy } from "../models/disabled.ts";
 import { groupCredentialId, MODEL_KEY_SOURCE, modelCredentialId } from "../models/layers.ts";
 import { withModelPrompt } from "../models/model-prompts.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "../models/store.ts";
+import { fitContextToModelWindow } from "./context-fit.ts";
 import { providerSpendLedger } from "./provider-spend.ts";
 
 const DEFAULT_MODEL_REFRESH_TIMEOUT_MS = 15_000;
@@ -1103,7 +1104,7 @@ export class ModelRuntime implements Models {
 				);
 				return prepared.provider.stream(
 					prepared.model as Model<TApi>,
-					this.withModelPrompt(model, context),
+					this.requestContext(model, context),
 					prepared.options as ApiStreamOptions<TApi>,
 				);
 			}),
@@ -1117,6 +1118,14 @@ export class ModelRuntime implements Models {
 	 */
 	private withModelPrompt(model: Model<Api>, context: Context): Context {
 		return withModelPrompt(context, this.modelsPath ? dirname(this.modelsPath) : undefined, model);
+	}
+
+	/**
+	 * What is sent for `context`: the model's own prompt added, then cut down to the context window set for the model
+	 * (context-fit.ts). Every request passes here, so helper requests obey the window like the main chat does.
+	 */
+	private requestContext(model: Model<Api>, context: Context): Context {
+		return fitContextToModelWindow(model, this.withModelPrompt(model, context)).context;
 	}
 
 	/** Adds the request's cost to this computer's estimate for the provider (provider-spend.ts) once it finished. */
@@ -1152,7 +1161,7 @@ export class ModelRuntime implements Models {
 				const prepared = await this.prepareRequest(model, options);
 				return prepared.provider.streamSimple(
 					prepared.model,
-					this.withModelPrompt(model, context),
+					this.requestContext(model, context),
 					prepared.options as SimpleStreamOptions,
 				);
 			}),

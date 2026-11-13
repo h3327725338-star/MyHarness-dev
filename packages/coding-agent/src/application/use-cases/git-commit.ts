@@ -47,7 +47,10 @@ export interface GitCommitUseCaseHost {
 	updatePhase: (phase: GitCommitTaskPhase, activity: string) => void;
 	/** An isolated, tool-free model request; never starts a coding/repair turn. */
 	generateMessage: (context: CommitMessageContext) => Promise<GeneratedCommitMessage>;
-	/** Only invoked for an explicitly reported pre-commit hook failure, at most three rounds. */
+	/**
+	 * Only invoked for an explicitly reported pre-commit hook failure, at most three rounds; a round that leaves the
+	 * working tree unchanged ends the repair instead of running the same checks again.
+	 */
 	repairCode?: (failure: GitCommandResult) => Promise<boolean>;
 	signal?: AbortSignal;
 	/** Commit with `--no-verify`: the user chose to skip Git hooks for direct commits. */
@@ -149,8 +152,24 @@ export class GitCommitUseCase {
 		}
 		if (repairRounds < 3 && hookFailed && this.host.repairCode) {
 			this.host.updatePhase("repairing", `正在修复提交前检查发现的问题（第 ${repairRounds + 1}/3 轮）`);
+			const before = await this.workingTreeFingerprint(target);
 			if (await this.host.repairCode(outcome.failure)) {
 				this.host.signal?.throwIfAborted();
+				// A round that left every file as it was (the agent reported a blocker, or the user declined what it
+				// asked) cannot change the checks' verdict: running them again would only fail the same way and start
+				// another identical round.
+				if (before !== undefined && before === (await this.workingTreeFingerprint(target))) {
+					return {
+						status: "failed",
+						target,
+						paths: pending.paths,
+						message,
+						failure: {
+							...outcome.failure,
+							stderr: `${outcome.failure.stderr}\nAutomatic pre-commit repair stopped: the repair round changed no files, so the checks were not run again.`,
+						},
+					};
+				}
 				// Repair changed the diff: regenerate the description and run normal hooks again.
 				return this.executeAttempt(target, repairRounds + 1);
 			}
@@ -168,6 +187,23 @@ export class GitCommitUseCase {
 		if (!target.only || pending.error || !pending.paths) return pending;
 		const allowed = new Set(target.only.map(normalizeCommitPath));
 		return { paths: pending.paths.filter((candidate) => allowed.has(normalizeCommitPath(candidate))) };
+	}
+
+	/**
+	 * The whole working tree's delta from HEAD (every pending path, not only this commit's), as one comparable string,
+	 * so a repair round that changed any file is told apart from one that changed none. `undefined` when it cannot
+	 * be read: the caller then keeps retrying as before instead of guessing.
+	 */
+	private async workingTreeFingerprint(target: GitCommitTarget): Promise<string | undefined> {
+		try {
+			const pending = await this.readPendingPaths({ ...target, only: undefined });
+			if (pending.error || !pending.paths) return undefined;
+			const state = await readCommitMessageContext(target.repositoryRoot, pending.paths, this.host.signal);
+			return JSON.stringify({ paths: state.paths, diff: state.diff });
+		} catch {
+			this.host.signal?.throwIfAborted();
+			return undefined;
+		}
 	}
 
 	/**

@@ -78,6 +78,36 @@ material they cover:
   website tab. It is installed from the npm registry, not copied into this
   source tree; the desktop build copies its `darkreader.js`, `LICENSE` and
   `package.json` into the packaged app (`runtime/node_modules/darkreader`).
+- The phone link's direct connection over the internet
+  (`packages/coding-agent/src/modes/web/phone-link/remote.ts`) uses the npm
+  package `werift` 0.25.2 (MIT, shinyoshiaki), a WebRTC implementation in
+  TypeScript. It is installed from the npm registry, unmodified, and not
+  copied into this source tree. Among the packages it brings, `mediabunny`
+  (MPL-2.0, Vanilagy; source at https://github.com/Vanilagy/mediabunny) is
+  shipped unmodified with its license in its own folder; `asn1js` is
+  BSD-3-Clause (Peculiar Ventures), `reflect-metadata` is Apache-2.0
+  (Microsoft Corporation), `tweetnacl` is Unlicense, and the rest are MIT or
+  0BSD.
+- The Android app (`packages/mobile`) is built with Gradle from libraries
+  that are downloaded from Google Maven and Maven Central at build time and
+  compiled into the APK; none is copied into this source tree: AndroidX Core
+  1.19.1, Activity 1.13.0 and WebKit 1.18.0 (Apache-2.0, The Android Open
+  Source Project), OkHttp 5.5.1 with Okio (Apache-2.0, Square, Inc.) and the
+  Kotlin standard library they need (Apache-2.0, JetBrains s.r.o. and Kotlin
+  contributors), and ZXing Android Embedded 4.3.0 (Apache-2.0, JourneyApps)
+  with ZXing core (Apache-2.0, ZXing authors), which reads the pairing QR
+  code. The app's page ships the same Preact, htm, marked and highlight.js
+  files as the Web UI (with `LICENSE.preact`, `LICENSE.htm` and
+  `LICENSE.heroicons` copied beside them), and its `core.bundle.js` is an
+  esbuild bundle of this repository's agent and provider code together with
+  the npm packages those import: `openai` (Apache-2.0, OpenAI),
+  `@anthropic-ai/sdk` (MIT, Anthropic, PBC), `@google/genai` (Apache-2.0,
+  Google LLC), `typebox` (MIT, sinclairzx81), `partial-json` (MIT, Muspi
+  Merol), `p-retry` (MIT, Sindre Sorhus) and `retry` (MIT, Tim Koschützki
+  and Felix Geisendörfer).
+- The QR code shown for phone pairing (`packages/coding-agent/web/js/qr-code.js`)
+  is MyHarness's own implementation of ISO/IEC 18004; no QR library is used.
+  "QR Code" is a registered trademark of DENSO WAVE INCORPORATED.
 - `packages/agent/src/harness/compaction/CODEX-NOTICE.md` and
   `CODEX-LICENSE` identify the adapted OpenAI Codex source and its Apache-2.0
   terms.
