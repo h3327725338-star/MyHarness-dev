@@ -127,6 +127,7 @@ import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { SessionBashRunner } from "../../tools/shell/session-bash.ts";
 import type { SubAgentBackgroundProgress, SubAgentBackgroundTask } from "../../tools/sub-agent.ts";
 import type { SymbolsCodeIntelligenceServices } from "../../tools/symbols-runtime.ts";
+import { toolIdempotency } from "../../tools/tool-idempotency.ts";
 import { cleanupOrphanedToolResults } from "../../tools/tool-result-persistence.ts";
 import { desktopWorkspaceChannel } from "../../tools/workspace.ts";
 import { BOOKMARK_CONTEXT_TYPE, bookmarkContext } from "../../tools/workspace-bookmarks.ts";
@@ -140,6 +141,7 @@ import {
 	type SubAgentDispatchState,
 	type SubAgentStateSnapshot,
 } from "../delegation/background-work.ts";
+import { resolveWorkerModelSupport } from "../delegation/worker-model.ts";
 import {
 	VisionAssistantManager,
 	type VisionAssistantMessageDetails,
@@ -226,6 +228,8 @@ export type AgentSessionEvent =
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	/** The set of active tools changed, whoever changed it (an extension, a settings switch, the user). */
+	| { type: "active_tools_changed"; names: readonly string[] }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -1381,6 +1385,8 @@ export class AgentSession {
 			this._pendingRunStartCallback = undefined;
 			onRunStart?.();
 		}
+		// A shell command repeated within one reply is a repeat; the same command in a later reply is asked on purpose.
+		if (event.type === "turn_start") toolIdempotency.beginReply(this.sessionManager.getSessionId());
 
 		// Record when the run delivers a final answer, so a user message consumed
 		// afterwards can restart the live-timer baseline as a new user round.
@@ -1815,12 +1821,16 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		const previous = new Set(this.getActiveToolNames());
 		const { tools, names: validToolNames } = this._tools.resolve(toolNames);
 		this.agent.state.tools = tools;
 
 		// Rebuild base system prompt with new tool set
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
 		this._setAgentSystemPrompt(this._systemPromptOverride ?? this._baseSystemPrompt);
+		const names = this.getActiveToolNames();
+		if (names.length !== previous.size || names.some((name) => !previous.has(name)))
+			this._emit({ type: "active_tools_changed", names });
 	}
 
 	/**
@@ -1979,7 +1989,18 @@ export class AgentSession {
 		const settings = this.settingsManager.getSubAgentSettings();
 		const ref = resolveAssistantModel(settings, this._mainModelRef());
 		// The effort the workers really get ("Default" is the model's highest level).
-		const resolved = ref && withSupportedEffort(ref, this._modelRuntime.getModel(ref.provider, ref.model));
+		const model = ref && this._modelRuntime.getModel(ref.provider, ref.model);
+		const resolved = ref && withSupportedEffort(ref, model);
+		// A model an extension registered exists in a worker only when the worker loads that extension too.
+		const support = resolved
+			? resolveWorkerModelSupport({
+					provider: resolved.provider,
+					modelId: resolved.model,
+					model,
+					providerEnabled: this._modelRuntime.isProviderEnabled(resolved.provider),
+					extensions: this._resourceLoader.getExtensions().extensions,
+				})
+			: {};
 		return {
 			...settings,
 			chatMode: this.sessionManager.getMode(),
@@ -1990,6 +2011,8 @@ export class AgentSession {
 			model: resolved?.model,
 			thinkingLevel: resolved?.thinkingLevel,
 			contextWindow: this.settingsManager.getConfiguredContextWindow("subagent"),
+			providerExtensionPath: support.providerExtensionPath,
+			unavailableReason: support.unavailableReason,
 		};
 	}
 
@@ -2145,6 +2168,11 @@ export class AgentSession {
 		if (this._beforeAgentRun) {
 			await this._beforeAgentRun();
 		}
+		// A program that runs its own tools can change a file before this session sees the call, so a checkpoint taken at
+		// the first call it sees could already hold that change (and then neither list it nor undo it). It is taken now
+		// instead, beside the request: the program cannot act before the model has answered. A call that arrives while it
+		// is still being taken waits for it (prepareForTool).
+		if (this.model?.runsOwnTools) void this._gitCheckpointCoordinator.prepare("run-start").catch(() => {});
 		this._isAgentRunActive = true;
 		this._runSequence += 1;
 		const operationId = this._beginOperation("agent-run");
@@ -3808,6 +3836,7 @@ export class AgentSession {
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
+				getAgentRole: () => this._agentRole,
 			},
 			{
 				registerProvider: (name, config) => {

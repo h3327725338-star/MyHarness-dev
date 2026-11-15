@@ -3,6 +3,7 @@ package com.myharness.mobile;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Notification;
+import android.provider.Settings;
 import android.app.NotificationManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -108,6 +109,27 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 	private boolean runWanted;
 	private String runTitle = "";
 	private boolean onScreen;
+	// While a reply is awaited and the app is not on screen, the page is told "tick" every second. A page in the
+	// background gets few timers of its own (after a while one a minute), too few to look for the PC's messages in
+	// Google Drive and to notice that the reply ended; what the app itself posts is not slowed down.
+	private final android.os.Handler ticker = new android.os.Handler(android.os.Looper.getMainLooper());
+	private boolean ticking;
+	private final Runnable tick = new Runnable() {
+		@Override
+		public void run() {
+			if (!ticking) return;
+			emitSimple("lifecycle", "state", "tick");
+			ticker.postDelayed(this, 1000);
+		}
+	};
+
+	private void syncTicker() {
+		boolean wanted = runWanted && !onScreen && page != null;
+		if (wanted == ticking) return;
+		ticking = wanted;
+		ticker.removeCallbacks(tick);
+		if (wanted) ticker.postDelayed(tick, 1000);
+	}
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
@@ -116,7 +138,7 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		getWindow().setStatusBarColor(Color.TRANSPARENT);
 		getWindow().setNavigationBarColor(Color.TRANSPARENT);
 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) getWindow().setNavigationBarContrastEnforced(false);
-		WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+		WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG || BuildConfig.INSPECT);
 		RunService.ensureChannels(this);
 
 		secrets = new SecretStore(this);
@@ -599,6 +621,7 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		onScreen = true;
 		// On screen nothing has to keep the app alive, and its notification would only be in the way.
 		RunService.stop(this);
+		syncTicker();
 	}
 
 	@Override
@@ -608,6 +631,7 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		// The app leaves the screen while a reply is being written: from here on Android may stop it, unless the run
 		// service holds it. Android allows starting the service for a few seconds after the app was on screen.
 		if (runWanted && !isFinishing()) RunService.start(this, runTitle);
+		syncTicker();
 	}
 
 	@Override
@@ -621,6 +645,8 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 		oauth.stop();
 		SignInService.stop(this);
 		http.abortAll();
+		ticking = false;
+		ticker.removeCallbacks(tick);
 		RunService.stop(this);
 		browser.destroy();
 		root.removeView(page);
@@ -924,6 +950,7 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 					// RunService.start takes quietly.
 					if (!onScreen) RunService.start(MainActivity.this, runTitle);
 				} else RunService.stop(MainActivity.this);
+				syncTicker();
 			});
 		}
 
@@ -938,10 +965,48 @@ public class MainActivity extends ComponentActivity implements HttpBridge.Sink, 
 						.setContentTitle(title)
 						.setContentText(text)
 						.setAutoCancel(true)
+						.setCategory(Notification.CATEGORY_MESSAGE)
+						.setVisibility(Notification.VISIBILITY_PUBLIC)
+						.setShowWhen(true)
 						.setContentIntent(RunService.openApp(MainActivity.this))
 						.build();
 				manager.notify(2, notification);
 			});
+		}
+
+		/** The system's page for this app's notifications (some phones keep banners off until the owner allows them there). */
+		@JavascriptInterface
+		public void openNotificationSettings() {
+			runOnUiThread(() -> {
+				Intent intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+				intent.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+				try {
+					startActivity(intent);
+				} catch (RuntimeException missing) {
+					// No such page on this phone.
+				}
+			});
+		}
+
+		/** The system's page for the one notification that is there while a reply is awaited, where the owner can switch it off. */
+		@JavascriptInterface
+		public void openWaitingSettings() {
+			runOnUiThread(() -> {
+				Intent intent = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+				intent.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+				intent.putExtra(Settings.EXTRA_CHANNEL_ID, RunService.RUN_CHANNEL);
+				try {
+					startActivity(intent);
+				} catch (RuntimeException missing) {
+					// No page for one channel on this phone: the app's notifications as a whole.
+					openNotificationSettings();
+				}
+			});
+		}
+
+		@JavascriptInterface
+		public boolean waitingHidden() {
+			return RunService.waitingHidden(MainActivity.this);
 		}
 
 		@JavascriptInterface

@@ -1340,9 +1340,10 @@ exports.createBrowser = (window, log, options = {}) => {
   /**
    * Screenshot of any tab, on screen or not, through the page's own compositor (DevTools protocol), so a background tab
    * is captured without being shown. The picture is scaled to the page's CSS pixels: a point in it is the same point
-   * the mouse commands take.
+   * the mouse commands take. `format: 'jpeg'` (with `quality`, 30-95, default 70) gives a much smaller picture for a
+   * viewer that asks again and again (the phone showing this tab); the default stays PNG.
    */
-  const snapshot = async (tab) => {
+  const snapshot = async (tab, { format, quality } = {}) => {
     if (tab.destroyed) throw new Error(`浏览器标签 ${tab.id} 已关闭`);
     keepAwake(tab);
     const contents = contentsOf(tab);
@@ -1391,7 +1392,8 @@ exports.createBrowser = (window, log, options = {}) => {
       }
     }
     const size = image && !image.isEmpty() ? image.getSize() : viewport || { width: 0, height: 0 };
-    return { snapshot: `data:image/png;base64,${buffer.toString('base64')}`, width: size.width, height: size.height, ...(tab.dialog ? { dialog: publicDialog(tab.dialog) } : {}) };
+    const jpeg = format === 'jpeg' && image && !image.isEmpty() ? image.toJPEG(Math.max(30, Math.min(95, Math.round(Number(quality)) || 70))) : null;
+    return { snapshot: jpeg ? `data:image/jpeg;base64,${jpeg.toString('base64')}` : `data:image/png;base64,${buffer.toString('base64')}`, width: size.width, height: size.height, ...(tab.dialog ? { dialog: publicDialog(tab.dialog) } : {}) };
   };
 
   const withTimeout = (promise, ms, message) => new Promise((resolve, reject) => {
@@ -2471,7 +2473,7 @@ exports.createBrowser = (window, log, options = {}) => {
       case 'stopFind':
         return stopFind(requireTab(value.tabId));
       case 'snapshot':
-        return snapshot(requireTab(value.tabId));
+        return snapshot(requireTab(value.tabId), { format: value.format, quality: value.quality });
       case 'mouse':
         return mouse(requireTab(value.tabId), value);
       case 'keys':

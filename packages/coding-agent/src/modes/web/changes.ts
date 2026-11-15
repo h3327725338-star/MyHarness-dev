@@ -14,7 +14,11 @@ import { isNonMutatingTool } from "../../git/checkpoints/coordinator.ts";
 import { runGit, runGitSync } from "../../git/repository/command.ts";
 import { getCachedGitInspect } from "../../git/repository/read-cache.ts";
 import type { ReviewChange, ReviewChangeStatus } from "../../git/repository/review-types.ts";
-import type { ChangeDetectionResult, GitTaskChangeSummary } from "../../git/repository/workspace-changes.ts";
+import {
+	type ChangeDetectionResult,
+	collectCheckpointChanges,
+	type GitTaskChangeSummary,
+} from "../../git/repository/workspace-changes.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
 import {
 	type ActivityKind,
@@ -34,6 +38,8 @@ export { batchWorktreeStats, invalidateWorktreeCache };
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES_PER_RUN = 64 * 1024 * 1024;
 const MAX_FILES_WITH_STATS = 300;
+/** How many files' earlier content is read from the checkpoint at the same time (one Git process each). */
+const BEFORE_READ_PARALLEL = 8;
 /** Diffs kept with a task's change card in the session: larger ones (per file, or all together) are left out. */
 const MAX_CARD_PATCH_CHARS = 200_000;
 const MAX_CARD_PATCH_CHARS_PER_RUN = 1_000_000;
@@ -56,6 +62,8 @@ export interface FileChangeSummary {
 	lineEndingsOnly?: boolean;
 	/** Another conversation changed this file more recently: that conversation commits it, this one keeps its history only. */
 	lastChangeElsewhere?: boolean;
+	/** Changed by the task that is still running: not saved with the conversation yet (the Changes panel only). */
+	live?: boolean;
 }
 
 /** One file of a task's change card: its summary and, while it fits the budget, its diff. */
@@ -91,6 +99,45 @@ interface Snapshot {
 	/** null: the file did not exist before the first edit/write of this run. */
 	before: string | null;
 	binary: boolean;
+}
+
+/** Why a file's earlier content is missing from a change card, by whether a Git checkpoint existed to read it from. */
+const UNAVAILABLE_WITH_CHECKPOINT = "The file's content before the task could not be read from the Git checkpoint.";
+const UNAVAILABLE_WITHOUT_CHECKPOINT =
+	"No Git checkpoint: the pre-task content of files changed by shell commands is not recorded.";
+
+interface BeforeContent {
+	text: string | null;
+	binary: boolean;
+	known: boolean;
+}
+
+/**
+ * One file of a task that a new message cut into several runs (see ChangeTracker.deferRun): how it first changed, how it
+ * changed last, and what it held before the first of those runs. Later runs never replace `before`.
+ */
+interface ChainFile {
+	path: string;
+	first: ReviewChange;
+	last: ReviewChange;
+	before: BeforeContent;
+	unavailable: string;
+}
+
+/**
+ * The status of a file after several runs in a row, from how the first and the last of them changed it; undefined when
+ * the file was created and deleted again, so the whole task left nothing behind.
+ */
+function mergeChainChange(entry: ChainFile): ReviewChange | undefined {
+	const { first, last } = entry;
+	const oldPath = first.oldPath;
+	if (first.status === "added") return last.status === "deleted" ? undefined : { path: entry.path, status: "added" };
+	if (first.status === "deleted") {
+		return { path: entry.path, status: last.status === "deleted" ? "deleted" : "modified" };
+	}
+	if (last.status === "deleted") return { path: oldPath ?? entry.path, status: "deleted" };
+	if (first.status === "renamed") return { path: entry.path, status: "renamed", ...(oldPath ? { oldPath } : {}) };
+	return { path: entry.path, status: "modified" };
 }
 
 function toRelative(cwd: string, absolute: string): string | undefined {
@@ -256,6 +303,13 @@ export class ChangeTracker {
 	private readonly checkpoints = new Map<number, GitCheckpoint>();
 	private readonly pendingBefore = new Map<string, { runId: number; rels: string[] }>();
 	/**
+	 * The files of runs a new message cut short, by path in the order they first changed: they have no card of their own,
+	 * the card of the task's last run holds them all (deferRun, finishChain).
+	 */
+	private readonly chain = new Map<string, ChainFile>();
+	private readonly chainElsewhere = new Map<string, ChangedElsewhere>();
+	private chainBytes = 0;
+	/**
 	 * Calls that may write files without naming them (shell commands, sub-agent batches, other tools) and have not
 	 * reported an end yet, by tool call id. Each is an open window in the shared registry while it runs.
 	 */
@@ -282,6 +336,7 @@ export class ChangeTracker {
 		this.snapshotBytes.clear();
 		this.pendingBefore.clear();
 		this.checkpoints.clear();
+		this.clearChain();
 	}
 
 	/**
@@ -550,8 +605,14 @@ export class ChangeTracker {
 	 * does not cover them when Git integration is off and no shell command ran, so add the net effect here.
 	 */
 	private mergeToolChanges(runId: number, record: RunChangeRecord): void {
-		const known = new Set(record.changes.map((change) => change.path));
+		record.changes.push(...this.toolChangesBeyond(runId, record, record.changes));
+	}
+
+	/** The net effect of the run's own file tool calls on the files `changes` does not list yet. */
+	private toolChangesBeyond(runId: number, record: RunChangeRecord, changes: readonly ReviewChange[]): ReviewChange[] {
+		const known = new Set(changes.map((change) => change.path));
 		const snapshots = this.snapshots.get(runId);
+		const found: ReviewChange[] = [];
 		for (const op of record.toolFileOps) {
 			if (!op.ok || known.has(op.path)) continue;
 			const snapshot = snapshots?.get(op.path);
@@ -559,18 +620,19 @@ export class ChangeTracker {
 			const exists = existsSync(absolute);
 			if (!snapshot) {
 				known.add(op.path);
-				record.changes.push({ path: op.path, status: exists ? "modified" : "deleted" });
+				found.push({ path: op.path, status: exists ? "modified" : "deleted" });
 				continue;
 			}
 			const after = readTextIfSmall(absolute);
 			if (snapshot.before === null && !exists) continue;
 			if (snapshot.before !== null && after.text === snapshot.before && exists) continue;
 			known.add(op.path);
-			record.changes.push({
+			found.push({
 				path: op.path,
 				status: snapshot.before === null ? "added" : exists ? "modified" : "deleted",
 			});
 		}
+		return found;
 	}
 
 	/**
@@ -579,12 +641,23 @@ export class ChangeTracker {
 	 * conversation or another program while the run went on; they leave the card and are listed under it.
 	 */
 	private attributeChanges(record: RunChangeRecord): void {
+		if (record.changes.length === 0) return;
+		const { kept, elsewhere } = this.attributed(record, record.changes);
+		record.changes = kept;
+		if (elsewhere.length > 0) record.elsewhere = elsewhere;
+	}
+
+	/** `changes` split into the ones the run can explain and the ones changed elsewhere; all kept without a registry. */
+	private attributed(
+		record: RunChangeRecord,
+		changes: readonly ReviewChange[],
+	): { kept: ReviewChange[]; elsewhere: ChangedElsewhere[] } {
 		const sessionKey = this.sessionKeyProvider?.();
-		if (!this.changeClaims || !sessionKey || record.changes.length === 0) return;
+		if (!this.changeClaims || !sessionKey || changes.length === 0) return { kept: [...changes], elsewhere: [] };
 		const ownPaths = new Set(
 			record.toolFileOps.filter((op) => op.ok).map((op) => pathIdentityKey(path.resolve(this.cwd, op.path))),
 		);
-		const { kept, elsewhere } = attributeRunChanges(record.changes, {
+		return attributeRunChanges(changes, {
 			registry: this.changeClaims,
 			sessionKey,
 			ownPaths,
@@ -593,8 +666,76 @@ export class ChangeTracker {
 			baseDir: this.cwd,
 			modifiedAt: statModifiedAt,
 		});
-		record.changes = kept;
-		if (elsewhere.length > 0) record.elsewhere = elsewhere;
+	}
+
+	/**
+	 * What a run that is still going on has changed so far, for the Changes panel: the files its own file tools changed,
+	 * and, once the run has a Git checkpoint, everything that differs from it and that this session can explain (the same
+	 * rule a finished run's card follows, applied up to now). In a folder without a checkpoint the files changed by
+	 * commands are only found when the run ends, against its content baseline. The record is not touched.
+	 */
+	async liveRunChanges(runId: number, checkpoint: GitCheckpoint | undefined): Promise<ReviewChange[]> {
+		const record = this.runs.get(runId);
+		if (!record || record.endedAt !== undefined) return [];
+		let detected: ReviewChange[] = [];
+		if (checkpoint?.status === "created" && checkpoint.worktreeTree) {
+			detected = await collectCheckpointChanges({ cwd: this.cwd, checkpoint }).catch(() => []);
+		}
+		// The run may have ended while Git was read: its card has the changes now.
+		if (record.endedAt !== undefined) return [];
+		const changes = [...detected, ...this.toolChangesBeyond(runId, record, detected)];
+		return this.attributed(record, changes).kept;
+	}
+
+	/** The diff of one file a run changed and has not recorded yet (see liveRunChanges). */
+	diffForLiveChange(
+		runId: number,
+		change: ReviewChange,
+		checkpoint: GitCheckpoint | undefined,
+	): { summary: FileChangeSummary; patch?: string } {
+		return this.diffForChange(runId, change, checkpoint);
+	}
+
+	/**
+	 * Reads what the run's changed files held before it from the Git checkpoint, several at a time, for the files no
+	 * tool call captured (a command or another program of this chat changed them). The change card and the panel then
+	 * find that content here instead of starting one blocking Git process per file while the page waits for the task
+	 * to finish. A file whose earlier content cannot be read this way is left to the reader that explains why.
+	 */
+	async prefetchBefore(
+		runId: number,
+		checkpoint: GitCheckpoint | undefined,
+		changes?: readonly ReviewChange[],
+	): Promise<void> {
+		const record = this.runs.get(runId);
+		const snapshots = this.snapshots.get(runId);
+		const source = this.checkpoints.get(runId) ?? checkpoint;
+		const tree = source?.worktreeTree;
+		if (!record || !snapshots || !source || !tree) return;
+		const wanted = (changes ?? record.changes)
+			.slice(0, MAX_FILES_WITH_STATS)
+			.filter((change) => !snapshots.has(change.path));
+		let next = 0;
+		const worker = async () => {
+			while (next < wanted.length) {
+				const change = wanted[next++];
+				const repoRelative = toRelative(
+					source.repositoryRoot,
+					path.resolve(this.cwd, change.oldPath ?? change.path),
+				);
+				if (!repoRelative) continue;
+				const shown = await gitShowAsync(source.repositoryRoot, `${tree}:${repoRelative}`).catch(() => undefined);
+				if (!shown || snapshots.has(change.path)) continue;
+				// Not in the checkpoint's tree: a file the run created has no earlier content; any other is unknown.
+				if (shown.text === null && !shown.binary && change.status !== "added") continue;
+				const size = shown.text ? Buffer.byteLength(shown.text) : 0;
+				const total = (this.snapshotBytes.get(runId) ?? 0) + size;
+				if (total > MAX_SNAPSHOT_BYTES_PER_RUN) continue;
+				this.snapshotBytes.set(runId, total);
+				snapshots.set(change.path, { before: shown.text, binary: shown.binary });
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(BEFORE_READ_PARALLEL, wanted.length) }, worker));
 	}
 
 	/** The calls of this run that never reported an end: their windows end with the run. */
@@ -604,11 +745,7 @@ export class ChangeTracker {
 		}
 	}
 
-	private beforeFor(
-		runId: number,
-		change: ReviewChange,
-		checkpoint: GitCheckpoint | undefined,
-	): { text: string | null; binary: boolean; known: boolean } {
+	private beforeFor(runId: number, change: ReviewChange, checkpoint: GitCheckpoint | undefined): BeforeContent {
 		const snapshot = this.snapshots.get(runId)?.get(change.path);
 		if (snapshot) return { text: snapshot.before, binary: snapshot.binary, known: true };
 		if (checkpoint?.worktreeTree) {
@@ -637,6 +774,28 @@ export class ChangeTracker {
 		const record = this.runs.get(runId);
 		const change = record?.changes.find((candidate) => candidate.path === filePath);
 		if (!record || !change) return undefined;
+		return this.diffForChange(runId, change, checkpoint);
+	}
+
+	private diffForChange(
+		runId: number,
+		change: ReviewChange,
+		checkpoint: GitCheckpoint | undefined,
+	): { summary: FileChangeSummary; patch?: string } {
+		const effective = this.checkpoints.get(runId) ?? checkpoint;
+		return this.diffFromBefore(
+			change,
+			this.beforeFor(runId, change, effective),
+			effective ? UNAVAILABLE_WITH_CHECKPOINT : UNAVAILABLE_WITHOUT_CHECKPOINT,
+		);
+	}
+
+	/** The diff of one changed file from the content it held before, against what is on disk now. */
+	private diffFromBefore(
+		change: ReviewChange,
+		before: BeforeContent,
+		unavailable: string,
+	): { summary: FileChangeSummary; patch?: string } {
 		const summary: FileChangeSummary = {
 			path: change.path,
 			status: change.status,
@@ -646,7 +805,6 @@ export class ChangeTracker {
 			binary: false,
 		};
 		const absolute = path.resolve(this.cwd, change.path);
-		const before = this.beforeFor(runId, change, this.checkpoints.get(runId) ?? checkpoint);
 		const after =
 			change.status === "deleted" ? { text: null, binary: false, tooLarge: false } : readTextIfSmall(absolute);
 		if (before.binary || after.binary) {
@@ -658,10 +816,7 @@ export class ChangeTracker {
 			return { summary };
 		}
 		if (!before.known) {
-			summary.unavailable =
-				(this.checkpoints.get(runId) ?? checkpoint)
-					? "The file's content before the task could not be read from the Git checkpoint."
-					: "No Git checkpoint: the pre-task content of files changed by shell commands is not recorded.";
+			summary.unavailable = unavailable;
 			return { summary };
 		}
 		return textDiff(summary, before.text, after.text, change.oldPath ?? change.path);
@@ -716,6 +871,120 @@ export class ChangeTracker {
 			elsewhere: elsewhere.slice(0, MAX_CARD_ELSEWHERE_FILES),
 			...(elsewhere.length > MAX_CARD_ELSEWHERE_FILES ? { elsewhereTotal: elsewhere.length } : {}),
 		};
+	}
+
+	// ---------------------------------------------------------------------
+	// A task cut into runs by new messages
+	// ---------------------------------------------------------------------
+
+	/** Whether runs a new message cut short have changes that still wait for the card of the task's last run. */
+	hasDeferredRuns(): boolean {
+		return this.chain.size > 0;
+	}
+
+	/**
+	 * A finished run that a new message cut short (its outcome is "redirected"): the message goes on with the same task, so
+	 * this run gets no card of its own. Its changes wait here, and the card of the task's last run (finishChain) lists the
+	 * union of them, each file measured from what it held before the first run that changed it. Call it once the run's
+	 * earlier content is read (prefetchBefore): the checkpoint of a later run starts after this run's own changes.
+	 */
+	deferRun(runId: number, checkpoint: GitCheckpoint | undefined): void {
+		const record = this.runs.get(runId);
+		if (!record) return;
+		const source = this.checkpoints.get(runId) ?? checkpoint;
+		// Paths a file moved away from in this run: the move already says it left (a tool call that names both ends can
+		// list the old path again as deleted).
+		const movedAway = new Set<string>();
+		for (const change of record.changes.slice(0, MAX_FILES_WITH_STATS)) {
+			if (change.status === "deleted" && movedAway.has(change.path)) continue;
+			const existing = this.chain.get(change.path);
+			if (existing) {
+				existing.last = change;
+				continue;
+			}
+			// A file moved in this run keeps the history of the path it came from.
+			const from = change.oldPath ? this.chain.get(change.oldPath) : undefined;
+			if (from) {
+				this.chain.delete(from.path);
+				movedAway.add(from.path);
+				const first: ReviewChange =
+					from.first.status === "added"
+						? { path: change.path, status: "added" }
+						: { path: change.path, status: "renamed", oldPath: from.first.oldPath ?? from.path };
+				this.chain.set(change.path, { ...from, path: change.path, first, last: change });
+				continue;
+			}
+			let before = this.beforeFor(runId, change, source);
+			const size = before.text ? Buffer.byteLength(before.text) : 0;
+			if (this.chainBytes + size > MAX_SNAPSHOT_BYTES_PER_RUN) before = { text: null, binary: false, known: false };
+			else this.chainBytes += size;
+			this.chain.set(change.path, {
+				path: change.path,
+				first: change,
+				last: change,
+				before,
+				unavailable: source ? UNAVAILABLE_WITH_CHECKPOINT : UNAVAILABLE_WITHOUT_CHECKPOINT,
+			});
+		}
+		// What another conversation or program changed meanwhile stays listed apart, never counted.
+		for (const file of record.elsewhere ?? []) this.chainElsewhere.set(file.path, file);
+	}
+
+	/**
+	 * The card of a task that a new message cut into runs, once its last run has ended: `runId` is that run (undefined when
+	 * no run follows the cut, e.g. the new message was refused). Every file the runs changed appears once, with the diff from
+	 * before the first run to what is on disk now; a file the runs changed and put back is left out. The held changes are
+	 * released.
+	 */
+	finishChain(
+		runId: number | undefined,
+		checkpoint: GitCheckpoint | undefined,
+	): { files: RunChangeCardFile[]; elsewhere?: ChangedElsewhere[]; elsewhereTotal?: number } {
+		if (runId !== undefined) this.deferRun(runId, checkpoint);
+		const files: RunChangeCardFile[] = [];
+		let kept = 0;
+		for (const entry of [...this.chain.values()].slice(0, MAX_FILES_WITH_STATS)) {
+			const change = mergeChainChange(entry);
+			if (!change) continue;
+			const diff = this.diffFromBefore(change, entry.before, entry.unavailable);
+			const { summary } = diff;
+			// Changed and changed back: nothing is left of it.
+			if (
+				change.status === "modified" &&
+				!summary.binary &&
+				!summary.unavailable &&
+				!summary.lineEndingsOnly &&
+				summary.additions === 0 &&
+				summary.deletions === 0
+			) {
+				continue;
+			}
+			if (!diff.patch) {
+				files.push(summary);
+			} else if (
+				diff.patch.length > MAX_CARD_PATCH_CHARS ||
+				kept + diff.patch.length > MAX_CARD_PATCH_CHARS_PER_RUN
+			) {
+				files.push({ ...summary, patchOmitted: true });
+			} else {
+				kept += diff.patch.length;
+				files.push({ ...summary, patch: diff.patch });
+			}
+		}
+		const own = new Set(files.map((file) => file.path));
+		const elsewhere = [...this.chainElsewhere.values()].filter((file) => !own.has(file.path));
+		this.clearChain();
+		return {
+			files,
+			...(elsewhere.length > 0 ? { elsewhere: elsewhere.slice(0, MAX_CARD_ELSEWHERE_FILES) } : {}),
+			...(elsewhere.length > MAX_CARD_ELSEWHERE_FILES ? { elsewhereTotal: elsewhere.length } : {}),
+		};
+	}
+
+	private clearChain(): void {
+		this.chain.clear();
+		this.chainElsewhere.clear();
+		this.chainBytes = 0;
 	}
 
 	// ---------------------------------------------------------------------

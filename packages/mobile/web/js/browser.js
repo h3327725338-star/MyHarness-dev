@@ -39,6 +39,7 @@ import {
 } from "./browser-model.js";
 import { Icon } from "./micons.js";
 import { copyText, haptic, isNative, onInsets, pushBack, shareText } from "./native.js";
+import { PcBrowser, pcBrowserUsable } from "./pc-browser.js";
 import { prefs, setPrefs } from "./prefs.js";
 import { Row, Sheet, actionSheet, confirmSheet, openSheet } from "./sheets.js";
 import { emit, state, toast, useStore } from "./store.js";
@@ -171,7 +172,7 @@ async function siteMenu(site) {
 
 /**
  * What an empty tab shows: the shortcuts of the PC browser's new-tab page (sites and groups, in the PC's order; before
- * the PC has sent them, its bookmarks), then what was bookmarked or visited on this phone.
+ * the PC has sent them, its bookmarks). What was bookmarked or visited on this phone is in the bookmarks sheet.
  */
 function StartPage({ onGo }) {
 	useStore((s) => s.browser);
@@ -179,8 +180,6 @@ function StartPage({ onGo }) {
 	const marks = useStore((s) => s.pcBookmarks);
 	const [open, setOpen] = useState(null); // { group, from }
 	const fromPc = useMemo(() => (dial.length ? dial : marks.filter((entry) => /^https?:/i.test(entry.url)).slice(0, 12).map((entry) => ({ id: `mark:${entry.url}`, type: "site", title: entry.title || "", url: entry.url, icon: entry.icon }))), [dial, marks]);
-	const known = new Set(fromPc.flatMap((entry) => (entry.type === "group" ? entry.items : [entry])).map((site) => site.url));
-	const own = [...library.bookmarks, ...library.history.filter((entry) => !library.bookmarks.some((mark) => mark.url === entry.url))].filter((entry) => !known.has(entry.url)).slice(0, 8);
 	// A group that left the list (the PC changed its shortcuts) closes.
 	const group = open && fromPc.find((entry) => entry.id === open.group.id && entry.type === "group");
 	const go = (url) => {
@@ -189,10 +188,7 @@ function StartPage({ onGo }) {
 	};
 	return html`<div class="start-page">
 		${fromPc.length > 0 && html`<div class="sd-grid" role="list">${fromPc.map((entry, index) => html`<${DialTile} key=${entry.id} entry=${entry} index=${index} onOpen=${go} onOpenGroup=${(target, from) => setOpen({ group: target, from })} onMenu=${siteMenu} />`)}</div>`}
-		${own.length > 0 &&
-		html`<div class="sd-section">${fromPc.length > 0 ? t("On this phone") : t("Recently on this phone")}</div>
-			<div class="sd-grid" role="list">${own.map((entry, index) => html`<${DialTile} key=${entry.url} entry=${{ type: "site", title: entry.title || hostOf(entry.url), url: entry.url }} index=${fromPc.length + index} onOpen=${go} onMenu=${siteMenu} />`)}</div>`}
-		${fromPc.length === 0 && own.length === 0 && html`<div class="start-empty"><span class="eicon"><${Icon} name="globe" size=${26} /></span>${t("Links in a reply open here. The assistant can also open and read pages in this browser when you ask it to.")}</div>`}
+		${fromPc.length === 0 && html`<div class="start-empty"><span class="eicon"><${Icon} name="globe" size=${26} /></span>${t("Links in a reply open here. The assistant can also open and read pages in this browser when you ask it to.")}</div>`}
 		${group ? html`<${DialGroup} key=${group.id} group=${group} from=${open.from} onOpen=${go} onMenu=${siteMenu} onClose=${() => setOpen(null)} />` : null}
 	</div>`;
 }
@@ -346,7 +342,17 @@ function FindBar({ find, onClose }) {
 	</form>`;
 }
 
+/**
+ * The browser pane. With a PC connected directly it shows the PC's own browser (its tabs, its sign-ins) over this
+ * phone's, which stays underneath for when the PC is out of reach or the user prefers the phone's.
+ */
 export function Browser() {
+	// "pc": the PC's browser is shown; "phone-can": it could be, the user chose the phone's; "phone": it cannot be.
+	const side = useStore((s) => (!pcBrowserUsable(s) ? "phone" : prefs.browserSide === "phone" ? "phone-can" : "pc"));
+	return html`<${PhoneBrowser} covered=${side === "pc"} canUsePc=${side !== "phone"} />${side === "pc" ? html`<${PcBrowser} StartPage=${StartPage} />` : null}`;
+}
+
+function PhoneBrowser({ covered, canUsePc }) {
 	const tabs = useStore((s) => s.browser.tabs);
 	const activeId = useStore((s) => s.browser.active);
 	const external = useStore((s) => s.browser.external);
@@ -365,7 +371,7 @@ export function Browser() {
 
 	const hasPage = !!tab?.url && !tab.error;
 	const onScreen = pane === "browser" || peek;
-	const showNative = hasPage && !tab.lazy && layers === 0 && onScreen && !editing;
+	const showNative = !covered && hasPage && !tab.lazy && layers === 0 && onScreen && !editing;
 
 	// Tell the shell where the page goes. The pane slides with a transform, which the shell follows by itself
 	// (pager.js); only the box inside the pane is sent from here.
@@ -466,6 +472,7 @@ export function Browser() {
 			sub: hasUrl ? hostOf(tab.url) : "",
 			actions: [
 				{ value: "new", label: t("New tab"), icon: "plus" },
+				canUsePc && { value: "pc", label: t("Use the PC's browser"), icon: "desktop" },
 				hasUrl && { value: "bookmark", label: isBookmarked(tab.url) ? t("Remove bookmark") : t("Add bookmark"), icon: "bookmark", checked: isBookmarked(tab.url) },
 				{ value: "bookmarks", label: t("Bookmarks"), icon: "book" },
 				{ value: "history", label: t("History"), icon: "clock" },
@@ -479,6 +486,7 @@ export function Browser() {
 			],
 		});
 		if (choice === "new") openTab("");
+		else if (choice === "pc") (setPrefs({ browserSide: "pc" }), emit());
 		else if (choice === "bookmark") toast(toggleBookmark(tab.url, tab.title) ? t("Bookmarked") : t("Bookmark removed"), "ok", 1500);
 		else if (choice === "bookmarks" || choice === "history") openSheet((close) => html`<${LibrarySheet} close=${close} kind=${choice} />`);
 		else if (choice === "find") setFinding(true);

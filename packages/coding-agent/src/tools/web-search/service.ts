@@ -5,11 +5,19 @@ import type { SessionManager } from "../../session/manager/index.ts";
 import { SelectedBrowser } from "./browser/select.ts";
 import { WebSearchCache } from "./cache.ts";
 import { EngineRunner } from "./engine-runner.ts";
+import { collapse } from "./engines/common.ts";
 import { type EngineResult, type SearchTimeRange, WEB_SEARCH_ENGINES } from "./engines/index.ts";
 import { abortError, failureFromError, isAccessBlock, WebSearchError } from "./errors.ts";
 import { type FetchLike, plainHttpFetch } from "./http.ts";
 import { type ReadPageResult, readPage } from "./page.ts";
 import { BrowserPageReader, type SignedInPage, signedInPageResult } from "./page-browser.ts";
+import {
+	listWebSearchSources,
+	timeRangeWords,
+	type WebSearchSource,
+	webSearchSourceEffort,
+	webSearchSourceModel,
+} from "./sources.ts";
 import { type BrowserTransport, browserLabel, HttpTransport } from "./transport.ts";
 import type {
 	WebFetchedPage,
@@ -20,6 +28,7 @@ import type {
 	WebSearchResult,
 	WebSearchRoute,
 	WebSearchSettingsSource,
+	WebSearchSourceId,
 } from "./types.ts";
 import {
 	canonicalizeHttpUrl,
@@ -49,6 +58,14 @@ export const WEB_SEARCH_LIMITS = {
 	searchReadBudgetMs: 8_000,
 	searchCacheTtlMs: 5 * 60 * 1_000,
 	fetchCacheTtlMs: 15 * 60 * 1_000,
+	/**
+	 * How long an extension source (another program's own search) may take for all queries of one call. The source is
+	 * told the time and returns what it has by then; `extensionSourceGraceMs` later it counts as failed.
+	 */
+	extensionSourceTimeoutMs: 60_000,
+	extensionSourceGraceMs: 5_000,
+	/** An extension source that failed as a whole is not asked again for this long, so a broken one costs one wait. */
+	extensionSourceCooldownMs: 2 * 60_000,
 } as const;
 
 export interface WebSearchServiceOptions {
@@ -74,6 +91,11 @@ export interface WebSearchServiceOptions {
 	signedInBrowser?: (url: string, signal: AbortSignal | undefined) => Promise<SignedInPage | undefined>;
 	/** Overrides WEB_SEARCH_LIMITS.searchReadBudgetMs (tests). */
 	searchReadBudgetMs?: number;
+	/** The extension search sources that exist; defaults to the ones extensions registered (see sources.ts). */
+	sources?: () => WebSearchSource[];
+	/** Overrides WEB_SEARCH_LIMITS.extensionSourceTimeoutMs and extensionSourceGraceMs (tests). */
+	extensionSourceTimeoutMs?: number;
+	extensionSourceGraceMs?: number;
 }
 
 export interface SearchRequest {
@@ -107,8 +129,16 @@ export interface EngineTestResult {
 export const WEB_SEARCH_TEST_QUERY = "open source software";
 
 interface RawResult extends EngineResult {
-	engine: WebSearchEngineId;
+	engine: WebSearchSourceId;
 	query: string;
+}
+
+/** What one extension source added to a search. */
+interface SourceRun {
+	/** One entry per query the source answered, also when it found nothing. */
+	answered: RawResult[][];
+	routes: WebSearchRoute[];
+	failures: WebSearchFailure[];
 }
 
 function sha256(value: string): string {
@@ -199,6 +229,8 @@ export class WebSearchService {
 	private readonly runner: EngineRunner;
 	private readonly browser: BrowserTransport | undefined;
 	private readonly pageReader: BrowserPageReader | undefined;
+	/** Extension sources that failed as a whole: until when they are left out, and the failure to report meanwhile. */
+	private readonly sourceCooldowns = new Map<string, { until: number; failure: WebSearchFailure }>();
 	readonly downloads: DownloadSlots;
 
 	constructor(options: WebSearchServiceOptions) {
@@ -278,11 +310,147 @@ export class WebSearchService {
 		};
 	}
 
+	private registeredSources(): WebSearchSource[] {
+		return this.options.sources?.() ?? listWebSearchSources();
+	}
+
+	/** The name of an engine or an extension source, for results and diagnostics. */
+	sourceLabel(id: WebSearchSourceId): string {
+		if (Object.hasOwn(WEB_SEARCH_ENGINES, id)) return WEB_SEARCH_ENGINES[id as WebSearchEngineId].label;
+		return this.registeredSources().find((source) => source.id === id)?.label ?? id;
+	}
+
+	/**
+	 * The extension sources a search uses: switched on in settings, provided by a loaded extension, and usable on this
+	 * computer. One that is switched on but missing here is left out without a word (the setting may have come from
+	 * another computer, or the program was removed).
+	 */
+	private usableSources(settings: ResolvedWebSearchSettings): WebSearchSource[] {
+		const registered = this.registeredSources();
+		return settings.extensionSources.flatMap((id) => {
+			const source = registered.find((candidate) => candidate.id === id);
+			if (!source) return [];
+			try {
+				return source.unavailable?.() ? [] : [source];
+			} catch {
+				return [];
+			}
+		});
+	}
+
+	/**
+	 * All queries of a call at one extension source. The source names pages only; they join the engines' results in
+	 * rankResults, and the pages are read by this service like any other result's. A query the source could not answer
+	 * is a failure of that query; a source that could not search at all is a failure of the source and puts it on a
+	 * cooldown. Only a stop by the person throws.
+	 */
+	private async runSource(
+		source: WebSearchSource,
+		queries: string[],
+		timeRange: SearchTimeRange | undefined,
+		model: string | undefined,
+		effort: string | undefined,
+		signal: AbortSignal | undefined,
+	): Promise<SourceRun> {
+		const run: SourceRun = { answered: [], routes: [], failures: [] };
+		const cooldown = this.sourceCooldowns.get(source.id);
+		if (cooldown && cooldown.until > this.now()) {
+			run.failures.push({
+				...cooldown.failure,
+				message: `${source.label} 暂停使用 ${Math.ceil((cooldown.until - this.now()) / 1_000)} 秒，原因是刚才的失败：${cooldown.failure.message}`,
+			});
+			return run;
+		}
+		// These programs' searches have no date filter: the range goes into the query as the words a person would add.
+		const words = queries.map((query) => (timeRange ? timeRangeWords(query, timeRange, this.now()) : undefined));
+		const asked = queries.map((query, index) => (words[index] ? `${query} ${words[index]}` : query));
+		const timeoutMs = this.options.extensionSourceTimeoutMs ?? WEB_SEARCH_LIMITS.extensionSourceTimeoutMs;
+		const graceMs = this.options.extensionSourceGraceMs ?? WEB_SEARCH_LIMITS.extensionSourceGraceMs;
+		const guard = new AbortController();
+		const onStop = () => guard.abort(signal?.reason);
+		if (signal?.aborted) onStop();
+		else signal?.addEventListener("abort", onStop, { once: true });
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const fail = (code: WebSearchFailure["code"], message: string) => {
+			const failure: WebSearchFailure = { engine: source.id, code, message };
+			this.sourceCooldowns.set(source.id, {
+				until: this.now() + WEB_SEARCH_LIMITS.extensionSourceCooldownMs,
+				failure,
+			});
+			run.failures.push(failure);
+			return run;
+		};
+		let answers: Awaited<ReturnType<WebSearchSource["search"]>>;
+		try {
+			const work = Promise.resolve().then(() =>
+				source.search({ queries: asked, model, effort, timeoutMs, signal: guard.signal }),
+			);
+			// A source that ignores its time and the signal finishes in the background; its answer is dropped.
+			work.catch(() => undefined);
+			answers = await Promise.race([
+				work,
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() => reject(new WebSearchError("timeout", `${Math.round(timeoutMs / 1_000)} 秒内没有返回结果。`)),
+						timeoutMs + graceMs,
+					);
+					guard.signal.addEventListener("abort", () => reject(abortError(guard.signal)), { once: true });
+				}),
+			]);
+		} catch (error) {
+			const stopped = abortError(signal);
+			if (stopped) throw stopped;
+			guard.abort(error);
+			if (error instanceof WebSearchError) return fail(error.code, error.message);
+			// The program's own words (not signed in, its plan's limit is reached): they are the diagnosis.
+			return fail("unavailable", error instanceof Error && error.message ? error.message : "搜索没有完成。");
+		} finally {
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onStop);
+		}
+		if (!Array.isArray(answers)) return fail("invalid_response", "返回的不是搜索结果列表。");
+		for (const [index, query] of queries.entries()) {
+			const answer = answers.find((candidate) => candidate?.query === asked[index]);
+			if (!answer || answer.error) {
+				run.failures.push({
+					query,
+					engine: source.id,
+					code: "unavailable",
+					message: answer?.error || "没有返回这个问题的结果。",
+				});
+				continue;
+			}
+			const results: RawResult[] = [];
+			for (const item of Array.isArray(answer.results) ? answer.results : []) {
+				if (typeof item?.url !== "string" || !item.url) continue;
+				const title = typeof item.title === "string" ? collapse(item.title) : "";
+				results.push({
+					title: title || item.url,
+					url: item.url,
+					snippet: typeof item.snippet === "string" ? collapse(item.snippet) : "",
+					publishedAt: typeof item.publishedAt === "string" ? item.publishedAt : undefined,
+					rank: results.length + 1,
+					engine: source.id,
+					query,
+				});
+			}
+			run.answered.push(results);
+			run.routes.push({
+				engine: source.id,
+				query,
+				via: "extension",
+				note: words[index] ? `${source.label} 没有时间筛选，已在搜索词后加上“${words[index]}”。` : undefined,
+				resultCount: results.length,
+			});
+		}
+		return run;
+	}
+
 	/** Merge per-engine results: dedupe by canonical URL, then rank with transparent heuristics. */
 	private rankResults(results: RawResult[], maxResults: number): WebSearchResult[] {
 		const grouped = new Map<
 			string,
-			RawResult & { querySet: Set<string>; engineSet: Set<WebSearchEngineId>; domain: string; score: number }
+			RawResult & { querySet: Set<string>; engineSet: Set<WebSearchSourceId>; domain: string; score: number }
 		>();
 		for (const result of results) {
 			const validation = validatePublicHttpUrl(result.url);
@@ -351,7 +519,7 @@ export class WebSearchService {
 			title: result.title,
 			url: result.url,
 			snippet: result.snippet,
-			source: [...result.engineSet].map((engine) => WEB_SEARCH_ENGINES[engine].label).join(", "),
+			source: [...result.engineSet].map((engine) => this.sourceLabel(engine)).join(", "),
 			query: result.query,
 			queries: [...result.querySet],
 			engineRank: result.rank,
@@ -367,12 +535,21 @@ export class WebSearchService {
 		if (queries.length > WEB_SEARCH_LIMITS.maxQueriesPerCall) {
 			throw new WebSearchError("limit", `单次最多支持 ${WEB_SEARCH_LIMITS.maxQueriesPerCall} 个搜索问题。`);
 		}
-		if (settings.engines.length === 0) {
+		const sources = this.usableSources(settings);
+		const sourceModels = sources.map((source) =>
+			webSearchSourceModel(source, settings.extensionSourceModels[source.id]),
+		);
+		const sourceEfforts = sources.map((source, index) =>
+			webSearchSourceEffort(source, sourceModels[index], settings.extensionSourceEfforts[source.id]),
+		);
+		if (settings.engines.length === 0 && sources.length === 0) {
 			throw new WebSearchError(
 				"no_engines",
 				"没有启用任何搜索引擎。请在 /settings → Web Search → Search Engines 中至少选择一个。",
 			);
 		}
+		/** Everything this call searches with, in the order results and diagnostics name them. */
+		const searched: WebSearchSourceId[] = [...settings.engines, ...sources.map((source) => source.id)];
 		// Pages to Read per Search is the person's setting, not a ceiling the Agent picks under: it may only turn
 		// reading off (0). Enough results are kept for that many pages to be read.
 		const pageCount = request.readPages === 0 ? 0 : settings.pagesPerSearch;
@@ -390,7 +567,15 @@ export class WebSearchService {
 		const routes: WebSearchRoute[] = [];
 
 		const cacheKey = sha256(
-			JSON.stringify({ queries, engines: settings.engines, timeRange: request.timeRange, maxResults }),
+			JSON.stringify({
+				queries,
+				engines: settings.engines,
+				timeRange: request.timeRange,
+				maxResults,
+				...(sources.length > 0
+					? { sources: sources.map((source, index) => [source.id, sourceModels[index] ?? ""]) }
+					: {}),
+			}),
 		);
 		let results = await this.cache.get<WebSearchResult[]>(
 			"search",
@@ -410,6 +595,19 @@ export class WebSearchService {
 				});
 				return false;
 			});
+			if (sources.length > 0) {
+				request.onProgress?.(
+					`正在用 ${sources.map((source) => source.label).join("、")} 搜索，这比搜索引擎慢，通常要十几秒。`,
+				);
+			}
+			// Beside the engines, not after them: the call takes as long as its slowest source.
+			const sourceWork = Promise.all(
+				sources.map((source, index) =>
+					this.runSource(source, queries, request.timeRange, sourceModels[index], sourceEfforts[index], signal),
+				),
+			);
+			// Awaited below; an engine that throws first (a stop) must not leave this rejection unhandled.
+			sourceWork.catch(() => undefined);
 			const perEngine = await Promise.all(
 				activeEngines.map((engine) =>
 					mapWithConcurrency(
@@ -434,15 +632,20 @@ export class WebSearchService {
 					),
 				),
 			);
-			const perTask = perEngine.flat();
+			const perTask: Array<RawResult[] | undefined> = perEngine.flat();
+			for (const run of await sourceWork) {
+				perTask.push(...run.answered);
+				routes.push(...run.routes);
+				failures.push(...run.failures);
+			}
 			// Report in a stable order (settings engine order, then query order), not completion order.
 			const order = (failure: WebSearchFailure) =>
-				settings.engines.indexOf(failure.engine!) * WEB_SEARCH_LIMITS.maxQueriesPerCall +
+				searched.indexOf(failure.engine!) * WEB_SEARCH_LIMITS.maxQueriesPerCall +
 				(failure.query ? queries.indexOf(failure.query) : -1);
 			failures.sort((a, b) => order(a) - order(b));
 			routes.sort(
 				(a, b) =>
-					settings.engines.indexOf(a.engine) - settings.engines.indexOf(b.engine) ||
+					searched.indexOf(a.engine) - searched.indexOf(b.engine) ||
 					queries.indexOf(a.query) - queries.indexOf(b.query),
 			);
 			const succeeded = perTask.filter((item): item is RawResult[] => item !== undefined);
@@ -452,10 +655,7 @@ export class WebSearchService {
 				throw new WebSearchError(
 					first?.code ?? "unavailable",
 					`所有搜索引擎的请求都失败了：${perEngine
-						.map(
-							(failure) =>
-								`${failure.engine ? WEB_SEARCH_ENGINES[failure.engine].label : "搜索"}：${failure.message}`,
-						)
+						.map((failure) => `${failure.engine ? this.sourceLabel(failure.engine) : "搜索"}：${failure.message}`)
 						.join("；")}`,
 				);
 			}
@@ -474,7 +674,7 @@ export class WebSearchService {
 			results,
 			pages: read.pages,
 			failures,
-			engines: settings.engines,
+			engines: searched,
 			routes,
 			cacheHit: cacheHit || read.cacheHit,
 		};
@@ -734,7 +934,8 @@ export class WebSearchService {
 						resultCount: results.length,
 						durationMs: this.now() - startedAt,
 						message: results.length > 0 ? `返回 ${results.length} 个结果${how}` : `没有返回结果${how}`,
-						via: route.via,
+						// Only built-in engines are tested here, so an extension source's route cannot occur.
+						via: route.via === "browser" ? "browser" : "http",
 					};
 				} catch (error) {
 					if (signal?.aborted) throw abortError(signal) ?? error;

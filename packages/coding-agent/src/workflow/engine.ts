@@ -384,6 +384,7 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 			if (!provider || !model || !thinkingLevel) {
 				failPreflight("Sub Agent 模型或思考强度配置不完整，请在 /settings 中重新设置。");
 			}
+			if (settings.unavailableReason) failPreflight(settings.unavailableReason);
 			const runtimeSettings: ResolvedSubAgentRuntimeSettings = resolveSubAgentRuntimeSettings({
 				...settings,
 				provider: provider!,

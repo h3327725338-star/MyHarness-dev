@@ -39,6 +39,13 @@ import {
 } from "../../tools/web-search/engines/tavily.ts";
 import { WebSearchError } from "../../tools/web-search/errors.ts";
 import { plainHttpFetch } from "../../tools/web-search/http.ts";
+import {
+	listWebSearchSources,
+	type WebSearchSource,
+	webSearchSourceEffort,
+	webSearchSourceEfforts,
+	webSearchSourceModel,
+} from "../../tools/web-search/sources.ts";
 import { HttpTransport } from "../../tools/web-search/transport.ts";
 import type { WebHost } from "./host.ts";
 import { HttpError, type WebHttpServer } from "./http-server.ts";
@@ -118,6 +125,25 @@ const SEARCH_ENGINES = [
 	{ value: "brave", label: "Brave" },
 	{ value: "tavily", label: "Tavily API" },
 ];
+/** The setting that holds the model of one extension search source: this prefix, then the source's id. */
+const SEARCH_SOURCE_MODEL = "webSearch.sourceModel.";
+/** The setting that holds the reasoning level of one extension search source: this prefix, then the source's id. */
+const SEARCH_SOURCE_EFFORT = "webSearch.sourceEffort.";
+
+/**
+ * The extension search sources this computer can use right now (their extension is loaded and their program is
+ * installed): what Web Search settings offers beside the built-in engines. Any other source is not shown at all.
+ */
+function usableSearchSources(): WebSearchSource[] {
+	return listWebSearchSources().filter((source) => {
+		try {
+			return !source.unavailable?.();
+		} catch {
+			return false;
+		}
+	});
+}
+
 /** The browsers the fallback can use; "auto" is the first installed one. */
 const SEARCH_BROWSERS = [
 	{ value: "auto", label: "Auto" },
@@ -333,6 +359,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		const vision = s.getVisionAssistantSettings();
 		const fallbackModel = s.getFallbackModelSettings();
 		const web = s.getWebSearchSettings();
+		const searchSources = usableSearchSources();
 		const code = s.getCodeIntelligenceSettings();
 		const popup = s.getPopupNotificationSettings();
 		const compaction = s.getCompactionModelSettings();
@@ -621,9 +648,47 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				section: "Tools",
 				label: "Search engines",
 				type: "multi",
-				value: web.engines,
-				options: SEARCH_ENGINES,
+				// The engines, then other programs' own search (extension sources) while this computer can use them.
+				value: [
+					...web.engines,
+					...web.extensionSources.filter((id) => searchSources.some((source) => source.id === id)),
+				],
+				options: [...SEARCH_ENGINES, ...searchSources.map((source) => ({ value: source.id, label: source.label }))],
 			},
+			// Which model each switched-on extension source searches with, and on which reasoning level when that model
+			// has more than one.
+			...searchSources
+				.filter((source) => web.extensionSources.includes(source.id) && (source.models?.() ?? []).length > 0)
+				.flatMap((source): SettingDef[] => {
+					const model = webSearchSourceModel(source, web.extensionSourceModels[source.id]);
+					const efforts = webSearchSourceEfforts(source, model);
+					return [
+						{
+							id: `${SEARCH_SOURCE_MODEL}${source.id}`,
+							section: "Tools",
+							label: `${source.label} search model`,
+							description:
+								"Model this search source uses. Every search spends the program's own plan quota and usually takes ten seconds or more.",
+							type: "enum",
+							value: model ?? "",
+							options: (source.models?.() ?? []).map((entry) => ({ value: entry.id, label: entry.label })),
+						},
+						...(efforts.length > 1
+							? [
+									{
+										id: `${SEARCH_SOURCE_EFFORT}${source.id}`,
+										section: "Tools",
+										label: `${source.label} search reasoning level`,
+										description:
+											"Reasoning level this search source's model uses. The search only passes your queries on, so a higher level mostly makes it slower and spends more of the plan.",
+										type: "enum",
+										value: webSearchSourceEffort(source, model, web.extensionSourceEfforts[source.id]) ?? "",
+										options: efforts.map((effort) => ({ value: effort, label: effort })),
+									} satisfies SettingDef,
+								]
+							: []),
+					];
+				}),
 			{
 				id: "webSearch.pagesPerSearch",
 				section: "Tools",
@@ -1071,6 +1136,35 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 	const applySetting = async (id: string, value: unknown): Promise<void> => {
 		const s = settings();
 		const session = host.session;
+		if (id.startsWith(SEARCH_SOURCE_MODEL)) {
+			const source = usableSearchSources().find(
+				(candidate) => candidate.id === id.slice(SEARCH_SOURCE_MODEL.length),
+			);
+			if (!source) throw new HttpError(400, "Unknown search source.");
+			if (typeof value !== "string" || !(source.models?.() ?? []).some((model) => model.id === value))
+				throw new HttpError(400, "Unknown model.");
+			const current = s.getWebSearchSettings();
+			s.setWebSearchSettings({
+				...current,
+				extensionSourceModels: { ...current.extensionSourceModels, [source.id]: value },
+			});
+			return;
+		}
+		if (id.startsWith(SEARCH_SOURCE_EFFORT)) {
+			const source = usableSearchSources().find(
+				(candidate) => candidate.id === id.slice(SEARCH_SOURCE_EFFORT.length),
+			);
+			if (!source) throw new HttpError(400, "Unknown search source.");
+			const current = s.getWebSearchSettings();
+			const model = webSearchSourceModel(source, current.extensionSourceModels[source.id]);
+			if (typeof value !== "string" || !webSearchSourceEfforts(source, model).includes(value))
+				throw new HttpError(400, "Unknown reasoning level.");
+			s.setWebSearchSettings({
+				...current,
+				extensionSourceEfforts: { ...current.extensionSourceEfforts, [source.id]: value },
+			});
+			return;
+		}
 		switch (id) {
 			case "steeringMode":
 			case "followUpMode": {
@@ -1302,9 +1396,14 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				else if (id === "webSearch.engines") {
 					if (!Array.isArray(value) || value.length === 0)
 						throw new HttpError(400, "Select at least one search engine.");
-					next.engines = value.filter(
-						(entry): entry is (typeof current.engines)[number] => typeof entry === "string",
-					);
+					const chosen = value.filter((entry): entry is string => typeof entry === "string");
+					const offered = new Set(usableSearchSources().map((source) => source.id));
+					next.engines = chosen.filter((entry) => !offered.has(entry)) as typeof current.engines;
+					// A switched-on source this computer cannot use right now was not in the list: it stays as saved.
+					next.extensionSources = [
+						...current.extensionSources.filter((entry) => !offered.has(entry)),
+						...chosen.filter((entry) => offered.has(entry)),
+					];
 				} else if (id === "webSearch.pagesPerSearch")
 					next.pagesPerSearch = numberValue(
 						value,
@@ -1668,6 +1767,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				active: activeTools.has(tool.name),
 				source: tool.sourceInfo?.source ?? "builtin",
 				extension: extensionTools.has(tool.name),
+				autoActive: session.getToolDefinition(tool.name)?.autoActive === true,
 			})),
 			skills: loader.getSkills().skills.map((skill) => ({
 				name: skill.name,
@@ -1723,7 +1823,15 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		// `ultracode` share the same sub-agent runtime (they call runExploreBatch), so they must never stay
 		// on while `agent` is off: strip them here as well (the UI also disables them, this is the
 		// server-side enforcement so the model can never be handed them while `agent` is off).
-		const requested = [...new Set(names as string[])];
+		// A tool its extension switches by itself (`autoActive`, e.g. one that follows the model) keeps the state it has:
+		// the panel shows its switch locked, and a request cannot turn it on for a model it means nothing to.
+		const isAuto = (name: string) => host.session.getToolDefinition(name)?.autoActive === true;
+		const requested = [
+			...new Set([
+				...(names as string[]).filter((name) => !isAuto(name)),
+				...host.session.getActiveToolNames().filter(isAuto),
+			]),
+		];
 		const agentOn = requested.includes("agent");
 		const finalNames = agentOn
 			? requested

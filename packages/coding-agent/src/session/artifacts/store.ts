@@ -216,47 +216,164 @@ function readGlobalIndex(dataRoot: string): ArtifactEntry[] | undefined {
 /** What the last index refresh saw of each session's artifact files (a hash of their paths, sizes and times). */
 const refreshedArtifacts = new Map<string, string>();
 
+/** One session of one data root, as the refresh bookkeeping names it. */
+export function sessionArtifactKey(scope: SessionDataPathInfo): string {
+	return `${resolve(scope.dataRoot)}\0${scope.workspaceId}\0${scope.sessionId}`;
+}
+
+/** What the last refresh saw of a session's artifact files; undefined when none has looked at it yet. */
+export function knownArtifactSignature(key: string): string | undefined {
+	return refreshedArtifacts.get(key);
+}
+
+/** Records what a refresh that ran elsewhere (the index worker) saw of a session's artifact files. */
+export function noteArtifactSignature(key: string, signature: string): void {
+	refreshedArtifacts.set(key, signature);
+}
+
 function listSessionArtifacts(scope: SessionDataPathInfo): { own: ArtifactEntry[]; signature: string; key: string } {
 	const own = listArtifacts(scope.dataRoot, { workspaceId: scope.workspaceId, sessionId: scope.sessionId });
 	const signature = createHash("sha1")
 		.update(own.map((entry) => `${entry.path}\0${entry.size}\0${entry.modified}`).join("\n"))
 		.digest("hex");
-	return { own, signature, key: `${resolve(scope.dataRoot)}\0${scope.workspaceId}\0${scope.sessionId}` };
+	return { own, signature, key: sessionArtifactKey(scope) };
+}
+
+/** The global index file as it is on disk right now: its write time and size. */
+function globalIndexStamp(dataRoot: string): string {
+	try {
+		const info = statSync(join(dataRoot, "artifacts", "index.json"));
+		return `${info.mtimeMs}:${info.size}`;
+	} catch {
+		return "";
+	}
+}
+
+/** One session whose artifact files a refresh found changed, with the files it has now. */
+interface SessionArtifactChange {
+	scope: SessionDataPathInfo;
+	own: ArtifactEntry[];
 }
 
 /**
- * Replace one session's entries in the global index and in its workspace's index. A full refresh reads every workspace
- * and rewrites all of their indexes, which blocks the whole server for seconds on a data root with many workspaces; it
- * still runs when the global index is missing or not in the known shape.
+ * Replace the entries of some sessions of one data root in the global index and in their workspaces' indexes, reading
+ * and writing the global index once for all of them. A full refresh reads every workspace and rewrites all of their
+ * indexes, which blocks the whole server for seconds on a data root with many workspaces; it still runs when the global
+ * index is missing or not in the known shape.
+ *
+ * The server's own thread and its index worker (index-refresh.ts) can both be here at once. Each works from the copy of
+ * the global index it read, so one that finds the file rewritten meanwhile starts over from the newer file instead of
+ * writing its older copy back over the other's entries.
  */
-function replaceSessionInIndexes(scope: SessionDataPathInfo, own: ArtifactEntry[]): void {
-	const global = readGlobalIndex(scope.dataRoot);
-	if (!global) {
-		refreshArtifactIndexes(scope.dataRoot);
+function replaceSessionsInIndexes(dataRoot: string, changes: SessionArtifactChange[]): void {
+	if (changes.length === 0) return;
+	const replaced = new Set(changes.map(({ scope }) => `${scope.workspaceId}\0${scope.sessionId}`));
+	const workspaces = [...new Set(changes.map(({ scope }) => scope.workspaceId))];
+	for (let attempt = 0; ; attempt++) {
+		const stamp = globalIndexStamp(dataRoot);
+		const global = readGlobalIndex(dataRoot);
+		if (!global) {
+			refreshArtifactIndexes(dataRoot);
+			return;
+		}
+		const entries = [
+			...global.filter((entry) => !replaced.has(`${entry.workspaceId}\0${entry.sessionId}`)),
+			...changes.flatMap(({ own }) => own),
+		].sort((a, b) => b.modified - a.modified || a.path.localeCompare(b.path));
+		if (attempt < 2 && globalIndexStamp(dataRoot) !== stamp) continue;
+		writeArtifactIndex(dataRoot, join(dataRoot, "artifacts"), entries);
+		for (const workspaceId of workspaces)
+			writeArtifactIndex(
+				dataRoot,
+				join(getWorkspaceDir(dataRoot, workspaceId), "artifacts"),
+				entries.filter((entry) => entry.workspaceId === workspaceId),
+			);
 		return;
 	}
-	const entries = [
-		...global.filter((entry) => entry.workspaceId !== scope.workspaceId || entry.sessionId !== scope.sessionId),
-		...own,
-	].sort((a, b) => b.modified - a.modified || a.path.localeCompare(b.path));
-	writeArtifactIndex(scope.dataRoot, join(scope.dataRoot, "artifacts"), entries);
-	writeArtifactIndex(
-		scope.dataRoot,
-		join(getWorkspaceDir(scope.dataRoot, scope.workspaceId), "artifacts"),
-		entries.filter((entry) => entry.workspaceId === scope.workspaceId),
-	);
+}
+
+function replaceSessionInIndexes(scope: SessionDataPathInfo, own: ArtifactEntry[]): void {
+	replaceSessionsInIndexes(scope.dataRoot, [{ scope, own }]);
+}
+
+/** Whether a session's artifact files differ from what the last refresh saw (one that never had any has nothing to index). */
+function artifactsChanged(known: string | undefined, signature: string, own: ArtifactEntry[]): boolean {
+	return known === undefined ? own.length > 0 : known !== signature;
+}
+
+/**
+ * Replaces one session's entries in the derived indexes when its artifact files differ from `known`, what the last
+ * refresh saw of them (a session that never had an artifact has nothing to index). Returns what it saw this time.
+ */
+export function refreshSessionIndexesIfChanged(scope: SessionDataPathInfo, known: string | undefined): string {
+	const { own, signature } = listSessionArtifacts(scope);
+	if (artifactsChanged(known, signature, own)) replaceSessionInIndexes(scope, own);
+	return signature;
 }
 
 /**
  * Refresh the derived indexes after a tool ran. Most tool runs (reading, editing project files, shell commands) do not
  * touch an artifact, so nothing happens unless this session's artifact files differ from what the last refresh saw (a
  * session that never had one has nothing to index). Only this session's entries are replaced.
+ *
+ * This does its work before it returns. A tool call asks through scheduleArtifactIndexRefresh (index-refresh.ts)
+ * instead, which does the same work off the server's thread.
  */
 export function refreshArtifactIndexesIfChanged(scope: SessionDataPathInfo): void {
-	const { own, signature, key } = listSessionArtifacts(scope);
-	const known = refreshedArtifacts.get(key);
-	if (known === undefined ? own.length > 0 : known !== signature) replaceSessionInIndexes(scope, own);
-	refreshedArtifacts.set(key, signature);
+	const key = sessionArtifactKey(scope);
+	refreshedArtifacts.set(key, refreshSessionIndexesIfChanged(scope, refreshedArtifacts.get(key)));
+}
+
+/** One round of index refreshes for the sessions whose tools just ran, with what the last refresh saw of each. */
+export interface IndexRefreshJob {
+	sessions: { scope: SessionDataPathInfo; known?: string }[];
+}
+
+/** What each session's artifact files look like now (undefined for one that could not be refreshed). */
+export interface IndexRefreshAnswer {
+	signatures: (string | undefined)[];
+	error?: string;
+}
+
+/**
+ * Runs one job where it is called: in the index worker, or on the server's thread when no worker can be started. The
+ * changed sessions of a data root go into its indexes together, so the global index is read and written once per job.
+ */
+export function runIndexRefreshJob(job: IndexRefreshJob): IndexRefreshAnswer {
+	let failure: string | undefined;
+	const fail = (error: unknown) => {
+		failure ??= error instanceof Error ? error.message : String(error);
+	};
+	const signatures: (string | undefined)[] = job.sessions.map(() => undefined);
+	const changed = new Map<string, { change: SessionArtifactChange; index: number; signature: string }[]>();
+	job.sessions.forEach(({ scope, known }, index) => {
+		try {
+			const { own, signature } = listSessionArtifacts(scope);
+			if (!artifactsChanged(known, signature, own)) {
+				signatures[index] = signature;
+				return;
+			}
+			const dataRoot = resolve(scope.dataRoot);
+			const list = changed.get(dataRoot) ?? [];
+			list.push({ change: { scope, own }, index, signature });
+			changed.set(dataRoot, list);
+		} catch (error) {
+			fail(error);
+		}
+	});
+	for (const list of changed.values()) {
+		try {
+			replaceSessionsInIndexes(
+				list[0]!.change.scope.dataRoot,
+				list.map(({ change }) => change),
+			);
+			// Only now are these files in the indexes: a failed write leaves them unknown, so the next call tries again.
+			for (const { index, signature } of list) signatures[index] = signature;
+		} catch (error) {
+			fail(error);
+		}
+	}
+	return { signatures, ...(failure ? { error: failure } : {}) };
 }
 
 /** After a chat was deleted: replace its entries in the derived indexes (the kept artifacts are marked as orphaned). */

@@ -506,6 +506,40 @@ export function runActive(active, title = "", owner = "local") {
 }
 export function notifyDone(title, text) {
 	if (isNative) bridge.notifyDone(String(title), String(text));
+	if (isNative && quietBanners && !localStorage.getItem(BANNER_HINT_KEY)) bannerHintDue = true;
+}
+// Xiaomi, Redmi and POCO phones keep the banners of an app off until its owner allows them: the notification is there,
+// but nothing pops up. The first time a reply ended that way, the app says so once it is opened again.
+export const quietBanners = /xiaomi|redmi|poco/i.test(nativeInfo.device || "");
+const BANNER_HINT_KEY = "myharness.mobile.bannerHint";
+let bannerHintDue = false;
+let bannerHint = null;
+export function onBannerHint(fn) {
+	bannerHint = fn;
+}
+document.addEventListener("visibilitychange", () => {
+	if (document.visibilityState !== "visible" || !bannerHintDue || !bannerHint) return;
+	bannerHintDue = false;
+	localStorage.setItem(BANNER_HINT_KEY, "1");
+	setTimeout(() => bannerHint(), 600);
+});
+export function openNotificationSettings() {
+	if (isNative && bridge.openNotificationSettings) bridge.openNotificationSettings();
+}
+// While a reply is awaited in the background Android shows a notification of the app ("MyHarness is answering"); the app
+// cannot remove it, the owner can: by switching that one kind of notification off in the system's settings.
+/** Whether the owner has switched it off. */
+export function waitingHidden() {
+	try {
+		return !!(isNative && bridge.waitingHidden && bridge.waitingHidden());
+	} catch {
+		return false;
+	}
+}
+/** The system's page with that switch. */
+export function openWaitingSettings() {
+	if (isNative && bridge.openWaitingSettings) bridge.openWaitingSettings();
+	else openNotificationSettings();
 }
 /** Colour of the system bars' icons and of the window behind the page. */
 export function setChrome(dark, background) {

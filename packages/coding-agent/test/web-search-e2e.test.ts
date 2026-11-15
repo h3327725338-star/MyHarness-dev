@@ -121,7 +121,7 @@ describe.skipIf(!enabled)("real Web Search E2E", () => {
 				"CRISPR gene editing",
 				"docker compose healthcheck",
 			];
-			const via = { http: 0, browser: 0 };
+			const via = { http: 0, browser: 0, extension: 0 };
 			for (const query of queries) {
 				const started = Date.now();
 				const response = await search.search({ queries: [query], fresh: true });

@@ -52,18 +52,20 @@ import {
 	summarizeRunWork,
 } from "../../utils/popup-notification.ts";
 import type { ChangeClaimRegistry } from "./change-claims.ts";
-import { ChangeTracker, type RunChangeRecord, toolCallMayWriteFiles } from "./changes.ts";
+import { ChangeTracker, type RunChangeCardFile, type RunChangeRecord, toolCallMayWriteFiles } from "./changes.ts";
 import type { WebDialogBridge } from "./dialogs.ts";
 import { GenerationSpeedMeter } from "./generation-speed.ts";
 import type { WebHttpServer } from "./http-server.ts";
 import { pagePresence } from "./page-presence.ts";
 import { RequestCacheMeter } from "./request-cache.ts";
+import { lastClosingRunChanges } from "./session-changes.ts";
 import { TranscriptCache } from "./transcript-cache.ts";
 import {
 	backgroundJobToWire,
 	entriesToWire,
 	entryProjectsToWire,
 	INTERRUPT_ENTRY,
+	isDeferredRunChanges,
 	messageToWire,
 	RUN_CHANGES_ENTRY,
 	runChangesToWire,
@@ -381,6 +383,10 @@ export class WebHost {
 		{ last: number; timer?: ReturnType<typeof setTimeout>; pending?: unknown }
 	>();
 	private runCounter = 0;
+	/** Runs started by this host since it was created: tells whether a message sent with "interrupt" got its run. */
+	private runsStarted = 0;
+	/** The newest run whose changes wait for its task's card (a new message cut it short). */
+	private deferredRunId: number | undefined;
 	private currentRunId: number | undefined;
 	private bashCountAtRunStart = 0;
 	private baselinePromise: Promise<WorkspaceBaseline | undefined> | undefined;
@@ -411,8 +417,15 @@ export class WebHost {
 	 * chat, because a slot can go on to another one (a fork in place starts a new chat here, and that one is the user's).
 	 */
 	scheduledSessionId: string | undefined;
+	/**
+	 * Messages sent with "interrupt" that are ending a run right now. A count, not a flag: a second one can arrive while
+	 * the first is still stopping the run, and the first one finishing must not make the run look user-cancelled.
+	 */
+	private interruptsInFlight = 0;
 	/** A message sent with "interrupt" is ending the run: that is the user moving on, not a task to be told about. */
-	private interruptingForMessage = false;
+	private get interruptingForMessage(): boolean {
+		return this.interruptsInFlight > 0;
+	}
 	/** True while an automatic (threshold / overflow) compaction runs: its run-state settle is not a task end. */
 	private autoCompactionActive = false;
 	/** Dialog ids already announced, so answering one of several stacked dialogs does not announce the rest again. */
@@ -737,8 +750,10 @@ export class WebHost {
 		// A checkpoint of a session another process owns belongs to that process.
 		// Opening a chat must not wait for the checkpoint scan: it runs git synchronously, and the new chat's response
 		// is only sent after bindSession returns. A host disposed before the timer fires is caught by the generation.
-		if (!session.isMirror) setTimeout(() => void this.recoverStartupCheckpoint(generation), 0);
-		else this.watchMirror(session as MirrorAgentSession, generation);
+		if (!session.isMirror) {
+			setTimeout(() => void this.recoverStartupCheckpoint(generation), 0);
+			setTimeout(() => this.recoverDeferredRunChanges(generation), 0);
+		} else this.watchMirror(session as MirrorAgentSession, generation);
 		this.unsubscribe = session.subscribe((event) => {
 			if (generation !== this.generation) return;
 			try {
@@ -831,6 +846,7 @@ export class WebHost {
 		for (const entry of this.toolTimers.values()) if (entry.timer) clearTimeout(entry.timer);
 		this.toolTimers.clear();
 		this.currentRunId = undefined;
+		this.deferredRunId = undefined;
 		this.baselinePromise = undefined;
 		this.baselineFailureReason = undefined;
 		this.lastAgentEnd = undefined;
@@ -1118,7 +1134,7 @@ export class WebHost {
 			case "run_state_changed":
 				if (isRunStateTerminal(event.state.state)) this.lastTerminalRunState = event.state;
 				else if (isRunStateActive(event.state.state)) this.lastTerminalRunState = undefined;
-				this.broadcast("run_state", event.state);
+				this.broadcast("run_state", this.publishedRunState(event.state));
 				if (isRunStateTerminal(event.state.state)) this.announceTaskEnd(event.state);
 				return;
 			case "entry_appended":
@@ -1127,6 +1143,10 @@ export class WebHost {
 			case "session_info_changed":
 				this.broadcast("session_info", { name: event.name });
 				this.scheduleUsage();
+				return;
+			case "active_tools_changed":
+				// The tools panel reads its switches again: an extension may switch tools as the model changes.
+				this.broadcast("resources_changed", {});
 				return;
 			case "thinking_level_changed":
 				this.broadcast("thinking_level", { level: event.level });
@@ -1162,11 +1182,16 @@ export class WebHost {
 				this.broadcast("auto_retry_end", {
 					success: event.success,
 					attempt: event.attempt,
-					// A cancelled retry is not a provider failure and keeps its own wording.
+					// A cancelled retry is not a provider failure and keeps its own wording. One that a new message ended
+					// (sent with "interrupt") has nothing to report: that is the user moving on, not a failed retry.
 					finalError:
-						event.success || !event.finalError || event.finalError === "Retry cancelled"
+						event.success || !event.finalError
 							? event.finalError
-							: explainProviderError(event.finalError),
+							: event.finalError === "Retry cancelled"
+								? this.interruptingForMessage
+									? undefined
+									: event.finalError
+								: explainProviderError(event.finalError),
 				});
 				return;
 			case "model_fallback_start":
@@ -1240,6 +1265,36 @@ export class WebHost {
 			default:
 				return;
 		}
+	}
+
+	/**
+	 * The run state as the pages and the phone see it. A run that a message sent with "interrupt" ends is not cancelled: it
+	 * goes out without the "cancelled" wording (the session writes "任务已取消" / "重试已取消" into it) and says so
+	 * itself, so nothing on any page reads as a stop the person did not ask for. A plain Stop keeps its state untouched.
+	 */
+	private publishedRunState(state: RunStateSnapshot): RunStateSnapshot & { redirected?: true } {
+		if (!this.interruptingForMessage) return state;
+		// The idle state that follows a stop still carries the stop's error text and reason.
+		const stopped =
+			state.state === "cancelled" ||
+			state.state === "interrupted" ||
+			(state.state === "idle" &&
+				(state.terminalReason === "user-cancelled" || state.terminalReason === "interrupted"));
+		return stopped ? { ...state, activity: "", error: undefined, redirected: true } : state;
+	}
+
+	/**
+	 * Says before the stop starts that the run is being ended for a new message. The stopped reply reaches the page with
+	 * stopReason "aborted" a moment later, and without this the page would draw the run's turn as cancelled until the
+	 * run's record (run_finished, after the changes are detected) and the saved marker (INTERRUPT_ENTRY) arrive. The page
+	 * takes it as the run's first record; run_finished replaces it.
+	 */
+	private announceRedirect(): void {
+		// The run the session is ending, by the session's own numbering: currentRunId only moves on agent_start, so a run
+		// still being prepared (memory lookup, context check) would be announced under the previous, finished run's number.
+		const { runId, startedAt } = this.session.getRunStateSnapshot();
+		if (!runId || runId <= 0 || startedAt === undefined) return;
+		this.broadcast("run_redirecting", { runId, startedAt, ts: Date.now() });
 	}
 
 	private summariseAgentEnd(messages: AgentMessage[], willRetry: boolean) {
@@ -1440,6 +1495,7 @@ export class WebHost {
 	private onAgentStart(): void {
 		const snapshotRunId = this.session.getRunStateSnapshot().runId;
 		this.currentRunId = snapshotRunId && snapshotRunId > 0 ? snapshotRunId : ++this.runCounter;
+		this.runsStarted += 1;
 		this.lastAgentEnd = undefined;
 		this.tracker.beginRun(this.currentRunId);
 		this.bashCountAtRunStart = this.session.bashExecutionCount;
@@ -1528,6 +1584,18 @@ export class WebHost {
 		return this.completionPromise !== undefined;
 	}
 
+	/**
+	 * The run that is going on right now and has not been recorded yet, with the checkpoint its changes are measured
+	 * against; undefined between runs and once the run's change card exists.
+	 */
+	liveRun(): { runId: number; checkpoint: GitCheckpoint | undefined } | undefined {
+		const runId = this.currentRunId;
+		if (runId === undefined || this.runFinished.has(runId)) return undefined;
+		const record = this.tracker.getRun(runId);
+		if (!record || record.endedAt !== undefined) return undefined;
+		return { runId, checkpoint: this.session.getGitCheckpoint() };
+	}
+
 	private startCompletion(): void {
 		if (this.completionPromise) return;
 		const runId = this.currentRunId;
@@ -1602,44 +1670,73 @@ export class WebHost {
 		let finalDetection = detection;
 		let indeterminateGit = false;
 		if (succeeded && detection && gitEnabled && checkpoint?.status === "created") {
-			try {
-				finalDetection = await collectFinalWorkspaceChanges({
-					cwd: this.cwd,
-					checkpoint: session.getGitCheckpoint(),
-					excludeExternalCommits,
-				});
-			} catch {
-				finalDetection = detection;
+			// The detection above already compared this checkpoint with the repository a moment ago. It is read again only
+			// when the session holds another checkpoint by now: a second identical comparison made every task end slower.
+			const latest = session.getGitCheckpoint();
+			if (latest !== checkpoint) {
+				try {
+					finalDetection = await collectFinalWorkspaceChanges({
+						cwd: this.cwd,
+						checkpoint: latest,
+						excludeExternalCommits,
+					});
+				} catch {
+					finalDetection = detection;
+				}
 			}
 			if (finalDetection?.status === "indeterminate") indeterminateGit = true;
 		}
 
 		this.setCompletionPhase("records");
 		let uncommitted = false;
-		if (succeeded && !indeterminateGit) {
-			if (!session.isMirror && session.settingsManager.getAutoMemorySettings().enabled) {
-				await session.scheduleAutoMemoryMaintenance();
-			}
-			const decisionCheckpoint = session.getGitCheckpoint();
-			if (decisionCheckpoint?.status === "created") {
-				const hasDelta = await hasGitCheckpointTaskChangesAsync(decisionCheckpoint).catch(() => true);
-				const gitSaveSatisfied = finalDetection?.status === "known" && finalDetection.git?.gitSave === "satisfied";
-				if (gitSaveSatisfied || !hasDelta) {
-					session.completeGitCheckpointAfterVerification();
-				} else {
-					uncommitted = true;
+		// Checkpoint and memory bookkeeping: when it fails, the run's record and its change card (or its place in the held
+		// task, see deferRunChanges) are still written below. Otherwise the changes would be in no card, and the held
+		// changes of the task this run belongs to would stay in the tracker for the next, unrelated task.
+		try {
+			if (succeeded && !indeterminateGit) {
+				if (!session.isMirror && session.settingsManager.getAutoMemorySettings().enabled) {
+					await session.scheduleAutoMemoryMaintenance();
 				}
+				const decisionCheckpoint = session.getGitCheckpoint();
+				if (decisionCheckpoint?.status === "created") {
+					const gitSaveSatisfied =
+						finalDetection?.status === "known" && finalDetection.git?.gitSave === "satisfied";
+					// The detection just found working-tree changes against this same checkpoint (HEAD did not move, so its
+					// list is the working-tree comparison itself): the checkpoint has task changes without asking Git again.
+					const knownDelta =
+						decisionCheckpoint === checkpoint &&
+						finalDetection?.status === "known" &&
+						finalDetection.changes.length > 0 &&
+						finalDetection.git?.headChanged !== true;
+					const hasDelta =
+						gitSaveSatisfied || knownDelta
+							? true
+							: await hasGitCheckpointTaskChangesAsync(decisionCheckpoint).catch(() => true);
+					if (gitSaveSatisfied || !hasDelta) {
+						session.completeGitCheckpointAfterVerification();
+					} else {
+						uncommitted = true;
+					}
+				}
+			} else {
+				await this.settleFailedCheckpoint(checkpoint);
+				const after = session.getGitCheckpoint();
+				uncommitted = after?.status === "created";
 			}
-		} else {
-			await this.settleFailedCheckpoint(checkpoint);
-			const after = session.getGitCheckpoint();
-			uncommitted = after?.status === "created";
-		}
 
-		// Keep the previous task's recovery handle when the next run starts with
-		// a fresh checkpoint. Read-only follow-ups must not consume its baseline.
-		const open = session.getGitCheckpoint();
-		if (open?.status === "created") this.pendingStartupCheckpoint = open;
+			// Keep the previous task's recovery handle when the next run starts with
+			// a fresh checkpoint. Read-only follow-ups must not consume its baseline.
+			const open = session.getGitCheckpoint();
+			if (open?.status === "created") this.pendingStartupCheckpoint = open;
+		} catch (error) {
+			this.broadcast("notice", {
+				id: `completion-${Date.now()}`,
+				message: `Task checkpoint bookkeeping failed; the task's changes are still recorded: ${error instanceof Error ? error.message : String(error)}`,
+				type: "warning",
+				ts: Date.now(),
+			});
+			uncommitted = session.getGitCheckpoint()?.status === "created";
+		}
 
 		if (runId !== undefined) {
 			const record = this.tracker.finishRun(
@@ -1647,9 +1744,21 @@ export class WebHost {
 				finalDetection ?? detection,
 				session.getGitCheckpoint() ?? checkpoint,
 			);
-			if (record && record.changes.length > 0)
-				this.recordRunChanges(runId, session.getGitCheckpoint() ?? checkpoint);
 			const payload = this.buildRunFinished(runId, record, uncommitted);
+			const cardCheckpoint = session.getGitCheckpoint() ?? checkpoint;
+			const hasChanges = !!record && record.changes.length > 0;
+			if (hasChanges) {
+				// What the files held before the task is read from the checkpoint side by side, not one blocking Git
+				// process per file while the card is built.
+				await this.tracker.prefetchBefore(runId, cardCheckpoint).catch(() => {});
+			}
+			if (payload.outcome === "redirected") {
+				// A new message cut this run short and the task goes on with it: no card yet. The changes are kept in the
+				// session (hidden) and held by the tracker for the card of the task's last run.
+				if (hasChanges) this.deferRunChanges(runId, cardCheckpoint);
+			} else if (hasChanges || this.tracker.hasDeferredRuns()) {
+				this.recordRunChanges(runId, cardCheckpoint);
+			}
 			this.runFinished.set(runId, payload);
 			this.finishedRuns += 1;
 			this.broadcast("run_finished", payload);
@@ -1660,33 +1769,115 @@ export class WebHost {
 	}
 
 	/**
-	 * Keeps what this run changed as a card in the conversation: the files with their counts and diffs go into the
-	 * session as a custom entry (never part of the model's messages), right after the run's reply. The card of every run
-	 * therefore stays where it is when later runs follow, and holds only that run's own changes. A mirrored session is
-	 * written by the process that owns it, so here its card is only shown, not saved.
+	 * Keeps what a task changed as a card in the conversation: the files with their counts and diffs go into the session
+	 * as a custom entry (never part of the model's messages), right after the reply of the run that ends the task. The
+	 * card of every task therefore stays where it is when later tasks follow, and holds only that task's own changes.
+	 * A task is one run, or several when new messages cut it short (see deferRunChanges): then the card lists the files
+	 * of all those runs, each once, as the task changed them from its start to its end. A mirrored session is written by
+	 * the process that owns it, so here its card is only shown, not saved.
 	 */
-	private recordRunChanges(runId: number, checkpoint: GitCheckpoint | undefined): void {
+	private recordRunChanges(runId: number | undefined, checkpoint: GitCheckpoint | undefined): void {
 		try {
-			// Files another chat or another program changed while the run went on are listed with the card, never counted.
-			const data = {
-				runId,
-				files: this.tracker.runChangeCard(runId, checkpoint),
-				...this.tracker.runChangeCardElsewhere(runId),
-			};
-			if (data.files.length === 0) return;
+			// Files another chat or another program changed while the task went on are listed with the card, never counted.
+			const chained = this.tracker.hasDeferredRuns();
+			const data = this.cardData(runId, checkpoint, chained);
+			// A task that was cut into runs always closes in the session, even when nothing is left to list: the held-back
+			// entries of its earlier runs then no longer count (see lastClosingRunChanges).
+			if (data.files.length === 0 && !chained) return;
 			const id = this.session.isMirror
-				? `run-changes-${runId}`
+				? `run-changes-${runId ?? `chain-${data.runId}`}`
 				: this.session.sessionManager.appendCustomEntry(RUN_CHANGES_ENTRY, data);
 			const item = runChangesToWire(id, Date.now(), data);
 			if (item) this.broadcast("entry_appended", { id, item });
 		} catch (error) {
-			this.broadcast("notice", {
-				id: `changes-${Date.now()}`,
-				message: `The list of changed files could not be saved: ${error instanceof Error ? error.message : String(error)}`,
-				type: "warning",
-				ts: Date.now(),
-			});
+			this.reportCardError(error);
 		}
+	}
+
+	/** The data of a task's card: one run's own changes, or the union of the runs a new message cut the task into. */
+	private cardData(runId: number | undefined, checkpoint: GitCheckpoint | undefined, chained: boolean) {
+		if (chained) {
+			const last = runId ?? this.deferredRunId ?? 0;
+			this.deferredRunId = undefined;
+			// `chain`: the diffs are the task's net change, so a card whose diff was left out cannot fall back to the last
+			// run's own record of the file (see /api/changes/card-diff).
+			return { runId: last, chain: true, ...this.tracker.finishChain(runId, checkpoint) };
+		}
+		if (runId === undefined) return { runId: 0, files: [] as RunChangeCardFile[] };
+		return {
+			runId,
+			files: this.tracker.runChangeCard(runId, checkpoint),
+			...this.tracker.runChangeCardElsewhere(runId),
+		};
+	}
+
+	/**
+	 * A run that a new message sent with "interrupt" cut short (outcome "redirected"): the task goes on with that message,
+	 * so the run gets no card now, neither on the page nor between the stopped reply and the message. Its changes are
+	 * saved in the session as a hidden entry (lists, counts and diffs as its own card would hold them, `deferred`), so
+	 * the Changes panel and the conversation's file ownership see them at once, and a restart that comes before the task
+	 * ends loses nothing (recoverDeferredRunChanges); the tracker holds them for the one card of the task's last run.
+	 */
+	private deferRunChanges(runId: number, checkpoint: GitCheckpoint | undefined): void {
+		try {
+			const data = {
+				runId,
+				deferred: true,
+				files: this.tracker.runChangeCard(runId, checkpoint),
+				...this.tracker.runChangeCardElsewhere(runId),
+			};
+			if (!this.session.isMirror) this.session.sessionManager.appendCustomEntry(RUN_CHANGES_ENTRY, data);
+		} catch (error) {
+			this.reportCardError(error);
+		}
+		this.tracker.deferRun(runId, checkpoint);
+		this.deferredRunId = runId;
+	}
+
+	/**
+	 * The new message of an "interrupt" got no run (it was refused, or a command handled it), so no later run will carry
+	 * the changes of the run it cut short: their card is written now instead of waiting for a run that is not coming.
+	 */
+	private flushDeferredRunChanges(): void {
+		if (!this.tracker.hasDeferredRuns() || this.completionActive || this.session.isStreaming) return;
+		this.recordRunChanges(undefined, this.session.getGitCheckpoint());
+	}
+
+	/**
+	 * Changes of runs that a new message cut short, saved in the session, whose task never got its card (the process
+	 * ended or the chat was closed before the last run finished): each one is shown as its own card at the end of the
+	 * conversation, like a task that ended there, so no recorded change stays invisible. Runs when a chat is opened.
+	 */
+	private recoverDeferredRunChanges(generation: number): void {
+		try {
+			if (generation !== this.generation || this.session.isMirror) return;
+			if (this.currentRunId !== undefined || this.tracker.hasDeferredRuns()) return;
+			const branch = this.session.sessionManager.getBranch();
+			for (const entry of branch.slice(lastClosingRunChanges(branch) + 1)) {
+				if (
+					entry.type !== "custom" ||
+					entry.customType !== RUN_CHANGES_ENTRY ||
+					!isDeferredRunChanges(entry.data)
+				) {
+					continue;
+				}
+				const { deferred: _deferred, ...data } = entry.data as Record<string, unknown>;
+				const id = this.session.sessionManager.appendCustomEntry(RUN_CHANGES_ENTRY, data);
+				const item = runChangesToWire(id, Date.now(), data);
+				if (item) this.broadcast("entry_appended", { id, item });
+			}
+		} catch {
+			// Recovery is best effort; the held-back entries stay in the session and still count in the Changes panel.
+		}
+	}
+
+	private reportCardError(error: unknown): void {
+		this.broadcast("notice", {
+			id: `changes-${Date.now()}`,
+			message: `The list of changed files could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+			type: "warning",
+			ts: Date.now(),
+		});
 	}
 
 	/** Failed-task checkpoint policy: close changeless checkpoints, keep the newest one with changes for explicit Undo/Commit. No UI text lives here. */
@@ -1729,7 +1920,8 @@ export class WebHost {
 			outcome,
 			state: state.state,
 			terminalReason: state.terminalReason,
-			error: state.error,
+			// A run a new message took over was not cancelled: the session's "任务已取消" is no part of its record.
+			error: outcome === "redirected" ? undefined : state.error,
 			startedAt: state.startedAt,
 			endedAt: Date.now(),
 			changeCount,
@@ -1885,7 +2077,9 @@ export class WebHost {
 		const model = session.model;
 		const checkpoint = this.openCheckpoint() ?? session.getGitCheckpoint();
 		const settings = session.settingsManager;
-		const run = session.getRunStateSnapshot();
+		// Through publishedRunState like the run_state event: a page that reloads while a message is ending the run reads the
+		// same neutral state, not the stop's raw one.
+		const run = this.publishedRunState(session.getRunStateSnapshot());
 		return {
 			mode: manager.getMode(),
 			slot: this.slotId,
@@ -2009,9 +2203,10 @@ export class WebHost {
 		const compacting = session.isCompacting;
 		const interrupt = mode === "interrupt" && !session.isWaitingForBackground && !compacting;
 		if (interrupt) {
-			this.interruptingForMessage = true;
+			this.interruptsInFlight += 1;
 			try {
 				const wasRunning = session.isStreaming;
+				if (wasRunning) this.announceRedirect();
 				await session.abort({ keepBackground: true });
 				await session.waitForForegroundIdle();
 				await this.waitForCompletion();
@@ -2024,7 +2219,7 @@ export class WebHost {
 					if (item) this.broadcast("entry_appended", { id, item });
 				}
 			} finally {
-				this.interruptingForMessage = false;
+				this.interruptsInFlight -= 1;
 			}
 		} else if (compacting && !session.isStreaming) {
 			// A compaction outside a run (/compact) cannot take a queued message; send once it has finished.
@@ -2054,12 +2249,19 @@ export class WebHost {
 					}
 				},
 			};
+			const runsBefore = this.runsStarted;
+			// A message that cut a run short but got no run of its own would leave that run's changes without a card.
+			const settleCutRun = () => {
+				if (interrupt && this.runsStarted === runsBefore) this.flushDeferredRunChanges();
+			};
 			const promptPromise = session.prompt(text, promptOptions);
 			promptPromise
 				.then(() => {
 					if (!acknowledged) resolve();
+					settleCutRun();
 				})
 				.catch((error: unknown) => {
+					settleCutRun();
 					if (options.clientMessageId)
 						this.broadcast("prompt_rejected", { clientMessageId: options.clientMessageId });
 					if (!acknowledged) {

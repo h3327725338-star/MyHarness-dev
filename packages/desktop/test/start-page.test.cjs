@@ -86,6 +86,8 @@ test('the starting page is a complete page in the interface language with the wi
   assert.match(html, /color-scheme:light;--bg:#fbfbfa/);
   for (const id of ['wc-min', 'wc-max', 'wc-close']) assert.match(html, new RegExp(`id="${id}"`));
   assert.match(html, /aria-label="最小化"/);
+  // The buttons are stacked above the animated content, which would otherwise take their clicks.
+  assert.match(html, /\.wc\{position:fixed;z-index:2;/);
   // The note for a long wait is in the page's script, in the same language, and never ends the script early.
   assert.match(html, /比平时久一点，还在启动…/);
   assert.doesNotMatch(html.slice(html.indexOf('<script>{const started')), /<\/script>.*<\/script>/s);

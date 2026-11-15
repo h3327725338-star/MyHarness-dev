@@ -151,6 +151,16 @@ export function containProcessTree(child: ChildProcess): void {
 }
 
 /**
+ * End what is left of a contained command's tree after the command itself has exited (processes it started that are
+ * still running and may hold its output pipes open). Only the job can do this: the command's pid may already belong to
+ * another process, so where there is no job nothing is touched. Returns whether a job was terminated.
+ */
+export function endContainedLeftovers(pid: number | undefined): boolean {
+	if (!pid) return false;
+	return processJobs.get(pid)?.terminate() ?? false;
+}
+
+/**
  * End the process tree of `pid` on Windows. A command in a job object (containProcessTree) ends with its job; anything
  * else goes to `taskkill /F /T`, batched with near-simultaneous requests.
  */

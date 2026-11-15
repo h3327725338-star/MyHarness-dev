@@ -9,6 +9,7 @@ import { openSystemLink } from "./link-target.js";
 import { commitChanges, keepTaskChanges, pushChanges, restorePreview, restoreToLatestCommit, undoImpact, undoTaskChanges } from "./git-flow.js";
 import { explainDeleteFailure } from "./git-delete.js";
 import { deleteCustomProvider } from "./overlays-settings.js";
+import { useFreshStoreEvent } from "./connect-page.js";
 import { EffortSlider, defaultEffortName, findModel, jobDefaultEffort, modelRefLabel, modelRefName } from "./model-menu.js";
 import { N_, serverText, t } from "./i18n.js";
 import { LANGUAGES } from "./lang.js";
@@ -240,15 +241,14 @@ function githubScreen() {
 	const event = useStore((s) => s.githubEvent);
 	const [prompt, setPrompt] = useState(null);
 	const [waiting, setWaiting] = useState(false);
-	useEffect(() => {
-		if (!event) return;
-		if (event.type === "prompt") return setPrompt(event.prompt);
+	useFreshStoreEvent(event, (next) => {
+		if (next.type === "prompt") return setPrompt(next.prompt);
 		setWaiting(false);
 		setPrompt(null);
-		if (event.type === "done") toast(event.verified ? t("The connection is valid; GitHub confirmed the account.") : t("GitHub connected; the credentials are saved."), "info", 5000);
-		if (event.type === "error") toast(serverText(event.message), "error", 9000);
+		if (next.type === "done") toast(next.verified ? t("The connection is valid; GitHub confirmed the account.") : t("GitHub connected; the credentials are saved."), "info", 5000);
+		if (next.type === "error") toast(serverText(next.message), "error", 9000);
 		reload();
-	}, [event?.nonce]);
+	});
 	if (!data) return { title: "GitHub Connect", loading: !error, error, rows: [] };
 	const account = data.account;
 	const pendingPrompt = prompt ?? data.pending?.prompt ?? null;
@@ -346,21 +346,20 @@ function mailScreen() {
 	const [waiting, setWaiting] = useState(false);
 	// Only the page that asked opens the sign-in page; other open tabs just show the link.
 	const opening = useRef(false);
-	useEffect(() => {
-		if (!event) return;
-		if (event.type === "prompt") {
-			setUrl(event.url);
-			if (opening.current) openSystemLink(event.url);
+	useFreshStoreEvent(event, (next) => {
+		if (next.type === "prompt") {
+			setUrl(next.url);
+			if (opening.current) openSystemLink(next.url);
 			opening.current = false;
 			return;
 		}
 		opening.current = false;
 		setWaiting(false);
 		setUrl(null);
-		if (event.type === "done") toast(t("Mailbox {email} connected; the credentials are saved.", { email: event.account?.email ?? "" }), "info", 5000);
-		if (event.type === "error") toast(serverText(event.message), "error", 9000);
+		if (next.type === "done") toast(t("Mailbox {email} connected; the credentials are saved.", { email: next.account?.email ?? "" }), "info", 5000);
+		if (next.type === "error") toast(serverText(next.message), "error", 9000);
 		reload();
-	}, [event?.nonce]);
+	});
 	if (!data) return { title: "Mail Connect", loading: !error, error, rows: [] };
 	const busy = waiting || !!data.pending;
 	const signInUrl = url ?? data.pending?.url ?? null;

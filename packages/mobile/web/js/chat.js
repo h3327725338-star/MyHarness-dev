@@ -125,6 +125,20 @@ export function Chat() {
 		if (stick.current) node.scrollTop = node.scrollHeight;
 	}, [chat.id, chat.items, chat.toolRuns, chat.running, chat.loadingOlder, chat.dialogs]);
 
+	// The conversation also grows while its items stay the same (a reply being written out, a block of work folding
+	// open, a picture arriving): the end stays in view then too.
+	const hasTurns = chat.items.length > 0;
+	useEffect(() => {
+		const node = scroll.current;
+		const inner = node?.querySelector(".chat-inner");
+		if (!inner || typeof ResizeObserver !== "function") return;
+		const observer = new ResizeObserver(() => {
+			if (stick.current) node.scrollTop = node.scrollHeight;
+		});
+		observer.observe(inner);
+		return () => observer.disconnect();
+	}, [chat.id, hasTurns]);
+
 	// The keyboard takes space from the conversation: the end stays in view.
 	useEffect(() => onInsets(() => stick.current && requestAnimationFrame(() => toBottom(false))), []);
 

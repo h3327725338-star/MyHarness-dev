@@ -1,6 +1,6 @@
 // Entry of the phone page: three panes side by side (chats, conversation, browser), everything else over them.
 // native.js comes first: it routes requests to other sites through the Android shell before any model SDK loads.
-import { browserBack, haptic, nativeReady, onNative, openExternal, pushBack } from "./native.js";
+import { browserBack, haptic, nativeReady, onBannerHint, onNative, openExternal, openNotificationSettings, pushBack } from "./native.js";
 import { zhCN, zhUnits } from "/shared/locales/zh-CN.js";
 import { html, render, useEffect, useRef } from "/shared/ui.js";
 import { MOBILE_ZH, MOBILE_ZH_UNITS } from "./locale-zh.js";
@@ -49,6 +49,17 @@ function App() {
 		nav.go = (pane) => pager.go(pane);
 		nav.openSettings = (section) => openSettings(section);
 		nav.openLink = () => openLinkPage();
+		// A phone that keeps banners off: said once, the first time a reply ended while the app was in the background.
+		onBannerHint(async () => {
+			const { confirmSheet } = await import("./sheets.js");
+			const { t } = await import("/shared/i18n.js");
+			const open = await confirmSheet({
+				title: t("The reply was ready, but nothing popped up?"),
+				message: t("The notification was sent, but this phone only shows banners for apps you allow. Open the notification settings and turn on “Floating notifications” (and “Lock screen notifications” if you want) for MyHarness."),
+				confirmLabel: t("Open settings"),
+			});
+			if (open) openNotificationSettings();
+		});
 		nav.openUrl = (url, options = {}) => {
 			if (options.external || !/^https?:/i.test(url)) return openExternal(url);
 			haptic("tick");

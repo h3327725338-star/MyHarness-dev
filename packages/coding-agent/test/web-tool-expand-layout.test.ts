@@ -42,6 +42,24 @@ describe("Expanded tool card layout", () => {
 		expect(taskList).toBeGreaterThan(-1);
 		expect(openRaw).toBeLessThan(taskList);
 	});
+	it("keeps the delegation card as light as a tool row: no side rule, no phase pill, one line per sub-task", () => {
+		const agentRule = /\.sub-agent \{([^}]*)\}/.exec(css)?.[1] ?? "";
+		expect(agentRule).toBeTruthy();
+		// Nothing rules the card at its left, and it does not pad itself in from a rule.
+		expect(agentRule).not.toMatch(/border-left|padding-left/);
+		const details = /function AgentDetails[\s\S]*?\n\}\n/.exec(transcriptSrc)?.[0] ?? "";
+		expect(details).toContain("sub-phase-head");
+		// The phase row is the sub-agent list's: a thin status mark and its "Phase n: name" wording, no filled pill, no bold name.
+		expect(details).toContain("TaskStatusIcon");
+		expect(details).not.toMatch(/badge|<strong/);
+		expect(css).toMatch(/\.sub-phase-head \{[^}]*font-size: var\(--fs-xs\)/);
+		expect(css).not.toMatch(/\.sub-phase-head \{[^}]*font-weight/);
+		// A sub-task's activity or error is one ellipsized line inside its row (the whole text is its title), never a block below it.
+		expect(transcriptSrc).toMatch(/sub-note truncate/);
+		expect(transcriptSrc).not.toMatch(/sub-last|TASK_DOT/);
+		expect(css).not.toMatch(/\.sub-last/);
+		expect(/\.sub-note \{([^}]*)\}/.exec(css)?.[1]).toMatch(/min-width: 0/);
+	});
 	it("dropped the edit estimate mechanism from the wire and the browser", () => {
 		const sources = [
 			"../web/js/turns.js",

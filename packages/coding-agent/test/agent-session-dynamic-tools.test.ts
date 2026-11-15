@@ -100,6 +100,38 @@ describe("AgentSession dynamic tool registration", () => {
 		session.dispose();
 	});
 
+	it("announces a change of the active tool set, and only a real change", async () => {
+		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const resourceLoader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			modelRuntime: await createManualModelRuntime(agentDir),
+			settingsManager,
+			sessionManager: SessionManager.inMemory(),
+			resourceLoader,
+		});
+		const changes: Array<readonly string[]> = [];
+		session.subscribe((event) => {
+			if (event.type === "active_tools_changed") changes.push(event.names);
+		});
+		const active = session.getActiveToolNames();
+		expect(active).toContain("read");
+
+		// The same tools in another order are no change.
+		session.setActiveToolsByName([...active].reverse());
+		expect(changes).toEqual([]);
+
+		session.setActiveToolsByName(active.filter((name) => name !== "read"));
+		expect(changes).toHaveLength(1);
+		expect(changes[0]).not.toContain("read");
+		expect([...changes[0]].sort()).toEqual(session.getActiveToolNames().sort());
+
+		session.dispose();
+	});
+
 	it("exposes web tools only while Web Search is enabled", async () => {
 		const settingsManager = SettingsManager.inMemory({ webSearch: { enabled: false } });
 		const sessionManager = SessionManager.inMemory();

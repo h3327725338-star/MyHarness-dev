@@ -21,11 +21,29 @@
  * their claude.ai account (ENABLE_CLAUDEAI_MCP_SERVERS=false). A change of the chat's tools applies from the next
  * turn: `claude` reads its tool list when it starts, so it is started again between turns.
  *
- * What is left of the subscription's plan limits (the 5-hour and the weekly window) shows in the status bar of every
- * Claude Code chat, the same in all of them: the limits belong to the subscription, not to a chat. Any chat's `claude`
- * reports them with the answers it gets (rate_limit_event), and a chat that opens with none known or only old ones, or a
- * window that resets, has a short-lived `claude` asked for them the way its own /usage does (get_usage, with no model
- * request). The usage endpoint behind it refuses frequent questions, so they are few (LIMITS_*).
+ * Sub-agents: a MyHarness sub-agent can run on these models (`delegatedHostTools` on the models; MyHarness hands this
+ * file to the sub-agent's worker process). In such a session (`ctx.agentRole === "delegated"`) `claude` gets none of
+ * its own tools (`--tools ""`): every tool of the sub-agent's role goes over the MCP endpoint, the file and shell
+ * tools too, so MyHarness's read-only guard and its sandbox or worktree limits hold for each call. Nothing of a
+ * sub-agent is kept in the user's Claude Code history (`--no-session-persistence`, no link), and it has no memory
+ * folder of Claude Code's (CLAUDE_CODE_DISABLE_AUTO_MEMORY): that folder's path follows the working folder, which
+ * every sub-agent has its own, and with it in the prompt no two sub-agents could share a cached prompt.
+ *
+ * Web search source: apart from the provider, `claude`'s own WebSearch is offered to MyHarness's web_search as a search
+ * source ("Claude Code" in Web Search settings, off until the user switches it on, with a model of its own choice
+ * there). Chats on any model use it then. A search starts a `claude` of its own with WebSearch as its only tool, has
+ * it search every query of the call at once, and stops it when the results are in. It returns titles and URLs only;
+ * MyHarness merges them with its other sources and reads the pages itself. Each search is a model request on the
+ * user's plan, and nothing of it is kept in their Claude Code history.
+ *
+ * What is left of the subscription's plan limits (the 5-hour and the weekly window, and a weekly limit of a single
+ * model where the plan has one) is one set of numbers for the whole process: the limits belong to the subscription,
+ * not to a chat. MyHarness shows them beside the input box of every chat, on whatever model, with the time until each
+ * window resets (pi.registerPlanUsageSource; a MyHarness build from before that shows the percentages in the status
+ * bar of the chats on Claude Code instead). Any chat's `claude` reports them with the answers it gets
+ * (rate_limit_event), and when none are known, they are old, a window has reset or the user asks, a short-lived
+ * `claude` is asked for them the way its own /usage does (get_usage, with no model request). The usage endpoint behind
+ * it refuses frequent questions, so they are few (LIMITS_*).
  *
  * Compaction belongs to `claude` as well: its conversation holds the real context, so these models are marked
  * managesOwnContext. MyHarness shows how full the window is and neither gates on it nor compacts. "Compact now" is passed
@@ -103,18 +121,26 @@ const BACKGROUND_SHELLS: Record<string, string> = {
 	bash: `Start a long-running process (a dev server, a file watcher) in the background of MyHarness and get its job id at once. It keeps running after your reply ends; the user sees it in MyHarness's Background panel with its output and a stop button. Use your own Bash tool for every other command. Read its output with ${MCP_PREFIX}job_output and stop it with ${MCP_PREFIX}job_kill; what MyHarness's instructions say about a background job that ends applies to it.`,
 	pwsh: `The same as ${MCP_PREFIX}bash, in PowerShell: start a long-running process in the background of MyHarness and get its job id at once. Use your own Bash tool for every other command.`,
 };
-/** MyHarness tools `claude` is not offered over MCP: the card tool, and the ones its own tool does the work of. */
-const notOffered = (name: string) =>
-	name === PASSTHROUGH_TOOL || (name in OWN_TOOLS_FOR && !(name in BACKGROUND_SHELLS));
+/**
+ * MyHarness tools `claude` is not offered over MCP: the card tool, and the ones its own tool does the work of. In a
+ * sub-agent (`hostOnly`) none of its own tools does any work, so every tool but the card tool is offered.
+ */
+const notOffered = (name: string, hostOnly = false) =>
+	name === PASSTHROUGH_TOOL || (!hostOnly && name in OWN_TOOLS_FOR && !(name in BACKGROUND_SHELLS));
 
-/** Claude Code's own tools for a chat whose MyHarness tools are `active`: the `--tools` list, sorted, without repeats. */
-export function ownToolsFor(active: string[]): string[] {
+/**
+ * Claude Code's own tools for a chat whose MyHarness tools are `active`: the `--tools` list, sorted, without repeats.
+ * A sub-agent (`hostOnly`) gets none: MyHarness confines a sub-agent by checking every tool call it runs (read-only, or
+ * inside the sub-agent's own folder), and a tool `claude` runs by itself never passes that check.
+ */
+export function ownToolsFor(active: string[], hostOnly = false): string[] {
+	if (hostOnly) return [];
 	return [...new Set(active.flatMap((name) => OWN_TOOLS_FOR[name] ?? []))].sort();
 }
 
 /** The MyHarness tools of `active` that `claude` gets over MCP, by name. */
-export function offeredNames(active: string[]): string[] {
-	return active.filter((name) => !notOffered(name));
+export function offeredNames(active: string[], hostOnly = false): string[] {
+	return active.filter((name) => !notOffered(name, hostOnly));
 }
 const BACKGROUND_SHELL_SCHEMA = {
 	type: "object",
@@ -154,6 +180,21 @@ const TOOL_USE_ID_META = "claudecode/toolUseId";
  */
 const UNSEEN_CALL_MS = 60_000;
 /**
+ * `claude` ends its own Bash command at the time limit the call names, or at its longest one when it names none
+ * (BASH_MAX_TIMEOUT_MS, ten minutes unless the user's Claude Code settings say otherwise). Its other tools (Read, Write,
+ * Edit, Grep, Glob) take seconds; this is the most any of them gets.
+ */
+const BASH_MAX_TIMEOUT_MS = 10 * 60_000;
+const OWN_TOOL_LIMIT_MS = 10 * 60_000;
+/**
+ * A tool of `claude`'s own that has said nothing this long after its time limit is taken as stuck (seen 2026-11-13: a
+ * Bash call with a two-minute limit came back after six and a half hours, and the chat waited all that time). The
+ * request is stopped and the task goes on, as after a cut-off response.
+ */
+const OWN_TOOL_GRACE_MS = 5 * 60_000;
+/** How often the wait for `claude`'s own tools is looked at; a longer gap between two looks is a computer that slept. */
+const OWN_TOOL_CHECK_MS = 15_000;
+/**
  * MyHarness bounds what its tools return (50 KB by default) and every model gets a result as MyHarness made it. Left
  * alone, `claude` saves an MCP result of over 50,000 characters, or 25,000 tokens, to a file and gives the model the
  * path instead, which a chat without its Read tool could not open. These are the most `claude` lets a tool declare.
@@ -186,7 +227,8 @@ function ownEquivalents(active: string[]): string {
  * and what of Claude Code does not exist here. What MyHarness itself can bring back after a reply (a background job, a
  * sub-agent, a scheduled task) is left to MyHarness's own instructions, which describe it.
  */
-export function appendPromptFor(active: string[]): string {
+export function appendPromptFor(active: string[], hostOnly = false): string {
+	if (hostOnly) return SUB_AGENT_PROMPT;
 	const offered = offeredNames(active);
 	const tool = (name: string) => `${MCP_PREFIX}${name}`;
 	const shells = ["bash", "pwsh"].filter((name) => offered.includes(name)).map(tool);
@@ -222,9 +264,27 @@ export function appendPromptFor(active: string[]): string {
 	];
 	return lines.join("\n");
 }
+/**
+ * The same for a sub-agent of MyHarness. It does not depend on the tools: MyHarness runs all of them there, and its own
+ * instructions (the sub-agent's role and task) name them. Every sub-agent starts with the same text.
+ */
+const SUB_AGENT_PROMPT = [
+	"# MyHarness",
+	"- You are running inside MyHarness as one of its sub-agents: another agent gave you this task and reads your final reply as your report. Nobody reads it in a terminal.",
+	"- After this section come MyHarness's own instructions: your role as a sub-agent, its built-in prompt and the user's model prompt. Follow all of them; where they differ from Claude Code's instructions above, MyHarness's instructions win.",
+	"",
+	"# Tools in this chat",
+	"- MyHarness decides which tools this chat has. Its instructions name them by MyHarness's plain names.",
+	`- Every tool name they list is the ${MCP_PREFIX}<name> tool, with the arguments MyHarness's instructions describe. MyHarness runs it and enforces the limits of your role.`,
+	"- You have no tools of your own here: Claude Code's Read, Write, Edit, Grep, Glob, Bash and its other tools do not exist in this chat. A tool MyHarness's instructions do not list is not available.",
+	"",
+	"# What does not exist here",
+	"- Claude Code's own sub-agents, wake-ups, scheduled turns, loops, monitors, background tasks and task notifications do not exist here.",
+	"- Your work ends with your final reply. Never say you will check back or report later.",
+].join("\n");
 /** What `claude` gets appended to its own system prompt in a chat: the section above, then MyHarness's whole prompt. */
-export function appendedPrompt(active: string[], systemPrompt: string | undefined): string {
-	return [appendPromptFor(active), (systemPrompt ?? "").trim()].filter(Boolean).join("\n\n");
+export function appendedPrompt(active: string[], systemPrompt: string | undefined, hostOnly = false): string {
+	return [appendPromptFor(active, hostOnly), (systemPrompt ?? "").trim()].filter(Boolean).join("\n\n");
 }
 
 /** A file inside the chat's folder is named from that folder ("src/app.ts"); any other by its whole path. */
@@ -272,6 +332,48 @@ const STOPPED_BY_APP =
 /** What `claude` reads after a response cut off at the output limit whose tool calls were therefore never run. */
 export const CUT_CALLS_NOTE = `[system-reminder] Your last response was cut off at the output limit, so none of its tool calls ran. ${STOPPED_BY_APP} Go on with the task: make the calls again, and keep each response well within the limit, splitting large work into smaller steps.`;
 
+/** What `claude` reads after one of its own tools did not come back in time and MyHarness stopped the request (see OWN_TOOL_GRACE_MS). */
+export const STUCK_TOOL_NOTE = `[system-reminder] A tool call of your last response had not returned long after its own time limit, so the request was stopped. ${STOPPED_BY_APP} What that call started may be half done or still running: check its state before you rely on it, then go on with the task, in smaller steps where that helps.`;
+
+/** What the card of such a call shows, and what the chat keeps as its result. */
+const STUCK_TOOL_TEXT = "这个工具超过它自己的时限很久仍没有返回，MyHarness 已停下这一步，任务会接着做。";
+/** What the card of a call shows that `claude` gave up before running it (a request it started over, a turn that ended). */
+const DROPPED_CALL_TEXT = "Claude Code 没有运行这次调用：它所在的那次请求中途断开后重新开始了。";
+const UNANSWERED_CALL_TEXT = "Claude Code 没有报告这个工具的结果。";
+
+/**
+ * The longest `claude`'s Bash lets a command run in a chat's folder: its own ten minutes, or what the environment or
+ * the Claude Code settings of the user or the project set instead. Read when `claude` starts, as `claude` reads it.
+ */
+export function bashMaxTimeout(env: NodeJS.ProcessEnv, settingsFiles: string[]): number {
+	let longest = BASH_MAX_TIMEOUT_MS;
+	const take = (values: any) => {
+		for (const name of ["BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS"]) {
+			const value = Number(values?.[name]);
+			if (Number.isFinite(value) && value > longest) longest = value;
+		}
+	};
+	take(env);
+	for (const file of settingsFiles) {
+		try {
+			take(JSON.parse(fs.readFileSync(file, "utf8")).env);
+		} catch {
+			// No such file, or not JSON: `claude` does not take a limit from it either.
+		}
+	}
+	return longest;
+}
+
+/**
+ * How long one of `claude`'s own tools may take before its result is due: for Bash the limit the call names (never more
+ * than `bashMax`), or `bashMax` while the call names none or its arguments are still arriving.
+ */
+export function ownToolLimit(name: string | undefined, input: any, bashMax: number): number {
+	if (name !== "Bash") return OWN_TOOL_LIMIT_MS;
+	const asked = Number(input?.timeout);
+	return Number.isFinite(asked) && asked > 0 ? Math.min(asked, bashMax) : bashMax;
+}
+
 /**
  * The most a request may write, thinking included: the model's maxTokens, as on MyHarness's own Anthropic requests. A
  * smaller cap a caller asks for is not passed on, because `claude` cannot switch thinking off and would spend it all on
@@ -313,6 +415,7 @@ export function launchEnv(
 	base: NodeJS.ProcessEnv,
 	maxOutputTokens: number | undefined,
 	contextWindow: number,
+	hostOnly = false,
 ): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...base };
 	for (const name of STRIPPED_ENV) delete env[name];
@@ -338,6 +441,11 @@ export function launchEnv(
 	env.CLAUDE_CODE_SEND_FEEDBACK = "0";
 	// MyHarness's output limit for the model in place of `claude`'s own: it bounds a request whose thinking runs on.
 	if (maxOutputTokens) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxOutputTokens);
+	// A sub-agent has no memory folder of Claude Code's: it could not write there (none of `claude`'s own tools, and
+	// MyHarness's stay inside its sandbox or worktree), and the folder's path, which follows the working folder, would
+	// make the start of every sub-agent's prompt its own, so no two of them could share a cached prompt. It also
+	// leaves no empty project folder in the user's Claude Code data for every sub-agent that ran.
+	if (hostOnly) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
 	return env;
 }
 
@@ -356,16 +464,24 @@ type Shared = {
 	configFiles: Set<string>;
 	/** Chats whose next request is MyHarness's summary, not a turn of the conversation. */
 	compacting: Set<string>;
+	/** Sessions that are sub-agents of MyHarness: MyHarness runs every tool there (see hostRunsTools). */
+	delegated?: Set<string>;
 	models?: any[];
 	mcp?: McpEndpoint;
 	/** The subscription's plan limits as seen last by any chat, shown in every Claude Code chat. */
 	limits?: Limits;
-	/** The get_usage question under way, when the last one was asked, and when one failed last. */
+	/** The get_usage question under way, when the last one was asked, and when one failed last (and why). */
 	limitsQuery?: Promise<void>;
 	limitsQueriedAt?: number;
 	limitsFailedAt?: number;
+	limitsError?: string;
 	/** Fires when the next window resets. */
 	limitsTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Tells MyHarness's own display of plan limits that the numbers changed (pi.registerPlanUsageSource). Unset in a
+	 * MyHarness build from before that display: the status bar of each Claude Code chat shows them there.
+	 */
+	planUsageChanged?: () => void;
 };
 const SHARED_KEY = Symbol.for("myharness.claude-code-shell");
 const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
@@ -375,6 +491,14 @@ const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
 	compacting: new Set(),
 };
 (globalThis as any)[SHARED_KEY] = shared;
+
+/**
+ * Whether MyHarness runs every tool of this session, `claude` none of its own. True for a sub-agent's session
+ * (`ctx.agentRole === "delegated"`, noted when the session starts): MyHarness confines a sub-agent by checking each tool
+ * call it runs against the sub-agent's limits, and such a session has no card tool to show a call `claude` would run by
+ * itself. The models say so to MyHarness (`delegatedHostTools`), which gives no sub-agent to a program that cannot.
+ */
+const hostRunsTools = (sessionId: string): boolean => shared.delegated?.has(sessionId) === true;
 
 /** An app tool `claude` called: the card MyHarness runs and the MCP request `claude` sends meet here, in either order. */
 type AppCall = {
@@ -389,13 +513,21 @@ type AppCall = {
 type AppRequest = { name: string; key: string; toolUseId?: string; done: (result: any) => void };
 const appError = (text: string) => ({ content: [{ type: "text", text }], isError: true });
 
-type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
+type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void; settled: boolean };
 function deferred<T>(): Deferred<T> {
-	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => {
-		resolve = done;
+	let done!: (value: T) => void;
+	const promise = new Promise<T>((resolve) => {
+		done = resolve;
 	});
-	return { promise, resolve };
+	const self: Deferred<T> = {
+		promise,
+		settled: false,
+		resolve: (value) => {
+			self.settled = true;
+			done(value);
+		},
+	};
+	return self;
 }
 
 const dataDir = () =>
@@ -591,7 +723,15 @@ function ensureMcp(): Promise<McpEndpoint> {
 
 /** One plan limit window: how much of it is used (0-100), when it resets and when that was seen (ms since 1970). */
 export type LimitWindow = { used: number; resetsAt?: number; observedAt: number };
-export type Limits = { five_hour?: LimitWindow; seven_day?: LimitWindow };
+/** A weekly limit of one model's own ("Fable"), which some plans have beside the limits across all models. */
+export type ModelLimit = { label: string; used: number; resetsAt?: number };
+export type Limits = {
+	five_hour?: LimitWindow;
+	seven_day?: LimitWindow;
+	/** The single models' weekly limits, and when they were seen: only get_usage tells them, always all of them. */
+	models?: ModelLimit[];
+	modelsAt?: number;
+};
 const LIMIT_WINDOWS = ["five_hour", "seven_day"] as const;
 
 /** A rate_limit_event, which `claude` sends with an answer when a window's whole percentage or reset time changed. */
@@ -625,6 +765,21 @@ export function limitsFromUsage(answer: any, observedAt: number): Limits {
 			observedAt,
 		};
 	}
+	// The same answer lists every limit of the plan by kind; a weekly limit of one model's own names that model
+	// (seen with claude 2.1.325 on a Max plan, 2026-11-14: kind "weekly_scoped", scope.model.display_name "Fable").
+	const listed: any[] | undefined = Array.isArray(answer?.rate_limits?.limits) ? answer.rate_limits.limits : undefined;
+	if (listed) {
+		limits.modelsAt = observedAt;
+		limits.models = listed.flatMap((limit): ModelLimit[] => {
+			const label = limit?.scope?.model?.display_name;
+			if (limit?.kind !== "weekly_scoped" || typeof label !== "string" || !label.trim()) return [];
+			if (typeof limit.percent !== "number" || !Number.isFinite(limit.percent)) return [];
+			const resetsAt = typeof limit.resets_at === "string" ? Date.parse(limit.resets_at) : Number.NaN;
+			return [
+				{ label: label.trim(), used: limit.percent, resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined },
+			];
+		});
+	}
 	return limits;
 }
 
@@ -636,10 +791,16 @@ export function mergeLimits(current: Limits, next: Limits): Limits {
 		const held = current[name];
 		if (window && !(held && held.observedAt > window.observedAt)) merged[name] = window;
 	}
+	if (next.modelsAt !== undefined && !(current.modelsAt !== undefined && current.modelsAt > next.modelsAt)) {
+		merged.models = next.models ?? [];
+		merged.modelsAt = next.modelsAt;
+	}
 	return merged;
 }
 
-const limitExpired = (window: LimitWindow, now: number) => window.resetsAt !== undefined && window.resetsAt <= now;
+/** Known only from before it reset. A reading taken after its own reset time is the current one, however old that time. */
+const limitExpired = (window: LimitWindow, now: number) =>
+	window.resetsAt !== undefined && window.resetsAt <= now && window.observedAt < window.resetsAt;
 
 /** The status: what is left of each window, or "-" for one not known, or known only from before it reset. */
 export function limitsText(limits: Limits, now: number): string | undefined {
@@ -657,6 +818,88 @@ export function limitsNeedQuery(limits: Limits, now: number): boolean {
 	});
 	if (!windows.length || windows.some((window) => limitExpired(window, now))) return true;
 	return now - Math.max(...windows.map((window) => window.observedAt)) >= LIMITS_FRESH_MS;
+}
+
+/** The limits as MyHarness's own display takes them (pi.registerPlanUsageSource): what is left, by whose limit it is. */
+export type PlanUsageGroup = {
+	label: string;
+	modelIds?: string[];
+	windows: { kind: "five_hour" | "weekly"; leftPercent: number; resetsAt?: number }[];
+};
+
+/**
+ * The plan's limits across all models first (no label), then each single model's weekly limit with the models of
+ * `models` it applies to: the ones whose name has the limit's label as a word ("Fable" for "Claude Code · Fable 5.2").
+ */
+export function planUsageGroups(limits: Limits, models: { id: string; name: string }[]): PlanUsageGroup[] {
+	const left = (used: number) => Math.max(0, Math.min(100, 100 - used));
+	// A reset time that had already passed when the window was read says nothing about its next reset.
+	const ahead = (resetsAt: number | undefined, readAt: number | undefined) =>
+		resetsAt !== undefined && readAt !== undefined && resetsAt <= readAt ? undefined : resetsAt;
+	const plan = LIMIT_WINDOWS.flatMap((name) => {
+		const window = limits[name];
+		const kind = name === "five_hour" ? ("five_hour" as const) : ("weekly" as const);
+		return window
+			? [{ kind, leftPercent: left(window.used), resetsAt: ahead(window.resetsAt, window.observedAt) }]
+			: [];
+	});
+	const word = (text: string, label: string) =>
+		new RegExp(`(^|[^a-z0-9])${label.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`).test(
+			text.toLowerCase(),
+		);
+	return [
+		...(plan.length ? [{ label: "", windows: plan }] : []),
+		...(limits.models ?? []).map((limit) => ({
+			label: limit.label,
+			modelIds: models.filter((model) => word(model.name, limit.label)).map((model) => model.id),
+			windows: [
+				{
+					kind: "weekly" as const,
+					leftPercent: left(limit.used),
+					resetsAt: ahead(limit.resetsAt, limits.modelsAt),
+				},
+			],
+		})),
+	];
+}
+
+/** When the newest of the plan's two windows was seen, if any was. */
+function limitsObservedAt(limits: Limits): number | undefined {
+	const seen = LIMIT_WINDOWS.flatMap((name) => (limits[name] ? [limits[name]!.observedAt] : []));
+	return seen.length ? Math.max(...seen) : undefined;
+}
+
+/** What MyHarness's display of plan limits shows for Claude right now. */
+function planUsageSnapshot() {
+	const limits = shared.limits ?? {};
+	const now = Date.now();
+	// The earliest moment a question would really be asked again: one a minute at most.
+	const next = shared.limitsQueriedAt !== undefined ? shared.limitsQueriedAt + LIMITS_MIN_INTERVAL_MS : 0;
+	return {
+		groups: planUsageGroups(limits, MODELS),
+		observedAt: limitsObservedAt(limits),
+		refreshing: !!shared.limitsQuery,
+		error: shared.limitsFailedAt !== undefined ? (shared.limitsError ?? "claude 没有给出额度") : undefined,
+		nextRefreshAt: next > now ? next : undefined,
+	};
+}
+
+/**
+ * MyHarness's display asks for the numbers: `claude` is asked when none are known, a window has reset or the newest
+ * reading is older than `maxAgeMs`. The user's own request (no age allowed) is also made soon after a failure.
+ */
+function refreshPlanUsage(maxAgeMs: number = LIMITS_MIN_INTERVAL_MS): Promise<void> {
+	const limits = shared.limits ?? {};
+	const now = Date.now();
+	const observedAt = limitsObservedAt(limits);
+	const readAt = limits.modelsAt ?? 0;
+	const expired =
+		LIMIT_WINDOWS.some((name) => limits[name] && limitExpired(limits[name]!, now)) ||
+		(limits.models ?? []).some(
+			(limit) => limit.resetsAt !== undefined && limit.resetsAt <= now && readAt < limit.resetsAt,
+		);
+	if (observedAt !== undefined && !expired && now - observedAt < maxAgeMs) return Promise.resolve();
+	return refreshLimits(maxAgeMs <= 0);
 }
 
 /** What get_usage needs of `claude`: none of its tools, settings, MCP servers or slash commands, and no transcript. */
@@ -692,15 +935,24 @@ function showStatus(
 	ctx: any = shared.contexts.get(sessionId),
 	onClaudeCode = usesClaudeCode(ctx),
 ): void {
-	const limits = onClaudeCode ? limitsText(shared.limits ?? {}, Date.now()) : undefined;
+	// MyHarness's own display of plan limits, where there is one, shows them in every chat: not here a second time.
+	const limits = onClaudeCode && !shared.planUsageChanged ? limitsText(shared.limits ?? {}, Date.now()) : undefined;
 	const compacting = shared.sessions.get(sessionId)?.compactingNow ? "Claude Code 正在压缩上下文…" : undefined;
 	try {
 		ctx?.ui?.setStatus?.(PROVIDER_ID, [limits, compacting].filter(Boolean).join(" · ") || undefined);
 	} catch {}
 }
 
-/** Every open Claude Code chat shows the same limits. */
+/** MyHarness's display of plan limits reads them again: the numbers changed, or a reading began or ended. */
+function notifyPlanUsage(): void {
+	try {
+		shared.planUsageChanged?.();
+	} catch {}
+}
+
+/** The limits are the same everywhere: MyHarness's display of them follows, and every open Claude Code chat. */
 function showLimits(): void {
+	notifyPlanUsage();
 	for (const [sessionId, ctx] of shared.contexts) showStatus(sessionId, ctx);
 }
 
@@ -728,7 +980,8 @@ function scheduleLimitsReset(): void {
 			shared.limitsTimer = undefined;
 			showLimits();
 			scheduleLimitsReset();
-			if ([...shared.contexts.values()].some(usesClaudeCode)) void refreshLimits();
+			// A sub-agent's worker has no status bar to show them in.
+			if ([...shared.contexts].some(([id, ctx]) => !hostRunsTools(id) && usesClaudeCode(ctx))) void refreshLimits();
 		},
 		Math.min(next - now + LIMITS_RESET_DELAY_MS, MAX_TIMER_MS),
 	);
@@ -736,27 +989,37 @@ function scheduleLimitsReset(): void {
 	shared.limitsTimer = timer;
 }
 
-/** Asks `claude` for the plan limits, unless it was asked within the last minute or failed lately. */
-function refreshLimits(): Promise<void> {
+/**
+ * Asks `claude` for the plan limits, unless it was asked within the last minute or failed lately. `asked` is the user's
+ * own request to read them again: that one is made soon after a failure too, though not twice a minute either.
+ */
+function refreshLimits(asked = false): Promise<void> {
 	if (shared.limitsQuery) return shared.limitsQuery;
 	const now = Date.now();
 	if (shared.limitsQueriedAt !== undefined && now - shared.limitsQueriedAt < LIMITS_MIN_INTERVAL_MS) {
 		return Promise.resolve();
 	}
-	if (shared.limitsFailedAt !== undefined && now - shared.limitsFailedAt < LIMITS_RETRY_MS) return Promise.resolve();
+	if (!asked && shared.limitsFailedAt !== undefined && now - shared.limitsFailedAt < LIMITS_RETRY_MS) {
+		return Promise.resolve();
+	}
 	shared.limitsQueriedAt = now;
 	const query: Promise<void> = queryLimits()
 		.then((limits) => {
 			shared.limitsFailedAt = undefined;
+			shared.limitsError = undefined;
 			noteLimits(limits);
 		})
-		.catch(() => {
+		.catch((error) => {
 			shared.limitsFailedAt = Date.now();
+			shared.limitsError = error instanceof Error ? error.message : String(error);
 		})
 		.finally(() => {
 			if (shared.limitsQuery === query) shared.limitsQuery = undefined;
+			// The display shows that a reading is under way, and how it ended.
+			notifyPlanUsage();
 		});
 	shared.limitsQuery = query;
+	notifyPlanUsage();
 	return query;
 }
 
@@ -770,7 +1033,11 @@ function queryLimits(): Promise<Limits> {
 	const observedAt = Date.now();
 	return new Promise((resolve, reject) => {
 		const env = launchEnv(process.env, undefined, readContextWindow());
-		const child = spawn(binary, LIMITS_ARGS, {
+		// A script stands in for `claude` in tests (MYHARNESS_CLAUDE_BIN): it is run by this process's own Node.
+		const [command, commandArgs] = /\.(mjs|cjs|js)$/i.test(binary)
+			? [process.execPath, [binary, ...LIMITS_ARGS]]
+			: [binary, LIMITS_ARGS];
+		const child = spawn(command, commandArgs, {
 			cwd: os.homedir(),
 			env,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -883,8 +1150,29 @@ class CliSession {
 	private stderr = "";
 	private gotInit = false;
 	private resumedFrom?: string;
+	/** One of `claude`'s own tools did not come back in time and its request was stopped; MyHarness has not gone on yet. */
+	stuck = false;
+	/**
+	 * The running program has been sent a turn of this chat, so it holds the conversation. A chat with a link is
+	 * continued from Claude Code's saved conversation after a restart; a sub-agent keeps none, so a program started
+	 * again there is given the chat's earlier messages as text.
+	 */
+	conversationHere = false;
 	/** Results of Claude Code's own tools, by tool_use id. */
 	private toolResults = new Map<string, Deferred<any>>();
+	/** Each such tool that is still running: its name and how long it may take (see ownToolLimit). */
+	private ownCalls = new Map<string, { name?: string; limit: number }>();
+	/** The longest `claude`'s Bash lets a command run, as read when it started. */
+	private bashMax = BASH_MAX_TIMEOUT_MS;
+	/** Looks at the wait for `claude`'s own tools while one is running; `quietMs` is how long nothing has come back. */
+	private ownWatch?: { timer: ReturnType<typeof setInterval>; lookedAt: number; quietMs: number };
+	/** Questions `claude` has put to the user that are still open; a tool waits behind them as long as it takes. */
+	private openPrompts = 0;
+	/**
+	 * The response `claude` is streaming in the main conversation, with the tool calls it has begun so far. It is over
+	 * at its `message_stop`; one that never gets there was given up (see followResponse).
+	 */
+	private streaming?: { id?: string; calls: string[] };
 	/** App tool calls of this turn by tool_use id, in the order `claude` made them. */
 	private appCalls = new Map<string, AppCall>();
 	/** MCP requests that arrived before the call they belong to was seen. */
@@ -918,6 +1206,11 @@ class CliSession {
 		return shared.contexts.get(this.sessionId)?.cwd ?? process.cwd();
 	}
 
+	/** A sub-agent's session: MyHarness runs every tool, and nothing of it is kept in Claude Code's history. */
+	get hostOnly(): boolean {
+		return hostRunsTools(this.sessionId);
+	}
+
 	/** The MyHarness tools switched on in this chat, by name: what decides which tools `claude` has. */
 	activeNames(): string[] {
 		return this.tools.map((tool) => tool.name).filter((name) => name !== PASSTHROUGH_TOOL);
@@ -925,14 +1218,16 @@ class CliSession {
 
 	/** Claude Code's own tools this chat gets: the ones a switched-on MyHarness tool stands for. */
 	ownTools(): string[] {
-		return ownToolsFor(this.activeNames());
+		return ownToolsFor(this.activeNames(), this.hostOnly);
 	}
 
 	offeredTools(): any[] {
+		const hostOnly = this.hostOnly;
 		return this.tools
-			.filter((tool) => !notOffered(tool.name))
+			.filter((tool) => !notOffered(tool.name, hostOnly))
 			.map((tool) =>
-				BACKGROUND_SHELLS[tool.name]
+				// A sub-agent's shell is MyHarness's own, with its own arguments: nothing else runs its commands.
+				BACKGROUND_SHELLS[tool.name] && !hostOnly
 					? { name: tool.name, description: BACKGROUND_SHELLS[tool.name], inputSchema: BACKGROUND_SHELL_SCHEMA }
 					: {
 							name: tool.name,
@@ -948,7 +1243,7 @@ class CliSession {
 	 * restarts `claude` with the new one between turns.
 	 */
 	appendPrompt(systemPrompt: string | undefined): string {
-		return appendedPrompt(this.activeNames(), systemPrompt);
+		return appendedPrompt(this.activeNames(), systemPrompt, this.hostOnly);
 	}
 
 	/** A file of this chat's for `claude` to read when it starts; removed when MyHarness exits (a side request's at close). */
@@ -1028,7 +1323,10 @@ class CliSession {
 				};
 				args.push("--mcp-config", this.privateFile("mcp", ".json", JSON.stringify(config)));
 			}
-			const link = readLinks()[this.sessionId];
+			// A sub-agent runs once and is never continued: nothing of it is kept in the user's Claude Code history,
+			// and it has no link (workers of one batch run at the same time and would write the links file together).
+			const link = this.hostOnly ? undefined : readLinks()[this.sessionId];
+			if (this.hostOnly) args.push("--no-session-persistence");
 			if (link && path.resolve(link.cwd) === path.resolve(this.cwd)) {
 				args.push("--resume", link.claudeSessionId);
 				this.resumedFrom = link.claudeSessionId;
@@ -1036,8 +1334,24 @@ class CliSession {
 				this.resumedFrom = undefined;
 			}
 		}
-		const env = launchEnv(process.env, outputLimitFor(model), readContextWindow());
-		const child = spawn(binary, args, { cwd: this.cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		// A program started now has seen nothing of this chat yet (see conversationHere).
+		this.conversationHere = false;
+		const env = launchEnv(process.env, outputLimitFor(model), readContextWindow(), this.hostOnly);
+		this.bashMax = bashMaxTimeout(env, [
+			path.join(os.homedir(), ".claude", "settings.json"),
+			path.join(this.cwd, ".claude", "settings.json"),
+			path.join(this.cwd, ".claude", "settings.local.json"),
+		]);
+		// A script stands in for `claude` in tests (MYHARNESS_CLAUDE_BIN): it is run by this process's own Node.
+		const [command, commandArgs] = /\.(mjs|cjs|js)$/i.test(binary)
+			? [process.execPath, [binary, ...args]]
+			: [binary, args];
+		const child = spawn(command, commandArgs, {
+			cwd: this.cwd,
+			env,
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
 		this.child = child;
 		this.gotInit = false;
 		this.stderr = "";
@@ -1077,6 +1391,9 @@ class CliSession {
 			waiting.resolve({ is_error: true, content: reason });
 			this.toolResults.delete(id);
 		}
+		this.ownCalls.clear();
+		this.stopOwnWatch();
+		this.streaming = undefined;
 		this.forgetAppCalls(reason);
 		this.compactDone?.(undefined);
 		this.compactDone = undefined;
@@ -1117,19 +1434,26 @@ class CliSession {
 			this.forgetAppCalls("这一轮已经结束");
 		}
 		this.turnActive = true;
+		this.conversationHere = true;
 		this.send({ type: "user", session_id: "", parent_tool_use_id: null, message: { role: "user", content } });
 	}
 
-	interrupt(): void {
+	interrupt(reason = "已中断"): void {
 		if (!this.turnActive) return;
 		this.turnActive = false;
 		this.draining = true;
 		this.queue.length = 0;
 		this.send({ type: "control_request", request_id: randomUUID(), request: { subtype: "interrupt" } });
-		this.releaseWaiting("已中断");
+		this.releaseWaiting(reason);
 		if (this.interruptTimer) clearTimeout(this.interruptTimer);
 		this.interruptTimer = setTimeout(() => {
-			if (this.draining) this.close();
+			if (!this.draining) return;
+			// A turn sent since then sits behind the interrupt in a program that is not stopping. Ending the program
+			// alone would leave that turn waiting for an answer nobody writes any more, so its reader is told to
+			// start the program again and send the turn once more.
+			const turnWaiting = this.turnActive;
+			this.close();
+			if (turnWaiting) this.push({ type: "__exit", restart: true, problem: "claude 没有在中断后停下" });
 		}, INTERRUPT_GRACE_MS);
 		this.interruptTimer.unref();
 	}
@@ -1165,7 +1489,9 @@ class CliSession {
 		}
 		if (event.type === "system" && event.subtype === "init") {
 			this.gotInit = true;
-			if (!this.ephemeral) writeLink(this.sessionId, { claudeSessionId: event.session_id, cwd: this.cwd });
+			if (!this.ephemeral && !this.hostOnly) {
+				writeLink(this.sessionId, { claudeSessionId: event.session_id, cwd: this.cwd });
+			}
 			if (event.apiKeySource && event.apiKeySource !== "none") {
 				shared.contexts
 					.get(this.sessionId)
@@ -1191,6 +1517,7 @@ class CliSession {
 			if (this.lastCompaction) this.lastCompaction.summary = plainText(event.message?.content);
 			return;
 		}
+		this.followResponse(event);
 		this.expectTools(event);
 		// Results come whether or not the provider is reading right now: tool cards are waiting for them.
 		if (event.type === "user" && Array.isArray(event.message?.content) && !event.parent_tool_use_id) {
@@ -1198,7 +1525,9 @@ class CliSession {
 				if (block.type !== "tool_result") continue;
 				// The entry stays: a fast tool can finish before its card starts waiting. takeToolResult removes it.
 				this.toolResults.get(block.tool_use_id)?.resolve(block);
+				this.ownCalls.delete(block.tool_use_id);
 			}
+			this.noteProgress();
 			return;
 		}
 		if (event.type === "result") {
@@ -1214,6 +1543,126 @@ class CliSession {
 		}
 		if (this.compactDone) return;
 		if (event.type === "stream_event" || event.type === "assistant" || event.type === "result") this.push(event);
+	}
+
+	/**
+	 * Follows the response `claude` is streaming in the main conversation, to notice one it gives up. `claude` asks
+	 * again by itself when a request fails part-way (a dropped connection; it reports `api_retry`), and the new attempt
+	 * starts over with new tool_use ids. A call the dead attempt had begun never runs and never gets a result: its card
+	 * waited for ever, and the whole chat with it, while `claude` went on working unseen (2026-11-14: fifteen minutes,
+	 * until the user pressed Stop). Such calls are dropped the moment the next attempt shows, streamed or whole, and
+	 * the provider drops what it has read of the dead attempt (see runTurn).
+	 *
+	 * Likewise a call of an earlier response that has no result by the time `claude` asks the model again, or ends the
+	 * turn, will never have one: `claude` only goes on once every tool of a response has reported.
+	 */
+	private followResponse(event: any): void {
+		if (event.parent_tool_use_id) return;
+		if (event.type === "result") {
+			this.dropBegunCalls();
+			this.failUnanswered();
+			return;
+		}
+		if (event.type === "assistant") {
+			if (this.streaming && event.message?.id && event.message.id !== this.streaming.id) this.dropBegunCalls();
+			this.noteProgress();
+			return;
+		}
+		if (event.type !== "stream_event") return;
+		const part = event.event;
+		if (part?.type === "message_start") {
+			this.dropBegunCalls();
+			this.failUnanswered();
+			this.streaming = { id: part.message?.id, calls: [] };
+		} else if (part?.type === "content_block_start") {
+			const block = part.content_block;
+			if (block?.type === "tool_use" && typeof block.id === "string") this.streaming?.calls.push(block.id);
+		} else if (part?.type === "message_stop") {
+			this.streaming = undefined;
+		}
+		this.noteProgress();
+	}
+
+	/** The calls begun by a response `claude` gave up: nothing waits for them, and no later request is paired with them. */
+	private dropBegunCalls(): void {
+		const begun = this.streaming?.calls ?? [];
+		this.streaming = undefined;
+		for (const id of begun) {
+			const waiting = this.toolResults.get(id);
+			if (waiting) {
+				waiting.resolve({ is_error: true, content: DROPPED_CALL_TEXT });
+				this.toolResults.delete(id);
+			}
+			this.ownCalls.delete(id);
+			const call = this.appCalls.get(id);
+			if (!call) continue;
+			for (const done of call.waiters.splice(0)) done(appError(DROPPED_CALL_TEXT));
+			this.appCalls.delete(id);
+		}
+	}
+
+	/** No result is coming any more for a tool of `claude`'s own that has none yet; its card ends instead of waiting. */
+	private failUnanswered(): void {
+		for (const waiting of this.toolResults.values()) {
+			// The entry stays until its card takes it, like a result that came in time.
+			if (!waiting.settled) waiting.resolve({ is_error: true, content: UNANSWERED_CALL_TEXT });
+		}
+		this.ownCalls.clear();
+	}
+
+	// Watching the tools `claude` runs by itself
+
+	/** Something came back from `claude`: its tools are not standing still. */
+	private noteProgress(): void {
+		if (this.ownWatch) this.ownWatch.quietMs = 0;
+	}
+
+	private startOwnWatch(): void {
+		if (this.ownWatch) return;
+		const timer = setInterval(() => this.checkOwnTools(), OWN_TOOL_CHECK_MS);
+		timer.unref();
+		this.ownWatch = { timer, lookedAt: Date.now(), quietMs: 0 };
+	}
+
+	private stopOwnWatch(): void {
+		if (!this.ownWatch) return;
+		clearInterval(this.ownWatch.timer);
+		this.ownWatch = undefined;
+	}
+
+	/**
+	 * A tool of `claude`'s own has a time limit `claude` enforces itself (see ownToolLimit). When nothing at all has come
+	 * back from `claude` for that long and OWN_TOOL_GRACE_MS more, the tool is stuck inside `claude` and its card would
+	 * wait as long as that lasts. The request is stopped instead: the cards end with an error, and MyHarness goes on with
+	 * the task by itself (STUCK_TOOL_NOTE), as after a response cut off at the output limit.
+	 *
+	 * Only time `claude` is really working counts: not while it waits for a MyHarness tool's card or for the user's
+	 * answer to a question, and not time the computer slept through.
+	 */
+	private checkOwnTools(now = Date.now()): void {
+		const watch = this.ownWatch;
+		if (!watch) return;
+		const passed = Math.min(Math.max(now - watch.lookedAt, 0), 2 * OWN_TOOL_CHECK_MS);
+		watch.lookedAt = now;
+		if (this.ownCalls.size === 0) {
+			this.stopOwnWatch();
+			return;
+		}
+		const waitsForApp = [...this.appCalls.values()].some((call) => call.result === undefined);
+		if (this.openPrompts > 0 || waitsForApp) {
+			watch.quietMs = 0;
+			return;
+		}
+		watch.quietMs += passed;
+		const calls = [...this.ownCalls.values()];
+		if (watch.quietMs < Math.max(...calls.map((call) => call.limit)) + OWN_TOOL_GRACE_MS) return;
+		const names = [...new Set(calls.map((call) => call.name ?? "工具"))].join("、");
+		this.stuck = true;
+		shared.contexts
+			.get(this.sessionId)
+			?.ui?.notify(`Claude Code 的 ${names} 超过时限很久仍没有返回，这一步已停下，任务自动接着做。`, "warning");
+		if (this.turnActive) this.interrupt(STUCK_TOOL_TEXT);
+		else this.releaseWaiting(STUCK_TOOL_TEXT);
 	}
 
 	private onCompactBoundary(metadata: any): void {
@@ -1287,6 +1736,7 @@ class CliSession {
 			respond({ behavior: "deny", message: "No interface is available to approve this tool." });
 			return;
 		}
+		this.openPrompts++;
 		try {
 			if (name === "AskUserQuestion" && Array.isArray(request.input?.questions)) {
 				const answers: Record<string, string> = {};
@@ -1316,6 +1766,9 @@ class CliSession {
 			}
 		} catch (error) {
 			respond({ behavior: "deny", message: error instanceof Error ? error.message : String(error) });
+		} finally {
+			this.openPrompts--;
+			this.noteProgress();
 		}
 	}
 
@@ -1345,8 +1798,15 @@ class CliSession {
 				else this.noteAppCall(block.id, block.name.slice(MCP_PREFIX.length), assistant ? block.input : undefined);
 				continue;
 			}
-			if (side || this.toolResults.has(block.id)) continue;
-			this.toolResults.set(block.id, deferred());
+			if (side) continue;
+			if (!this.toolResults.has(block.id)) this.toolResults.set(block.id, deferred());
+			if (this.toolResults.get(block.id)?.settled) continue;
+			// A block that has just started names no time limit yet; the whole message does.
+			this.ownCalls.set(block.id, {
+				name: block.name,
+				limit: ownToolLimit(block.name, assistant ? block.input : undefined, this.bashMax),
+			});
+			this.startOwnWatch();
 		}
 	}
 
@@ -1504,7 +1964,7 @@ function effortFor(model: any, level: string | undefined): string | undefined {
  * How a tool `claude` uses looks as a MyHarness call, also while its arguments are still arriving. MyHarness's shells
  * are offered only to start background jobs (BACKGROUND_SHELLS), so such a call is one whatever its arguments say.
  */
-function shapeToolCall(id: string, name: string, input: any, cwd: string): any {
+function shapeToolCall(id: string, name: string, input: any, cwd: string, hostOnly = false): any {
 	// The summary comes first: a card shows the first text among a call's arguments.
 	if (!name.startsWith(MCP_PREFIX))
 		return {
@@ -1514,14 +1974,17 @@ function shapeToolCall(id: string, name: string, input: any, cwd: string): any {
 			arguments: { summary: callSummary(name, input, cwd), tool: name, input },
 		};
 	const appName = name.slice(MCP_PREFIX.length);
+	// A sub-agent's shell call is MyHarness's own, as the model wrote it.
 	const args =
-		BACKGROUND_SHELLS[appName] && input && typeof input === "object" ? { ...input, run_in_background: true } : input;
+		!hostOnly && BACKGROUND_SHELLS[appName] && input && typeof input === "object"
+			? { ...input, run_in_background: true }
+			: input;
 	return { type: "toolCall", id, name: appName, arguments: args };
 }
 
 function mapToolCall(session: CliSession, id: string, name: string, input: any): any {
 	if (name.startsWith(MCP_PREFIX)) session.noteAppCall(id, name.slice(MCP_PREFIX.length), input);
-	return shapeToolCall(id, name, input, session.cwd);
+	return shapeToolCall(id, name, input, session.cwd, session.hostOnly);
 }
 
 async function runTurn(stream: any, session: CliSession, model: any, context: any, options: any): Promise<void> {
@@ -1555,7 +2018,7 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 	// So do its own tools (`--tools`) and the app tools it lists once, when it connects to MyHarness's MCP endpoint.
 	const toolSet = session.ephemeral
 		? ""
-		: `${session.ownTools().join(",")}|${offeredNames(session.activeNames()).join(",")}`;
+		: `${session.ownTools().join(",")}|${offeredNames(session.activeNames(), session.hostOnly).join(",")}`;
 	const signature = `${model.id}|${effort ?? ""}|${readContextWindow()}|${maxOutputTokens ?? ""}|${promptHash}|${toolSet}`;
 	/**
 	 * The request reached its output limit. `claude` would now ask the model by itself to go on, unseen here. MyHarness
@@ -1596,6 +2059,7 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 		}
 		session.lastUserTimestamp = last?.timestamp;
 		session.cutOff = false;
+		session.stuck = false;
 		session.sendUser(content);
 	};
 
@@ -1605,45 +2069,89 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 		session.signature = signature;
 		await session.start(model, effort, context.systemPrompt);
 	}
-	const hasLink = !session.ephemeral && !!readLinks()[session.sessionId];
+	// Whether `claude` already holds this chat's earlier messages: from its saved conversation, or, for a sub-agent,
+	// which keeps none, because the running program is the one that was sent them.
+	const linked = () =>
+		!session.ephemeral && (session.hostOnly ? session.conversationHere : !!readLinks()[session.sessionId]);
+	const hasLink = linked();
+	/** Sends this request's turn once more, to a program started again in place of one that would not stop. */
+	let sendAgain = () => prepareUserTurn(!linked());
 	if (last?.role === "toolResult") {
 		for (let i = messages.length - 1; i >= 0 && messages[i].role === "toolResult"; i--) {
 			session.deliverAppResult(messages[i]);
 		}
-		// The turn is over in `claude`: the program went away between two tool rounds (restart, idle close, a compaction),
-		// or the round was cut off at the output limit and interrupted. Pick the conversation back up.
-		if (!session.turnActive) {
-			const earlier = hasLink ? "" : renderTranscript(messages);
+		const goOnWith = (note: string) => {
+			const earlier = linked() ? "" : renderTranscript(messages);
 			const history = earlier ? `<earlier-conversation>\n${earlier}\n</earlier-conversation>\n\n` : "";
-			const goOn = session.cutOff ? CUT_CALLS_NOTE : "Continue where you left off.";
+			session.sendUser([{ type: "text", text: `${history}${note}` }]);
+		};
+		let goOn = "Continue where you left off.";
+		// The turn is over in `claude`: the program went away between two tool rounds (restart, idle close, a compaction),
+		// the round was cut off at the output limit and interrupted, or one of its own tools was stuck and the request
+		// stopped. Pick the conversation back up.
+		if (!session.turnActive) {
+			if (session.cutOff) goOn = CUT_CALLS_NOTE;
+			else if (session.stuck) goOn = STUCK_TOOL_NOTE;
 			session.cutOff = false;
-			session.sendUser([{ type: "text", text: `${history}${goOn}` }]);
+			session.stuck = false;
+			goOnWith(goOn);
 		}
+		sendAgain = async () => goOnWith(goOn);
 	} else if (!(session.turnActive && session.lastUserTimestamp === last?.timestamp)) {
 		await prepareUserTurn(!hasLink);
 	}
 
 	const onAbort = () => session.interrupt();
 	options?.signal?.addEventListener("abort", onAbort, { once: true });
+	// One wait for Stop for the whole request: a listener per event read piled thousands of them onto the signal.
+	let stopWaiting: (() => void) | undefined;
+	const aborted = new Promise<any>((resolve) => {
+		const signal: AbortSignal | undefined = options?.signal;
+		if (!signal) return;
+		const onStop = () => resolve({ type: "__abort" });
+		signal.addEventListener("abort", onStop, { once: true });
+		stopWaiting = () => signal.removeEventListener("abort", onStop);
+	});
 	try {
-		const blocks = new Map<number, { index: number; json: string; id?: string; name?: string }>();
+		const blocks = new Map<number, { index: number; json: string; id?: string; name?: string; parsedAt?: number }>();
 		let calls = 0;
 		let retried = false;
+		let restarted = false;
+		/**
+		 * The response being read piece by piece: where its content starts in `output`, and how many tool calls were
+		 * complete before it. `claude` starts a request over by itself when it fails part-way (a dropped connection), so
+		 * a response can stop without its `message_stop` and the next attempt begin. Everything read of the dead attempt
+		 * is taken back then: a call it had begun never runs in `claude`, and left in the message MyHarness ran a card
+		 * for it that waited for ever (see CliSession.followResponse).
+		 */
+		let attempt: { start: number; calls: number } | undefined;
+		const dropAttempt = () => {
+			if (!attempt) return;
+			output.content.length = attempt.start;
+			calls = attempt.calls;
+			blocks.clear();
+			attempt = undefined;
+		};
 		for (;;) {
 			if (options?.signal?.aborted) {
 				fail("aborted", "已中断");
 				return;
 			}
-			const abortPromise = new Promise<any>((resolve) => {
-				if (options?.signal)
-					options.signal.addEventListener("abort", () => resolve({ type: "__abort" }), { once: true });
-			});
-			const event = await Promise.race([session.next(), abortPromise]);
+			const event = await Promise.race([session.next(), aborted]);
 			if (event.type === "__abort") {
 				fail("aborted", "已中断");
 				return;
 			}
 			if (event.type === "__exit") {
+				// The program did not stop after an interrupt and was ended with this request's turn still in it: start
+				// it again (the conversation is resumed) and send the turn once more.
+				if (event.restart && !restarted) {
+					restarted = true;
+					dropAttempt();
+					await session.start(model, effort, context.systemPrompt);
+					await sendAgain();
+					continue;
+				}
 				// A remembered conversation that no longer exists: start over with the chat's history.
 				if (!event.gotInit && event.resumedFrom && !retried) {
 					retried = true;
@@ -1661,10 +2169,16 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 				// Normally already seen piece by piece; without streaming this is the only copy.
 				const message = event.message;
 				if (!message?.id || session.alreadySeen(message.id)) continue;
-				session.markSeen(message.id);
+				// A response that was not streamed while a streamed one is still open: the open one was given up.
+				dropAttempt();
 				output.responseId = message.id;
 				applyUsage(output.usage, message.usage);
 				for (const block of message.content ?? []) {
+					// `claude` writes a response that was not streamed one block per message, all under the response's
+					// id, so the id alone cannot tell a block that was read from one that is new.
+					const blockKey = `${message.id}\n${block.type}\n${block.id ?? block.text ?? ""}`;
+					if (session.alreadySeen(blockKey)) continue;
+					session.markSeen(blockKey);
 					if (block.type === "text") {
 						const contentIndex = output.content.push({ type: "text", text: block.text }) - 1;
 						stream.push({ type: "text_start", contentIndex, partial: output });
@@ -1704,6 +2218,9 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 			}
 			const part = event.event;
 			if (part?.type === "message_start") {
+				// A response still open here never finished: this one is `claude` asking again.
+				dropAttempt();
+				attempt = { start: output.content.length, calls };
 				session.markSeen(part.message?.id);
 				output.responseId = part.message?.id;
 				applyUsage(output.usage, part.message?.usage);
@@ -1726,7 +2243,8 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 					blocks.set(part.index, { index, json: "" });
 					stream.push({ type: "thinking_start", contentIndex: index, partial: output });
 				} else if (block?.type === "tool_use") {
-					const index = output.content.push(shapeToolCall(block.id, block.name, {}, session.cwd)) - 1;
+					const index =
+						output.content.push(shapeToolCall(block.id, block.name, {}, session.cwd, session.hostOnly)) - 1;
 					blocks.set(part.index, { index, json: "", id: block.id, name: block.name });
 					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 				}
@@ -1747,12 +2265,20 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 					});
 				} else if (delta?.type === "input_json_delta") {
 					block.json += delta.partial_json;
-					output.content[block.index] = shapeToolCall(
-						block.id ?? "",
-						block.name ?? "",
-						parseStreamingJson(block.json),
-						session.cwd,
-					);
+					// Reading the arguments so far costs time in proportion to their length. Long ones (a file being
+					// written) are read at most every 50 ms, which is how often the page takes an update; the complete
+					// arguments are read when the block ends.
+					const now = Date.now();
+					if (block.json.length < 4096 || now - (block.parsedAt ?? 0) >= 50) {
+						block.parsedAt = now;
+						output.content[block.index] = shapeToolCall(
+							block.id ?? "",
+							block.name ?? "",
+							parseStreamingJson(block.json),
+							session.cwd,
+							session.hostOnly,
+						);
+					}
 					stream.push({
 						type: "toolcall_delta",
 						contentIndex: block.index,
@@ -1786,7 +2312,9 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 					stream.push({ type: "toolcall_end", contentIndex: block.index, toolCall, partial: output });
 					calls++;
 				}
-			} else if (part?.type === "message_stop" && calls > 0) {
+			} else if (part?.type === "message_stop") {
+				attempt = undefined;
+				if (calls === 0) continue;
 				output.stopReason = "toolUse";
 				stream.push({ type: "done", reason: "toolUse", message: output });
 				stream.end();
@@ -1795,11 +2323,12 @@ async function runTurn(stream: any, session: CliSession, model: any, context: an
 		}
 	} finally {
 		options?.signal?.removeEventListener("abort", onAbort);
+		stopWaiting?.();
 	}
 }
 
 /** For tests: one turn read from events fed by hand, with no `claude` started. */
-export const internals = { CliSession, runTurn };
+export const internals = { CliSession, runTurn, searchWithClaude, shared };
 
 function streamSimple(model: any, context: any, options: any): any {
 	const stream = createAssistantMessageEventStream();
@@ -1838,6 +2367,306 @@ function streamSimple(model: any, context: any, options: any): any {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Web search source: `claude`'s own WebSearch, for every chat whatever its model
+// ---------------------------------------------------------------------------------------------------------------------
+
+export const SEARCH_SOURCE_ID = "claude-code";
+/** The model a search runs on while the user has picked none in Web Search settings: the cheapest and quickest. */
+export const SEARCH_DEFAULT_MODEL = "claude-haiku-5-5";
+/** The reasoning levels a search may run on (what `claude --effort` takes), and the one used while none is picked. */
+export const SEARCH_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+export const SEARCH_DEFAULT_EFFORT = "low";
+/** The relay writes one tool call per query and nothing else. */
+const SEARCH_MAX_OUTPUT_TOKENS = 8_000;
+/** `claude` programs searching at once, over all chats and sub-agents; a search beyond that waits its turn. */
+const SEARCH_CONCURRENCY = 3;
+/** A stopped `claude` gets this long to end by itself before it is killed. */
+const SEARCH_EXIT_GRACE_MS = 2_000;
+
+/**
+ * What makes `claude` a relay: it calls its WebSearch once per line and is stopped the moment the results are in, before
+ * it would write an answer. Appended to Claude Code's own prompt, which stays (see Client name at the top of this file).
+ */
+export const SEARCH_RELAY_PROMPT = [
+	"# Search relay",
+	"You are being used as a search relay by MyHarness. Each line of the user's message is one search query.",
+	"For every line, call the WebSearch tool once with that line as the query, word for word. Make all the calls in one response, in parallel.",
+	"Do not answer the queries, do not rephrase, translate, shorten or merge them, and do not search for anything that is not a line of the message.",
+	"When the results are in, reply with the single word DONE.",
+].join("\n");
+
+/** What a search needs of `claude`: its WebSearch and nothing else of its own, of the user's setup or of a project. */
+export function searchArgs(model: string, promptFile: string, effort = SEARCH_DEFAULT_EFFORT): string[] {
+	return [
+		"-p",
+		"--input-format",
+		"stream-json",
+		"--output-format",
+		"stream-json",
+		"--verbose",
+		"--model",
+		model,
+		"--effort",
+		SEARCH_EFFORTS.includes(effort) ? effort : SEARCH_DEFAULT_EFFORT,
+		"--tools",
+		"WebSearch",
+		// Its only tool is the search, and nobody is there to answer a permission prompt.
+		"--permission-mode",
+		"bypassPermissions",
+		"--setting-sources",
+		"",
+		"--strict-mcp-config",
+		"--disable-slash-commands",
+		"--no-chrome",
+		// A search is no conversation: nothing of it is kept in the user's Claude Code history.
+		"--no-session-persistence",
+		"--append-system-prompt-file",
+		promptFile,
+	];
+}
+
+type SearchLink = { title: string; url: string };
+type SearchAnswer = { query: string; results: SearchLink[]; error?: string };
+
+/** A query as one line of the relay's message: the model is told a line is a query. */
+const oneLine = (query: string) => query.replace(/\s+/g, " ").trim();
+const sameQuery = (a: string, b: string) => oneLine(a).toLowerCase() === oneLine(b).toLowerCase();
+
+/**
+ * The pages one WebSearch call found, from the event that carries its result: the structured copy `claude` adds for
+ * its clients (`tool_use_result.results[].content`), or the "Links: [...]" line of the text the model reads.
+ */
+export function searchLinks(event: any, block: any): SearchLink[] {
+	const structured = (Array.isArray(event?.tool_use_result?.results) ? event.tool_use_result.results : []).flatMap(
+		(entry: any) => (Array.isArray(entry?.content) ? entry.content : []),
+	);
+	let links: any[] = structured;
+	if (!links.length) {
+		const line = /^Links: (\[.*\])\s*$/m.exec(plainText(block?.content))?.[1];
+		try {
+			links = line ? JSON.parse(line) : [];
+		} catch {
+			links = [];
+		}
+	}
+	const seen = new Set<string>();
+	return links.flatMap((link: any) => {
+		const url = typeof link?.url === "string" ? link.url.trim() : "";
+		if (!/^https?:\/\//i.test(url) || seen.has(url)) return [];
+		seen.add(url);
+		return [{ title: typeof link.title === "string" ? link.title : "", url }];
+	});
+}
+
+/**
+ * Follows a search run's events: which WebSearch call belongs to which query, and what each found. A call whose query
+ * the model changed after all is matched by its place, when as many such calls as queries without one remain.
+ */
+export class SearchRun {
+	readonly queries: string[];
+	private answers = new Map<number, SearchAnswer>();
+	/** WebSearch calls by tool call id: the query's index, or the query text of a call that matched none yet. */
+	private calls = new Map<string, number | string>();
+	/** Results of calls that matched no query, in the order they finished. */
+	private strays: Array<{ results: SearchLink[]; error?: string }> = [];
+	/** Why `claude` ended its turn in an error (not signed in, the plan's limit), when it did. */
+	problem?: string;
+	ended = false;
+
+	constructor(queries: string[]) {
+		this.queries = queries;
+	}
+
+	get complete(): boolean {
+		return this.answers.size === this.queries.length;
+	}
+
+	take(event: any): void {
+		if (event?.type === "assistant") {
+			for (const part of event.message?.content ?? []) {
+				if (part?.type !== "tool_use" || part.name !== "WebSearch") continue;
+				const asked = String(part.input?.query ?? "");
+				const index = this.queries.findIndex(
+					(query, at) => sameQuery(query, asked) && ![...this.calls.values()].includes(at),
+				);
+				this.calls.set(String(part.id), index >= 0 ? index : asked);
+			}
+		} else if (event?.type === "user") {
+			for (const block of event.message?.content ?? []) {
+				if (block?.type !== "tool_result") continue;
+				const call = this.calls.get(String(block.tool_use_id));
+				if (call === undefined) continue;
+				const found = block.is_error
+					? { results: [], error: plainText(block.content).slice(0, 500) || "claude 的搜索失败了。" }
+					: { results: searchLinks(event, block) };
+				if (typeof call === "number") this.answers.set(call, { query: this.queries[call], ...found });
+				else this.strays.push(found);
+			}
+		} else if (event?.type === "result") {
+			this.ended = true;
+			if (event.is_error)
+				this.problem = String(event.result || event.subtype || "claude 没有完成搜索。").slice(0, 500);
+		}
+	}
+
+	/** Every query's answer; one the run did not get to carries `missing` as its error. */
+	finish(missing: string): SearchAnswer[] {
+		const open = this.queries.map((_query, index) => index).filter((index) => !this.answers.has(index));
+		if (open.length > 0 && open.length === this.strays.length) {
+			for (const [at, index] of open.entries())
+				this.answers.set(index, { query: this.queries[index], ...this.strays[at] });
+		}
+		return this.queries.map((query, index) => this.answers.get(index) ?? { query, results: [], error: missing });
+	}
+}
+
+const searchSlots = { busy: 0, waiting: [] as Array<() => void> };
+
+/** A place among the `claude` programs that may search at once, or undefined when the time ran out while waiting. */
+function takeSearchSlot(timeoutMs: number, signal: AbortSignal | undefined): Promise<(() => void) | undefined> {
+	const release = () => {
+		searchSlots.busy -= 1;
+		searchSlots.waiting.shift()?.();
+	};
+	if (searchSlots.busy < SEARCH_CONCURRENCY) {
+		searchSlots.busy += 1;
+		return Promise.resolve(release);
+	}
+	return new Promise((resolve) => {
+		const give = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", leave);
+			searchSlots.busy += 1;
+			resolve(release);
+		};
+		const leave = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", leave);
+			const at = searchSlots.waiting.indexOf(give);
+			if (at >= 0) searchSlots.waiting.splice(at, 1);
+			resolve(undefined);
+		};
+		const timer = setTimeout(leave, timeoutMs);
+		signal?.addEventListener("abort", leave, { once: true });
+		searchSlots.waiting.push(give);
+	});
+}
+
+/**
+ * One `claude` searches every query of a web_search call with its own WebSearch, all at once, and is stopped when the
+ * results are in: the answer it would write then is a request nobody reads. What it found (titles and URLs; its
+ * WebSearch gives no snippets) goes back to MyHarness, which merges it with the other sources and reads the pages.
+ */
+async function searchWithClaude(request: {
+	queries: string[];
+	model?: string;
+	effort?: string;
+	timeoutMs: number;
+	signal?: AbortSignal;
+}): Promise<SearchAnswer[]> {
+	const binary = findClaude();
+	if (!binary) throw new Error("找不到 claude 程序。请先安装 Claude Code，或设置 MYHARNESS_CLAUDE_BIN。");
+	const startedAt = Date.now();
+	const timeLeft = () => request.timeoutMs - (Date.now() - startedAt);
+	const late = `${Math.round(request.timeoutMs / 1000)} 秒内没有搜完这个问题。`;
+	const release = await takeSearchSlot(request.timeoutMs, request.signal);
+	if (!release) return request.queries.map((query) => ({ query, results: [], error: late }));
+	try {
+		const directory = path.join(dataDir(), "search");
+		fs.mkdirSync(directory, { recursive: true });
+		const promptFile = path.join(dataDir(), "search-prompt.md");
+		if (!fs.existsSync(promptFile) || fs.readFileSync(promptFile, "utf8") !== SEARCH_RELAY_PROMPT) {
+			fs.writeFileSync(promptFile, SEARCH_RELAY_PROMPT);
+		}
+		const lines = request.queries.map(oneLine);
+		const run = new SearchRun(lines);
+		const args = searchArgs(request.model || SEARCH_DEFAULT_MODEL, promptFile, request.effort);
+		// A script stands in for `claude` in tests (MYHARNESS_CLAUDE_BIN): it is run by this process's own Node.
+		const [command, commandArgs] = /\.(mjs|cjs|js)$/i.test(binary)
+			? [process.execPath, [binary, ...args]]
+			: [binary, args];
+		const child = spawn(command, commandArgs, {
+			// An empty folder of MyHarness's own: the search has nothing to do with any project.
+			cwd: directory,
+			env: launchEnv(process.env, SEARCH_MAX_OUTPUT_TOKENS, readContextWindow()),
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => {
+			stderr = `${stderr}${chunk}`.slice(-2000);
+		});
+		child.stdin?.on("error", () => {});
+		const outcome = await new Promise<"done" | "late" | "stopped" | "exited">((resolve) => {
+			let settled = false;
+			const settle = (how: "done" | "late" | "stopped" | "exited") => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				request.signal?.removeEventListener("abort", onStop);
+				// Nothing more is wanted of it: closing its input ends it, and it is killed if that takes long.
+				child.stdin?.end();
+				if (child.exitCode === null) {
+					if (how === "stopped" || how === "late" || how === "done") child.kill();
+					setTimeout(() => {
+						if (child.exitCode === null) child.kill("SIGKILL");
+					}, SEARCH_EXIT_GRACE_MS).unref();
+				}
+				resolve(how);
+			};
+			const onStop = () => settle("stopped");
+			const timer = setTimeout(() => settle("late"), Math.max(0, timeLeft()));
+			if (request.signal?.aborted) onStop();
+			else request.signal?.addEventListener("abort", onStop, { once: true });
+			child.on("error", (error) => {
+				stderr ||= error.message;
+				settle("exited");
+			});
+			child.on("close", () => settle("exited"));
+			createInterface({ input: child.stdout! }).on("line", (line) => {
+				let event: any;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					return;
+				}
+				if (event.type === "rate_limit_event") noteLimits(limitsFromEvent(event.rate_limit_info, Date.now()));
+				run.take(event);
+				if (run.complete || run.ended) settle("done");
+			});
+			child.stdin?.write(
+				`${JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: lines.join("\n") }] } })}\n`,
+			);
+		});
+		if (outcome === "stopped") throw new Error("已中断");
+		const answers = run.finish(outcome === "late" ? late : "claude 没有搜索这个问题。");
+		if (answers.every((answer) => answer.error)) {
+			// Nothing was searched at all: say why, in the program's own words when it gave any (not signed in, the plan's
+			// limit is reached). MyHarness then leaves this source alone for a while instead of waiting again.
+			const why =
+				run.problem ||
+				(outcome === "exited" ? stderr.trim() || "claude 没有搜索就退出了。" : undefined) ||
+				(outcome === "late"
+					? `claude 在 ${Math.round(request.timeoutMs / 1000)} 秒内没有返回任何搜索结果。`
+					: undefined);
+			if (why) throw new Error(why);
+		}
+		// The answers go back under the queries exactly as they were asked.
+		return answers.map((answer, index) => ({ ...answer, query: request.queries[index] }));
+	} finally {
+		release();
+	}
+}
+
+/** Whether `claude` is installed, asked at most every half minute: Web Search settings and every search ask. */
+let claudeSeen: { at: number; found: boolean } | undefined;
+function claudeInstalled(): boolean {
+	const now = Date.now();
+	if (!claudeSeen || now - claudeSeen.at > 30_000) claudeSeen = { at: now, found: !!findClaude() };
+	return claudeSeen.found;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -1863,6 +2692,11 @@ export default function (pi: ExtensionAPI) {
 		contextWindow: readContextWindow(),
 		// `claude` decides when to compact, by the same length (see /context-length).
 		managesOwnContext: true,
+		// Its own tools act inside `claude`: the task's checkpoint is taken when the task starts (see Model.runsOwnTools).
+		runsOwnTools: true,
+		// In a sub-agent's session it runs none of them and MyHarness runs every tool (see hostRunsTools), so these
+		// models can be a sub-agent's model.
+		delegatedHostTools: true,
 		maxTokens: 64_000,
 	}));
 	pi.registerProvider({
@@ -1875,7 +2709,9 @@ export default function (pi: ExtensionAPI) {
 					name: "Claude Code 自己的登录",
 					// Nothing is read or stored here: `claude` owns its login. This only says whether the program exists.
 					async resolve() {
-						return findClaude() ? { auth: { apiKey: "claude-code-cli" }, source: "claude 程序" } : undefined;
+						return findClaude()
+							? { auth: { apiKey: "claude-code-cli" }, source: "Claude Code 自己的登录" }
+							: undefined;
 					},
 				},
 			},
@@ -1898,6 +2734,38 @@ export default function (pi: ExtensionAPI) {
 		],
 	} as any);
 
+	// `claude`'s own WebSearch as a search source of MyHarness's web_search, for chats on any model. It shows in Web
+	// Search settings while `claude` is installed; the user switches it on there and picks the model and the reasoning
+	// level it searches with. A MyHarness build from before search sources has no such method; the provider must still
+	// load there.
+	pi.registerWebSearchSource?.({
+		id: SEARCH_SOURCE_ID,
+		label: "Claude Code",
+		models: () =>
+			MODELS.map((model) => ({
+				id: model.id,
+				label: model.name.replace(/^Claude Code · /, ""),
+				efforts: SEARCH_EFFORTS,
+			})),
+		defaultModel: SEARCH_DEFAULT_MODEL,
+		defaultEffort: SEARCH_DEFAULT_EFFORT,
+		unavailable: () => (claudeInstalled() ? undefined : "找不到 claude 程序"),
+		search: searchWithClaude,
+	});
+
+	// What is left of the plan, for MyHarness's own display of plan limits beside the input box of every chat, while
+	// `claude` is installed. A MyHarness build from before that display has no such method: the status bar of the chats
+	// on Claude Code shows the numbers there. A sub-agent's worker has no display; registering there does nothing.
+	if (claudeInstalled()) {
+		shared.planUsageChanged =
+			pi.registerPlanUsageSource?.({
+				id: PROVIDER_ID,
+				label: "Claude",
+				snapshot: planUsageSnapshot,
+				refresh: (options?: { maxAgeMs?: number }) => refreshPlanUsage(options?.maxAgeMs),
+			}) ?? undefined;
+	}
+
 	const usingClaudeCode = (model: any) => model?.provider === PROVIDER_ID;
 	/** The card tool means nothing to other models, so it is only active while this provider is. */
 	const syncActiveTools = (model: any) => {
@@ -1910,6 +2778,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: PASSTHROUGH_TOOL,
 		label: "Claude Code",
+		// Switched by syncActiveTools as the model changes: tool lists show it as automatic.
+		autoActive: true,
 		description:
 			"Internal to the Claude Code provider: shows a tool Claude Code is running by itself and waits for its result. Never call this directly.",
 		parameters: Type.Object({ summary: Type.Optional(Type.String()), tool: Type.String(), input: Type.Any() }),
@@ -1980,7 +2850,15 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event: any, ctx: any) => {
-		shared.contexts.set(ctx.sessionManager.getSessionId(), ctx);
+		const sessionId = ctx.sessionManager.getSessionId();
+		shared.contexts.set(sessionId, ctx);
+		// A sub-agent's session (a MyHarness build from before `agentRole` loads no extension into one): MyHarness runs
+		// every tool there, the card tool does not exist, and there is no status bar for the plan limits.
+		if (ctx.agentRole === "delegated") {
+			shared.delegated ??= new Set();
+			shared.delegated.add(sessionId);
+			return;
+		}
 		syncActiveTools(ctx.model);
 		forgetImpossibleUsage(ctx);
 		followLimits(ctx, ctx.model);
@@ -2078,5 +2956,6 @@ export default function (pi: ExtensionAPI) {
 		shared.sessions.get(sessionId)?.close();
 		shared.sessions.delete(sessionId);
 		shared.contexts.delete(sessionId);
+		shared.delegated?.delete(sessionId);
 	});
 }

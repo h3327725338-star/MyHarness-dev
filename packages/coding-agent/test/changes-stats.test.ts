@@ -179,6 +179,7 @@ describe("cache invalidation, TTL, workspace isolation, and fallback rescan", ()
 				getGitCheckpoint: () => undefined,
 			},
 			broadcast: vi.fn(),
+			liveRun: () => undefined,
 		};
 
 		registerFileRoutes(serverMock as never, hostMock as never);
@@ -261,6 +262,7 @@ describe("cache invalidation, TTL, workspace isolation, and fallback rescan", ()
 				getGitCheckpoint: () => undefined,
 			},
 			broadcast: vi.fn(),
+			liveRun: () => undefined,
 		};
 
 		registerFileRoutes(serverMock as never, hostMock as never);
@@ -298,6 +300,7 @@ describe("fresh=1 query parameter bypasses the worktree cache", () => {
 				getGitCheckpoint: () => undefined,
 			},
 			broadcast: vi.fn(),
+			liveRun: () => undefined,
 		};
 		registerFileRoutes(serverMock as never, hostMock as never);
 		return routes;
@@ -435,6 +438,7 @@ describe("the conversation's uncommitted count", () => {
 				getGitCheckpoint: () => undefined,
 			},
 			broadcast: vi.fn(),
+			liveRun: () => undefined,
 		};
 		registerFileRoutes(serverMock as never, hostMock as never);
 		return routes;

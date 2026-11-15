@@ -579,6 +579,65 @@ describe("Web UI: action descriptions", () => {
 			expect(describeAction(call, { isError: true }, run, "").extra).toBeUndefined();
 		}
 	});
+	it("names the tool of a workflow or ultracode delegation once, with or without a workflow name", async () => {
+		const { getLang, setLang } = await import(new URL("lang.js", webDir).href);
+		const previous = getLang();
+		const phases = [{ name: "Investigate", tasks: [{ description: "a", prompt: "b" }] }];
+		const said = (action: { verb: string; target: string; detail: string }) =>
+			[action.verb, action.target, action.detail].filter(Boolean).join(" ");
+		try {
+			for (const [lang, verb] of [
+				["en", "Delegating"],
+				["zh-CN", "正在委派"],
+			]) {
+				setLang(lang);
+				for (const tool of ["ultracode", "workflow"]) {
+					// No workflow name yet (the arguments are still streaming): the tool's name alone, not twice.
+					const bare = describeAction({ name: tool, args: {} }, undefined, { status: "running" }, "");
+					expect(bare).toMatchObject({ kind: "agent", target: tool, detail: "" });
+					expect(said(bare)).toBe(`${verb} ${tool}`);
+					// The workflow's name leads and the tool's name follows once, as a tag.
+					const named = describeAction(
+						{ name: tool, args: { name: "core-scan", phases } },
+						undefined,
+						{ status: "running" },
+						"",
+					);
+					expect(named).toMatchObject({ target: "core-scan", detail: tool });
+					expect(said(named)).toBe(`${verb} core-scan ${tool}`);
+					// A workflow named like its tool is still said once.
+					const same = describeAction(
+						{ name: tool, args: { name: tool, phases } },
+						undefined,
+						{ status: "running" },
+						"",
+					);
+					expect(said(same)).toBe(`${verb} ${tool}`);
+				}
+			}
+			// The state of the call changes the verb only; the repeated name never comes back.
+			setLang("en");
+			const call = { name: "ultracode", args: { name: "core-scan", phases } };
+			expect(said(describeAction(call, { isError: false }, undefined, ""))).toBe("Delegated core-scan ultracode");
+			expect(said(describeAction(call, { isError: true }, undefined, ""))).toBe(
+				"Failed to delegate core-scan ultracode",
+			);
+			// The agent tool and other detail-carrying tools keep their wording.
+			expect(
+				describeAction(
+					{ name: "agent", args: { task: "find the bug\nmore" } },
+					undefined,
+					{ status: "running" },
+					"",
+				),
+			).toMatchObject({
+				target: "find the bug",
+				detail: "",
+			});
+		} finally {
+			setLang(previous);
+		}
+	});
 	it("describes tool calls in plain language and keeps the raw facts", () => {
 		const read = describeAction(
 			{ id: "1", name: "read", args: { path: "C:\\proj\\src\\a.ts", offset: 5, limit: 10 } },
@@ -769,6 +828,49 @@ describe("Web UI: a run ended by an interrupting message", () => {
 		expect(turns).toHaveLength(2);
 		expect(interruptedByNext(turns[0], turns[1])).toBe(true);
 		expect(turns[0].steps.some((step: any) => step.type === "custom")).toBe(false);
+	});
+
+	it("reads as turning to the message from the server's early announcement, not as cancelled while the stop settles", async () => {
+		const { buildTurns, nextRound, redirectedRunRecord, runForTurn, turnOutcome } = await import(
+			new URL("turns.js", webDir).href
+		);
+		const startedAt = 1_000_000;
+		const sentAt = startedAt + 30_000;
+		// The stopped reply reaches the page with stopReason "aborted" while the interrupting message is still pending: until
+		// the run's record (after the changes are detected) and the saved marker arrive, nothing else says it was switched.
+		const turns = buildTurns(
+			[
+				{ kind: "user", id: "u1", ts: startedAt, text: "go" },
+				{
+					kind: "assistant",
+					liveId: "l1",
+					ts: startedAt + 100,
+					endedAt: sentAt + 200,
+					stopReason: "aborted",
+					error: "Request was aborted",
+					blocks: [{ type: "thinking", text: "…" }],
+				},
+				{ kind: "user", ts: sentAt, text: "换个问题", pending: true },
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		const stopped = turns[0];
+		expect(turnOutcome(stopped, { run: undefined, live: false, waiting: false })).toBe("cancelled");
+
+		// The server's run_redirecting (sent before the stop starts) is the run's first record: no "cancelled" at any moment.
+		const early = redirectedRunRecord({ runId: 3, startedAt, ts: sentAt + 50 });
+		expect(early).toMatchObject({ runId: 3, outcome: "redirected", startedAt, endedAt: sentAt + 50 });
+		const run = runForTurn(stopped, { 3: early }, nextRound(turns, 0));
+		expect(run).toBe(early);
+		expect(turnOutcome(stopped, { run, live: false, waiting: false })).toBe("redirected");
+		// The message that interrupted is no part of that run.
+		expect(runForTurn(turns[1], { 3: early }, undefined)).toBeUndefined();
+
+		// run_finished brings the full record under the same run number and replaces it; the outcome stays.
+		const finished = { runId: 3, outcome: "redirected", startedAt, endedAt: sentAt + 900, changeCount: 2 };
+		const replaced = runForTurn(stopped, { 3: finished }, nextRound(turns, 0));
+		expect(replaced).toBe(finished);
+		expect(turnOutcome(stopped, { run: replaced, live: false, waiting: false })).toBe("redirected");
 	});
 
 	it("reads as turning to the message, not as cancelled", async () => {
@@ -2556,6 +2658,7 @@ describe("Web UI: cross-session turns cache (store.js bag + turns.js hit check)"
 
 describe("Web UI: paged transcript client (store.js loadTranscript/fetchMoreTranscript, W175)", () => {
 	let pageStore: {
+		loadSnapshot: (slot?: string) => Promise<unknown>;
 		loadTranscript: (slot: string, options?: { limit?: number }) => Promise<unknown>;
 		refreshSlot: (slot: string, options?: { full?: boolean }) => Promise<void>;
 		fetchMoreTranscript: (slot: string) => Promise<string>;
@@ -2602,6 +2705,49 @@ describe("Web UI: paged transcript client (store.js loadTranscript/fetchMoreTran
 	afterEach(() => {
 		globalThis.fetch = realFetch as typeof fetch;
 		handler = null;
+	});
+
+	it("a snapshot taken while a message is ending the run seeds the provisional record, and a transcript read keeps it", async () => {
+		const slot = "page-redirect";
+		const snapshot = {
+			slot,
+			run: { state: "idle", activity: "", startedAt: 5_000, lastActivityAt: 5_400, runId: 7, redirected: true },
+			flags: {},
+			queue: { steering: [], followUp: [] },
+			dialogs: [],
+			surface: null,
+			subAgents: { items: [], running: 0 },
+			backgroundJobs: [],
+			session: { id: "s-redirect" },
+		};
+		handler = (url: string) => (url.startsWith("/api/state") ? snapshot : { items: range(0, 2) });
+		await pageStore.loadSnapshot(slot);
+		const runs = () => pageStore.inSlot(slot, () => pageStore.state.runs as Record<string, any>);
+		expect(runs()[7]).toMatchObject({
+			runId: 7,
+			outcome: "redirected",
+			provisional: true,
+			startedAt: 5_000,
+			endedAt: 5_400,
+		});
+		// A transcript read (reconnect, compaction_end...) drops the finished runs' records but not the one that only the
+		// announcement (or this snapshot) can give.
+		pageStore.inSlot(slot, () => {
+			pageStore.state.runs = {
+				...(pageStore.state.runs as object),
+				3: { runId: 3, outcome: "completed", startedAt: 1, endedAt: 2 },
+			};
+		});
+		await pageStore.loadTranscript(slot);
+		expect(Object.keys(runs())).toEqual(["7"]);
+		// Another chat opened in the same slot does not inherit it.
+		handler = (url: string) =>
+			url.startsWith("/api/state")
+				? { ...snapshot, run: { state: "idle", activity: "" }, session: { id: "s-other" } }
+				: { items: range(0, 2) };
+		await pageStore.loadSnapshot(slot);
+		await pageStore.loadTranscript(slot);
+		expect(runs()).toEqual({});
 	});
 
 	it("① the first screen passes limit=120 and keeps the paging cursor", async () => {
@@ -3108,5 +3254,124 @@ describe("Web UI: the three layers of a provider", () => {
 		expect("baseUrl" in cleared).toBe(false);
 		// A key typed for the model goes to the credential store, never into models.json.
 		expect("apiKey" in models.buildModel({ ...draft, apiKey: "typed" })).toBe(false);
+	});
+});
+
+// ---- Review tests for the Interrupt "redirected" fix: the provisional run record, the snapshot, and the phone.
+// ----
+describe("Interrupt redirect (provisional run record, phone)", () => {
+	const user = (ts: number, text: string, extra: Record<string, unknown> = {}) => ({
+		kind: "user",
+		id: `u${ts}`,
+		ts,
+		text,
+		...extra,
+	});
+	const assistant = (ts: number, text: string, extra: Record<string, unknown> = {}) => ({
+		kind: "assistant",
+		id: `a${ts}`,
+		ts,
+		final: true,
+		blocks: [{ type: "text", text }],
+		...extra,
+	});
+	// What a page that was reloaded right after run 1 finished holds: no run records at all (loadTranscript empties them).
+	const reloadedPage = () => {
+		const run2Start = 20_000;
+		const turns = buildTurns(
+			[
+				user(1_000, "one"),
+				assistant(2_000, "answer one"),
+				user(run2Start - 5, "two"),
+				{
+					kind: "assistant",
+					id: "a-stop",
+					ts: run2Start + 400,
+					stopReason: "aborted",
+					error: "Request was aborted",
+					blocks: [],
+				},
+				user(run2Start + 900, "three", { pending: true }),
+			],
+			{ cwd: "", toolRuns: {} },
+		);
+		return { turns, run2Start };
+	};
+
+	it("a provisional record announced under a stale run id never outranks the real record of the run (tie on startedAt)", async () => {
+		const { nextRound, redirectedRunRecord, runForTurn } = await import(new URL("turns.js", webDir).href);
+		const { turns, run2Start } = reloadedPage();
+		// Server side (R1 in web-host.test.ts): run_redirecting carried runId 1 (the previous run) with run 2's startedAt.
+		const stale = redirectedRunRecord({ runId: 1, startedAt: run2Start, ts: run2Start + 450 });
+		const real = { runId: 2, outcome: "redirected", startedAt: run2Start, endedAt: run2Start + 800, changeCount: 3 };
+		const picked = runForTurn(turns[1], { 1: stale, 2: real }, nextRound(turns, 1));
+		expect(picked).toBe(real);
+	});
+
+	it("the provisional record never makes the summary read undefined or NaN; it only lacks the file count until run_finished", async () => {
+		const { nextRound, redirectedRunRecord, runForTurn, turnDuration, turnOutcome } = await import(
+			new URL("turns.js", webDir).href
+		);
+		const { processSummaryState } = await import(new URL("process-summary.js", webDir).href);
+		const { turns, run2Start } = reloadedPage();
+		const provisional = redirectedRunRecord({ runId: 2, startedAt: run2Start, ts: run2Start + 450 });
+		const final = { runId: 2, outcome: "redirected", startedAt: run2Start, endedAt: run2Start + 800, changeCount: 3 };
+		const label = (run: any) => {
+			const picked = runForTurn(turns[1], { 2: run }, nextRound(turns, 1));
+			expect(picked).toBe(run);
+			const outcome = turnOutcome(turns[1], { run: picked, live: false, waiting: false });
+			const changeCount = picked ? picked.changeCount : undefined;
+			return processSummaryState({
+				last: true,
+				outcome,
+				stats: { actions: 2 },
+				duration: turnDuration(turns[1], picked),
+				changeCount,
+			});
+		};
+		const early = label(provisional);
+		const later = label(final);
+		expect(early.outcome).toBe("redirected");
+		expect(`${early.label}|${later.label}`).not.toMatch(/undefined|NaN|null/);
+		expect(early.label).not.toContain("changed");
+		expect(later.label).toContain("3 files changed");
+	});
+
+	it("the phone does not read the stopped turn as cancelled while the run's record is pending (run_redirecting is forwarded to it)", async () => {
+		const live = await import(new URL("../../mobile/web/js/live.js", import.meta.url).href);
+		const { nextRound, runForTurn, turnOutcome } = await import(new URL("turns.js", webDir).href);
+		const chat: any = { items: [], toolRuns: {}, runs: {}, queue: [], dialogs: [], running: false, title: "" };
+		// The frames the gateway forwards (phone-link/gateway.ts EVENTS): run_state with the neutral redirected state,
+		// the stopped reply, and nothing else until run_finished.
+		live.applyEvent(chat, "agent_start", { runId: 1 });
+		live.applyEvent(chat, "message_start", { item: { kind: "user", ts: 1_000, text: "go" } });
+		live.applyEvent(chat, "run_redirecting", { runId: 1, startedAt: 1_000, ts: 30_050 });
+		live.applyEvent(chat, "message_end", {
+			liveId: "l1",
+			endedAt: 30_100,
+			item: { kind: "assistant", ts: 1_100, stopReason: "aborted", error: "Request was aborted", blocks: [] },
+		});
+		live.applyEvent(chat, "run_state", {
+			state: "cancelled",
+			activity: "",
+			redirected: true,
+			runId: 1,
+			startedAt: 1_000,
+		});
+		live.addPending(chat, { clientMessageId: "c1", text: "switch" });
+		const turns = buildTurns(chat.items, { cwd: "", toolRuns: chat.toolRuns });
+		const run = runForTurn(turns[0], chat.runs, nextRound(turns, 0));
+		// This is what the phone's Turn computes (packages/mobile/web/js/transcript.js): OUTCOME_NOTE.cancelled is "Stopped".
+		expect(turnOutcome(turns[0], { run, live: false, waiting: false })).toBe("redirected");
+		// run_finished brings the full record under the same number.
+		live.applyEvent(chat, "run_finished", {
+			runId: 1,
+			outcome: "redirected",
+			startedAt: 1_000,
+			endedAt: 30_900,
+			changeCount: 2,
+		});
+		expect(chat.runs[1]).toMatchObject({ outcome: "redirected", changeCount: 2 });
+		expect(chat.runs[1].provisional).toBeUndefined();
 	});
 });

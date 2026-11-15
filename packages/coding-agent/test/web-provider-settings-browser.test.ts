@@ -8,7 +8,7 @@ import { detectInstalledBrowsers, LocalBrowser } from "../src/tools/web-search/b
 
 const installed = detectInstalledBrowsers();
 it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.length)(
-	"edits a value an extension provider stores itself, and shows the provider's own message for a bad one",
+	"edits the values an extension provider stores itself, for the provider and for single models, and shows the provider's own message for a bad one",
 	async () => {
 		const root = mkdtempSync(join(process.env.MYHARNESS_TEMP_DIR ?? tmpdir(), "myharness-provider-settings-"));
 		const server = new WebHttpServer();
@@ -20,6 +20,7 @@ it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.lengt
 			for (const dir of ["js", "vendor", "css"])
 				server.mount({ prefix: `/${dir}/`, directory: fileURLToPath(new URL(`../web/${dir}`, import.meta.url)) });
 			let stored = "1M";
+			let storedForBig = "";
 			server.route("GET", "/api/providers", () => ({
 				providers: [
 					{
@@ -34,13 +35,27 @@ it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.lengt
 						supportsApiKeyLogin: false,
 						supportsOAuth: false,
 						custom: false,
+						authLabel: "the program's own login",
+						models: [
+							{ id: "big", name: "Own · Big", contextWindow: 1000000, levels: ["low", "high"], image: true },
+							{ id: "plain", name: "Own · Plain", contextWindow: 200000, levels: [], image: false },
+						],
 						settings: [
 							{
 								id: "length",
 								label: "Length",
 								description: "Between 100K and 1M.",
 								placeholder: "1M",
+								model: null,
 								value: stored,
+							},
+							{
+								id: "length:big",
+								label: "Model length",
+								description: "For this model alone.",
+								placeholder: "1M",
+								model: "big",
+								value: storedForBig,
 							},
 						],
 						credentials: null,
@@ -51,10 +66,12 @@ it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.lengt
 			}));
 			server.route("POST", "/api/providers/setting", ({ body }) => {
 				const { id, setting, value } = body as { id: string; setting: string; value: string };
-				if (id !== "own-program" || setting !== "length") throw new HttpError(404, "unknown setting");
+				if (id !== "own-program" || (setting !== "length" && setting !== "length:big"))
+					throw new HttpError(404, "unknown setting");
 				if (value === "5k") throw new HttpError(400, "Too short.");
-				stored = value.toUpperCase();
-				return { ok: true, value: stored };
+				if (setting === "length") stored = value.toUpperCase();
+				else storedForBig = value.toUpperCase();
+				return { ok: true, value: value.toUpperCase() };
 			});
 			server.route("GET", "/api/providers/custom", () => ({
 				path: null,
@@ -103,6 +120,32 @@ try {
  button().click();
  await until(()=>input().value==='300K');
  await until(()=>button().disabled);
+ // The card: what signs the provider in, in its own words, and its models below it without the provider's name.
+ check(document.querySelector('.prov-root').textContent.includes("the program's own login"),'the sign-in line is missing');
+ const rows=()=>[...document.querySelectorAll('.pf-model-list .pf-model')];
+ check(rows().map(el=>el.querySelector('.pf-model-title').textContent).join()==='Big,Plain','models: '+rows().map(el=>el.textContent).join());
+ check(rows()[0].querySelector('.badge[title]').title==='low · high','the levels of a model are not named');
+ check(!rows()[1].querySelector('.badge[title]'),'a model without levels shows a thinking badge');
+ check(rows()[0].textContent.includes('1.0M')&&rows()[1].textContent.includes('200.0K'),'the context sizes are missing');
+ // A model without a value of its own is a row that does not open; the other opens to its field.
+ check(!rows()[1].querySelector('button'),'a row with nothing to set can be opened');
+ const modelField=()=>[...document.querySelectorAll('.pf-model .field-label')].find(el=>el.textContent.includes('Model length'));
+ check(!modelField(),'a model field is drawn before its row was opened');
+ rows()[0].querySelector('button.pf-model-toggle').click();
+ await until(()=>modelField());
+ check(modelField().querySelector('input').value===''&&modelField().querySelector('input').placeholder==='1M','the model field does not start empty');
+ type(modelField().querySelector('input'),'400k');
+ await until(()=>!modelField().querySelector('button').disabled);
+ check(rows()[0].querySelector('.prov-dirty'),'an unsaved value of a model is not marked on its row');
+ modelField().querySelector('button').click();
+ await until(()=>modelField().querySelector('input').value==='400K');
+ await until(()=>!rows()[0].querySelector('.prov-dirty'));
+ // Folded and opened again, the saved value is there; the provider's own value was not touched.
+ rows()[0].querySelector('button.pf-model-toggle').click();
+ await wait(400);
+ rows()[0].querySelector('button.pf-model-toggle').click();
+ await until(()=>modelField()&&modelField().querySelector('input').value==='400K');
+ check(input().value==='300K','saving a model value changed the provider value: '+input().value);
  document.body.insertAdjacentHTML('beforeend','<p id="ready">passed</p>');
 } catch(error){document.body.insertAdjacentHTML('beforeend','<p id="ready">'+error.stack+'</p>');}
 `,

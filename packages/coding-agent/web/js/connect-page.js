@@ -65,6 +65,21 @@ const GITHUB_SOURCE = {
 const accountRef = (account) => `${account.provider}:${account.email}`;
 
 /**
+ * Runs `onEvent` only for store events that arrive after mount, ignoring any event already sitting in the store when
+ * the component mounted (so reopening Settings or the panel never replays an old sign-in toast).
+ */
+export function useFreshStoreEvent(event, onEvent) {
+	const seen = useRef(event);
+	const handler = useRef(onEvent);
+	handler.current = onEvent;
+	useEffect(() => {
+		if (!event || event === seen.current || (event.nonce != null && event.nonce === seen.current?.nonce)) return;
+		seen.current = event;
+		handler.current(event);
+	}, [event?.nonce, event]);
+}
+
+/**
  * GitHub and mail connection state, reloaded whenever the server reports progress. `notify` shows the outcome of a
  * sign-in as a toast (the Settings page does; the right panel only refreshes) and opens a mail sign-in page this page
  * asked for.
@@ -101,37 +116,35 @@ export function useConnections({ notify = false } = {}) {
 			if (value?.type === "webMail") loadWeb();
 		});
 	}, []);
-	useEffect(() => {
-		if (!githubEvent) return;
-		if (githubEvent.type === "prompt") return setPrompt((p) => ({ ...p, github: githubEvent.prompt }));
+	useFreshStoreEvent(githubEvent, (event) => {
+		if (event.type === "prompt") return setPrompt((p) => ({ ...p, github: event.prompt }));
 		setPrompt((p) => ({ ...p, github: null }));
-		if (notify && githubEvent.type === "done")
+		if (notify && event.type === "done")
 			toast(
-				githubEvent.verified
+				event.verified
 					? t("The connection is valid; GitHub confirmed the account.")
-					: githubEvent.source === "gh" || githubEvent.source === "git"
-						? t("GitHub connected as @{login} with the sign-in this computer already had.", { login: githubEvent.account?.login ?? "" })
+					: event.source === "gh" || event.source === "git"
+						? t("GitHub connected as @{login} with the sign-in this computer already had.", { login: event.account?.login ?? "" })
 						: t("GitHub connected; the credentials are saved."),
 				"info",
 				5000,
 			);
-		if (notify && githubEvent.type === "error") toast(serverText(githubEvent.message), "error", 9000);
+		if (notify && event.type === "error") toast(serverText(event.message), "error", 9000);
 		reload();
-	}, [githubEvent?.nonce]);
-	useEffect(() => {
-		if (!mailEvent) return;
-		if (mailEvent.type === "prompt") {
-			setPrompt((p) => ({ ...p, mail: mailEvent.url }));
-			if (opening.current) openSystemLink(mailEvent.url);
+	});
+	useFreshStoreEvent(mailEvent, (event) => {
+		if (event.type === "prompt") {
+			setPrompt((p) => ({ ...p, mail: event.url }));
+			if (opening.current) openSystemLink(event.url);
 			opening.current = false;
 			return;
 		}
 		opening.current = false;
 		setPrompt((p) => ({ ...p, mail: null }));
-		if (notify && mailEvent.type === "done") toast(t("Mailbox {email} connected; the credentials are saved.", { email: mailEvent.account?.email ?? "" }), "info", 5000);
-		if (notify && mailEvent.type === "error") toast(serverText(mailEvent.message), "error", 9000);
+		if (notify && event.type === "done") toast(t("Mailbox {email} connected; the credentials are saved.", { email: event.account?.email ?? "" }), "info", 5000);
+		if (notify && event.type === "error") toast(serverText(event.message), "error", 9000);
 		reload();
-	}, [mailEvent?.nonce]);
+	});
 	const githubPrompt = prompt.github ?? github?.pending?.prompt ?? null;
 	const mailUrl = prompt.mail ?? mail?.pending?.url ?? null;
 	return {

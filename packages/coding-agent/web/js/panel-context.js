@@ -199,6 +199,9 @@ export function ContextPanel() {
 	const agentActive = resources ? resources.tools.some((tool) => tool.name === "agent" && tool.active) : false;
 	const isDelegatedChild = (name) => name === "workflow" || name === "ultracode" || name === "agent_tasks";
 	const toggleTool = async (name, on) => {
+		// A tool whose switch follows the current model (autoActive, e.g. agy_tool) is never toggled by hand: the row's switch is
+		// disabled, and this is the second guard; the server ignores the requested state of such tools as well.
+		if (resources.tools.some((tool) => tool.name === name && tool.autoActive)) return;
 		// workflow/ultracode/agent_tasks share the sub-agent runtime with agent: they stay disabled while agent is off.
 		// The UI disables them (see below); this is the second guard for keyboard/scripts, and the server
 		// strips them again so the model can never receive them while agent is off.
@@ -254,9 +257,11 @@ export function ContextPanel() {
 		<${Section} title=${t("Tools")} count=${resources ? `${resources.tools.filter((t) => t.active).length}/${resources.tools.length}` : ""} defaultOpen=${false}>
 			${!resources ? html`<${Spinner} />` : resources.tools.map((tool) => {
 				const needsAgent = isDelegatedChild(tool.name) && !agentActive;
-				const disabled = snap.active || needsAgent;
+				const auto = tool.autoActive === true;
+				const disabled = snap.active || needsAgent || auto;
 				const shown = toolDescription(tool);
-				return html`<div class="res-row" key=${tool.name} title=${needsAgent ? t("Enable the agent tool first") : undefined}><div class="col grow"><span class="mono">${tool.name}${tool.extension ? html` <span class="badge">${t("extension")}</span>` : null}</span><span class="dim res-desc" title=${descriptionTip(tool, shown)}>${shown}</span></div><span title=${needsAgent ? t("Enable the agent tool first") : undefined}><${Toggle} checked=${tool.active} label=${tool.name} disabled=${disabled} onChange=${(v) => toggleTool(tool.name, v)} /></span></div>`;
+				const rowTip = needsAgent ? t("Enable the agent tool first") : auto ? t("Turned on and off automatically: it follows the current model.") : undefined;
+				return html`<div class="res-row" key=${tool.name} title=${rowTip}><div class="col grow"><span class="mono">${tool.name}${tool.extension ? html` <span class="badge">${t("extension")}</span>` : null}${auto ? html` <span class="badge">${t("auto")}</span>` : null}</span><span class="dim res-desc" title=${descriptionTip(tool, shown)}>${shown}</span></div><span title=${rowTip}><${Toggle} checked=${tool.active} label=${tool.name} disabled=${disabled} onChange=${(v) => toggleTool(tool.name, v)} /></span></div>`;
 			})}
 		<//>
 		<${Section} title=${t("Project context files")} count=${resources?.contextFiles.length} defaultOpen=${false}>

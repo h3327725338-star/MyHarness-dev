@@ -42,7 +42,7 @@ import {
 	type RuntimeTraceScope,
 } from "../observability/runtime-trace.ts";
 import { loadSystemPrompt, loadSystemPromptLines } from "../system-prompts/loader/index.ts";
-import { containProcessTree } from "../utils/child-process.ts";
+import { containProcessTree, endContainedLeftovers } from "../utils/child-process.ts";
 import { getMyHarnessInvocation } from "../utils/myharness-invocation.ts";
 import { killProcessTreeAndWait } from "../utils/shell.ts";
 import type { BusinessToolDefinition } from "./contracts/index.ts";
@@ -55,6 +55,8 @@ import { truncateHead } from "./truncate.ts";
 
 const PER_TASK_OUTPUT_CAP = 20 * 1024;
 const SUB_AGENT_STOP_TIMEOUT_MS = 5_000;
+/** How long a worker's output pipes may stay open after the worker itself has exited (see the "exit" handler). */
+const WORKER_EXIT_DRAIN_MS = 2_000;
 /** Zero means delegated Explore tasks have no wall-clock deadline by default. */
 export const DEFAULT_SUB_AGENT_TASK_TIMEOUT_MS = 0;
 /** Zero means a delegated Explore task may use as many model/tool turns as needed. */
@@ -208,6 +210,13 @@ export interface SubAgentRuntimeSettings {
 	thinkingLevel?: ThinkingLevel;
 	/** Independent context cap forwarded to the child AgentSession. */
 	contextWindow?: number;
+	/**
+	 * The extension file that registers the model's provider, when the model comes from an extension. A worker loads
+	 * no extensions by itself, so without this file the model does not exist there (see worker-model.ts).
+	 */
+	providerExtensionPath?: string;
+	/** Why no sub-agent can run on the configured model; a dispatch is refused with this text before anything starts. */
+	unavailableReason?: string;
 	/** Maximum wall-clock duration of one delegated Explore task; zero means no limit. */
 	taskTimeoutMs?: number;
 	/** Canonical name for the total wall-clock limit; taskTimeoutMs remains supported. */
@@ -231,6 +240,7 @@ export type ResolvedSubAgentRuntimeSettings = Required<
 		| "chatMode"
 		| "symbolsEnabled"
 		| "contextWindow"
+		| "providerExtensionPath"
 		| "taskTimeoutMs"
 		| "totalRuntimeLimitMs"
 		| "maxTurns"
@@ -471,6 +481,7 @@ export function resolveSubAgentRuntimeSettings(
 		model: settings.model ?? "",
 		thinkingLevel: settings.thinkingLevel ?? "off",
 		contextWindow: settings.contextWindow,
+		providerExtensionPath: settings.providerExtensionPath,
 		taskTimeoutMs: totalRuntimeLimitMs,
 		totalRuntimeLimitMs,
 		maxTurns: resolvedSubAgentMaxTurns(settings.maxTurns),
@@ -1025,6 +1036,7 @@ async function runExploreTask(options: {
 	model: string;
 	thinkingLevel: ThinkingLevel;
 	contextWindow?: number;
+	providerExtensionPath?: string;
 	taskTimeoutMs?: number;
 	totalRuntimeLimitMs?: number;
 	maxTurns?: number;
@@ -1440,6 +1452,17 @@ async function runExploreTask(options: {
 				}
 				settle(() => reject(wrapped));
 			});
+			// "close" waits for the worker's output pipes, and on Windows a process the worker started can hold a copy of
+			// them after the worker itself is gone (a command it left running, a provider's own program). The worker's
+			// last line is written before it exits, so shortly after the exit whatever is left of its tree is ended;
+			// the pipes close and the task is reported instead of waiting for the stall watchdog.
+			child.once("exit", () => {
+				const leftovers = setTimeout(() => {
+					if (!settled) endContainedLeftovers(child.pid);
+				}, WORKER_EXIT_DRAIN_MS);
+				leftovers.unref();
+				child.once("close", () => clearTimeout(leftovers));
+			});
 			child.on("close", (code) => {
 				buffer += stdoutDecoder.end();
 				stderr = truncateSubAgentOutput(stderr + stderrDecoder.end());
@@ -1617,6 +1640,8 @@ export function buildSubAgentArgs(options: {
 	contextWindow?: number;
 	systemPromptPath: string;
 	guardPath: string;
+	/** The extension that registers the model's provider; the only extension a worker loads besides its guard. */
+	providerExtensionPath?: string;
 	mode?: SubAgentMode;
 	/** `codeIntelligence.symbolsEnabled`; false leaves symbols out of the worker's `--tools`. */
 	symbolsEnabled?: boolean;
@@ -1637,6 +1662,9 @@ export function buildSubAgentArgs(options: {
 		"--no-extensions",
 		"--extension",
 		options.guardPath,
+		// A model that an extension registers exists in the worker only with that extension loaded. The worker's
+		// session is delegated: it takes none of the extension's tools, only its provider.
+		...(options.providerExtensionPath ? ["--extension", options.providerExtensionPath] : []),
 		"--tools",
 		toolNames.join(","),
 		"--model",
@@ -1871,6 +1899,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 						symbolsEnabled: options.settings.symbolsEnabled,
 						thinkingLevel: options.settings.thinkingLevel,
 						contextWindow: options.settings.contextWindow,
+						providerExtensionPath: options.settings.providerExtensionPath,
 						description: task.description,
 						prompt: workerPromptFor(index),
 						goal: task.goal ?? task.prompt,
@@ -1958,7 +1987,9 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 						});
 					}
 				} finally {
-					if (sandbox) {
+					// What the mirror left out matters to whoever reads a report made from that mirror. A task that
+					// failed has no report: the list would only bury the one line that says why it failed.
+					if (sandbox && results[index].status !== "failed") {
 						for (const note of sandbox.importNotes)
 							results[index].unresolved = pushUniqueLimited(results[index].unresolved, `未带入镜像：${note}`);
 					}
@@ -2108,6 +2139,8 @@ export function createSubAgentToolDefinition(
 			if (!settings.provider || !settings.model || !settings.thinkingLevel) {
 				throw new Error("Sub Agent model or thinking level is not configured. Configure it in /settings.");
 			}
+			// Known before anything is copied or started: no worker could run on this model.
+			if (settings.unavailableReason) throw new Error(settings.unavailableReason);
 			const runtimeSettings = resolveSubAgentRuntimeSettings(settings);
 			const parentTraceScope = options?.getTraceParentScope?.();
 

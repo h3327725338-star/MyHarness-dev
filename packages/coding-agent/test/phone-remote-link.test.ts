@@ -184,7 +184,7 @@ describe("phone link from any network", () => {
 	 * What backend-remote.js does over any transport: open a session, call a route, read the event stream. `burst`: that
 	 * many snapshots of a growing reply are sent at once before the last event.
 	 */
-	async function useLink(pipe: PhonePipe, uploadBytes = 0, burst = 0) {
+	async function useLink(pipe: PhonePipe, uploadBytes = 0, burst = 0, extra: Array<[string, unknown]> = []) {
 		const key = await phoneCrypto.importKey(keyText);
 		const sealedOpen = await phoneCrypto.seal(key, phoneCrypto.linkAad("open", "req", PHONE_ID), { name: "Pixel 9" });
 		const opened = await pipe.request("open", { d: PHONE_ID, ...sealedOpen });
@@ -234,6 +234,7 @@ describe("phone link from any network", () => {
 			emit("run_state", { slot: "s1", running: false });
 			emit("usage", { slot: "s1", tokens: 99 });
 		}
+		for (const [event, data] of extra) emit(event, data);
 		emit("message_update", { slot: "s1", text: "半句" });
 		emit("terminal_output", { secret: true }); // not an event a phone gets
 		await until(() =>
@@ -255,6 +256,16 @@ describe("phone link from any network", () => {
 		pipe.close();
 		// Every message file was read and removed by its receiver.
 		await until(() => [...(drive.folders.get("link")?.keys() ?? [])].length === 0);
+		await until(() => remote.status().connections.length === 0);
+	});
+
+	it("forwards the announcement that a message is ending a run (run_redirecting), so the phone does not read its stopped reply as cancelled", async () => {
+		const pipe = phoneRemote.openRelay({ drive, pcId: PC_ID, phoneId: PHONE_ID, pollMs: 40 });
+		const redirecting = { slot: "s1", runId: 2, startedAt: 5, ts: 6 };
+		const { frames } = await useLink(pipe, 0, 0, [["run_redirecting", redirecting]]);
+		expect(frames.map((frame) => frame.e)).toEqual(["link", "run_redirecting", "message_update"]);
+		expect(frames[1]!.d).toEqual(redirecting);
+		pipe.close();
 		await until(() => remote.status().connections.length === 0);
 	});
 

@@ -59,6 +59,24 @@ export function preparePageCapture({ reach = 0 } = {}) {
 		}
 	};
 }
+// Flipping the colour theme (store.js: data-color-theme / data-chat-mode follow the mode on screen) makes every button, chip
+// and border that has a colour transition fade from the other mode's colours to its own over 90-160 ms. Inside the reveal
+// that is a visible shimmer: in the first moments of the circle, and again on the restored page the instant a reversed reveal
+// ends. `colourFadeGuard()` is taken before the flip and the returned function after it: it finishes the colour transitions
+// the flip started, so the new picture is drawn in its own colours at once. Only transitions this flip started, and only
+// colours: a list fading in or a panel sliding keeps its motion, and the switch's own colour motion is left alone.
+const COLOUR_PROPERTY = /(^|-)color$|^(fill|stroke|box-shadow)$/;
+function colourFadeGuard() {
+	if (typeof CSSTransition !== "function") return () => {};
+	const before = new Set(document.getAnimations());
+	return () => {
+		for (const animation of document.getAnimations()) {
+			if (before.has(animation) || !(animation instanceof CSSTransition) || !COLOUR_PROPERTY.test(animation.transitionProperty)) continue;
+			if (animation.effect?.target?.closest?.(".mode-switch")) continue;
+			try { animation.finish(); } catch {}
+		}
+	};
+}
 // Captured elements can be excluded from hit testing during a View Transition, even with pointer-events:none.
 // Forward a physical press inside the live switch's bounds only when the snapshot prevented it reaching the button.
 function pressSwitch(event) {
@@ -80,6 +98,23 @@ export function reverseModeReveal(mode) {
 	return true;
 }
 
+// The new page's layer drawn without the reveal's animation (layout.css) is where the playback ends: the whole page for a
+// reveal going forward, nothing for one going back. At the end the animation and the transition's layers can leave the
+// screen in different frames; with the stylesheet already at the end point, that frame shows the last picture again.
+// Before this, a forward reveal fell back to the hidden start for one frame now and then, and the whole old page flashed
+// over the new one right after the circle had filled the window. Forward, the end point is set only once the animation
+// has drawn a frame of its own, so the first frames of the circle cannot show the whole new page instead.
+function holdEndPoint(run, animation, rate) {
+	const root = document.documentElement;
+	if (rate < 0) {
+		root.classList.remove("mode-reveal-shown");
+		return;
+	}
+	animation.ready.then(() => requestAnimationFrame(() => {
+		if (active === run && run.animation === animation && animation.playbackRate > 0) root.classList.add("mode-reveal-shown");
+	}), () => {});
+}
+
 // Start (or restart) the run's reveal at `time` playing in direction `rate`; the previous animation, if any, goes.
 function playReveal(run, time, rate) {
 	const previous = run.animation;
@@ -87,12 +122,19 @@ function playReveal(run, time, rate) {
 	animation.currentTime = time;
 	animation.playbackRate = rate;
 	run.animation = animation;
+	holdEndPoint(run, animation, rate);
 	animation.onfinish = () => {
 		if (active !== run || run.animation !== animation) return;
-		if (run.target === run.from) run.restore?.();
+		if (run.target === run.from) {
+			const settleColours = colourFadeGuard();
+			run.restore?.();
+			settleColours();
+		}
 		active = null;
 		run.transition.skipTransition();
-		animation.cancel();
+		// The animation holds its last frame until the transition's own layers are gone: cancelled at once, the new
+		// page's layer would fall back to its hidden start (the stylesheet's zero-size clip) for as long as it is drawn.
+		run.transition.finished.catch(() => {}).finally(() => animation.cancel());
 		release();
 	};
 	if (previous) { previous.onfinish = null; previous.cancel(); }
@@ -103,9 +145,13 @@ export async function revealMode(update, { from, to, restore } = {}) {
 		active.transition.skipTransition();
 		active = null;
 	}
-	const settled = async () => {
+	// The last reveal's end point (holdEndPoint) stays until here: this reveal's new page starts hidden again.
+	document.documentElement.classList.remove("mode-reveal-shown");
+	const settled = async (guard = false) => {
+		const settleColours = guard ? colourFadeGuard() : null;
 		update();
 		await new Promise((done) => setTimeout(done, 0));
+		settleColours?.();
 	};
 	if (typeof document.startViewTransition !== "function" || !motionEnabled() || document.visibilityState !== "visible") {
 		release();
@@ -119,7 +165,7 @@ export async function revealMode(update, { from, to, restore } = {}) {
 	let transition;
 	const putBack = preparePageCapture();
 	document.documentElement.classList.add("mode-revealing");
-	try { transition = document.startViewTransition(settled); }
+	try { transition = document.startViewTransition(() => settled(true)); }
 	catch { putBack(); release(); await settled(); return; }
 	// After the update the old page is mostly gone; what is left of it (a switch that was superseded) is put back.
 	transition.updateCallbackDone.catch(() => {}).finally(putBack);

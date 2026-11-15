@@ -1,7 +1,7 @@
 // The left pane: which side messages go to (this phone or the PC), and that side's chats.
 import { t } from "/shared/i18n.js";
 import { Spinner, html, useEffect, useMemo, useRef, useState } from "/shared/ui.js";
-import { pc } from "./backend-remote.js";
+import { pc, routeName } from "./backend-remote.js";
 import { backend, nav, setMode } from "./backends.js";
 import { Icon, Mark } from "./micons.js";
 import { haptic } from "./native.js";
@@ -57,10 +57,7 @@ function ChatRow({ chat, on, onOpen, onMenu }) {
 
 /** How the PC is reached now, in words. */
 export function routeLabel(link) {
-	if (link.route === "relay") return t("Through Google Drive");
-	if (link.route === "direct") return t("Direct connection");
-	if (link.route === "lan") return t("Local network");
-	return "";
+	return routeName(link.route);
 }
 
 /** The PCs of the Google account, the ones that are on first; tapping one connects to it. */

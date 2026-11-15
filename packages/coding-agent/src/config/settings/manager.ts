@@ -172,17 +172,53 @@ function normalizeWebSearchSettings(settings: WebSearchSettings | undefined): Re
 						.toLowerCase(),
 			) ?? defaults.browser,
 		useBrowserCookies: source.useBrowserCookies === true,
+		extensionSources: normalizeExtensionSourceIds(source.extensionSources),
+		extensionSourceModels: normalizeExtensionSourceModels(source.extensionSourceModels),
+		extensionSourceEfforts: normalizeExtensionSourceModels(source.extensionSourceEfforts),
 	};
 }
 
+/** Ids of extension search sources as saved: trimmed, lowercase, each once. Which of them exist is known at search time. */
+function normalizeExtensionSourceIds(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const ids = value
+		.filter((entry): entry is string => typeof entry === "string")
+		.map((entry) => entry.trim().toLowerCase())
+		.filter(Boolean);
+	return [...new Set(ids)];
+}
+
+/** One text per extension source id (its search model, its reasoning level): ids lowercase, texts trimmed, blanks dropped. */
+function normalizeExtensionSourceModels(value: unknown): Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const models: Record<string, string> = {};
+	for (const [id, model] of Object.entries(value)) {
+		const key = id.trim().toLowerCase();
+		if (key && typeof model === "string" && model.trim()) models[key] = model.trim();
+	}
+	return models;
+}
+
 const reportedRemovedSettings = new Set<string>();
+let removedSettingNoticesMuted = false;
 
 /** Test hook: forget which removed settings were already reported. */
 export function resetRemovedSettingNotices(): void {
 	reportedRemovedSettings.clear();
+	removedSettingNoticesMuted = false;
+}
+
+/**
+ * A sub-agent's worker reads the same settings files as the process that started it, which has reported these
+ * already. Printed again there, the notice lands in the worker's error output, in front of the one line that says why
+ * a worker failed.
+ */
+export function muteRemovedSettingNotices(): void {
+	removedSettingNoticesMuted = true;
 }
 
 function noticeRemovedSetting(scope: SettingsScope, key: string, message: string): void {
+	if (removedSettingNoticesMuted) return;
 	const id = `${scope}:${key}`;
 	if (reportedRemovedSettings.has(id)) return;
 	reportedRemovedSettings.add(id);

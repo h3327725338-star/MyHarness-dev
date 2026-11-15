@@ -6,7 +6,6 @@ import { loadSystemPrompt, loadSystemPromptLines } from "../../system-prompts/lo
 import type { BusinessToolDefinition } from "../contracts/index.ts";
 import { FULL_TEXT_OUTPUT } from "../tool-result-persistence.ts";
 import { cutAtCharBoundary } from "../truncate.ts";
-import { WEB_SEARCH_ENGINES } from "./engines/index.ts";
 import { abortError } from "./errors.ts";
 import { selectExcerpts } from "./excerpts.ts";
 import {
@@ -98,6 +97,9 @@ const disabledSettings = {
 		browserFallback: SETTINGS_DEFAULTS.webSearch.browserFallback,
 		browser: SETTINGS_DEFAULTS.webSearch.browser,
 		useBrowserCookies: SETTINGS_DEFAULTS.webSearch.useBrowserCookies,
+		extensionSources: [],
+		extensionSourceModels: {},
+		extensionSourceEfforts: {},
 	}),
 };
 
@@ -148,11 +150,11 @@ function summarizePage(page: WebFetchedPage): PageSummary {
 	};
 }
 
-function formatFailures(failures: readonly WebSearchFailure[]): string | undefined {
+function formatFailures(failures: readonly WebSearchFailure[], labelOf: (id: string) => string): string | undefined {
 	if (failures.length === 0) return undefined;
 	return `Diagnostics:\n${failures
 		.map((failure) => {
-			const where = [failure.engine && WEB_SEARCH_ENGINES[failure.engine].label, failure.query, failure.url]
+			const where = [failure.engine && labelOf(failure.engine), failure.query, failure.url]
 				.filter(Boolean)
 				.join(" · ");
 			return `- [${failure.code}] ${where ? `${where}: ` : ""}${failure.message}`;
@@ -167,24 +169,31 @@ function pageHeader(page: WebFetchedPage, label: string): string {
 	return lines.join("\n");
 }
 
-/** "Google (Firefox), Bing (HTTP)": which transport actually answered each engine. */
-function formatEngines(response: WebSearchResponse): string {
+/**
+ * "Google (Firefox), Bing (HTTP), Claude Code 搜索": which transport actually answered each engine. An extension
+ * source is another program's own search and has no transport to name.
+ */
+function formatEngines(response: WebSearchResponse, labelOf: (id: string) => string): string {
 	return response.engines
 		.map((engine) => {
 			const vias = new Set(
 				response.routes
-					.filter((route) => route.engine === engine)
+					.filter((route) => route.engine === engine && route.via !== "extension")
 					.map((route) => (route.via === "browser" ? (route.browser ?? "Firefox") : "HTTP")),
 			);
-			const label = WEB_SEARCH_ENGINES[engine].label;
+			const label = labelOf(engine);
 			if (vias.size === 0) return label;
 			return `${label} (${[...vias].join("+")})`;
 		})
 		.join(", ");
 }
 
-function formatSearchResponse(response: WebSearchResponse, queries: string[]): { preview: string; fullText?: string } {
-	const sections: string[] = [`Engines: ${formatEngines(response)}`];
+function formatSearchResponse(
+	response: WebSearchResponse,
+	queries: string[],
+	labelOf: (id: string) => string,
+): { preview: string; fullText?: string } {
+	const sections: string[] = [`Engines: ${formatEngines(response, labelOf)}`];
 	if (response.results.length === 0) sections.push("No search results.");
 	else {
 		sections.push(
@@ -218,7 +227,7 @@ function formatSearchResponse(response: WebSearchResponse, queries: string[]): {
 			`Pages read (${pagePreviews.length}; most relevant excerpts shown, full text is saved):\n\n${pagePreviews.join("\n\n")}`,
 		);
 	}
-	const diagnostics = formatFailures(response.failures);
+	const diagnostics = formatFailures(response.failures, labelOf);
 	if (diagnostics) sections.push(diagnostics);
 	if (response.cacheHit) sections.push("Cache: session cache hit.");
 	const preview = sections.join("\n\n");
@@ -244,7 +253,8 @@ function formatFetchResponse(response: WebFetchResponse): { preview: string; ful
 			}`,
 		);
 	}
-	const diagnostics = formatFailures(response.failures);
+	// A page failure names no engine, so no label is ever looked up here.
+	const diagnostics = formatFailures(response.failures, (id) => id);
 	if (diagnostics) sections.push(diagnostics);
 	return {
 		preview: sections.length > 0 ? sections.join("\n\n") : "No pages were fetched.",
@@ -256,13 +266,24 @@ function formatFetchResponse(response: WebFetchResponse): { preview: string; ful
  * A single query or URL written as plain text instead of a one-item list: there is only one way to read it, so it is
  * used as that list rather than failing validation and costing the model a round trip (seen in real use for queries).
  * A string holding a JSON list was already turned into the list by the shared argument recovery before this runs.
+ * The same holds for the field named in the singular (`query`, `url`) when the list itself is not given: models
+ * write one query that way, and in real chats each such call was refused once before it was sent again as a list.
  */
-function listFromPlainText<T>(args: T, key: "queries" | "urls"): T {
-	const value = (args as Record<string, unknown> | undefined)?.[key];
-	if (typeof value !== "string") return args;
+export function listFromPlainText<T>(args: T, key: "queries" | "urls"): T {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+	let record = args as Record<string, unknown>;
+	if (record[key] === undefined) {
+		const singular = key === "queries" ? "query" : "url";
+		const single = record[singular];
+		if (typeof single !== "string" && !Array.isArray(single)) return args;
+		const { [singular]: _named, ...others } = record;
+		record = { ...others, [key]: single };
+	}
+	const value = record[key];
+	if (typeof value !== "string") return record as T;
 	const text = value.trim();
-	if (!text || text.startsWith("[")) return args;
-	return { ...(args as Record<string, unknown>), [key]: [text] } as T;
+	if (!text || text.startsWith("[")) return record as T;
+	return { ...record, [key]: [text] } as T;
 }
 
 export function createWebSearchToolDefinition(
@@ -302,7 +323,7 @@ export function createWebSearchToolDefinition(
 				),
 				signal,
 			);
-			const formatted = formatSearchResponse(response, params.queries);
+			const formatted = formatSearchResponse(response, params.queries, (id) => service.sourceLabel(id));
 			return textResult(
 				formatted.preview,
 				{

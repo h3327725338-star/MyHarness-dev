@@ -66,9 +66,15 @@
 | `fallback.ts` | `ModelFallbackCoordinator`：主模型重试和恢复都用完后，把当前任务交给 `fallbackModel` 设置的备用模型继续；备用模型也失败时给出主、备两边的原因；任务结束后切回主模型 |
 | `error-explanation.ts` | 把模型请求的原始错误（如 `520 status code (no body)`）翻译成中文原因和处理建议，供 Web UI 和任务结束状态显示；不影响重试判断 |
 
+### plan-usage/ — 订阅套餐剩余额度
+
+| 文件 | 内容 |
+| --- | --- |
+| `sources.ts` | 扩展用 `pi.registerPlanUsageSource()` 注册的“用量来源”（Claude Code、agy 插件各一个）：订阅套餐的 5 小时窗口和每周窗口还剩多少、何时重置。进程里只有一份来源表（同 id 重新注册即替换）；`planUsageStates()` 在交给浏览器前清理数字（百分比夹到 0–100，丢掉无效窗口）；`onPlanUsageChanged` 让 `modes/web/routes-plan-usage.ts` 广播 `plan_usage` 事件。只有类型和注册表，不依赖其他模块 |
+
 ### 对外接口
 
-`src/index.ts` 导出 `ModelRuntime`（`runtime/index.ts`）、`model-resolver.ts`、`AuthStorage`、`api-key-collection.ts`、`ModelRegistry`。
+`src/index.ts` 导出 `ModelRuntime`（`runtime/index.ts`）、`model-resolver.ts`、`AuthStorage`、`api-key-collection.ts`、`ModelRegistry`，以及 `plan-usage/sources.ts` 的类型（`PlanUsageSource` 等）。
 
 ### 依赖
 

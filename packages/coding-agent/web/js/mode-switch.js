@@ -28,6 +28,19 @@ function SignalMark({ signal, mode }) {
 	return html`<span class=${`mode-mark ${ui.cls}`} title=${t(ui.label)}><${Icon} name=${ui.icon} size=${11} /></span>`;
 }
 
+/**
+ * Where the knob is drawn right now (its translate, stretch and corner rounding), read from the running slide. A click that
+ * turns the slide around starts the way back from here: the icon's progress runs on its own clock and is not where the knob is.
+ */
+function readKnob(node) {
+	if (!node) return null;
+	const style = getComputedStyle(node);
+	const matrix = /^matrix\(([^)]+)\)$/.exec(style.transform);
+	if (!matrix) return null;
+	const [sx, , , sy, x] = matrix[1].split(",").map(Number);
+	return Number.isFinite(x) && Number.isFinite(sx) && Number.isFinite(sy) ? { x, sx, sy, radius: style.borderRadius } : null;
+}
+
 /** A soft sliding knob with a continuously morphing icon; task marks stay attached to their own side. */
 export function ModeSwitch() {
 	const mode = useStore((s) => s.view.modeIntent || s.view.chatMode);
@@ -40,6 +53,7 @@ export function ModeSwitch() {
 	const paths = useRef([]);
 	const progress = useRef(mode === "general" ? 1 : 0);
 	const previous = useRef(mode);
+	const knobAt = useRef(null);
 	useLayoutEffect(() => {
 		const target = mode === "general" ? 1 : 0;
 		const paint = (value) => {
@@ -48,31 +62,43 @@ export function ModeSwitch() {
 		};
 		if (previous.current === mode || !motionEnabled()) {
 			previous.current = mode;
+			knobAt.current = null;
 			paint(target);
 			return;
 		}
 		previous.current = mode;
 		const from = progress.current;
 		paint(from);
+		// A slide that was still running is turned around from where the knob is drawn, not from where the icon is.
+		const live = knobAt.current;
+		knobAt.current = null;
+		const x = target ? 28 : 0;
+		const oldX = live ? live.x : from * 28;
+		const travel = Math.abs(x - oldX);
+		// What is left to slide sets how long it takes (a full slide as before, a turn-around close to its end a brisk one).
+		const span = Math.max(.5, Math.min(1, travel / 28));
 		const start = performance.now();
 		let frame;
 		const tick = (now) => {
-			const t = Math.min(1, (now - start) / 520);
+			const t = Math.min(1, (now - start) / (520 * span));
 			paint(from + (target - from) * (t * t * (3 - 2 * t)));
 			if (t < 1) frame = requestAnimationFrame(tick);
 		};
 		frame = requestAnimationFrame(tick);
-		const x = target ? 28 : 0;
-		const oldX = from * 28;
-		const direction = target ? 1 : -1;
+		const direction = x >= oldX ? 1 : -1;
+		const lead = Math.min(12, travel * .45);
 		const animation = knob.current?.animate?.([
-			{ transform: `translateX(${oldX}px) scale(1, 1)`, borderRadius: "50%" },
-			{ transform: `translateX(${oldX + direction * 12}px) scale(1.3, .78)`, borderRadius: "42%", offset: .35 },
+			{ transform: `translateX(${oldX}px) scale(${live ? `${live.sx}, ${live.sy}` : "1, 1"})`, borderRadius: live?.radius || "50%" },
+			{ transform: `translateX(${oldX + direction * lead}px) scale(1.3, .78)`, borderRadius: "42%", offset: .35 },
 			{ transform: `translateX(${x + direction * 2}px) scale(.88, 1.12)`, borderRadius: "48%", offset: .7 },
 			{ transform: `translateX(${x - direction}px) scale(1.05, .96)`, borderRadius: "50%", offset: .87 },
 			{ transform: `translateX(${x}px) scale(1, 1)`, borderRadius: "50%" },
-		], { duration: 580, easing: "cubic-bezier(.25,.1,.25,1)" });
-		return () => { cancelAnimationFrame(frame); animation?.cancel(); };
+		], { duration: 580 * span, easing: "cubic-bezier(.25,.1,.25,1)" });
+		return () => {
+			cancelAnimationFrame(frame);
+			if (animation?.playState === "running") knobAt.current = readKnob(knob.current);
+			animation?.cancel();
+		};
 	}, [mode]);
 	return html`<button class=${`mode-switch ${mode}`} role="switch" aria-checked=${mode === "general"} aria-label=${t("General mode")} title=${`${t(MODE_LABEL[mode])} · ${label}`} onClick=${() => actions.switchMode(next)}>
 		<span class="mode-side coding" aria-hidden="true"><${Icon} name="terminal" size=${11} /><span class="mode-signal"><${SignalMark} signal=${signals.coding} mode="coding" /></span></span>

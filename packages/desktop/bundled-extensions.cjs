@@ -3,7 +3,7 @@
 const { existsSync } = require('node:fs');
 const { join } = require('node:path');
 
-const BUNDLED_EXTENSIONS = ['claude-code-shell.ts'];
+const BUNDLED_EXTENSIONS = ['claude-code-shell.ts', 'agy-shell.ts'];
 
 function bundledExtensionArgs(appDir, agentDir) {
   return BUNDLED_EXTENSIONS.flatMap((name) => {

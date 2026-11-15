@@ -36,6 +36,19 @@ const LINK_DRIVE_MS = 10000;
 const linkWriteMs = (chars) => LINK_DRIVE_MS + Math.ceil(chars / 50000) * 1000;
 export const DEFAULT_ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
 
+/** The ways to a PC of the account, fastest first. */
+export const PC_ROUTES = ["lan", "direct", "relay"];
+
+/**
+ * The ways the user left on (Settings → PC connection), fastest first. `saved` is what prefs.js keeps,
+ * `{ lan, direct, relay }`: a way is on unless it says `false`. Nothing left on counts as everything on, since a
+ * choice that reaches no PC by any way can only be a damaged one.
+ */
+export function allowedRoutes(saved) {
+	const on = PC_ROUTES.filter((route) => saved?.[route] !== false);
+	return on.length ? on : [...PC_ROUTES];
+}
+
 export const offerName = (pcId, phoneId, conn) => `o__${pcId}__${phoneId}__${conn}.json`;
 export const answerName = (phoneId, pcId, conn) => `a__${phoneId}__${pcId}__${conn}.json`;
 export const relayName = (to, from, conn, seq) => `m__${to}__${from}__${conn}__${seq.toString(36).padStart(8, "0")}.json`;
@@ -407,6 +420,8 @@ export function openRelay({ drive, pcId, phoneId, now = Date.now, pollMs = RELAY
 	let keepAlive = 0;
 	let lastSeq = 0;
 	let lastBusy = now();
+	let lastLook = 0;
+	let lastOut = now();
 	let looking = 0;
 	let reading = false;
 	const seen = new Set();
@@ -454,6 +469,7 @@ export function openRelay({ drive, pcId, phoneId, now = Date.now, pollMs = RELAY
 	// for more only delays every one of them.
 	const client = new PipeClient((message) => {
 		if (message.t !== "k") lastBusy = now();
+		lastOut = now();
 		queue.push(message);
 		if (message.t === "bye") flush();
 		else if (!flushTimer && !writing) flushTimer = setTimeout(flush, FLUSH_MS);
@@ -525,8 +541,29 @@ export function openRelay({ drive, pcId, phoneId, now = Date.now, pollMs = RELAY
 		if (client.closed) return;
 		const busy = client.pending.size > 0 || now() - lastBusy < RELAY_BUSY_MS;
 		// A look that hangs does not hold up the next one; a few at most run at once.
-		if (looking < RELAY_LOOKS_AT_ONCE) look();
+		if (looking < RELAY_LOOKS_AT_ONCE) {
+			lastLook = now();
+			look();
+		}
 		pollTimer = setTimeout(poll, busy ? busyPollMs : pollMs);
+	};
+	// Everything above runs on the page's timers, and a page that is not on screen gets few of them: after a while one
+	// a minute at most. The PC's answers would then be seen a minute late, and the sign of life the PC waits for (it
+	// closes a connection it has not heard from for 150 s, and the phone does not learn of it) would hardly come in
+	// time. The app's shell is not slowed down: while a reply is awaited in the background it calls this every second,
+	// and what is due is done without waiting for a timer.
+	const kick = () => {
+		if (client.closed) return;
+		const busy = client.pending.size > 0 || now() - lastBusy < RELAY_BUSY_MS;
+		if (now() - lastLook >= (busy ? busyPollMs : pollMs)) {
+			clearTimeout(pollTimer);
+			poll();
+		}
+		if (now() - lastOut >= RELAY_KEEPALIVE_MS) client.send({ t: "k" });
+		if (queue.length && !writing) {
+			clearTimeout(flushTimer);
+			flush();
+		}
 	};
 	pollTimer = setTimeout(poll, pollMs);
 	keepAlive = setInterval(() => client.send({ t: "k" }), RELAY_KEEPALIVE_MS);
@@ -535,5 +572,5 @@ export function openRelay({ drive, pcId, phoneId, now = Date.now, pollMs = RELAY
 		clearTimeout(flushTimer);
 		clearInterval(keepAlive);
 	});
-	return { transport: "relay", request: (op, envelope, timeoutMs) => client.request(op, envelope, timeoutMs), events: (envelope, onFrame, abort) => client.events(envelope, onFrame, abort), close: () => client.close(undefined, true), onClose: (listener) => client.onClose(listener) };
+	return { transport: "relay", request: (op, envelope, timeoutMs) => client.request(op, envelope, timeoutMs), events: (envelope, onFrame, abort) => client.events(envelope, onFrame, abort), close: () => client.close(undefined, true), onClose: (listener) => client.onClose(listener), kick };
 }

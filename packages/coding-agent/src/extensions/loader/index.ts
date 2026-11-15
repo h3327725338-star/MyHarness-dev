@@ -33,6 +33,8 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
 import { time } from "../../observability/timings.ts";
 import type { ExecOptions } from "../../platform/process/exec.ts";
 import { execCommand } from "../../platform/process/exec.ts";
+import { type PlanUsageSource, registerPlanUsageSource } from "../../providers/plan-usage/sources.ts";
+import { registerWebSearchSource, type WebSearchSource } from "../../tools/web-search/sources.ts";
 import { resolvePath } from "../../utils/paths.ts";
 // Extensions use a dedicated entry instead of the public facade. Keeping this
 // import leaf-level prevents loader -> src/index.ts -> loader initialization
@@ -411,17 +413,36 @@ function createExtensionAPI(
 
 		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {
 			runtime.assertActive();
+			// Which extension a provider comes from is kept: a sub-agent's worker loads that file to run on its models.
+			extension.providers ??= new Set();
 			if (typeof providerOrName === "string") {
 				if (!config) throw new Error("Provider config is required when registering by name");
 				runtime.registerProvider(providerOrName, config, extension.path);
+				extension.providers.add(providerOrName);
 				return;
 			}
 			runtime.registerNativeProvider(providerOrName, extension.path);
+			extension.providers.add(providerOrName.id);
 		},
 
 		unregisterProvider(name: string) {
 			runtime.assertActive();
 			runtime.unregisterProvider(name, extension.path);
+			extension.providers?.delete(name);
+		},
+
+		// One list per process (tools/web-search/sources.ts): a source is a program on this computer, the same for
+		// every chat, and the settings page lists it without a chat of its own.
+		registerWebSearchSource(source: WebSearchSource) {
+			runtime.assertActive();
+			registerWebSearchSource(source);
+		},
+
+		// Also one list per process (providers/plan-usage/sources.ts): the browser reads the plan's numbers for every
+		// chat. The notifier it returns is not tied to this extension's chat, so it keeps working when that chat is gone.
+		registerPlanUsageSource(source: PlanUsageSource) {
+			runtime.assertActive();
+			return registerPlanUsageSource(source);
 		},
 
 		events: eventBus,

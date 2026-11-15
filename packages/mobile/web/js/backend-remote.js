@@ -5,19 +5,20 @@
 //
 // Two kinds of PC: one paired with its QR code (reached on the local network only), and one of the Google account the
 // phone is signed in with (account.js), reached from any network: on the local network when the PC listens there,
-// else over a direct WebRTC connection, else through files in the account's Drive (link-remote.js). The requests and
-// answers are the same sealed messages on every route.
+// else over a direct WebRTC connection, else through files in the account's Drive (link-remote.js). Which of these
+// three are tried is the user's choice (Settings → PC connection, `prefs.pcRoutes`). The requests and answers are the
+// same sealed messages on every route.
 import { t } from "/shared/i18n.js";
 import { fileToBase64, UPLOAD_MAX_BYTES } from "./attachments.js";
-import { addPending, applyEvent, markDelivered, removePending } from "./live.js";
+import { addPending, applyEvent, carryLive, markDelivered, mergeReloaded, removePending } from "./live.js";
 import { accountLink, onAccountPcs, onAccountView } from "./account.js";
 import { mirrorPcTab } from "./browser-model.js";
 import { kvGet, kvSet } from "./db.js";
 import { importKey, linkAad, open, parsePairing, seal } from "./link-crypto.js";
-import { openDirect, openRelay } from "./link-remote.js";
+import { allowedRoutes, openDirect, openRelay, PC_ROUTES } from "./link-remote.js";
 import { haptic, httpFetch, nativeInfo, notifyDone, onNative, runActive, secretDelete, secretGet, secretSet } from "./native.js";
 import { chatModeOf, DEFAULT_KEY, emptyLists, isOpen, pathKey } from "./pc-groups.js";
-import { prefs } from "./prefs.js";
+import { onPrefs, prefs } from "./prefs.js";
 import { emit, emptyChat, emptyModels, FOLDS_KEY, LIST_MODE_KEY, saveJson, state, toast } from "./store.js";
 
 const LINK_KEY = "myharness.mobile.link";
@@ -36,6 +37,10 @@ const HIDDEN_REST_MS = 120000;
 // opened again (a direct connection that died while the app was frozen is otherwise noticed only after its own timeouts).
 const ALIVE_AFTER_HIDDEN_MS = 8000;
 const ALIVE_WAIT_MS = { lan: 5000, direct: 5000, relay: 15000 };
+// Through Google Drive the PC closes a connection it has not heard from for 150 s, and the phone writes a sign of life
+// every 45 s. A page Android put to sleep in the background wrote none: asleep for longer than this, the connection is
+// gone for certain, and asking it whether it is alive would only wait out ALIVE_WAIT_MS before connecting again.
+const RELAY_GONE_MS = 110000;
 // What the PC side showed last (its chat lists and the open chat), kept on the phone and shown at once when the app
 // opens or reconnects, while the PC is asked again.
 const CACHE_KEY = "pc.cache";
@@ -59,16 +64,41 @@ let counter = 0;
 let opening = null;
 let stream = null; // AbortController of the event stream
 let retryTimer = 0;
+let retryAt = 0; // when the next try to connect is due (0: none is planned)
 let retries = 0;
 let hiddenTimer = 0;
 let directTimer = 0;
 let directTrying = false;
+let stopRace = null; // ends the attempts of the last raceRoutes that are still under way
 let generation = 0; // grows with every connect and unpair: late answers of an older link are ignored
 let hiddenAt = 0;
+let awakeAt = Date.now(); // when the page last ran (a page asleep in the background runs no timers)
+let slept = { ms: 0, at: 0 }; // the last long sleep and when it ended
+let frames = Promise.resolve(); // settles when every event received so far has been applied
+
+/** The page runs: how long it was asleep until a moment ago (0 when it was not). */
+function noteAwake() {
+	const now = Date.now();
+	if (now - awakeAt > 15000) slept = { ms: now - awakeAt, at: now };
+	awakeAt = now;
+	return slept.at && now - slept.at < 5000 ? slept.ms : 0;
+}
 
 const bags = new Map(); // slot id → chat object (store.js: emptyChat) with { slot, loaded, cursor, cwd }
 let slots = []; // the PC's open chats (SlotStatus)
 let activeSlot = "";
+
+/** The ways to a PC of the account the user left on (Settings → PC connection), fastest first. */
+const routesOn = () => allowedRoutes(prefs.pcRoutes);
+const fasterOn = () => routesOn().some((route) => route !== "relay");
+
+/** A way to the PC, in words. */
+export function routeName(route) {
+	if (route === "relay") return t("Through Google Drive");
+	if (route === "direct") return t("Direct connection");
+	if (route === "lan") return t("Local network");
+	return "";
+}
 
 function setLink(patch) {
 	state.pc.link = { ...state.pc.link, ...patch };
@@ -198,10 +228,11 @@ function watchPipe(pipe) {
 }
 
 /**
- * Every route to a PC of the account at once: its local network address, a direct WebRTC connection and the relay
- * through Drive. The first that opens a session is used; a faster one that opens later takes over (`upgrade`), a
+ * Every route to a PC of the account that is turned on, at once: its local network address, a direct WebRTC connection
+ * and the relay through Drive. The first that opens a session is used; a faster one that opens later takes over (`upgrade`), a
  * slower one is closed. Waiting for the direct connection to fail before trying the relay took half a minute on mobile
- * data, where a direct path rarely exists without a TURN server. Resolves with `{ route, host, pipe, answer }`.
+ * data, where a direct path rarely exists without a TURN server. A route that is turned off is never used, whatever
+ * happens to the others: the failure then names the ones that are on. Resolves with `{ route, host, pipe, answer }`.
  */
 function raceRoutes(mine) {
 	const link = accountLink();
@@ -213,11 +244,17 @@ function raceRoutes(mine) {
 	};
 	const stopDirect = new AbortController();
 	const target = { drive: link.drive, pcId: config.pcId, phoneId: config.deviceId };
+	const on = routesOn();
 	// Drive's folders are found once per app start; both remote routes need them.
-	const ready = link.drive.ready();
+	let ready = null;
+	const driveReady = () => (ready ??= link.drive.ready());
+	const failed = (error) => {
+		if (on.length === PC_ROUTES.length || error.status === 403 || error.status === 429 || error.message === "superseded") return error;
+		return new LinkFailure(t("{reason} Only these ways are on: {routes} (Settings → PC connection).", { reason: t(error.message || "The PC cannot be reached."), routes: on.map(routeName).join(" / ") }), error.status || 0);
+	};
 	let relayPipe = null;
 	const routes = [];
-	if (config.port && (config.hosts.length || state.pc.link.host))
+	if (on.includes("lan") && config.port && (config.hosts.length || state.pc.link.host))
 		routes.push([
 			"lan",
 			async () => {
@@ -226,11 +263,11 @@ function raceRoutes(mine) {
 				return { route: "lan", host: found, pipe: null, answer: await openOn({ address: found }) };
 			},
 		]);
-	if (typeof globalThis.RTCPeerConnection === "function")
+	if (on.includes("direct") && typeof globalThis.RTCPeerConnection === "function")
 		routes.push([
 			"direct",
 			async () => {
-				await ready;
+				await driveReady();
 				let pipe;
 				try {
 					pipe = await openDirect({ ...target, key, RTCPeerConnection: globalThis.RTCPeerConnection, signal: stopDirect.signal });
@@ -242,23 +279,36 @@ function raceRoutes(mine) {
 				return openPipe("direct", pipe);
 			},
 		]);
-	routes.push([
-		"relay",
-		async () => {
-			await ready;
-			relayPipe = openRelay(target);
-			return openPipe("relay", relayPipe);
-		},
-	]);
+	if (on.includes("relay"))
+		routes.push([
+			"relay",
+			async () => {
+				await driveReady();
+				relayPipe = openRelay(target);
+				return openPipe("relay", relayPipe);
+			},
+		]);
+	// Nothing that is on can even be tried here (the PC does not listen on the local network, the phone has no WebRTC).
+	if (!routes.length) return Promise.reject(failed(new LinkFailure(on.includes("lan") ? t("Not on the PC's local network.") : t("This phone has no WebRTC."), 0)));
 	return new Promise((resolve, reject) => {
 		let winner = null;
 		let settled = 0;
 		let reason = null;
+		stopRace = () => {
+			stopDirect.abort();
+			if (winner) return;
+			reject(new LinkFailure("superseded", 0));
+			try {
+				relayPipe?.close();
+			} catch {
+				// Already closed.
+			}
+		};
 		const done = (route) => {
 			trying.delete(route);
 			settled += 1;
 			show();
-			if (settled === routes.length && !winner) reject(reason || new LinkFailure(t("The PC cannot be reached."), 0));
+			if (settled === routes.length && !winner) reject(failed(reason || new LinkFailure(t("The PC cannot be reached."), 0)));
 		};
 		for (const [route, run] of routes) {
 			trying.add(route);
@@ -270,7 +320,7 @@ function raceRoutes(mine) {
 						if (route !== "relay") relayPipe?.close();
 						if (route === "lan") stopDirect.abort();
 						resolve(result);
-					} else if (winner && ROUTE_RANK[route] < ROUTE_RANK[winner.route] && mine === generation && session === winner.answer.s) {
+					} else if (winner && ROUTE_RANK[route] < ROUTE_RANK[winner.route] && mine === generation && session === winner.answer.s && routesOn().includes(route)) {
 						winner = result;
 						upgrade(result);
 					} else result.pipe?.close();
@@ -351,28 +401,30 @@ function directReason(error) {
 
 function scheduleFaster(delay = DIRECT_RETRY_MS) {
 	clearTimeout(directTimer);
-	directTimer = setTimeout(tryFaster, delay);
+	if (fasterOn()) directTimer = setTimeout(tryFaster, delay);
 }
 
 /**
- * On the relay, the local network and a direct connection are tried again; when one opens, requests and events move
- * to it (`upgrade`). A phone on mobile data that walks into the PC's Wi-Fi, or gets IPv6, gets the faster route.
+ * On the relay, the local network and a direct connection are tried again (those that are turned on); when one opens,
+ * requests and events move to it (`upgrade`). A phone on mobile data that walks into the PC's Wi-Fi, or gets IPv6, gets the faster route.
  */
 async function tryFaster() {
 	const link = accountLink();
 	const usable = () => config?.kind === "account" && key && state.pc.link.route === "relay" && state.pc.link.status === "online" && document.visibilityState === "visible";
-	if (directTrying || !link || !usable()) return;
+	if (directTrying || !link || !usable() || !fasterOn()) return;
 	directTrying = true;
 	const mine = generation;
+	// Still wanted when the attempt is through: the same connection, and the way was not turned off meanwhile.
+	const wanted = (route) => mine === generation && usable() && routesOn().includes(route);
 	try {
 		freshLan();
-		const found = config.port ? await findLan() : "";
-		if (found && mine === generation && usable()) {
+		const found = wanted("lan") && config.port ? await findLan() : "";
+		if (found && wanted("lan")) {
 			const answer = await openOn({ address: found });
-			if (mine === generation && usable()) upgrade({ route: "lan", host: found, pipe: null, answer });
+			if (wanted("lan")) upgrade({ route: "lan", host: found, pipe: null, answer });
 			return;
 		}
-		if (typeof globalThis.RTCPeerConnection !== "function") return;
+		if (!wanted("direct") || typeof globalThis.RTCPeerConnection !== "function") return;
 		await link.drive.ready();
 		let pipe;
 		try {
@@ -383,7 +435,7 @@ async function tryFaster() {
 		}
 		noteDirect(null);
 		const result = await openPipe("direct", pipe);
-		if (mine === generation && usable()) upgrade(result);
+		if (wanted("direct")) upgrade(result);
 		else result.pipe.close();
 	} catch {
 		// The relay goes on; the next try is in a while.
@@ -393,9 +445,31 @@ async function tryFaster() {
 	}
 }
 
+/**
+ * The ways to the PC were chosen anew (Settings → PC connection). A connection on a way that is still on goes on
+ * undisturbed; any other is closed and the PC is reached again with the ways that are on now.
+ */
+function routesChanged() {
+	if (config?.kind !== "account" || !key) return;
+	const on = routesOn();
+	if (!on.includes("direct") && state.pc.link.direct) setLink({ direct: null });
+	const link = state.pc.link;
+	if (link.status === "online" && on.includes(link.route)) {
+		// From the relay, a faster way that was just turned on is tried at once; none left on, and no more tries are due.
+		if (link.route === "relay") scheduleFaster(300);
+		return;
+	}
+	// An attempt under way is given up, not waited for: its direct try alone can take half a minute to fail.
+	stopRace?.();
+	dropTransport();
+	opening = null;
+	pc.reconnect();
+}
+
 /** Find a route to the PC that answers and open a session there. */
 async function openSession() {
-	opening ??= (async () => {
+	if (opening) return opening;
+	const attempt = (async () => {
 		const mine = generation;
 		freshLan();
 		let result;
@@ -409,8 +483,10 @@ async function openSession() {
 		}
 		adopt(result, mine);
 	})().finally(() => {
-		opening = null;
+		// An attempt that was given up (routesChanged) leaves the one started after it alone.
+		if (opening === attempt) opening = null;
 	});
+	opening = attempt;
 	return opening;
 }
 
@@ -828,11 +904,19 @@ async function loadChat(bag, { quiet = false } = {}) {
 	try {
 		const [snap, page] = await Promise.all([call("GET", "/api/state", undefined, bag.slot), call("GET", `/api/transcript?limit=${PAGE}&images=ref`, undefined, bag.slot)]);
 		if (mine !== generation) return;
+		// Events that came before this answer are applied first (they are opened one after another, which takes longer than
+		// opening the answer): the answer is the newer state, and applied before them it drew what they describe twice.
+		await frames.catch(() => {});
+		if (mine !== generation) return;
 		applySnapshot(bag, snap);
+		// What the page shows of a reply that is being written, and the PC has not saved yet, stays (see carryLive).
+		const live = carryLive(page.items || [], bag.items, bag.toolRuns, { active: !!snap.active });
 		// Messages still on their way (sent from this phone, not yet confirmed) stay after what the PC has saved.
+		// A message the PC has saved in the meantime is not kept a second time as "on its way" (see mergeReloaded).
 		const pending = bag.items.filter((item) => item.pending);
-		bag.items = [...(page.items || []), ...pending];
-		bag.toolRuns = {};
+		const known = new Set(bag.items.filter((item) => item.id).map((item) => item.id));
+		bag.items = mergeReloaded(live.items, pending, known);
+		bag.toolRuns = live.toolRuns;
 		bag.hasMore = !!page.hasMore;
 		bag.cursor = page.nextCursor || null;
 		bag.loaded = true;
@@ -971,14 +1055,21 @@ async function runStream(mine, { moved = false } = {}) {
 		let chain = Promise.resolve();
 		const onFrame = (text) => {
 			chain = chain.then(async () => {
-				const [n, c] = text.split(".");
-				const message = await open(key, aad, { n, c });
-				// Frames are numbered by the PC: one that is not newer than the last was replayed or reordered.
-				if (mine !== generation || !(message.i > last)) return;
-				last = message.i;
-				if (message.e === "link") catchUp();
-				else onEvent(message.e, message.d || {});
+				// One frame that cannot be opened or applied must not stop every frame after it: the link would look
+				// connected while nothing on the page changes any more.
+				try {
+					const [n, c] = text.split(".");
+					const message = await open(key, aad, { n, c });
+					// Frames are numbered by the PC: one that is not newer than the last was replayed or reordered.
+					if (mine !== generation || !(message.i > last)) return;
+					last = message.i;
+					if (message.e === "link") catchUp();
+					else onEvent(message.e, message.d || {});
+				} catch (error) {
+					console.warn("event not applied", error);
+				}
 			});
+			frames = chain;
 		};
 		const { body } = await envelope("events", { s: session, q: ++counter });
 		if (transport) {
@@ -1030,8 +1121,63 @@ async function runStream(mine, { moved = false } = {}) {
 		if (fatal) return;
 		const delay = RETRY_DELAYS[Math.min(retries++, RETRY_DELAYS.length - 1)];
 		clearTimeout(retryTimer);
+		retryAt = Date.now() + delay;
 		retryTimer = setTimeout(() => mine === generation && (document.visibilityState === "visible" || watched.size > 0) && connect(), delay);
 	}
+}
+
+// ---- A reply awaited in the background ---------------------------------------------------------------------------
+// The app's shell says "tick" every second while a reply is awaited and the app is not on screen (MainActivity). A page
+// in the background gets few timers, so what must not wait is done on that tick: the relay looks into Drive
+// (link-remote.js: kick), and now and then the PC is asked whether the reply is still being written. That question is
+// what notices a connection that died without a word (through Drive the PC closes a connection it has not heard from,
+// and removes its last message a moment later) and a reply whose end no event told: the chat is read again, which
+// announces the reply (loadChat), or the connection is opened again, which reads the chat too.
+const PROBE_EVERY_MS = 60000;
+const PROBE_WAIT_MS = 30000;
+let asking = null; // { at, mine } while the PC is being asked
+let askedAt = 0;
+
+function backgroundTick() {
+	if (!config || document.visibilityState !== "hidden") return;
+	transport?.kick?.();
+	if (!watched.size) return;
+	const now = Date.now();
+	// A try to connect again that is overdue (its timer is one of those the page gets late).
+	if (state.pc.link.status === "offline" && retryAt && now > retryAt + 1500) {
+		connect();
+		return;
+	}
+	if (asking && asking.mine !== generation) asking = null;
+	if (asking) {
+		if (now - asking.at < PROBE_WAIT_MS) return;
+		// No answer: the connection is gone, whatever it looks like.
+		asking = null;
+		askedAt = now;
+		pc.reconnect();
+		return;
+	}
+	if (state.pc.link.status !== "online" || !session || now - askedAt < PROBE_EVERY_MS) return;
+	const mine = generation;
+	const slot = [...watched.keys()].pop();
+	asking = { at: now, mine };
+	const done = () => {
+		if (asking?.mine !== mine) return false;
+		asking = null;
+		askedAt = Date.now();
+		return mine === generation;
+	};
+	call("GET", "/api/state", undefined, slot).then(
+		(snap) => {
+			if (!done()) return;
+			const bag = bags.get(slot);
+			// Still being written: a sign of life. Ended and the page does not know: the chat is read, which says so.
+			if (snap.active) watch(slot, { started: true });
+			else if (bag?.loaded) loadChat(bag, { quiet: true }).catch(() => {});
+			else replyEnding(slot, "");
+		},
+		() => done() && pc.reconnect(),
+	);
 }
 
 /** Read again what may have changed while no event stream was attached (the open chat and the chat list). */
@@ -1126,6 +1272,7 @@ function checkAlive() {
 function connect() {
 	if (!config || !key) return;
 	clearTimeout(retryTimer);
+	retryAt = 0;
 	clearTimeout(directTimer);
 	stream?.abort();
 	stream = null;
@@ -1137,6 +1284,14 @@ function connect() {
 
 function clientMessageId() {
 	return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * One step in the PC's built-in browser (pc-browser.js): its tabs, a tab's picture, a tap, a scroll, typed text.
+ * The PC checks every value (routes-phone-browser.ts).
+ */
+export async function pcBrowser(action, params = {}) {
+	return call("POST", "/api/phone-browser", { action, ...params }, undefined);
 }
 
 export const pc = {
@@ -1155,7 +1310,11 @@ export const pc = {
 		} else config = null;
 		if (config) await restoreCache();
 		onNative("lifecycle", (event) => {
-			if (event.state === "foreground" && config && state.pc.link.status !== "online" && state.pc.link.status !== "connecting") connect();
+			if (event.state === "tick") backgroundTick();
+			else if (event.state === "foreground" && config && state.pc.link.status !== "online" && state.pc.link.status !== "connecting") connect();
+		});
+		onPrefs((_, patch) => {
+			if ("pcRoutes" in patch) routesChanged();
 		});
 		// The phone moved to another network (Wi-Fi, mobile data): a faster route may exist now.
 		const networkChanged = () => {
@@ -1167,14 +1326,18 @@ export const pc = {
 			clearTimeout(hiddenTimer);
 			if (document.visibilityState === "visible") {
 				const away = hiddenAt ? Date.now() - hiddenAt : 0;
+				const asleep = noteAwake();
 				hiddenAt = 0;
 				if (config && state.pc.link.status === "offline") connect();
+				else if (config && state.pc.link.route === "relay" && asleep > RELAY_GONE_MS) connect();
 				else if (config && away > ALIVE_AFTER_HIDDEN_MS) checkAlive();
 			} else {
 				hiddenAt = Date.now();
+				askedAt = hiddenAt;
 				if (config) hiddenTimer = setTimeout(rest, HIDDEN_REST_MS);
 			}
 		});
+		setInterval(noteAwake, 5000);
 		// The PC is connected as soon as the app opens, on either side, so that it is there when the PC side is opened.
 		if (config && document.visibilityState === "visible") connect();
 		// The first time, the only PC of the account that is on is connected without a tap; not a PC the user disconnected.

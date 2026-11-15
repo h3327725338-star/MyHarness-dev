@@ -10,9 +10,9 @@ import { html, useEffect, useRef, useState, COLLAPSE_MS, Collapse, Fold, FoldIn,
 import { Select } from "./select.js";
 import { api, attempt, loadModels, loadProviders, loadSettings, post, setView, toast, useStore } from "./store.js";
 import { confirmDialog, inputDialog } from "./actions.js";
-import { clip } from "./util.js";
+import { clip, effortName, fmtTokens } from "./util.js";
 import { N_, serverText, t, tNodes } from "./i18n.js";
-import { Field, ProviderForm, SaveBar, apiLabel, apiOptions, apiShort, focusField, followIntoView, shortUrl, steadyRow, useUnsaved } from "./provider-form.js";
+import { Field, ProviderForm, SaveBar, apiLabel, apiOptions, apiShort, focusField, followIntoView, revealUnder, shortUrl, steadyRow, useUnsaved } from "./provider-form.js";
 import { BASE_URL_EXAMPLE, baseUrlProblem, entryHasSharedKey, findRow, isLayeredMember, memberGapCount, memberValues, providerTree, rowName, uniqueProviderId } from "./provider-models.js";
 import { nebiusSummary, openServicePage, useNebiusInfo } from "./service-keys.js";
 import { ExternalLogin } from "./provider-login.js";
@@ -22,7 +22,10 @@ const NEW = "\u0000new";
 const GLOBAL = "\u0000global";
 const NEW_KEY = "\u0000new-key";
 
-/** One value a provider from an extension stores itself; the provider checks it, and its message says what is wrong. */
+/**
+ * One value a provider from an extension stores itself; the provider checks it, and its message says what is wrong.
+ * Drawn as a label / value row like the rest of a provider's card.
+ */
 function ProviderSettingField({ providerId, setting, onSaved, onDirty }) {
 	const [value, setValue] = useState(setting.value);
 	const [busy, setBusy] = useState(false);
@@ -44,12 +47,62 @@ function ProviderSettingField({ providerId, setting, onSaved, onDirty }) {
 		}
 		setBusy(false);
 	};
-	return html`<${Field} label=${setting.label} hint=${setting.description}>
-		<div class="row">
-			<input class="field grow" value=${value} placeholder=${setting.placeholder ?? undefined} disabled=${busy} onInput=${(event) => setValue(event.currentTarget.value)} onKeyDown=${(event) => { if (event.key === "Enter") { event.preventDefault(); save(); } }} />
+	return html`<${Field} class="pf-row pf-setting" label=${setting.label} hint=${setting.description}>
+		<div class="row pf-setting-line">
+			<input class="field" value=${value} placeholder=${setting.placeholder ?? undefined} disabled=${busy} onInput=${(event) => setValue(event.currentTarget.value)} onKeyDown=${(event) => { if (event.key === "Enter") { event.preventDefault(); save(); } }} />
 			<button class="btn" disabled=${!dirty || busy} onClick=${(event) => { event.preventDefault(); save(); }}>${busy ? t("Saving…") : t("Save")}</button>
 		</div>
 	<//>`;
+}
+
+/**
+ * One model a provider from an extension offers: its name, what it can do and the context it is measured against. The
+ * values the provider keeps for this model alone (how long its conversation may grow) open under its row.
+ */
+function ExtensionModel({ providerId, model, title, settings, aligned, onSaved, onDirty }) {
+	const [open, setOpen] = useState(false);
+	const [dirty, setDirty] = useState({});
+	// Once opened the fields stay, so a value typed there is still there when the row is opened again.
+	const mounted = useRef(false);
+	if (open) mounted.current = true;
+	const anyDirty = Object.values(dirty).some(Boolean);
+	const summary = html`<span class="truncate pf-model-title">${title}</span>
+		${title !== model.id ? html`<span class="dim mono truncate pf-model-id">${model.id}</span>` : null}
+		${anyDirty ? html`<span class="dot accent prov-dirty" title=${t("Unsaved changes")} />` : null}
+		<span class="pf-model-badges">
+			${model.levels?.length ? html`<span class="badge" title=${model.levels.map((level) => effortName(level)).join(" · ")}>${t("thinking")}</span>` : null}
+			${model.image ? html`<span class="badge">${t("images")}</span>` : null}
+			${model.contextWindow ? html`<span class="dim pf-model-size" title=${t("Context window")}>${fmtTokens(model.contextWindow)}</span>` : null}
+		</span>`;
+	if (!settings.length) {
+		return html`<div class="pf-model pf-model-listed prov-node" data-model=${model.id}>
+			<div class="row pf-model-head prov-row prov-row-fixed"><div class="pf-model-toggle prov-row-toggle grow">${aligned ? html`<span class="pf-fold-gap" />` : null}${summary}</div></div>
+		</div>`;
+	}
+	const toggle = (event) => {
+		const row = event.currentTarget.closest(".pf-model-head");
+		setOpen(!open);
+		if (!open) revealUnder(row);
+	};
+	return html`<div class=${`pf-model pf-model-listed prov-node ${open ? "open" : ""}`} data-model=${model.id}>
+		<div class="row pf-model-head prov-row">
+			<button type="button" class="pf-model-toggle prov-row-toggle grow" aria-expanded=${open} onClick=${toggle}><${Fold} />${summary}</button>
+		</div>
+		<${Collapse} open=${open} keepMounted=${mounted.current}>
+			${mounted.current
+				? html`<div class="col pf-model-body">
+					${settings.map((setting) => html`<${ProviderSettingField} key=${setting.id} providerId=${providerId} setting=${setting} onSaved=${onSaved} onDirty=${(d) => { setDirty((current) => (!!current[setting.id] === d ? current : { ...current, [setting.id]: d })); onDirty(setting.id, d); }} />`)}
+				</div>`
+				: null}
+		<//>
+	</div>`;
+}
+
+/** The models' names without the provider's own name in front of each ("agy · Gemini 4 Argon" in agy's own card). */
+function ownModelNames(models) {
+	const parts = models.map((model) => String(model.name || model.id).split(" · "));
+	const shared = parts.length > 0 && parts.every((part) => part.length > 1 && part[0] === parts[0][0]);
+	return models.map((model, index) => (shared ? parts[index].slice(1).join(" · ") : model.name || model.id));
 }
 
 /** The chats working on a provider right now: deleting it stops them, so the user decides first. */
@@ -125,8 +178,11 @@ const modelCount = (n) => (n === 1 ? t("1 model") : t("{n} models", { n }));
 const modelsOf = ({ provider, entry }) => entry?.config?.models?.length ?? provider.modelCount ?? 0;
 const totalModels = (row) => row.members.reduce((sum, member) => sum + modelsOf(member), 0);
 
-/** The key in use, with the entry to manage all keys of the provider (the form puts its label beside it). */
-function KeySummary({ provider, onManage, busy }) {
+/**
+ * The key in use, with the entry to manage all keys of the provider (the form puts its label beside it). `ownSignIn`
+ * is what signs in a provider from an extension while no key is saved here, in the provider's own words.
+ */
+function KeySummary({ provider, onManage, busy, ownSignIn }) {
 	if (provider.externalLogin) return html`<${ExternalLogin} key=${provider.id} provider=${provider} />`;
 	const c = provider.credentials;
 	const active = c?.apiKeys.find((k) => k.active);
@@ -138,7 +194,9 @@ function KeySummary({ provider, onManage, busy }) {
 			? html`<span class="truncate grow"><span>${serverText(active.label)}</span> <span class="dim mono">${active.suffix ? `••••${active.suffix}` : ""}</span></span><span class="badge ok">${t("in use")}</span>`
 			: oauthActive
 				? html`<span class="grow">${t("OAuth login")}</span><span class="badge ok">${t("in use")}</span>`
-				: html`<span class="grow dim">${provider.configured && provider.authSource ? t("Set outside MyHarness ({source})", { source: serverText(provider.authSource) }) : t("No API key saved")}</span>`}
+				: ownSignIn
+					? html`<span class="truncate grow key-own">${serverText(ownSignIn)}</span>`
+					: html`<span class="grow dim">${provider.configured && provider.authSource ? t("Set outside MyHarness ({source})", { source: serverText(provider.authSource) }) : t("No API key saved")}</span>`}
 		${provider.supportsApiKeyLogin || count || c?.hasOAuth ? html`<button class="btn sm" disabled=${busy} onClick=${onManage}>${count > 1 ? t("Manage API keys ({n})", { n: count }) : count ? t("Manage API keys") : t("Add API key")}</button>` : null}
 	</div>`;
 }
@@ -648,27 +706,40 @@ function ProviderDetail({ row, rows, focus, takenIds, apiTypes, defaults, onSave
 				${bar}
 			</div>`;
 	} else {
-		// A provider from an extension: shown as it is; its address and models are managed there.
+		// A provider from an extension: its card says how it signs in and holds the values it stores itself; the models
+		// it offers hang below it like any provider's, each with the values that are for that model alone. Its address
+		// and its list of models are the extension's, so neither is edited here.
+		const settings = provider.settings ?? [];
+		const listed = provider.models ?? [];
+		const names = ownModelNames(listed);
+		const settingsOf = (model) => settings.filter((setting) => setting.model === model.id);
+		const perModel = listed.some((model) => settingsOf(model).length > 0);
+		const settingDirty = (id, d) => onDirty(`setting:${id}`, d);
+		// A provider that takes no key here signs in by itself: the row says so instead of naming a key.
+		const signsInItself = !!provider.externalLogin || !(provider.supportsApiKeyLogin || provider.credentials?.apiKeys?.length || provider.credentials?.hasOAuth);
+		const signIn = html`<${KeySummary} provider=${provider} busy=${!!busy} ownSignIn=${provider.authLabel} onManage=${() => setManaging(provider.id)} />`;
 		body = html`<div class="prov-tree">
 			<section class="prov-root">
 				${head}
 				<div class="prov-root-body">
-					<div class="pf-conn"><div class="pf-fields">
-						${provider.baseUrl ? html`<div class="col field-label pf-row"><span class="field-name">${t("Base URL")}</span><span class="mono pf-value">${provider.baseUrl}</span></div>` : null}
-						<div class="col field-label pf-row"><span class="field-name">${provider.externalLogin ? t("Sign-in status") : t("API key")}</span>${keyArea}</div>
-						<div class="col field-label pf-row"><span class="field-name">${t("Models")}</span><span class="pf-value">${t("{modelCount} models", { modelCount: provider.modelCount })}</span></div>
-						<span class="dim pf-hint">${t("This provider is not defined in models.json (it comes from an extension), so its address and models are managed there.")}</span>
-					</div></div>
+					<div class="pf-view"><div class="pf-conn"><div class="pf-fields">
+						${/^https?:\/\//i.test(provider.baseUrl ?? "") ? html`<div class="col field-label pf-row"><span class="field-name">${t("Base URL")}</span><span class="mono pf-value">${provider.baseUrl}</span></div>` : null}
+						<div class="col field-label pf-row"><span class="field-name">${signsInItself ? t("Sign-in status") : t("API key")}</span>${signIn}</div>
+						${settings.filter((setting) => !setting.model).map((setting) => html`<${ProviderSettingField} key=${setting.id} providerId=${provider.id} setting=${setting} onSaved=${reload} onDirty=${(d) => settingDirty(setting.id, d)} />`)}
+						<div class="col field-label pf-row"><span class="field-name">${t("Comes from")}</span><span class="dim pf-hint">${t("This provider comes from an extension, which decides its address and which models it offers.")}</span></div>
+					</div></div></div>
 				</div>
 			</section>
-			${provider.settings?.length
-				? html`<section class="set-card prov-ext-settings">
-					<div class="set-card-head"><strong>${t("Provider settings")}</strong></div>
-					<div class="set-card-body pf-fields">
-						${provider.settings.map((setting) => html`<${ProviderSettingField} key=${setting.id} providerId=${provider.id} setting=${setting} onSaved=${reload} onDirty=${(d) => onDirty(`setting:${setting.id}`, d)} />`)}
-					</div>
-				</section>`
-				: null}
+			<div class="prov-branch">
+				<div class="prov-node prov-plain"><div class="pf-models">
+					<div class="pf-models-head"><strong class="pf-models-title">${t("Models")} <span class="dim">${listed.length}</span></strong></div>
+					${listed.length
+						? html`<div class="prov-branch pf-model-list">
+							${listed.map((model, index) => html`<${ExtensionModel} key=${model.id} providerId=${provider.id} model=${model} title=${names[index]} settings=${settingsOf(model)} aligned=${perModel} onSaved=${reload} onDirty=${settingDirty} />`)}
+						</div>`
+						: html`<div class="dim pf-empty">${provider.configured ? t("The extension has not listed any model yet.") : t("The models show here once this provider is signed in.")}</div>`}
+				</div></div>
+			</div>
 		</div>`;
 	}
 	return html`<div ref=${rootRef} class="stack prov-fill">

@@ -5,6 +5,7 @@
  *   node packages/mobile/build.mjs            the page only: fills android/app/src/main/assets/www
  *   node packages/mobile/build.mjs --apk      the page, then the signed release APK into packages/mobile/dist
  *   node packages/mobile/build.mjs --debug    the page, then a debug APK (inspectable page, separate signature)
+ *   node packages/mobile/build.mjs --apk --inspect   the release APK with an inspectable page (MyHarness-<version>-inspect.apk)
  *
  * The page is the phone UI (`web/`), the desktop Web UI files it shares (`shared-files.mjs`) and the agent core
  * (`src/core.ts`) bundled for a browser. Only the APK steps need Java and the Android SDK; see README.md.
@@ -21,6 +22,7 @@ import { coreEntry, mobileDir, oauthAppsFile, promptFiles, sharedFiles, webDir, 
 const args = new Set(process.argv.slice(2));
 const wantApk = args.has("--apk");
 const wantDebug = args.has("--debug");
+const wantInspect = args.has("--inspect");
 
 const pkg = JSON.parse(readFileSync(join(mobileDir, "package.json"), "utf8"));
 
@@ -142,6 +144,7 @@ function buildApk(debug) {
 		`-PmyharnessVersionCode=${versionCode(pkg.version)}`,
 	];
 	if (!debug) gradleArgs.push(`-PmyharnessSigningProperties=${signingProperties(tools).replace(/\\/g, "/")}`);
+	if (!debug && wantInspect) gradleArgs.push("-PmyharnessInspect=true");
 	const run = spawnSync(gradle, gradleArgs, { cwd: androidDir, env: tools.env, stdio: "inherit", shell: process.platform === "win32" });
 	if (run.status !== 0) throw new Error(`Gradle failed (exit ${run.status}).`);
 	const kind = debug ? "debug" : "release";
@@ -149,7 +152,7 @@ function buildApk(debug) {
 	if (!existsSync(built)) throw new Error(`Gradle finished but ${built} is missing.`);
 	const dist = join(mobileDir, "dist");
 	mkdirSync(dist, { recursive: true });
-	const target = join(dist, `MyHarness-${pkg.version}${debug ? "-debug" : ""}.apk`);
+	const target = join(dist, `MyHarness-${pkg.version}${debug ? "-debug" : wantInspect ? "-inspect" : ""}.apk`);
 	cpSync(built, target);
 	console.log(`APK written to ${target}`);
 }

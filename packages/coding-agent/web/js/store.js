@@ -23,7 +23,7 @@ import { COLOR_THEMES_VERSION, colorThemeOf, modeColorThemesOf } from "./appeara
 import { savedPromptsOf } from "./saved-prompts.js";
 import { takeRestartState } from "./restart-state.js";
 import { chatModeOf, draftToServer, expandedKey } from "./chat-modes.js";
-import { INTERRUPT_ENTRY } from "./turns.js";
+import { INTERRUPT_ENTRY, redirectedRunRecord } from "./turns.js";
 import { createSseWatchdog, isDeadStream } from "./sse-watchdog.js";
 import { exportReadOnly, getEventSourceFactory, getFetch } from "./export-mode.js";
 import { readResponse } from "./http-transport.js";
@@ -44,6 +44,9 @@ const SLOT_DEFAULTS = () => ({
 	snap: null,
 	items: [],
 	toolRuns: {},
+	// How many tool calls of this chat have ended since the page opened: what may have changed files (the Changes panel
+	// re-reads the running task's changes on it).
+	toolEnds: 0,
 	runs: {},
 	queue: { steering: [], followUp: [] },
 	// Messages sent while a run is active, shown in the queue until the server's queue carries them (or they land):
@@ -282,6 +285,8 @@ export const state = {
 	providers: null,
 	/** Latest Google Drive sync status (`sync_status`), or null until the settings page has asked once. */
 	syncStatus: null,
+	/** What is left of the agy and Claude plans (`GET /api/plan-usage`, `plan_usage` events); global, not per chat. */
+	planUsage: { sources: [] },
 	editorInsert: null,
 	/** Chats whose Stop was pressed and whose run has not ended yet: the button shows that the stop is under way. */
 	stopping: {},
@@ -886,6 +891,10 @@ export async function loadSnapshot(slot = targetSlot ?? activeSlot) {
 		const previousCwd = workspaceKey(state.snap);
 		const previousSession = state.snap?.session?.id;
 		state.snap = snap;
+		// A page that opens or reloads while a message is ending the run missed run_redirecting: the snapshot says so.
+		const ending = snap.run;
+		if (ending?.redirected && ending.runId && ending.startedAt && !state.runs[ending.runId])
+			state.runs = { ...state.runs, [ending.runId]: redirectedRunRecord({ runId: ending.runId, startedAt: ending.startedAt, ts: ending.lastActivityAt, session: snap.session?.id }) };
 		// Only a slot whose own previous session owned the panel hands it on. While a mode switch reveals another chat
 		// the panel is already the target's and the slot on screen is still the one being left: a snapshot of that slot
 		// then is not its chat being replaced, and must not take the target's tabs.
@@ -1045,7 +1054,11 @@ export async function loadTranscript(slot = targetSlot ?? activeSlot, { limit } 
 		}
 		state.items = carry.length ? [...data.items, ...carry] : data.items;
 		state.toolRuns = { ...runningTools, ...toolRuns };
-		state.runs = {};
+		// The records of finished runs are the server's to give again; one that only says a message is ending its run
+		// (run_redirecting) has no other source until run_finished, so a read in that window must not drop it. Only while the
+		// slot still shows that chat: another chat opened in the slot must not inherit it.
+		const shown = state.snap?.session?.id;
+		state.runs = Object.fromEntries(Object.entries(state.runs).filter(([, run]) => run.provisional && !!shown && run.session === shown));
 		// Old servers answer without paging fields: that is a complete transcript.
 		state.transcriptHasMore = data.hasMore === true;
 		state.transcriptCursor = data.nextCursor ?? null;
@@ -1242,6 +1255,26 @@ export async function loadSlots() {
 		markActiveSeen();
 	} catch {
 		// The list is refreshed by the next slots event.
+	}
+}
+
+// The plan numbers belong to the page, not to a chat. An event is the server's latest word; an answer to a request is
+// dropped when an event arrived while it was on its way, so a slow answer never puts older numbers back.
+let planUsageEvents = 0;
+export const planUsageMark = () => planUsageEvents;
+export function applyPlanUsage(data, mark = planUsageEvents, fromEvent = false) {
+	if (!Array.isArray(data?.sources) || (!fromEvent && mark !== planUsageEvents)) return;
+	if (fromEvent) planUsageEvents += 1;
+	set({ planUsage: { sources: data.sources } });
+}
+
+/** Background data: a failed read leaves what is shown as it is and says nothing; the next event or read fills it in. */
+export async function loadPlanUsage() {
+	const mark = planUsageMark();
+	try {
+		applyPlanUsage(await api("/api/plan-usage", { slot: "", timeoutMs: 10_000 }), mark);
+	} catch {
+		// Shown by the next plan_usage event or read.
 	}
 }
 
@@ -1697,10 +1730,16 @@ export async function switchChatMode(target) {
 	const previousSlot = activeSlot;
 	const previousPanel = panelKey;
 	const targetView = { mode, path: state.modeState?.[mode]?.lastSessionFile, timing, retry: () => switchChatMode(mode) };
-	// Lock sends before a View Transition captures the old page; its update callback selects the target.
-	state.switching = { ...targetView, seq, error: null };
+	// Lock sends before a View Transition captures the old page; its update callback selects the target. The lock is
+	// not `state.switching`: the page redraws once more before the capture, and with `switching` set it would draw the
+	// target's "Loading…" in place of the conversation being left, so the old page flashed to a skeleton and the
+	// reveal swept over that instead of over the conversation.
+	unselectedSwitch = seq;
 	let pending;
-	const revealed = revealMode(() => { if (isLatestSwitch(seq)) pending = beginSwitch(targetView, seq); }, { from: previousMode, to: mode, restore: () => {
+	const revealed = revealMode(() => {
+		if (unselectedSwitch === seq) unselectedSwitch = 0;
+		if (isLatestSwitch(seq)) pending = beginSwitch(targetView, seq);
+	}, { from: previousMode, to: mode, restore: () => {
 		if (!isLatestSwitch(seq)) return;
 		nextSwitch();
 		activeSlot = previousSlot;
@@ -1738,6 +1777,9 @@ export async function switchChatMode(target) {
 let switchSeq = 0;
 export const nextSwitch = () => ++switchSeq;
 export const isLatestSwitch = (seq) => seq === switchSeq;
+// A mode switch that has started but has not selected its target yet (see switchChatMode): sends are locked for the
+// moment the old page is still on screen. A newer switch takes over by number, so a stale value locks nothing.
+let unselectedSwitch = 0;
 
 /**
  * The sidebar row a new chat was shown in before the service answered, by the slot the service then gave it. The
@@ -1812,7 +1854,7 @@ export function failSwitch(seq, error) {
 	emit(true);
 }
 export function retrySwitch() { return state.switching?.retry?.(); }
-export const canSendToActive = () => !state.switching && !!activeSlot && !String(activeSlot).startsWith("pending:") && bagOf(activeSlot).loaded;
+export const canSendToActive = () => !state.switching && !(unselectedSwitch && unselectedSwitch === switchSeq) && !!activeSlot && !String(activeSlot).startsWith("pending:") && bagOf(activeSlot).loaded;
 
 /**
  * Show another open session. Sessions keep running in the background, so this only changes which bag is on screen.
@@ -2062,6 +2104,7 @@ export async function boot() {
 					if (data?.status && !state.syncStatus) set({ syncStatus: data.status });
 				}, { quiet: true });
 				connectEvents();
+				void loadPlanUsage();
 				prefetchOtherMode();
 				return;
 			}
@@ -2162,7 +2205,11 @@ function connectEvents() {
 		const reconnect = state.everConnected;
 		set({ connected: true, everConnected: true });
 		if (reconnect) tellTerminals("reconnect");
-		if (reconnect && booted && !state.restarting) await attempt(refreshAll, { quiet: true });
+		// Events missed while the stream was down are not replayed: the plan numbers are read again with everything else.
+		if (reconnect && booted && !state.restarting) {
+			void loadPlanUsage();
+			await attempt(refreshAll, { quiet: true });
+		}
 	};
 	source.onerror = () => {
 		set({ connected: false });
@@ -2213,9 +2260,18 @@ function connectEvents() {
 	on("agent_settled", () => {});
 	on("completion", (d) => set({ completion: d.active ? { ...d, startedAt: d.startedAt ?? Date.now() } : false }));
 	on("memory_status", (d) => set({ memoryMaintenance: d }));
+	// Global like `slots`: it carries no slot, whichever chat is on screen.
+	on("plan_usage", (d) => applyPlanUsage(d, planUsageEvents, true));
 	on("run_state", (d) => {
 		if (!state.snap) return;
 		state.snap = { ...state.snap, run: d, active: ["queued", "starting", "running", "waiting", "recovering"].includes(d.state) };
+		emit();
+	});
+	// The server's marker that a message sent with "interrupt" is ending this run, sent before the stop starts. The stopped
+	// reply would otherwise draw the run's turn as cancelled until run_finished arrives; its record replaces this one.
+	on("run_redirecting", (d) => {
+		if (!d.runId || !d.startedAt || state.runs[d.runId]) return;
+		state.runs = { ...state.runs, [d.runId]: redirectedRunRecord({ ...d, session: state.snap?.session?.id }) };
 		emit();
 	});
 	on("run_finished", (d, slot) => {
@@ -2295,6 +2351,7 @@ function connectEvents() {
 	on("tool_end", (d) => {
 		const run = state.toolRuns[d.toolCallId] || {};
 		state.toolRuns = { ...state.toolRuns, [d.toolCallId]: { ...run, status: d.isError ? "error" : "done", endedAt: d.ts, partial: undefined } };
+		state.toolEnds = (state.toolEnds || 0) + 1;
 		appendStreamedItem(
 			{ kind: "toolResult", ts: d.ts, toolCallId: d.toolCallId, toolName: d.toolName, text: d.text, images: d.images, isError: d.isError, details: d.details, live: true },
 		);
@@ -2466,8 +2523,10 @@ function connectEvents() {
 		emit(true);
 	});
 	on("login_event", (d) => set({ loginEvent: d.type === "done" ? null : d }));
-	on("github_event", (d) => set({ githubEvent: { ...d, nonce: Date.now() } }));
-	on("mail_event", (d) => set({ mailEvent: { ...d, nonce: Date.now() } }));
+	// Monotonic nonce so rapid events in the same millisecond still trigger hooks without colliding.
+	let connectEventSeq = 0;
+	on("github_event", (d) => set({ githubEvent: { ...d, nonce: ++connectEventSeq } }));
+	on("mail_event", (d) => set({ mailEvent: { ...d, nonce: ++connectEventSeq } }));
 	on("generation_speed", (d) => {
 		if (state.snap) state.snap = { ...state.snap, speed: d.speed };
 		emit();

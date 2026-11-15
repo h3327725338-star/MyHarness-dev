@@ -797,84 +797,108 @@ export function collectGitCheckpointWorkingTreeChanges(checkpoint: GitCheckpoint
 	};
 }
 
-/** Async counterpart for interactive recovery decisions; never blocks the UI on Git subprocesses. */
+/** Runs `task` over `items`, a few at a time, and keeps the results in the order of the items. */
+async function mapBounded<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next++;
+			results[index] = await task(items[index]);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return results;
+}
+
+/** How many Git subprocesses one comparison runs at the same time. */
+const CHECKPOINT_GIT_PARALLEL = 6;
+
+/**
+ * Async counterpart for interactive recovery decisions; never blocks the UI on Git subprocesses.
+ *
+ * Every command here only reads (GIT_OPTIONAL_LOCKS=0: none of them refreshes the index), so the independent ones run
+ * side by side: on Windows each Git process costs tens of milliseconds to start, and this comparison runs after every
+ * task that could have changed files.
+ */
 export async function collectGitCheckpointWorkingTreeChangesAsync(checkpoint: GitCheckpoint): Promise<{
 	changes?: GitCheckpointHeadChange[];
 	error?: string;
 }> {
 	if (!checkpoint.worktreeTree) return { error: "checkpoint 缺少工作区基线树。" };
+	const root = checkpoint.repositoryRoot;
 	const changes = new Map<string, GitCheckpointHeadChange>();
-	const baseline = await runCheckpointGitAsync(
-		checkpoint.repositoryRoot,
-		["ls-tree", "-r", "-z", "--name-only", checkpoint.worktreeTree],
-		true,
-	);
+	const [baseline, trackedResult, worktreeDiff, indexDiff, untracked] = await Promise.all([
+		runCheckpointGitAsync(root, ["ls-tree", "-r", "-z", "--name-only", checkpoint.worktreeTree], true),
+		runCheckpointGitAsync(root, ["ls-files", "-z"], true),
+		runCheckpointGitAsync(root, ["diff", "--name-status", "-z", "--no-renames", checkpoint.worktreeTree, "--"], true),
+		runCheckpointGitAsync(
+			root,
+			[
+				"diff",
+				"--cached",
+				"--name-status",
+				"-z",
+				"--no-renames",
+				checkpoint.indexTree ?? checkpoint.worktreeTree,
+				"--",
+			],
+			true,
+		),
+		runCheckpointGitAsync(root, ["ls-files", "--others", "--exclude-standard", "-z"], true),
+	]);
 	if (!baseline.ok) return { error: formatGitFailure(baseline) };
 	const baselinePaths = new Set(parseNulSeparated(baseline.stdout));
-	const trackedResult = await runCheckpointGitAsync(checkpoint.repositoryRoot, ["ls-files", "-z"], true);
 	if (!trackedResult.ok) return { error: formatGitFailure(trackedResult) };
 	const tracked = new Set(parseNulSeparated(trackedResult.stdout));
-	const worktreeDiff = await runCheckpointGitAsync(
-		checkpoint.repositoryRoot,
-		["diff", "--name-status", "-z", "--no-renames", checkpoint.worktreeTree, "--"],
-		true,
-	);
 	if (!worktreeDiff.ok) return { error: formatGitFailure(worktreeDiff) };
 	for (const change of parseGitNameStatus(worktreeDiff.stdout)) {
 		if (baselinePaths.has(change.path) && !tracked.has(change.path)) continue;
 		changes.set(change.path, change);
 	}
 
-	const indexDiff = await runCheckpointGitAsync(
-		checkpoint.repositoryRoot,
-		[
-			"diff",
-			"--cached",
-			"--name-status",
-			"-z",
-			"--no-renames",
-			checkpoint.indexTree ?? checkpoint.worktreeTree,
-			"--",
-		],
-		true,
-	);
 	if (!indexDiff.ok) return { error: formatGitFailure(indexDiff) };
-	for (const change of parseGitNameStatus(indexDiff.stdout)) {
-		if (baselinePaths.has(change.path) && !tracked.has(change.path)) continue;
-		if (!changes.has(change.path)) {
-			const baseline = await isIndexPathAtWorktreeBaselineAsync(checkpoint, change.path);
-			if (baseline.error) return { error: baseline.error };
-			if (baseline.same) continue;
-		}
-		changes.set(change.path, change);
-	}
-
-	for (const path of baselinePaths) {
-		if (tracked.has(path)) continue;
-		const baselineOid = await runCheckpointGitAsync(
-			checkpoint.repositoryRoot,
-			["rev-parse", "--verify", `${checkpoint.worktreeTree}:${path}`],
-			true,
-		);
-		if (!baselineOid.ok || !baselineOid.stdout) return { error: formatGitFailure(baselineOid) };
-		const currentPath = resolve(checkpoint.repositoryRoot, path);
-		const stat = await lstatIfExistsAsync(currentPath);
-		if (!stat) {
-			changes.set(path, { path, status: "deleted" });
-			continue;
-		}
-		const currentOid = await runCheckpointGitAsync(checkpoint.repositoryRoot, ["hash-object", currentPath], true);
-		if (!currentOid.ok || !currentOid.stdout) return { error: formatGitFailure(currentOid) };
-		if (currentOid.stdout !== baselineOid.stdout) {
-			changes.set(path, { path, status: "modified" });
-		}
-	}
-
-	const untracked = await runCheckpointGitAsync(
-		checkpoint.repositoryRoot,
-		["ls-files", "--others", "--exclude-standard", "-z"],
-		true,
+	const indexChanges = parseGitNameStatus(indexDiff.stdout).filter(
+		(change) => !(baselinePaths.has(change.path) && !tracked.has(change.path)),
 	);
+	// A staged path the worktree comparison did not report may sit at the baseline: only those need their own check.
+	const unchecked = indexChanges.filter((change) => !changes.has(change.path));
+	const atBaseline = await mapBounded(unchecked, CHECKPOINT_GIT_PARALLEL, (change) =>
+		isIndexPathAtWorktreeBaselineAsync(checkpoint, change.path),
+	);
+	const sameAsBaseline = new Set<string>();
+	for (let index = 0; index < unchecked.length; index++) {
+		const result = atBaseline[index];
+		if (result.error) return { error: result.error };
+		if (result.same) sameAsBaseline.add(unchecked[index].path);
+	}
+	for (const change of indexChanges) {
+		if (!sameAsBaseline.has(change.path)) changes.set(change.path, change);
+	}
+
+	// Files that were untracked when the checkpoint was taken (they are in its tree, not in the index).
+	const untrackedAtBaseline = [...baselinePaths].filter((path) => !tracked.has(path));
+	const compared = await mapBounded(
+		untrackedAtBaseline,
+		CHECKPOINT_GIT_PARALLEL,
+		async (path): Promise<{ error?: string; change?: GitCheckpointHeadChange }> => {
+			const currentPath = resolve(root, path);
+			const [baselineOid, stat] = await Promise.all([
+				runCheckpointGitAsync(root, ["rev-parse", "--verify", `${checkpoint.worktreeTree}:${path}`], true),
+				lstatIfExistsAsync(currentPath),
+			]);
+			if (!baselineOid.ok || !baselineOid.stdout) return { error: formatGitFailure(baselineOid) };
+			if (!stat) return { change: { path, status: "deleted" } };
+			const currentOid = await runCheckpointGitAsync(root, ["hash-object", currentPath], true);
+			if (!currentOid.ok || !currentOid.stdout) return { error: formatGitFailure(currentOid) };
+			return currentOid.stdout !== baselineOid.stdout ? { change: { path, status: "modified" } } : {};
+		},
+	);
+	for (const result of compared) {
+		if (result.error) return { error: result.error };
+		if (result.change) changes.set(result.change.path, result.change);
+	}
+
 	if (!untracked.ok) return { error: formatGitFailure(untracked) };
 	for (const path of parseNulSeparated(untracked.stdout)) {
 		if (!baselinePaths.has(path)) changes.set(path, { path, status: "added" });

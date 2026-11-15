@@ -5,7 +5,7 @@
 .turn.enter { animation: turn-in 340ms var(--ease-out) both; }
 @keyframes turn-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 
-.user-row { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; }
+.user-row { position: relative; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; transition: opacity 260ms var(--ease); }
 .user-bubble {
 	max-width: 86%; background: var(--user-bg); border: 1px solid var(--user-border); border-radius: 20px 20px 6px 20px;
 	padding: 10px 15px; font-size: var(--fs-read); line-height: 1.55; min-width: 0;
@@ -22,7 +22,8 @@
 .file-card .ficon { width: 34px; height: 34px; border-radius: 10px; flex: none; display: flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); }
 .file-card .fname { font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .user-pending { opacity: 0.6; }
-.user-note { font-size: var(--fs-xs); color: var(--text-3); display: flex; align-items: center; gap: 5px; }
+/* "Sending…" hangs under the bubble without taking a line of its own: when the PC has the message, nothing below moves. */
+.user-note { position: absolute; top: 100%; right: 4px; margin-top: 5px; font-size: var(--fs-xs); color: var(--text-3); display: flex; align-items: center; gap: 5px; white-space: nowrap; animation: part-in 220ms var(--ease-out) both; }
 .user-tag { display: inline-flex; align-items: center; gap: 5px; align-self: flex-end; padding: 2px 9px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-xs); font-weight: 600; }
 
 /* The work between the question and the answer: reasoning and tool calls, folded into one row when it is done. */
@@ -56,6 +57,9 @@
 .web-item .whost { flex: none; max-width: 38%; color: var(--text-4); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note-text { color: var(--text); }
 
+/* What appears while a reply is being written (the dots, a block of work, the answer) comes in softly. */
+.part-in { animation: part-in 280ms var(--ease-out) both; }
+@keyframes part-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .final { min-width: 0; }
 .final .md { font: var(--fs-read) / var(--lh-read) var(--font-read); }
 .caret { display: inline-block; width: 8px; height: 1.05em; margin-left: 2px; vertical-align: -0.16em; border-radius: 2px; background: var(--accent); animation: caret 1s steps(2, start) infinite; }

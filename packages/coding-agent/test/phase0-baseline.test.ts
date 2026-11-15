@@ -77,6 +77,7 @@ describe("Phase 0 compatibility contracts", () => {
 		expect(binaryBuild).toContain("bun build --compile ./dist/bun/web.js");
 		expect(binaryBuild).toContain("./src/utils/image-resize-worker.ts");
 		expect(binaryBuild).toContain("./src/utils/jxl-decode-worker.ts");
+		expect(binaryBuild).toContain("./src/session/artifacts/index-refresh-worker.ts");
 		expect(binaryBuild).toContain("--outfile dist/myharness");
 		expect(packageJson.scripts?.["copy-binary-assets"]).toContain("../../system-prompts");
 

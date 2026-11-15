@@ -2,13 +2,15 @@
 // A turn is the user's message, then the work (reasoning and tool calls, folded into one block once it is done),
 // then the answer. The same component draws the phone's own chats and the PC's.
 import { count, serverText, t } from "/shared/i18n.js";
-import { Collapse, Spinner, html, memo, useEffect, useMemo, useRef, useState } from "/shared/ui.js";
+import { Collapse, Spinner, html, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/shared/ui.js";
 import { actionTitle, buildTurns, groupLabel, groupSteps, nextRound, runForTurn, turnDuration, turnOutcome, turnSegments } from "/shared/turns.js";
 import { clip, fmtBytes, fmtDuration } from "/shared/util.js";
 import { hostOf } from "./browser-model.js";
+import { lastingKey } from "./live.js";
 import { Markdown } from "./markdown.js";
 import { Icon } from "./micons.js";
 import { copyText, haptic, pushBack, saveFile, shareText } from "./native.js";
+import { advance, arrive, createReveal, drawnPrefix, prefix, revealing } from "./reveal.js";
 import { actionSheet } from "./sheets.js";
 import { toast } from "./store.js";
 
@@ -245,7 +247,7 @@ function processSummary(segment, live) {
 	return t("Took {steps}", { steps: count(actions.length, "step") });
 }
 
-function Process({ segment, live, defaultOpen, onOpenUrl }) {
+function Process({ segment, live, defaultOpen, entering, onOpenUrl }) {
 	const [open, setOpen] = useState(defaultOpen);
 	const touched = useRef(false);
 	// The block of a reply being written stays open so the work can be watched; it folds itself when the answer starts,
@@ -255,7 +257,7 @@ function Process({ segment, live, defaultOpen, onOpenUrl }) {
 	}, [defaultOpen]);
 	const groups = useMemo(() => groupSteps(segment.steps), [segment.steps]);
 	const failed = segment.stats?.failedActions > 0;
-	return html`<div class="process ${live ? "live" : ""}">
+	return html`<div class="process ${live ? "live" : ""} ${entering ? "part-in" : ""}">
 		<button
 			class="process-head"
 			aria-expanded=${open ? "true" : "false"}
@@ -284,6 +286,109 @@ function Process({ segment, live, defaultOpen, onOpenUrl }) {
 	</div>`;
 }
 
+// ---- Text that is being written ----------------------------------------------------------------
+// Messages that arrived while the page was open (by an event, not read from the saved chat), and when each was first
+// drawn: only those are written out. A chat opened later shows its replies whole.
+const firstDrawn = new Map();
+const FRESH_MS = 5000;
+const STALE_MS = 15000;
+
+function arrivedJustNow(message) {
+	const id = message?.liveId;
+	if (!id) return false;
+	const now = performance.now();
+	if (!firstDrawn.has(id)) {
+		// A reply that ended a while ago and is drawn only now (its chat was not on screen) did not arrive just now.
+		const old = message.final && message.endedAt && Date.now() - message.endedAt > STALE_MS;
+		firstDrawn.set(id, old ? now - FRESH_MS : now);
+		if (firstDrawn.size > 300) firstDrawn.delete(firstDrawn.keys().next().value);
+	}
+	return !message.final || now - firstDrawn.get(id) < FRESH_MS;
+}
+
+// How far each text of a reply has been written out, by the name of its place in the reply (`textName`). A text keeps
+// its name while it moves on the page: what the model writes is drawn as the answer until a tool call follows it, and
+// from then on as a note between the steps; and a reply read again from the PC keeps the name it had while it was
+// written (live.js: carryLive). Without this memory the same words were written out a second time.
+const written = new Map(); // name → { text, shown }
+const WRITTEN_MAX = 400;
+
+/** Text is shown whole, not written out: the reader switched motion off, or the page is not on screen. */
+const shownAtOnce = () => document.documentElement.dataset.motion === "off" || document.visibilityState === "hidden";
+
+function writtenSoFar(name, text) {
+	const before = name ? written.get(name) : null;
+	return before && text.startsWith(prefix(before.text, before.shown)) ? Math.min(before.shown, text.length) : 0;
+}
+
+function noteWritten(name, text, shown) {
+	if (!name) return;
+	written.delete(name);
+	written.set(name, { text, shown });
+	if (written.size > WRITTEN_MAX) written.delete(written.keys().next().value);
+}
+
+/** A text that arrived just now (`fresh` when nothing of it was drawn yet) is still being written out. */
+function beingWritten(name, text, fresh) {
+	if (!text || shownAtOnce()) return false;
+	const before = written.get(name);
+	if (!before) return !!fresh;
+	return before.shown < text.length && text.startsWith(prefix(before.text, before.shown));
+}
+
+/** The name of a reply's answer text: the same as the note it becomes when a tool call follows (turns.js: a step's key). */
+function textName(message) {
+	const at = (message.blocks || []).findIndex((block) => block.type === "text" && block.text?.trim());
+	return `${message.liveId || message.id || message.ts}-${Math.max(at, 0)}`;
+}
+
+/**
+ * A reply's text. While it arrives (`fresh` when it is first drawn) it is written out at a steady speed instead of
+ * jumping by whatever piece came in (reveal.js); `open`: more may still come. Text that was there when the chat was
+ * opened is simply shown. `name`: see `written`; `onWritten` is called when the text is on the page to its end.
+ */
+function StreamText({ text, fresh, open, caret, name, onWritten }) {
+	const state = useRef(null);
+	if (!state.current) state.current = { reveal: createReveal(fresh && !shownAtOnce() ? writtenSoFar(name, text) : text.length), text, frame: 0, at: 0 };
+	const s = state.current;
+	const [shown, setShown] = useState(() => Math.floor(s.reveal.shown));
+	// Text that is not the old text with more at its end (another message in the same place) is shown whole.
+	if (shownAtOnce() || !text.startsWith(prefix(s.text, Math.floor(s.reveal.shown)))) s.reveal = createReveal(text.length);
+	s.text = text;
+	s.name = name;
+	s.onWritten = onWritten;
+	useLayoutEffect(() => {
+		// Nobody watches a page that is not on screen, and it gets no frames to write in.
+		if (shownAtOnce()) s.reveal = createReveal(text.length);
+		arrive(s.reveal, text.length, performance.now(), !open);
+		// The frames go on while more text arrives: they read what is current, not what was when they started.
+		const show = (count) => {
+			setShown(count);
+			noteWritten(s.name, s.text, count);
+			// What comes after this text on the page waited for it (Turn).
+			if (count >= s.text.length) s.onWritten?.();
+		};
+		if (!revealing(s.reveal)) {
+			show(text.length);
+			return;
+		}
+		noteWritten(s.name, s.text, Math.floor(s.reveal.shown));
+		if (s.frame) return;
+		s.at = 0;
+		const tick = (now) => {
+			s.frame = 0;
+			const count = advance(s.reveal, s.at ? now - s.at : 8);
+			s.at = now;
+			show(count);
+			if (revealing(s.reveal)) s.frame = requestAnimationFrame(tick);
+		};
+		s.frame = requestAnimationFrame(tick);
+	}, [text, open]);
+	useEffect(() => () => cancelAnimationFrame(s.frame), []);
+	const writing = shown < text.length;
+	return html`<${Markdown} text=${writing ? drawnPrefix(text, shown) : text} />${caret || writing ? html`<span class="caret"></span>` : null}`;
+}
+
 // ---- A turn ------------------------------------------------------------------------------------
 function ChangesCard({ item }) {
 	const files = item.files || [];
@@ -305,17 +410,57 @@ const Turn = memo(function Turn({ turn, live, awaiting, run, last, actions, reso
 	const duration = done ? turnDuration(turn, run) : 0;
 	const finalText = turn.final?.text || "";
 	const copyAnswer = async () => (await copyText(finalText)) && (haptic("tick"), toast(t("Copied"), "ok", 1400));
+	// The parts of a reply appear one after another, as they were made. Through Google Drive several come at once (a
+	// sentence, the tool call after it, its result and the answer): drawn together, the tool call was done before the
+	// sentence in front of it was written, and two texts were written at the same time. So while a text is being written
+	// out, what follows it waits (`held`); the text says when it is done (`onWritten`).
+	const messages = useMemo(() => new Map((turn.assistants || []).map((message) => [String(message.liveId || message.id || message.ts), message])), [turn]);
+	// A note's key is its message's name and the number of its block (turns.js). Asked only for a note that is drawn:
+	// asking is what marks a message as drawn.
+	const freshNote = (step) => {
+		const message = messages.get(step.key.replace(/-\d+$/, ""));
+		return message ? arrivedJustNow(message) : live;
+	};
+	const fresh = new Map();
+	const freshOf = (step) => (fresh.has(step.key) ? fresh.get(step.key) : fresh.set(step.key, freshNote(step)).get(step.key));
+	const [, redraw] = useState(0);
+	const holding = useRef(false);
+	const onWritten = useCallback(() => holding.current && redraw((n) => n + 1), []);
+	let shownSegments = segments.length;
+	if (live) {
+		const first = segments.findIndex((segment) => segment.type === "text" && beingWritten(segment.step.key, segment.step.text, freshOf(segment.step)));
+		if (first >= 0) shownSegments = first + 1;
+	}
+	const lastShown = segments[shownSegments - 1];
+	const held = shownSegments < segments.length || (live && !!turn.final && lastShown?.type === "text" && beingWritten(lastShown.step.key, lastShown.step.text, freshOf(lastShown.step)));
+	holding.current = held;
 	const lastProcess = segments.reduce((at, segment, index) => (segment.type === "process" ? index : at), -1);
+	const lastSegment = segments[segments.length - 1];
+	// The block of work that is going on right now, or text that is being written: the page shows that the PC is busy.
+	const working = live && !turn.final && lastProcess >= 0 && lastProcess === segments.length - 1;
+	const writing = !!turn.final?.streaming || (lastSegment?.type === "text" && !!lastSegment.step.streaming);
+	// Otherwise the three dots say so, for as long as the reply is not over: also between the moment the model starts
+	// and its first word, which through Google Drive can be seconds.
+	const waiting = live && !held && (awaiting || !(working || writing));
+	// Parts that appear while the reply is written come in softly; a chat that is opened shows them at once.
+	const part = live ? "part-in" : "";
 	return html`<div class="turn enter" data-turn=${turn.key}>
 		${turn.jobReport && html`<div class="marker">${t("Background work finished")}</div>`}
 		${turn.user && html`<${UserMessage} item=${turn.user} actions=${actions} resolveImage=${resolveImage} onView=${onView} />`}
-		${segments.map((segment, index) =>
-			segment.type === "process"
-				? html`<${Process} key=${segment.key} segment=${segment} live=${live && index === lastProcess && !turn.final && index === segments.length - 1} defaultOpen=${live && !turn.final && index === segments.length - 1} onOpenUrl=${onOpenUrl} />`
-				: html`<div class="final" key=${segment.key}><${Markdown} text=${segment.step.text} /></div>`,
-		)}
-		${turn.final && html`<div class="final selectable"><${Markdown} text=${finalText} />${turn.final.streaming ? html`<span class="caret"></span>` : null}</div>`}
-		${live && awaiting && html`<div class="status-line"><span class="typing"><i></i><i></i><i></i></span></div>`}
+		${[
+			...segments
+				.slice(0, shownSegments)
+				.map((segment, index) =>
+					segment.type === "process"
+						? html`<${Process} key=${segment.key} segment=${segment} live=${live && index === lastProcess && !turn.final && index === segments.length - 1} defaultOpen=${live && !turn.final && index === segments.length - 1} entering=${live} onOpenUrl=${onOpenUrl} />`
+						: html`<div class="final ${part}" key=${segment.key}><${StreamText} text=${segment.step.text} fresh=${live && freshOf(segment.step)} open=${!!segment.step.streaming} name=${segment.step.key} onWritten=${onWritten} /></div>`,
+				),
+			// The answer has the key of the note it was or becomes (see `written`), so the same element goes on being written.
+			turn.final && !held
+				? html`<div class="final selectable ${part}" key=${`x-${textName(turn.final.message)}`}><${StreamText} text=${finalText} fresh=${arrivedJustNow(turn.final.message)} open=${!!turn.final.streaming} caret=${!!turn.final.streaming} name=${textName(turn.final.message)} /></div>`
+				: null,
+		]}
+		${waiting && html`<div class="status-line part-in"><span class="typing"><i></i><i></i><i></i></span></div>`}
 		${turn.changes && html`<${ChangesCard} item=${turn.changes} />`}
 		${done &&
 		turn.error &&
@@ -358,6 +503,7 @@ function Standalone({ item }) {
  */
 export function Transcript({ items, toolRuns, runs, running, awaiting, cwd, actions, resolveImage, onOpenUrl, modelLabel }) {
 	const previous = useRef(null);
+	const names = useRef(new Map());
 	const turns = useMemo(() => {
 		const built = buildTurns(items, { toolRuns, cwd }, previous.current);
 		previous.current = built;
@@ -371,13 +517,21 @@ export function Transcript({ items, toolRuns, runs, running, awaiting, cwd, acti
 			break;
 		}
 	}
+	// The reply that is being written is the last turn's, unless that turn is only a message sent meanwhile, which waits
+	// below the reply until the PC takes it: the reply above it goes on.
+	let liveRound = lastRound;
+	if (running) {
+		let at = lastRound;
+		while (at >= 0 && (turns[at].standalone || (turns[at].user?.pending && turns[at].user.whileRunning && !turns[at].assistants?.length))) at--;
+		if (at >= 0) liveRound = at;
+	}
 	return html`<div class="turns">
 		${turns.map((turn, index) => {
 			if (turn.standalone) return html`<${Standalone} key=${turn.key} item=${turn.standalone} />`;
 			const last = index === lastRound;
-			const live = running && last;
+			const live = running && index === liveRound;
 			return html`<${Turn}
-				key=${turn.key}
+				key=${lastingKey(names.current, turn)}
 				turn=${turn}
 				live=${live}
 				awaiting=${live && awaiting}

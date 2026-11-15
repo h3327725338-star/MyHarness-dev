@@ -1,7 +1,9 @@
 /** Internal NDJSON worker for isolated Explore tasks. Not a user-facing output mode. */
 
-import { SettingsManager } from "../../config/settings/index.ts";
+import { muteRemovedSettingNotices, SettingsManager } from "../../config/settings/index.ts";
 import { getAgentDir } from "../../config.ts";
+import { emitSessionShutdownEvent } from "../../extensions/runtime/runner.ts";
+import { applyHttpProxySettings, configureHttpDispatcher } from "../../platform/process/http-dispatcher.ts";
 import { flushRawStdout, restoreStdout, takeOverStdout, writeRawStdout } from "../../platform/process/output-guard.ts";
 import { resolveCliModel } from "../../providers/runtime/model-resolver.ts";
 import { SessionManager } from "../../session/manager/index.ts";
@@ -47,7 +49,13 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 		const parsed = parseArgs(args);
 		const cwd = process.cwd();
 		const agentDir = getAgentDir();
+		// The process that started this worker has reported removed settings already; here the notice would only sit
+		// in front of the line that says why a worker failed.
+		muteRemovedSettingNotices();
 		const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+		// The user's proxy and network time limits hold for a sub-agent's requests as they do for the chat's.
+		applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+		configureHttpDispatcher(settingsManager.getNetworkTimeouts());
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
@@ -60,6 +68,15 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 				appendSystemPrompt: parsed.appendSystemPrompt,
 			},
 		});
+		// A worker runs with exactly the extensions it was handed: the guard that confines it and, for a model an
+		// extension registers, that extension. One that did not load would leave the worker unconfined or without its
+		// model, so the worker does not start.
+		const extensionErrors = services.resourceLoader.getExtensions().errors;
+		if (extensionErrors.length > 0) {
+			throw new Error(
+				`子智能体进程未能加载扩展：${extensionErrors.map((entry) => `${entry.path}：${entry.error}`).join("；")}`,
+			);
+		}
 		let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"] | undefined;
 		const pendingSteers: string[] = [];
 		let promptSeen = false;
@@ -122,7 +139,17 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 				cliThinking: parsed.thinking,
 				modelRuntime: services.modelRuntime,
 			});
-			if (!resolved.model) throw new Error(resolved.error ?? "Delegated model not available");
+			if (!resolved.model) {
+				// A provider an extension registers can fail to register (its own error is among the diagnostics).
+				const problems = services.diagnostics
+					.filter((entry) => entry.type === "error")
+					.map((entry) => entry.message);
+				// The resolver's own text is kept unless it is the plain "not found", which points at a CLI option.
+				if (resolved.error && !resolved.error.includes("--list-models")) problems.unshift(resolved.error);
+				throw new Error(
+					`子智能体进程里没有模型“${parsed.model}”：它的 Provider 没有注册或已停用。${problems.length > 0 ? `（${problems.join("；")}）` : ""}`,
+				);
+			}
 			const created = await createAgentSessionFromServices({
 				services,
 				sessionManager: SessionManager.inMemory(cwd, {
@@ -158,6 +185,15 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 				stdinStream.unref?.();
 			} catch {
 				// Exit path is still covered by the parent process kill.
+			}
+			// Extensions hear that the session is over: a provider that keeps a program of its own running for the
+			// session (the Claude Code shell) ends it here, not when the worker process is killed.
+			if (session) {
+				try {
+					await emitSessionShutdownEvent(session.extensionRunner, { type: "session_shutdown", reason: "quit" });
+				} catch {
+					// An extension's shutdown handler must not keep a finished worker from reporting.
+				}
 			}
 			await session?.dispose();
 			await services.dispose();

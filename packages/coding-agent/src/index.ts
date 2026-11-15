@@ -324,6 +324,15 @@ export type {
 } from "./providers/credentials/api-key-collection.ts";
 export { readStoredCredential } from "./providers/credentials/auth-storage.ts";
 export { ModelRegistry } from "./providers/models/registry.ts";
+// Plan usage sources that extensions provide (pi.registerPlanUsageSource)
+export type {
+	PlanUsageGroup,
+	PlanUsageSnapshot,
+	PlanUsageSource,
+	PlanUsageSourceState,
+	PlanUsageWindow,
+	PlanUsageWindowKind,
+} from "./providers/plan-usage/sources.ts";
 export {
 	type CreateModelRuntimeOptions,
 	type ModelCredentialUsage,
@@ -563,6 +572,14 @@ export {
 	type WriteToolOptions,
 	withFileMutationQueue,
 } from "./tools/registry.ts";
+// Search sources that extensions provide (pi.registerWebSearchSource)
+export type {
+	WebSearchSource,
+	WebSearchSourceAnswer,
+	WebSearchSourceModel,
+	WebSearchSourceRequest,
+	WebSearchSourceResult,
+} from "./tools/web-search/sources.ts";
 // Text and image helpers (no clipboard module; clipboard code was removed from utils/)
 
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";

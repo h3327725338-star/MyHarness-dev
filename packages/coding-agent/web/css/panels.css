@@ -338,6 +338,28 @@
 @keyframes cu-pulse { 50% { opacity: 0.35; } }
 .cu-actions { display: flex; gap: 8px; margin-top: 2px; }
 
+/* Plan limits (popover of the composer bar, plan-usage.js): one section per source, a caption per group, a row per window.
+   A window is one line of text (its name, when it resets, what is left) over a hairline bar, so the list stays light. */
+.pu { display: flex; flex-direction: column; font-size: var(--fs-sm); }
+.pu-source { display: flex; flex-direction: column; gap: 10px; padding: 8px 12px 12px; }
+.pu-source + .pu-source { border-top: 1px solid var(--border); }
+.pu-head { display: flex; align-items: center; gap: 6px; min-height: 24px; margin-bottom: -2px; }
+.pu-head strong { font-weight: 600; }
+.pu-age { font-size: var(--fs-xs); }
+.pu-note { font-size: var(--fs-xs); line-height: 1.4; }
+.pu-error { color: var(--warn); }
+.pu-group { display: flex; flex-direction: column; gap: 8px; }
+.pu-caption { font-size: var(--fs-xs); margin-bottom: -2px; }
+.pu-row { display: grid; grid-template-columns: 46px minmax(0, 1fr) auto; column-gap: 8px; row-gap: 5px; align-items: baseline; }
+.pu-name { color: var(--text-2); white-space: nowrap; }
+.pu-reset { min-width: 0; font-size: var(--fs-xs); color: var(--text-3); }
+.pu-pct { text-align: right; font-weight: 500; font-variant-numeric: tabular-nums; }
+.pu-pct.warn { color: var(--warn); } .pu-pct.danger { color: var(--danger); }
+.pu .cu-bar { grid-column: 1 / -1; height: 3px; }
+/* New numbers glide to their length, like the bars in the composer. */
+.pu .cu-fill { transition: width var(--t-slow) var(--ease); }
+.pu-foot { padding: 8px 12px 10px; border-top: 1px solid var(--border); font-size: var(--fs-xs); line-height: 1.4; color: var(--text-4); }
+
 /* File tabs: one bar per tab. The name stays readable (the folder after it, dimmer, gives way first), the viewer's own
    tools follow, then edit/save and one "more" menu. Tools that matter less fold away as the bar narrows. */
 .panel-pane:not([hidden]):has(> .file-viewer) { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }

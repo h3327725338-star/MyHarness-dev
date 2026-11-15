@@ -15,6 +15,7 @@
 | `manager/cwd.ts` | 会话记录的工作目录不存在时的检查与提示（`getMissingSessionCwdIssue` 只读检查、`assertSessionCwdExists` 不存在时抛 `MissingSessionCwdError`） |
 | `mode-state.ts` | `ModeStateStore`：coding/general 两套本地偏好（上次会话、默认模型、草稿、个人提示），带锁读写 `chat-mode-state.json`，不是第二套 Settings |
 | `artifacts/store.ts` | 会话 `artifacts/`（reports/tests/temporary）的创建、按会话列举、派生索引刷新、删除聊天后的孤儿标记；读写前拒绝 symlink/junction |
+| `artifacts/index-refresh.ts`、`artifacts/index-refresh-worker.ts` | 工具调用结束后的派生索引刷新：`scheduleArtifactIndexRefresh()` 只登记会话、立刻返回，短时间内的请求合成一次，在 worker 线程里读写索引（两次之间至少隔 20 秒）；worker 起不来时退回本线程。`index-refresh-worker.ts` 是独立 worker 入口，被 `build:binary` 单独列为编译入口，改名要同步 `package.json` |
 | `artifacts/written-files.ts` | `readWrittenFiles()`：从对话 JSONL 的 write/edit 结果读出这次对话写过哪些文件、是否新建、最后写入时间（比文件头时间早的条目是从父对话继承的，不算）；`readChatActivity()` 再加上工作目录和会产生文件的工具运行时间段（每条工具结果到它前一条记录之间，只读和搜索类工具不算；后台任务算到这一轮结束，以及之后再查看它的时候）；是否算产出、能否放进回收站由 `application/use-cases/produced-files.ts` 判断 |
 | `projection/index.ts` | 从条目树到上下文：`buildSessionContext()`、`buildContextEntries()`、`getLatestCompactionEntry()`、环检测 |
 | `storage/jsonl/index.ts` | JSONL 的解析与容错、文件头读取、追加与重写、会话目录与元数据、列表扫描、搬迁；`moveSessionToWorkspace()` 把整个会话目录移到同一 Data root 的另一个工作区（合并工作区时用） |

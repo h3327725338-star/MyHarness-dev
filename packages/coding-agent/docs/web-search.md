@@ -13,7 +13,7 @@ Google 和 Bing 不需要 API Key：MyHarness 先用轻量的普通 HTTP 请求�
 | 选项 | 含义 | 范围 | 默认 |
 | --- | --- | --- | --- |
 | **Web Search** | 总开关。关闭时两个工具不会出现在 Agent 的工具列表和系统提示中；已有 Session 和工具结果不会被删除 | On / Off | On |
-| **Search Engines** | 允许使用哪些搜索引擎，可以同时开多个 | 见下表 | Tavily API、Google |
+| **Search Engines** | 允许使用哪些搜索引擎，可以同时开多个。电脑上装有 `claude` 或 `agy` 时，这里还会列出 Claude Code、agy 两个搜索来源（默认不选），见下方"插件提供的搜索来源" | 见下表 | Tavily API、Google |
 | **Browser Fallback** | 轻量请求被拦截时，是否允许用本机浏览器打开真实的搜索页或网页。这一行同时显示实际会用哪个浏览器，或为什么不可用 | On / Off | On |
 | **Browser** | 兜底用哪个浏览器。Auto = 按 Firefox、Chrome、Edge 的顺序用第一个已安装的 | Auto / Firefox / Chrome / Edge | Auto |
 | **Use My Browser's Cookies** | 打开后，把你日常使用的同一种浏览器里的 Cookie 复制一份到 MyHarness 专用的浏览器配置里，这样你已经登录的网站可以直接读取。见下方"复用日常浏览器的 Cookie" | On / Off | Off |
@@ -70,6 +70,35 @@ Search Engines 页面的 **Test Selected Engines** 会用每个已启用的引�
 }
 ```
 
+### 插件提供的搜索来源
+
+除了上面的搜索引擎，扩展可以用 `pi.registerWebSearchSource()` 注册"搜索来源"：由另一个程序自己的联网搜索给出结果。随安装包带的两个插件各注册了一个：
+
+| 来源 | 用的是什么 | 默认模型 | 可选的 Thinking Effort | 返回什么 |
+| --- | --- | --- | --- | --- |
+| Claude Code | 本机已登录的 `claude` 自带的 WebSearch。一次调用的全部问题交给同一个 `claude`，它同时搜索，结果一到就停掉它（不等它写总结） | Haiku 5.5 | low、medium、high、xhigh、max（传给 `claude --effort`） | 标题和网址，没有摘要 |
+| agy | 本机已登录的 `agy`（Google Antigravity CLI）自带的 search_web（Google 搜索）。每个问题搜一次 | Gemini 3.8 Flash | agy 给所选模型提供的档位（多数是 low、medium、high；没有档位的模型不显示这一行） | 网站名、网址，摘要取自 agy 的搜索小结中引用该网站的那一句 |
+
+来源只负责"给出结果列表"。之后的步骤与搜索引擎完全相同、没有改动：和各引擎的结果按网址合并去重、排序，再由 MyHarness 自己读取真实网页；网页读不了时照常走浏览器兜底和登录流程。所以开了来源以后，Agent 拿到的仍然是真实网页的正文，不是那个程序写的总结。
+
+- **开关**：默认全部关闭。电脑上找得到对应程序时，来源才出现在 **Search Engines** 下拉里（和引擎放在一起选）；选中后下面多出一行"`<名称>` 搜索模型"，用来选这个来源搜索时用哪个模型；所选模型有不止一个 Thinking Effort 档位时，再多出一行"`<名称>` 搜索 Thinking Effort"。可以只开来源、一个引擎都不选。
+- **Thinking Effort**：没有选时用最低档（low）。搜索只是把问题原样转交给那个程序的搜索工具，调高主要是更慢、更费额度。选过的档位换了模型后仍然保存；新模型没有这一档时按最低档搜索，设置页显示的是实际会用的那一档。
+- **保存位置**：`settings.json` 的 `webSearch.extensionSources`（开了哪些来源）、`webSearch.extensionSourceModels`（各自选的模型）和 `webSearch.extensionSourceEfforts`（各自选的 Thinking Effort），与 `engines` 分开。程序被卸载或插件没加载时，保存的选择不会被删掉，只是搜索时跳过、设置页不显示；程序回来后自动恢复。手机端不使用这些来源（发给手机的搜索配置只含 `engines`）。
+- **所有模型都能用**：来源挂在 `web_search` 工具后面，任何模型的对话（包括定时任务开的对话）调用 `web_search` 时都会用到已开启的来源，不限于 Claude Code / agy 自己的对话。子智能体（Explore / Workflow）在独立进程里运行、不加载这些插件，它们的 `web_search` 只用搜索引擎；所以想让子智能体也能联网，至少保留一个搜索引擎。
+- **额度与速度**：每次搜索是那个程序的一次模型请求，消耗它自己的套餐额度。它比搜索引擎慢，整次搜索要等最慢的来源：2026-11-14 实测，Claude Code（Haiku 5.5）3 个问题约 9 秒，agy（Gemini 3.8 Flash）3 个问题约 15 秒；搜索引擎通常 1–2 秒。搜索进行中，进度里会写明正在用哪些来源。
+- **失败**：一个来源 60 秒内没有结果按这个来源失败处理；整个来源失败后暂停 2 分钟，期间不再启动那个程序。失败原因写在 Diagnostics 里（未登录、额度用完、没有所选模型等原样写出），其他引擎和来源的结果照常返回；只有全部引擎和来源都失败时工具调用才报错。
+- **时间范围**：这两个程序的搜索没有时间筛选。`timeRange` 对来源的做法是在搜索词后加上对应的时间（如 `November 2026`、`2026年11月`），并在 `details.routes` 的 `note` 里写明。
+- **停止**：停止对话会立刻结束 `web_search`，并结束为这次搜索启动的 `claude` / `agy` 进程。
+- **Test Selected Engines** 只测试搜索引擎，不测试来源。
+
+agy 来源的几点说明：
+
+- 每次搜索会在 agy 自己的历史里留下一条很短的对话（agy 没有提供删除对话的方式）。
+- 只使用 agy 自己的登录；Provider 卡片上保存的 Gemini API Key 不用于搜索。
+- 结果取自 agy 为每一步保存的原始输出（`~/.gemini/antigravity-cli/brain/<对话>/.system_generated/steps/…/output.txt`）。这个位置不在 agy 的文档里，agy 更新后可能改变；读不到时改为让模型自己列出搜索到的来源，再从它的回答里读取。
+- Google 给的是跳转链接，插件对每个链接发一次不跟随跳转的请求换成真实网址（10 个约 0.5 秒，总共最多等 6 秒）；换不出来的保留跳转链接，读网页时仍会跳到原网页。
+- Google 的条款限制其他软件使用 Antigravity 的登录。这个来源只启动官方的 `agy acp`；开关由用户自己决定，开启后定时任务等无人值守的对话调用 `web_search` 时也会用到它。
+
 ### 旧配置迁移
 
 - 上一版本的默认引擎列表 `["duckduckgo", "brave"]`，如果是由没有 `browserFallback` 字段的旧版本保存的，视为"从未改过的默认值"，迁移为当前的默认 `["tavily", "google"]`。其他旧列表（例如只选了 `brave`）是用户自己的选择，保持不变；以新格式保存过的 `["duckduckgo", "brave"]` 也保持不变。
@@ -88,6 +117,7 @@ web_search / web_fetch（tool.ts，Agent 只看到这两个工具）
                   └─ BrowserTransport：SelectedBrowser（browser/select.ts）按设置选一个 LocalBrowser
                         ├─ Firefox：扩展 + 远程调试协议（browser/firefox.ts、extension.ts、bridge.ts、rdp.ts）
                         └─ Chrome / Edge：DevTools 协议，走管道（browser/chromium.ts）
+      → 插件搜索来源（sources.ts）：扩展用 registerWebSearchSource 注册；一次调用的全部 query 一起交给来源，只取回结果列表
       → readPage（page.ts）：web_fetch 和搜索后读网页，与搜索引擎无关
           └─ 被网站拒绝时 → 桌面版：内置浏览器（workspace.ts 的 readInBuiltInBrowser → page-browser.ts 的 signedInPageResult）
                           → 其他情况：BrowserPageReader（page-browser.ts）：用同一个浏览器读正文
@@ -161,7 +191,7 @@ Windows 上只对专用验证浏览器进程及其子进程的主窗口（可见
 
 | Tool | 参数 | 返回 |
 | --- | --- | --- |
-| `web_search` | `queries`（1–10 个独立问题；只写一个纯文本问题时按一个问题的列表处理）、可选 `timeRange`（`day`/`week`/`month`/`year`；Bing 没有“过去一年”筛选，`year` 在 Bing 上不限时间）、`maxResults`（1–50，默认 10，且不少于 Pages to Read per Search）、`readPages`（只有 0 有效，表示不读网页；其他值都按 Pages to Read per Search 读取）、`fresh` | `Engines:` 行写明每个引擎实际走的方式（如 `Google (HTTP), Bing (Firefox)`）；合并去重后的结果（标题、URL、来源引擎、摘要、发布日期）；以及前几个结果网页里与问题最相关的片段。`details.routes` 里有每个引擎 × 问题的方式和改用 Firefox 的原因 |
+| `web_search` | `queries`（1–10 个独立问题；只写一个纯文本问题时按一个问题的列表处理）、可选 `timeRange`（`day`/`week`/`month`/`year`；Bing 没有“过去一年”筛选，`year` 在 Bing 上不限时间）、`maxResults`（1–50，默认 10，且不少于 Pages to Read per Search）、`readPages`（只有 0 有效，表示不读网页；其他值都按 Pages to Read per Search 读取）、`fresh` | `Engines:` 行写明每个引擎实际走的方式（如 `Google (HTTP), Bing (Firefox)`）；合并去重后的结果（标题、URL、来源引擎、摘要、发布日期）；以及前几个结果网页里与问题最相关的片段。`details.routes` 里有每个引擎 × 问题的方式和改用 Firefox 的原因。插件搜索来源在 `Engines:` 行只写名字（如 `Claude Code`），在 `details.routes` 里 `via` 为 `extension` |
 | `web_fetch` | `urls`（1–60 个，实际最多读取 Max URLs per Fetch 个；只写一个纯文本 URL 时按一个 URL 的列表处理）、`fresh` | 每个 URL 的 Markdown 正文或独立的失败原因 |
 
 搜索规划由 Agent 负责：它决定搜什么、搜几次、读哪些网页、证据够不够。
@@ -170,7 +200,7 @@ Windows 上只对专用验证浏览器进程及其子进程的主窗口（可见
 
 ```text
 Agent 调用 web_search
-  → 各引擎同时进行，每个引擎内最多 3 个 query 同时进行
+  → 各引擎同时进行，每个引擎内最多 3 个 query 同时进行；已开启的插件搜索来源与引擎同时进行
       → 轻量请求 →（被拦截时）Firefox →（需要人工时，仅交互界面）可见窗口
   → 按规范化 URL 合并去重、过滤不安全 URL、排序（多个引擎都返回的结果排名更高）
   → 按排名读取 N 个网页（N = Pages to Read per Search）：读不了的（404、拒绝、没有正文等）由下一个结果补上
@@ -241,4 +271,5 @@ npm.cmd run test:web-search:e2e
 - Bing 的降级结果识别是基于查询词和结果文本的启发式判断；搜索引擎 HTML DOM 或反自动化策略变化时，解析器和判断规则仍需维护。
 - 用浏览器读网页只是让请求看起来和真人浏览一样，不保证能通过所有网站的反爬；需要付费或账号权限的内容在登录前仍然读不到。
 - Firefox Transport 依赖 localhost Remote Debugging / IPC、已安装的 Firefox 和专用 profile；Firefox 未安装、扩展接入失败、4 个 profile 都被其他 MyHarness 进程占用且排队超时，或浏览器崩溃时，会返回明确失败，不会把错误伪装成搜索结果。
+- 插件搜索来源依赖另一个程序（`claude`、`agy`）的输出格式和登录状态，程序更新后可能需要跟着改；它们的搜索比搜索引擎慢约十秒以上，并消耗那个程序的套餐额度。agy 来源读取的是 agy 未写入文档的保存位置，并会在 agy 的历史里留下对话。
 - 高频搜索仍可能触发搜索引擎 CAPTCHA 或限流；Google 轻量路径固定使用 IPv4，因为当前 IPv6 网络表现不可靠。

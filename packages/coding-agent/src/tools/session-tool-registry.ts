@@ -16,7 +16,8 @@ import { createSyntheticSourceInfo, type SourceInfo } from "../extensions/contra
 import type { ExtensionRunner } from "../extensions/runtime/runner.ts";
 import { wrapRegisteredTools } from "../extensions/runtime/wrapper.ts";
 import { WebSearchApiKeys } from "../providers/credentials/web-search-keys.ts";
-import { artifactScope, ensureSessionArtifacts, refreshArtifactIndexesIfChanged } from "../session/artifacts/store.ts";
+import { scheduleArtifactIndexRefresh } from "../session/artifacts/index-refresh.ts";
+import { artifactScope, ensureSessionArtifacts } from "../session/artifacts/store.ts";
 import type { SessionManager } from "../session/manager/index.ts";
 import type { UltracodeToolOptions, WorkflowToolOptions } from "../workflow/tool.ts";
 import type { AgentTasksToolOptions } from "./agent-tasks.ts";
@@ -390,16 +391,11 @@ export class SessionToolRegistry {
 					try {
 						return await persisted.execute(...args);
 					} finally {
+						// The tool's result does not wait for the derived indexes: on a large data root bringing them up to
+						// date takes seconds, which used to freeze every chat after each of these calls (index-refresh.ts).
 						const scope = artifactScope(sessionManager);
 						if (scope && ["write", "edit", "apply_patch", "apply_rename", "bash", "pwsh"].includes(tool.name)) {
-							try {
-								refreshArtifactIndexesIfChanged(scope);
-							} catch (error) {
-								console.warn(
-									"[artifacts] Could not refresh derived indexes:",
-									error instanceof Error ? error.message : String(error),
-								);
-							}
+							scheduleArtifactIndexRefresh(scope);
 						}
 					}
 				},

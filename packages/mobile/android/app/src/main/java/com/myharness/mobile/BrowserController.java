@@ -28,8 +28,14 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
+
+import androidx.webkit.WebSettingsCompat;
+import androidx.webkit.WebViewFeature;
 
 /**
  * The built-in browser: one WebView per tab, stacked in a host view that sits above the app's own page. The page draws
@@ -79,7 +85,7 @@ final class BrowserController {
 				// Such a page may also ask for a fresh copy: what it reads must not be an answer kept from last time.
 				if (input.optBoolean("fresh", false)) view.getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
 				String url = input.optString("url", "");
-				if (!url.isEmpty()) view.loadUrl(url);
+				if (!url.isEmpty()) load(id, view, url, agent.isEmpty());
 				if (input.optBoolean("activate", true)) activate(id);
 				break;
 			}
@@ -92,7 +98,7 @@ final class BrowserController {
 			case "load": {
 				WebView view = tabs.get(id);
 				if (view == null) view = create(id);
-				view.loadUrl(input.getString("url"));
+				load(id, view, input.getString("url"), true);
 				break;
 			}
 			case "back": {
@@ -133,8 +139,9 @@ final class BrowserController {
 				if (view != null) {
 					boolean desktop = input.optBoolean("on", false);
 					WebSettings settings = view.getSettings();
-					String base = WebSettings.getDefaultUserAgent(activity);
-					settings.setUserAgentString(desktop ? base.replace("Mobile ", "").replaceFirst("\\(Linux; Android [^)]*\\)", "(X11; Linux x86_64)") : base);
+					if (desktop) desktopTabs.add(id);
+					else desktopTabs.remove(id);
+					settings.setUserAgentString(agent(desktop));
 					settings.setUseWideViewPort(true);
 					settings.setLoadWithOverviewMode(true);
 					view.reload();
@@ -258,6 +265,30 @@ final class BrowserController {
 	// ---- Tabs ------------------------------------------------------------------------------
 
 	@SuppressLint("SetJavaScriptEnabled")
+	/** Tabs their owner switched to the desktop version of sites. */
+	private final Set<String> desktopTabs = new HashSet<>();
+
+	/** How a page is told which browser this is: a phone's Chrome, or a computer's for the desktop version of a site. */
+	private String agent(boolean desktop) {
+		String phone = WebSettings.getDefaultUserAgent(activity).replace("; wv", "").replaceFirst("Version/\\d+\\.\\d+ ", "");
+		return desktop ? phone.replace("Mobile ", "").replaceFirst("\\(Linux; Android [^)]*\\)", "(X11; Linux x86_64)") : phone;
+	}
+
+	/** Sites that only work in a computer's browser and say so to a phone: they get the desktop version at once. */
+	private static boolean desktopOnly(String url) {
+		String host = Uri.parse(url).getHost();
+		return host != null && host.equals("web.whatsapp.com");
+	}
+
+	/** Load an address in a tab; `ownAgent` is false for a page that was given the name of another browser. */
+	private void load(String id, WebView view, String url, boolean ownAgent) {
+		if (ownAgent) {
+			String wanted = agent(desktopTabs.contains(id) || desktopOnly(url));
+			if (!wanted.equals(view.getSettings().getUserAgentString())) view.getSettings().setUserAgentString(wanted);
+		}
+		view.loadUrl(url);
+	}
+
 	private WebView create(String id) {
 		WebView existing = tabs.get(id);
 		if (existing != null) return existing;
@@ -278,6 +309,12 @@ final class BrowserController {
 		settings.setAllowFileAccess(false);
 		settings.setAllowContentAccess(false);
 		settings.setSafeBrowsingEnabled(true);
+		// The pages are shown the way a phone's browser shows them: sites turn an "app's embedded page" away, and they
+		// tell one by the "wv" in its name and by the app's name it sends with every request.
+		settings.setUserAgentString(agent(false));
+		if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+			WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, Collections.emptySet());
+		}
 		CookieManager.getInstance().setAcceptCookie(true);
 		CookieManager.getInstance().setAcceptThirdPartyCookies(view, true);
 		view.setBackgroundColor(0xFFFFFFFF);
@@ -316,6 +353,7 @@ final class BrowserController {
 
 	private void close(String id) {
 		WebView view = tabs.remove(id);
+		desktopTabs.remove(id);
 		if (view == null) return;
 		host.removeView(view);
 		view.stopLoading();

@@ -9,6 +9,7 @@ import { BranchChip, MergeBackChip } from "./branch-menu.js";
 import { openImageLightbox } from "./lightbox.js";
 
 import { ContextMeter } from "./context-usage.js";
+import { PlanUsageMeter } from "./plan-usage.js";
 import { EffortPicker, ModelMenu } from "./model-menu.js";
 import { rankSearch } from "./search.js";
 import { debounce, fmtDuration, plural, pointerMoved } from "./util.js";
@@ -933,6 +934,7 @@ const send = async (mode) => {
 					<span class="grow" />
 					<${ModelPicker} />
 					<${MainEffortPicker} />
+					<${PlanUsageMeter} />
 					<${ContextMeter} />
 					${showStop
 						? stopping

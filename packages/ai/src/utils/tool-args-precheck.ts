@@ -44,6 +44,9 @@ function matchesType(value: unknown, expected: string): boolean {
 	return jsonTypeOf(value) === expected;
 }
 
+/** The types `validateToolArguments` reads from a string that spells the value (see its semantic coercion). */
+const SCALARS_READ_FROM_TEXT = new Set(["number", "integer", "boolean"]);
+
 const PREVIEW_CHARS = 160;
 
 /** The offending value as one escaped line, so control characters cannot forge a second message. */
@@ -109,6 +112,10 @@ function checkValue(value: unknown, schema: PrecheckSchema, path: string): Prech
 		if (typeof value === "string" && (types.includes("array") || types.includes("object"))) {
 			return containerSentAsString(value, types, path);
 		}
+		// A number or a boolean written as text ("5", "true") is left to the full validation, which reads such a
+		// string as the value it spells for a field of exactly that one type and refuses any other text itself.
+		// Refusing it here cost a second request for a call whose meaning was never in doubt.
+		if (typeof value === "string" && types.length === 1 && SCALARS_READ_FROM_TEXT.has(types[0]!)) return null;
 		return {
 			message: `${path}: expected type ${types.join("/")} but got ${jsonTypeOf(value)}`,
 			guidance: [`Write ${label} as ${types.join(" or ")}, given ${jsonTypeOf(value)}.`],

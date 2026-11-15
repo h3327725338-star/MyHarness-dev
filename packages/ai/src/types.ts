@@ -840,6 +840,19 @@ export interface Model<TApi extends Api> {
 	 * so an interface can show how full it is, but a host must not gate requests on it or compact on the model's behalf.
 	 */
 	managesOwnContext?: boolean;
+	/**
+	 * The provider's own program runs tools by itself while it answers (it reads, writes and runs commands in the working
+	 * folder), and the host learns of a call only as it happens. A host that keeps a snapshot of the folder from before a
+	 * task's first change therefore takes it when the task starts, not when it sees the first call.
+	 */
+	runsOwnTools?: boolean;
+	/**
+	 * Only for a `runsOwnTools` model: in a delegated (sub-agent) session its program runs none of its own tools, and
+	 * every tool call comes back to the host. A host that confines a sub-agent by checking each tool call (a read-only
+	 * rule, a sandbox folder) can only do so for calls it runs itself, so it gives a sub-agent to a `runsOwnTools` model
+	 * only when this is set.
+	 */
+	delegatedHostTools?: boolean;
 	maxTokens: number;
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */

@@ -378,6 +378,7 @@ Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆�
 - `maxTurns` 默认 `0`（无限制）；达到正数上限会保留 `partial` 结果。`stallTimeoutMs` 为 `0` 时关闭 stall watchdog。硬停止只保留给真实不可用进展：stall watchdog、墙钟超时、`maxTurns` 上限和取消；`noProgressDetection` 和 `repeatedOperationDetection`（默认开启）控制的是向运行中的子 Agent 注入“收敛提醒” steering 消息的强度（重复操作、连续工具失败、几轮无新信息按阈值周期性提醒），计数本身不再终止任务。
 - 带 `questions` 的 Explore task 要求子 Agent 逐项回答并在报告末尾给出 `## Completion checklist`；报告缺清单或声明了未回答问题时，任务记为 `partial`（`stopReason: "incomplete_answer"`）并列出未回答项。
 - `workflow` 运行一个或多个 sequential phases，每个 phase 可以包含多个并行 Explore tasks。第一个 phase 之后的每个 phase 都会收到上一阶段的 results。
+- 子智能体模型可以来自扩展注册的 Provider：子智能体在独立的 worker 进程里运行，除了自己的 guard 之外不加载扩展；当所选模型属于某个扩展注册的 Provider 时，MyHarness 会把这一个扩展文件也交给 worker。自己执行工具的模型（`runsOwnTools`）只有同时声明 `delegatedHostTools`（在子智能体里所有工具都交回 MyHarness 执行）才能用作子智能体模型：Claude Code shell 的模型可以，agy shell 的模型不可以。不能用的模型在派发前就会被 `agent` 和 workflow 拒绝并说明原因，不会复制文件或启动进程。
 
 `/workflow` 和 `/ultracode` prompt commands 分别指示 main AI 使用 `workflow` 和 `ultracode` tools。`/ultracode` 使用更严格的中文 instructions；如果第一次 Ultracode run 不够，会继续执行后续 run。所有 phase 和 task descriptions 都由 main AI 决定；child agents 不能再创建更多 agents。`workflow` 和 `ultracode` 与 `agent` 共用同一套子代理运行时，因此也跟随同一个模式开关：读写模式下它们派出的子代理同样只能在各自 worktree 内写入，两个工具的描述、参数提示和系统提示里的相关句子会按模式改写；只读模式下这些文字与开关加入之前逐字一致。
 
@@ -413,6 +414,9 @@ Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆�
 | 字段 | 含义 | 范围 | 默认 |
 | --- | --- | --- | --- |
 | `engines` | 启用的搜索引擎：`google`、`bing`、`duckduckgo`、`brave`、`tavily`（没有 API Key 时走 Tavily 免费的免 Key 通道） | 任意组合 | `["tavily", "google"]` |
+| `extensionSources` | 开启的插件搜索来源（扩展用 `registerWebSearchSource` 注册的，如 `claude-code`、`agy`）。与 `engines` 分开保存；对应程序不在时保留不删，搜索时跳过 | 来源 id 的列表 | `[]` |
+| `extensionSourceModels` | 各来源搜索时使用的模型；没有写的来源用它自己的默认模型（Claude Code 是 Haiku 5.5，agy 是 Gemini 3.8 Flash） | `{ "<来源 id>": "<模型 id>" }` | `{}` |
+| `extensionSourceEfforts` | 各来源搜索时使用的 Thinking Effort；没有写、或所选模型没有这一档时，用来源的默认档（两个插件都是 `low`） | `{ "<来源 id>": "low" \| "medium" \| "high" \| "xhigh" \| "max" }` | `{}` |
 | `browserFallback` | 轻量请求被拦截时，是否允许用本机浏览器（MyHarness 专用配置）打开真实的搜索页或网页 | On / Off | `true` |
 | `browser` | 兜底用哪个浏览器；`auto` = Firefox、Chrome、Edge 中第一个已安装的 | `auto` / `firefox` / `chrome` / `edge` | `"auto"` |
 | `useBrowserCookies` | 是否把日常浏览器的 Cookie 复制一份到专用配置，用来读取已登录的网站 | On / Off | `false` |

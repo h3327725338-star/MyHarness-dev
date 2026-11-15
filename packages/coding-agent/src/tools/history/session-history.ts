@@ -300,6 +300,20 @@ function formatRead(result: HistoryReadResult): string {
 	return lines.join("\n");
 }
 
+/**
+ * The chat's id under a name the field does not have (`id`, `session_id`, `sessionId`): `session_search` lists chats
+ * with an id, and models pass it on under that word. With `session` itself missing there is one way to read it.
+ */
+export function sessionFromOtherName(args: unknown): SessionGetToolInput {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return args as SessionGetToolInput;
+	const record = args as Record<string, unknown>;
+	if (record.session !== undefined) return args as SessionGetToolInput;
+	const name = ["session_id", "sessionId", "id"].find((key) => typeof record[key] === "string");
+	if (!name) return args as SessionGetToolInput;
+	const { [name]: session, ...others } = record;
+	return { ...others, session } as SessionGetToolInput;
+}
+
 export function createSessionGetToolDefinition(
 	_cwd: string,
 	options?: SessionHistoryToolOptions,
@@ -312,6 +326,7 @@ export function createSessionGetToolDefinition(
 			"Read one earlier saved chat by session id: its hand-off note (with how far it reaches) and either the messages around entry_id (along that message's own branch) or the newest messages of its current branch. Use it to check exact numbers, wording and later corrections before relying on an earlier chat. This chat's own messages from before a context checkpoint are read the same way, with this chat's id and an entry_id the checkpoint lists. Read-only.",
 		promptSnippet: loadSystemPrompt("tools/session-get/snippet.md"),
 		parameters: sessionGetSchema,
+		prepareArguments: sessionFromOtherName,
 		executionMode: "parallel",
 		async execute(_toolCallId, input: SessionGetToolInput, signal) {
 			if (signal?.aborted) throw new Error("Operation aborted");

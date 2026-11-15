@@ -37,7 +37,9 @@ import { registerFileRoutes, registerFolderBrowser } from "./routes-files.ts";
 import { registerGitRoutes } from "./routes-git.ts";
 import { registerMailRoutes } from "./routes-mail.ts";
 import { registerModeRoutes } from "./routes-modes.ts";
+import { registerPhoneBrowserRoutes } from "./routes-phone-browser.ts";
 import { registerPhoneLinkRoutes } from "./routes-phone-link.ts";
+import { registerPlanUsageRoutes } from "./routes-plan-usage.ts";
 import { registerProviderRoutes } from "./routes-providers.ts";
 import { registerScheduleRoutes } from "./routes-schedules.ts";
 import { registerSessionRoutes } from "./routes-sessions.ts";
@@ -240,6 +242,8 @@ export async function runWebMode(
 	registerAccountRoutes(server);
 	registerMailRoutes(server);
 	registerBookmarkRoutes(server, host);
+	// What is left of the subscription plans (Claude Code, agy): global, read from the plugins' sources, no chat needed.
+	const disposePlanUsageRoutes = registerPlanUsageRoutes(server);
 	// Google Drive sync: the engine polls in the background; the routes only expose status and configuration.
 	const isSessionActive = (_workspaceId: string, sessionId: string) =>
 		hub
@@ -360,6 +364,7 @@ export async function runWebMode(
 			onChange: () => server.broadcast("phone_link_changed", {}),
 		});
 		registerPhoneLinkRoutes(server, phoneLinkStore, phoneLink, accountPhones);
+		registerPhoneBrowserRoutes(server);
 		void phoneLink.apply();
 		accountPhones.start();
 	}
@@ -390,6 +395,7 @@ export async function runWebMode(
 		shuttingDown = true;
 		lifecycle.dispose();
 		if (nameTimer) clearInterval(nameTimer);
+		disposePlanUsageRoutes();
 		server.broadcast(restarting ? "restarting" : "shutdown", {});
 		try {
 			scheduleService.dispose();

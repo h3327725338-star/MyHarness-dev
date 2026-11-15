@@ -5,13 +5,14 @@ import { Spinner, html, useEffect, useState } from "/shared/ui.js";
 import { fmtBytes } from "/shared/util.js";
 import { API_KINDS, PROVIDER_PRESETS, fetchModelIds, getProviders, local, providerKey, removeProvider, saveProvider } from "./backend-local.js";
 import { account } from "./account.js";
-import { pc } from "./backend-remote.js";
+import { pc, routeName } from "./backend-remote.js";
 import { setMode } from "./backends.js";
 import { SEARCH_ENGINES, clearBrowsingData } from "./browser-model.js";
 import { storageEstimate } from "./db.js";
 import { AccountPcs, routeLabel } from "./drawer.js";
+import { allowedRoutes, PC_ROUTES } from "./link-remote.js";
 import { Icon } from "./micons.js";
-import { canScan, haptic, nativeInfo, onNative, scanQr, secretGet, secretSet } from "./native.js";
+import { canScan, haptic, isNative, nativeInfo, onNative, openNotificationSettings, openWaitingSettings, quietBanners, scanQr, secretGet, secretSet, waitingHidden } from "./native.js";
 import { colorThemes, prefs, setPrefs, shownChatMode } from "./prefs.js";
 import { Page, Row, Sheet, Switch, actionSheet, confirmSheet, openPage, openSheet, pickSheet, promptSheet } from "./sheets.js";
 import { attempt, toast, useStore } from "./store.js";
@@ -264,6 +265,32 @@ export async function pairFromLink(text) {
 	return false;
 }
 
+const ROUTE_NOTES = {
+	lan: "Fastest. Only when the phone is on the PC's network and the PC listens there.",
+	direct: "Over the internet, without a detour. Rarely possible on mobile data.",
+	relay: "Works on any network; each message takes a second or two. The PC's browser is not shown this way.",
+};
+const ROUTE_ICONS = { lan: "wifi", direct: "globe", relay: "drive" };
+
+/** Which ways to a PC of the account this phone tries (prefs.pcRoutes); at least one stays on. */
+function RoutesSection() {
+	const update = usePrefs();
+	const on = allowedRoutes(prefs.pcRoutes);
+	const set = (route, value) => {
+		const next = Object.fromEntries(PC_ROUTES.map((id) => [id, id === route ? value : on.includes(id)]));
+		if (!PC_ROUTES.some((id) => next[id])) return toast(t("At least one way must stay on."), "error", 3200);
+		update({ pcRoutes: next });
+	};
+	return html`<${Section}
+		title=${t("Ways to connect")}
+		note=${t("Only the ways turned on are tried. When none of them reaches the PC, the app says so and does not use another. The choice stays on this phone. A PC paired with its QR code is always reached on the local network.")}
+	>
+		${PC_ROUTES.map(
+			(route) => html`<${Row} key=${route} icon=${ROUTE_ICONS[route]} title=${routeName(route)} sub=${t(ROUTE_NOTES[route])}><${Switch} on=${on.includes(route)} onChange=${(value) => set(route, value)} label=${routeName(route)} /><//>`,
+		)}
+	<//>`;
+}
+
 function LinkPage({ close }) {
 	const link = useStore((s) => s.pc.link);
 	const [busy, setBusy] = useState(false);
@@ -306,6 +333,7 @@ function LinkPage({ close }) {
 			<${AccountPcs} onPicked=${close} />
 			<div class="rows-note">${t("Reached from any network: on the local network when the PC listens there, else directly over the internet, else through your Google Drive (slower). Every message stays encrypted with this phone's key.")}</div>
 		</div>`}
+		${signed && html`<${RoutesSection} />`}
 		${link.paired
 			? html`<div class="status-card ${link.status === "online" ? "ok" : link.status === "offline" ? "bad" : ""}">
 						<span class="sicon">${link.status === "connecting" ? html`<${Spinner} size=${20} />` : html`<${Icon} name="desktop" size=${22} />`}</span>
@@ -335,6 +363,29 @@ function LinkPage({ close }) {
 					</div>`}
 		<div class="rows-note">${t("The phone and the PC talk directly over your local network; nothing goes through a server. Every message is encrypted with a key that only the QR code carried. A paired phone can make the agent on the PC act, so pair only your own phone.")}</div>
 	<//>`;
+}
+
+/**
+ * The notification Android shows while a reply is awaited in the background. Only the owner can hide it: this row
+ * leads to its switch in the system's settings and says whether it is hidden.
+ */
+function WaitingRow() {
+	const [hidden, setHidden] = useState(waitingHidden);
+	useEffect(() => {
+		const check = () => document.visibilityState === "visible" && setHidden(waitingHidden());
+		document.addEventListener("visibilitychange", check);
+		return () => document.removeEventListener("visibilitychange", check);
+	}, []);
+	return html`<${Row}
+		icon="bell"
+		title=${t("Hide the “answering” notification")}
+		sub=${hidden
+			? t("Hidden: nothing is shown while MyHarness waits for a reply in the background. You are still told when the reply is ready.")
+			: t("While it waits for a reply in the background, Android shows “MyHarness is answering”. Switch that kind of notification off on the next page and it is gone; you are still told when the reply is ready.")}
+		value=${hidden ? t("Hidden") : t("Shown")}
+		chevron
+		onClick=${() => openWaitingSettings()}
+	/>`;
 }
 
 export function openLinkPage() {
@@ -453,6 +504,15 @@ function SettingsPage({ close }) {
 			/>
 			<${Row} icon="enter" title=${t("Enter sends the message")} sub=${t("Off: Enter starts a new line.")}><${Switch} on=${!!prefs.sendOnEnter} onChange=${(on) => update({ sendOnEnter: on })} label=${t("Enter sends the message")} /><//>
 			<${Row} icon="bell" title=${t("Notify when a reply is ready")} sub=${t("When the app is in the background.")}><${Switch} on=${prefs.notifyDone !== false} onChange=${(on) => update({ notifyDone: on })} label=${t("Notify when a reply is ready")} /><//>
+			${isNative &&
+			html`<${Row}
+				icon="bell"
+				title=${t("Banner and sound in the system settings")}
+				sub=${quietBanners ? t("This phone keeps an app's banners off until you allow them: turn on “Floating notifications” for MyHarness there.") : t("Where Android decides how MyHarness may notify you.")}
+				chevron
+				onClick=${() => openNotificationSettings()}
+			/>`}
+			${isNative && html`<${WaitingRow} />`}
 		<//>
 		<${Section} title=${t("Browser")}>
 			<${Row} icon="search" title=${t("Search engine of the address field")} value=${SEARCH_ENGINES.find((entry) => entry.value === prefs.browserSearch)?.label || "Google"} chevron onClick=${() => pick(t("Search engine"), SEARCH_ENGINES, "browserSearch")} />

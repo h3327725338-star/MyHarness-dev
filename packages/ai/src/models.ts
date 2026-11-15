@@ -80,6 +80,8 @@ export interface ProviderSetting {
 	readonly label: string;
 	readonly description?: string;
 	readonly placeholder?: string;
+	/** The id of the one model this value is for; unset for a value of the provider as a whole. */
+	readonly model?: string;
 	/** Current value, as the field shows it. Must not throw. */
 	get(): string;
 	/** Validates and stores the value. Throws with a message for the user when it is not acceptable. */

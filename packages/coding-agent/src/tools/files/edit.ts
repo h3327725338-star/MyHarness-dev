@@ -23,8 +23,10 @@ import { committedAfterCancel } from "./mutation-result.ts";
 import {
 	assertFileWasReadBefore,
 	canonicalFilePathKey,
+	type FileReadState,
 	recordFileStateAfterMutation,
 	resolveFileStateScope,
+	statFileReadState,
 } from "./read-state.ts";
 
 const replaceEditSchema = Type.Object(
@@ -149,19 +151,26 @@ export function createEditToolDefinition(
 			// same way the write tool counts lines only for them.
 			const localFileSystem = ops === defaultEditOperations;
 			const scope = resolveFileStateScope(ctx);
-			// P2-11 idempotency: a repeated identical edit cannot apply twice (oldText is
-			// gone after the first commit), so the repeat is refused as a duplicate before
-			// the mutation queue instead of failing against the changed file. Only a
-			// previously successful edit marks the key; thrown outcomes stay retryable.
+			// P2-11 idempotency: a repeated identical edit cannot apply twice while the file
+			// is as the first one left it (oldText is gone after the commit), so the repeat
+			// is refused as a duplicate before the mutation queue instead of failing against
+			// the changed file. Once anything has touched the file since, the edit runs as
+			// any other. Only a previously successful edit marks the key; thrown outcomes
+			// stay retryable.
 			const key = idempotencyKey("edit", scope, {
 				path: canonicalFilePathKey(absolutePath),
 				edits,
 			});
-			if (toolIdempotency.has(key)) {
-				return {
-					content: [{ type: "text", text: duplicateToolResultText("edit") }],
-					details: { diff: "", patch: "", idempotentDuplicate: true as const },
-				};
+			const applied = toolIdempotency.get(key) as FileReadState | undefined;
+			if (applied) {
+				const current = await statFileReadState(absolutePath);
+				if (current && current.mtimeMs === applied.mtimeMs && current.size === applied.size) {
+					return {
+						content: [{ type: "text", text: duplicateToolResultText("edit") }],
+						details: { diff: "", patch: "", idempotentDuplicate: true as const },
+					};
+				}
+				toolIdempotency.delete(key);
 			}
 
 			return withFileMutationQueue(
@@ -220,8 +229,10 @@ export function createEditToolDefinition(
 					// Session is not reported as an external modification.
 					if (localFileSystem) await recordFileStateAfterMutation(absolutePath, scope);
 					const mutation = committedAfterCancel(signal);
-					// Mark the key only after a successful commit, so a failed edit stays retryable.
-					toolIdempotency.set(key, true);
+					// Mark the key only after a successful commit, so a failed edit stays retryable, with the
+					// shape the file has now: the repeat is a duplicate only while that shape is still on disk.
+					const appliedState = localFileSystem ? await statFileReadState(absolutePath) : undefined;
+					if (appliedState) toolIdempotency.set(key, appliedState);
 					return {
 						content: [
 							{

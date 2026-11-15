@@ -1,5 +1,10 @@
 import type { ResolvedWebSearchSettings, WebSearchEngineId } from "../../config/settings/types.ts";
 
+/**
+ * What searched: a built-in engine, or a search source an extension provides (see sources.ts), by its id.
+ */
+export type WebSearchSourceId = WebSearchEngineId | (string & {});
+
 export type WebSearchFailureCode =
 	| "aborted"
 	| "blocked"
@@ -36,14 +41,14 @@ export interface WebSearchResult {
 	/** Independent queries that produced this URL after result fusion. */
 	queries?: string[];
 	engineRank: number;
-	engines: WebSearchEngineId[];
+	engines: WebSearchSourceId[];
 	publishedAt?: string;
 }
 
 export interface WebSearchFailure {
 	query?: string;
 	url?: string;
-	engine?: WebSearchEngineId;
+	engine?: WebSearchSourceId;
 	code: WebSearchFailureCode;
 	message: string;
 }
@@ -67,9 +72,10 @@ export interface WebFetchResponse {
 
 /** Which transport answered one engine x query of a search. */
 export interface WebSearchRoute {
-	engine: WebSearchEngineId;
+	engine: WebSearchSourceId;
 	query: string;
-	via: "http" | "browser";
+	/** "extension": another program's own search answered, through the extension that provides the source. */
+	via: "http" | "browser" | "extension";
 	/** The browser that was used ("Firefox", "Chrome", "Edge"), when one was. */
 	browser?: string;
 	/** Why the browser was used, when it was. */
@@ -82,8 +88,8 @@ export interface WebSearchResponse {
 	/** Top results read after searching; empty when page reading is off. */
 	pages: WebFetchedPage[];
 	failures: WebSearchFailure[];
-	/** Engines actually queried for this call. */
-	engines: WebSearchEngineId[];
+	/** Engines and extension sources actually queried for this call. */
+	engines: WebSearchSourceId[];
 	/** Successful engine x query runs and how each was reached; empty on a cache hit. */
 	routes: WebSearchRoute[];
 	cacheHit: boolean;

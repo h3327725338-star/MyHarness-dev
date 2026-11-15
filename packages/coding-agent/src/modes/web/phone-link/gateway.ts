@@ -37,6 +37,7 @@ const EVENTS = new Set([
 	"slot_closed",
 	"agent_start",
 	"run_state",
+	"run_redirecting",
 	"run_finished",
 	"message_start",
 	"message_update",
@@ -131,6 +132,14 @@ const ROUTES: Route[] = [
 	{ method: "POST", path: "/api/model", body: (input) => pick(input, ["provider", "id", "thinkingLevel"]) },
 	{ method: "POST", path: "/api/thinking", body: (input) => pick(input, ["level"]) },
 	{ method: "POST", path: "/api/files/upload", body: (input) => pick(input, ["name", "data"]) },
+	// The PC's built-in browser, shown on the phone as a picture and worked with taps (routes-phone-browser.ts checks
+	// the action and every value).
+	{
+		method: "POST",
+		path: "/api/phone-browser",
+		body: (input) =>
+			pick(input, ["action", "tabId", "url", "x", "y", "deltaX", "deltaY", "text", "enter", "key", "long"]),
+	},
 	// A new chat starts unbound, where the PC would start one (its current place), or in one of the Workspaces the PC
 	// lists for that mode; a phone names no other folder.
 	{

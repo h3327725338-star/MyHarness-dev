@@ -567,8 +567,12 @@ function AddWorkspaceDialog({ onClose }) {
  * Google Drive sync at a glance, beside Settings: the Drive mark with a dot in the state's color (green up to date,
  * pulsing while something moves, amber when something needs the user, red when sync cannot go on). Hovering says it in
  * words; a click opens the sync page. Not shown until Drive is connected, so it never nags about a feature not in use.
+ *
+ * While it is shown it is the footer's only light: it also stands for the connection to the local server, which has no
+ * dot of its own then. `conn` is that connection's state ({ on, tone, title }); while the page is cut off from the
+ * server the dot takes the connection's color (what the page knows about sync is old then) and the tooltip says so.
  */
-function SyncIndicator() {
+function SyncIndicator({ conn }) {
 	const status = useStore((s) => s.syncStatus);
 	// "2 min ago" in the tooltip must not stand still while nothing else redraws the sidebar.
 	const [, tick] = useState(0);
@@ -579,7 +583,10 @@ function SyncIndicator() {
 	if (!status?.connected) return null;
 	const summary = syncSummary(status, deriveSync(status));
 	const line = summaryLine(summary);
-	return html`<button class=${`sync-ind tone-${summary.tone}`} title=${`${t("Google Drive sync")}: ${line}`} aria-label=${`${t("Google Drive sync")}: ${line}`} onClick=${() => setView({ settingsOpen: true, settingsSection: "sync" })}>
+	const tone = conn && !conn.on ? conn.tone : summary.tone;
+	const label = conn && !conn.on ? conn.title : `${t("Google Drive sync")}: ${line}`;
+	const title = conn?.on ? `${label}\n${conn.title}` : label;
+	return html`<button class=${`sync-ind tone-${tone}`} title=${title} aria-label=${label} onClick=${() => setView({ settingsOpen: true, settingsSection: "sync" })}>
 		<${Icon} name="drive" size=${15} /><i />
 	</button>`;
 }
@@ -616,6 +623,10 @@ export function Sidebar() {
 		return () => clearTimeout(timer);
 	}, [connected]);
 	const connTone = connected ? "ok" : gaveUp ? "danger" : "warn";
+	const connTitle = connected ? t("Connected to the local MyHarness server") : gaveUp ? t("Disconnected — retrying") : t("Reconnecting…");
+	// With Google Drive connected, the Drive mark beside Settings carries the connection's state as well (one light, not
+	// two); without it the connection keeps its own dot.
+	const driveShown = useStore((s) => !!s.syncStatus?.connected) && !exportReadOnly();
 	// The box shows what is typed at once; the lists are filtered a moment after the last key, not on every key.
 	const [filterText, setFilterText] = useState("");
 	const [filter, setFilter] = useState("");
@@ -755,8 +766,7 @@ export function Sidebar() {
 		${exportReadOnly() ? html`<${ExportSidebarFoot} />` : null}
 		<div class="sidebar-foot">
 			${exportReadOnly() ? null : html`<button class="nav-btn grow" onClick=${() => setView({ settingsOpen: true })}><${Icon} name="gear" size=${16} />${t("Settings")}</button>`}
-			${exportReadOnly() ? null : html`<${SyncIndicator} />`}
-			<span class=${`conn ${connected ? "on" : "off"}`} title=${connected ? t("Connected to the local MyHarness server") : gaveUp ? t("Disconnected — retrying") : t("Reconnecting…")}><span class=${`dot ${connTone}`} /></span>
+			${driveShown ? html`<${SyncIndicator} conn=${{ on: connected, tone: connTone, title: connTitle }} />` : html`<span class=${`conn ${connected ? "on" : "off"}`} title=${connTitle}><span class=${`dot ${connTone}`} /></span>`}
 		</div>
 		<${Resizer} side="right" min=${200} max=${460} getValue=${() => state.view.sidebarW} onChange=${onWidth} onEnd=${() => setView({ sidebarW: state.view.sidebarW })} />
 		${adding ? html`<${AddWorkspaceDialog} onClose=${() => setAdding(false)} />` : null}

@@ -29,6 +29,7 @@ import {
 import { getAttachmentDir, getDataDir } from "../../config/paths/index.ts";
 import { decodeUploadChunk, MAX_UPLOAD_BYTES, writeUploadChunk } from "../../data/upload-chunks.ts";
 import { isBadFolderPath, planFolderTargets } from "../../data/workspace-sources.ts";
+import type { ReviewChange } from "../../git/repository/review-types.ts";
 import {
 	artifactScope,
 	listArtifacts,
@@ -1328,11 +1329,12 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		// conversation changed more recently belongs to that conversation, so the list keeps it as history while the number
 		// and the commit leave it out (see session-ownership.ts). Both scopes answer the number, because both buttons show
 		// their number at the same time.
-		const attributionOf = async (changes: readonly { path: string }[]) => {
+		const attributionOf = async (changes: readonly { path: string }[], livePaths: readonly string[] = []) => {
 			const conversation = collectSessionChanges(host.session.sessionManager.getBranch()).files;
 			return attributeConversationFiles({
 				sessionKey: host.session.sessionId,
-				conversationPaths: conversation.map((file) => file.path),
+				// The files the running task has changed so far count as this chat's from the moment they change.
+				conversationPaths: [...conversation.map((file) => file.path), ...livePaths],
 				cwd: currentCwd(),
 				dirtyPaths: changes.map((change) => change.path),
 				registry: host.changeClaims,
@@ -1345,14 +1347,19 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 				isElsewhereOwned(attribution.elsewhere, cwd, file.path) ? { ...file, lastChangeElsewhere: true } : file,
 			);
 		};
+		// What the task that is still running has changed so far (see ChangeTracker.liveRunChanges): listed with the
+		// conversation's saved changes from the moment they happen, not only once the task has finished.
+		const live = scope === "run" ? { files: [] } : await liveSessionChanges(host);
+		const livePaths = live.files.map((file) => file.path);
 		if (scope === "session") {
-			const { files } = collectSessionChanges(host.session.sessionManager.getBranch());
+			const saved = collectSessionChanges(host.session.sessionManager.getBranch()).files;
+			const files = withLiveChanges(saved, live.files);
 			// A conversation that recorded no change yet is the common case: answer without reading Git at all.
 			if (files.length === 0) return { scope, files, total: 0, uncommitted: 0 };
 			const listed = await host.tracker
-				.listWorktreeChanges(fresh ? { forceRefresh: true } : undefined)
+				.listWorktreeChanges(fresh || live.files.length > 0 ? { forceRefresh: true } : undefined)
 				.catch(() => undefined);
-			const attribution = listed?.repositoryRoot ? await attributionOf(listed.changes) : undefined;
+			const attribution = listed?.repositoryRoot ? await attributionOf(listed.changes, livePaths) : undefined;
 			return {
 				scope,
 				files: withElsewhereMark(files, attribution),
@@ -1367,7 +1374,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			const cwd = currentCwd();
 			const cached = fresh ? undefined : getCachedWorktreeChangesSync(cwd);
 			if (cached?.files) {
-				const attribution = cached.repositoryRoot ? await attributionOf(cached.changes) : undefined;
+				const attribution = cached.repositoryRoot ? await attributionOf(cached.changes, livePaths) : undefined;
 				return {
 					scope,
 					files: cached.files,
@@ -1391,7 +1398,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 				files,
 				total: listed.changes.length,
 				error: listed.error ?? null,
-				uncommitted: (root ? await attributionOf(listed.changes) : undefined)?.own.length,
+				uncommitted: (root ? await attributionOf(listed.changes, livePaths) : undefined)?.own.length,
 			};
 		}
 		const runParam = url.searchParams.get("runId");
@@ -1423,8 +1430,27 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		if (scope === "session") {
 			const { files, diffs } = collectSessionChanges(host.session.sessionManager.getBranch());
 			const summary = files.find((candidate) => candidate.path === file);
-			if (!summary) throw new HttpError(404, "No such change");
-			return { summary, history: diffs.get(file) ?? [] };
+			// The running task's own change of this file comes last, after the changes earlier tasks saved.
+			const live = await liveSessionChanges(host, file);
+			const current = live.files[0];
+			if (!summary && !current) throw new HttpError(404, "No such change");
+			const history = diffs.get(file) ?? [];
+			return {
+				summary: summary ?? current,
+				history: current
+					? [
+							...history,
+							{
+								entryId: `live-${live.runId}`,
+								runId: live.runId,
+								timestamp: new Date().toISOString(),
+								summary: current,
+								...(live.patch !== undefined ? { patch: live.patch } : {}),
+								live: true,
+							},
+						]
+					: history,
+			};
 		}
 		if (scope === "worktree") {
 			const cwd = currentCwd();
@@ -1461,7 +1487,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		const entry = host.session.sessionManager.getEntry(url.searchParams.get("id") ?? "");
 		const card =
 			entry?.type === "custom" && entry.customType === RUN_CHANGES_ENTRY
-				? (entry.data as { runId?: number; files?: RunChangeCardFile[] } | undefined)
+				? (entry.data as { runId?: number; chain?: boolean; files?: RunChangeCardFile[] } | undefined)
 				: undefined;
 		const kept = card?.files?.find((candidate) => candidate?.path === file);
 		if (kept && !kept.patchOmitted) {
@@ -1469,14 +1495,76 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 			return { summary, ...(patch ? { patch } : {}) };
 		}
 		const runId = Number(card?.runId ?? url.searchParams.get("runId"));
-		const live = Number.isFinite(runId)
-			? host.tracker.diffForRunFile(runId, file, host.session.getGitCheckpoint())
-			: undefined;
+		// The card of a task cut into runs by new messages holds the task's net change: the record of one run is not it.
+		const live =
+			Number.isFinite(runId) && card?.chain !== true
+				? host.tracker.diffForRunFile(runId, file, host.session.getGitCheckpoint())
+				: undefined;
 		if (live) return live;
 		if (!kept) throw new HttpError(404, "No such change");
 		const { patch: _patch, patchOmitted: _omitted, ...summary } = kept;
 		return { summary: { ...summary, unavailable: "The diff of this file was too large to keep with the chat." } };
 	});
+}
+
+/** How long the diff of one file may use the list of the running task's changes the panel has just read. */
+const LIVE_CHANGES_REUSE_MS = 3_000;
+const lastLiveChanges = new WeakMap<WebHost, { runId: number; at: number; changes: ReviewChange[] }>();
+
+/**
+ * The files the chat's running task has changed so far, with their counts; none between tasks. With `only`, just that
+ * file, together with its diff: the panel asks for it right after the list, so the list just read says whether the file
+ * is one of them, and its content is read from disk as it is now.
+ */
+async function liveSessionChanges(
+	host: WebHost,
+	only?: string,
+): Promise<{ runId?: number; files: FileChangeSummary[]; patch?: string }> {
+	const run = host.liveRun();
+	if (!run) return { files: [] };
+	try {
+		const recent = lastLiveChanges.get(host);
+		const reusable =
+			only !== undefined && recent?.runId === run.runId && Date.now() - recent.at < LIVE_CHANGES_REUSE_MS;
+		const changes = reusable ? recent.changes : await host.tracker.liveRunChanges(run.runId, run.checkpoint);
+		if (!reusable) lastLiveChanges.set(host, { runId: run.runId, at: Date.now(), changes });
+		const wanted = only === undefined ? changes : changes.filter((change) => change.path === only);
+		if (wanted.length === 0) return { runId: run.runId, files: [] };
+		await host.tracker.prefetchBefore(run.runId, run.checkpoint, wanted);
+		let patch: string | undefined;
+		const files = wanted.slice(0, 300).map((change) => {
+			const diff = host.tracker.diffForLiveChange(run.runId, change, run.checkpoint);
+			if (only !== undefined) patch = diff.patch;
+			return { ...diff.summary, live: true };
+		});
+		return { runId: run.runId, files, ...(patch !== undefined ? { patch } : {}) };
+	} catch {
+		// The list of saved changes still answers; the running task's own appear with its card at the latest.
+		return { runId: run.runId, files: [] };
+	}
+}
+
+/** The conversation's saved changes with the running task's own: a file in both keeps its saved counts plus the new ones. */
+function withLiveChanges(saved: readonly FileChangeSummary[], live: readonly FileChangeSummary[]): FileChangeSummary[] {
+	if (live.length === 0) return [...saved];
+	const byPath = new Map(saved.map((file) => [file.path, file]));
+	for (const file of live) {
+		const previous = byPath.get(file.path);
+		byPath.set(
+			file.path,
+			previous
+				? {
+						...previous,
+						status: file.status,
+						additions: previous.additions + file.additions,
+						deletions: previous.deletions + file.deletions,
+						binary: previous.binary || file.binary,
+						live: true,
+					}
+				: file,
+		);
+	}
+	return [...byPath.values()];
 }
 
 function safeIsDirectory(target: string): boolean {

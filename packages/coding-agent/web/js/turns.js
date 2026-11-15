@@ -186,11 +186,16 @@ export function describeAction(call, result, run, cwd) {
 			target = clip(firstLine(str(args.task || args.prompt || args.description || (Array.isArray(args.tasks) ? args.tasks.map((t) => t.task || t.prompt || "").join(" · ") : ""))), 120);
 			break;
 		case "workflow":
-		case "ultracode":
+		case "ultracode": {
 			kind = "agent";
-			target = clip(firstLine(str(args.task || args.title || args.goal || name)), 120);
-			detail = name;
+			// The tool's own name is said once: after the workflow's name (or task text) as a grey tag, or alone when the call has none.
+			// Only text can name a call: a malformed argument (an object or array) must not be printed as "[object Object]".
+			const named = [args.task, args.title, args.goal, args.name].find((value) => typeof value === "string" && value.trim());
+			const label = clip(firstLine(named ?? ""), 120);
+			target = label || name;
+			detail = label && label !== name ? name : "";
 			break;
+		}
 		case "ask_user_question": {
 			const first = Array.isArray(args.questions) ? args.questions[0] : undefined;
 			target = clip(firstLine(str(first?.question)), 120);
@@ -729,9 +734,20 @@ export function runForTurn(turn, runs, nextTurn) {
 		if (turn.endedAt && run.startedAt > turn.endedAt + 5000) continue;
 		if (nextStart && run.startedAt >= nextStart - 250) continue;
 		if (nextInRun(run)) continue;
-		if (!best || run.startedAt > best.startedAt) best = run;
+		// Two records of one start (an announcement under a stale number, and the real record): the real one wins.
+		if (!best || run.startedAt > best.startedAt || (run.startedAt === best.startedAt && best.provisional && !run.provisional)) best = run;
 	}
 	return best;
+}
+
+/**
+ * The first record of a run that a message sent with "interrupt" is stopping. The server announces it (run_redirecting)
+ * before the stop starts, so the run's turn reads "switched to your new message" from the first moment, never as
+ * "cancelled" the way its stopped reply (stopReason "aborted") alone would. run_finished replaces it with the full record.
+ */
+export function redirectedRunRecord({ runId, startedAt, ts, session }) {
+	// `session`: the chat it belongs to, so a transcript read for another chat in the same slot drops it (store.js).
+	return { runId, outcome: "redirected", startedAt, endedAt: ts || Date.now(), provisional: true, ...(session ? { session } : {}) };
 }
 
 export function turnOutcome(turn, { run, live, waiting }) {

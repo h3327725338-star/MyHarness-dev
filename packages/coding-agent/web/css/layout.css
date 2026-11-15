@@ -352,6 +352,10 @@
 ::view-transition, ::view-transition-group(*), ::view-transition-image-pair(*), ::view-transition-old(*), ::view-transition-new(*) { pointer-events: none; }
 ::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
 ::view-transition-new(root) { clip-path: circle(0px at 0 0); }
+/* Once a forward reveal is under way, the new page drawn without its animation is the whole page: where the reveal ends.
+   The animation and the transition's layers can go in different frames; the new page's layer is never left hidden over
+   the old page's picture in between (mode-transition.js, mode-reveal-shown). */
+html.mode-reveal-shown::view-transition-new(root) { clip-path: none; }
 /* Inside the mode reveal (mode-transition.js) the new mode is drawn as it stays: its columns and panel take their place at
    once instead of sliding and fading in under the circle, which also keeps the reveal's frames free of layout work. */
 html.mode-revealing .app, html.mode-revealing .main, html.mode-revealing .panel-slot { transition: none; }

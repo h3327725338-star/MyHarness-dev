@@ -6,6 +6,31 @@ import { count, serverText, t } from "./i18n.js";
 import { clip } from "./util.js";
 import { openServicePage } from "./service-keys.js";
 
+// Which folds the user opened or closed, remembered by the id of what they belong to (a tool call, a group of calls) and
+// not by the component that shows it right now. A component's own state is lost whenever it is built again, and that
+// happens while the agent works: a lone read becomes a group when the next read arrives, a finished turn folds its blocks
+// into one, a transcript read gives the saved messages other keys than the live ones. The call's id survives all of it.
+const choices = new Map();
+const KEPT_CHOICES = 1000;
+
+/** What the user chose for this fold: true (open), false (closed), or undefined when they never touched it. */
+export const keptChoice = (key) => choices.get(key);
+
+/** The memory lives as long as the chat is on screen: the transcript forgets it when it goes away or shows another chat. */
+export const forgetKeptChoices = () => choices.clear();
+
+/** `[choice, choose]` for a fold: read from the memory on every render, `choose(true | false)` writes it and renders again. */
+export function useKeptChoice(key) {
+	const [, render] = useState(0);
+	const choose = (open) => {
+		choices.delete(key);
+		choices.set(key, open);
+		if (choices.size > KEPT_CHOICES) choices.delete(choices.keys().next().value);
+		render((n) => n + 1);
+	};
+	return [choices.get(key), choose];
+}
+
 export const KIND_ICON = { read: "file", list: "folder", find: "search", search: "search", run: "terminal", edit: "edit", write: "fileDiff", web: "globe", fetch: "globe", github: "gitBranch", mail: "mail", agent: "layers", history: "clock", tool: "wrench" };
 
 /** The glyph at the start of a tool row: working, failed, stopped, or the icon of its kind. */

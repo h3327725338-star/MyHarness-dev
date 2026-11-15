@@ -11,8 +11,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getSessionConversationPath, getSessionDir, parseSessionDataPath } from "../src/config/paths/index.ts";
+import { flushArtifactIndexRefresh, scheduleArtifactIndexRefresh } from "../src/session/artifacts/index-refresh.ts";
 import {
 	deleteWorkspaceArtifacts,
 	ensureSessionArtifacts,
@@ -20,13 +21,28 @@ import {
 	refreshArtifactIndexes,
 	refreshArtifactIndexesIfChanged,
 	resolveArtifact,
+	runIndexRefreshJob,
 } from "../src/session/artifacts/store.ts";
 import { deleteSessionFile } from "../src/session/storage/jsonl/file-operations.ts";
 
+// Everything stays real; the spy only tells whether this thread did a refresh job itself.
+vi.mock("../src/session/artifacts/store.ts", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/session/artifacts/store.ts")>();
+	return { ...actual, runIndexRefreshJob: vi.fn(actual.runIndexRefreshJob) };
+});
+
 const roots: string[] = [];
-afterEach(() => {
+afterEach(async () => {
+	// No refresh may still be writing into a folder that is about to be removed.
+	await flushArtifactIndexRefresh();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+const indexFilesOf = (data: string, workspaceId: string) => [
+	join(data, "artifacts", "index.json"),
+	join(data, "artifacts", "README.md"),
+	join(data, "workspaces", workspaceId, "artifacts", "index.json"),
+	join(data, "workspaces", workspaceId, "artifacts", "README.md"),
+];
 function fixture(workspaceId = "workspace-a", sessionId = "session-a", dataRoot?: string) {
 	const data = dataRoot ?? mkdtempSync(join(tmpdir(), "myharness-artifacts-"));
 	if (!dataRoot) roots.push(data);
@@ -228,6 +244,77 @@ describe("conversation artifacts", () => {
 			deleteWorkspaceArtifacts(a.data, "workspace-a");
 			expect(JSON.parse(readFileSync(ownIndex, "utf8")).entries).toEqual([]);
 			expect(JSON.parse(readFileSync(globalIndex, "utf8")).entries).toEqual([]);
+		});
+	});
+
+	describe("derived index refresh after a tool call", () => {
+		const names = (data: string) =>
+			JSON.parse(readFileSync(join(data, "artifacts", "index.json"), "utf8"))
+				.entries.map((entry: { sessionId: string; name: string }) => `${entry.sessionId}:${entry.name}`)
+				.sort();
+
+		it("returns before any index is written, and the indexes follow off the calling thread", async () => {
+			const a = fixture();
+			scheduleArtifactIndexRefresh(a.scope);
+			// The tool call that asked is not held up: nothing has been read or written yet.
+			expect(existsSync(join(a.data, "artifacts", "index.json"))).toBe(false);
+			await flushArtifactIndexRefresh();
+			expect(names(a.data)).toEqual(["session-a:reports/report.md"]);
+			expect(existsSync(join(a.data, "workspaces", "workspace-a", "artifacts", "README.md"))).toBe(true);
+		});
+
+		it("does the work in a worker thread, not on the thread that asked", async () => {
+			const a = fixture();
+			vi.mocked(runIndexRefreshJob).mockClear();
+			scheduleArtifactIndexRefresh(a.scope);
+			await flushArtifactIndexRefresh();
+			expect(names(a.data)).toEqual(["session-a:reports/report.md"]);
+			// This thread's copy of the job was never run: the worker has its own.
+			expect(runIndexRefreshJob).not.toHaveBeenCalled();
+		});
+
+		it("gathers the calls of several sessions into one refresh and ends up as a full refresh would", async () => {
+			const a = fixture();
+			const b = fixture("workspace-b", "session-b", a.data);
+			for (let call = 0; call < 20; call++) {
+				scheduleArtifactIndexRefresh(a.scope);
+				scheduleArtifactIndexRefresh(b.scope);
+			}
+			writeFileSync(join(b.artifacts, "tests", "result.txt"), "result");
+			await flushArtifactIndexRefresh();
+			expect(names(a.data)).toEqual([
+				"session-a:reports/report.md",
+				"session-b:reports/report.md",
+				"session-b:tests/result.txt",
+			]);
+			const files = [...indexFilesOf(a.data, "workspace-a"), ...indexFilesOf(a.data, "workspace-b")];
+			const incremental = files.map((file) => readFileSync(file, "utf8"));
+			refreshArtifactIndexes(a.data);
+			expect(files.map((file) => readFileSync(file, "utf8"))).toEqual(incremental);
+		});
+
+		it("rewrites nothing for a later call that changed no artifact", async () => {
+			const a = fixture();
+			scheduleArtifactIndexRefresh(a.scope);
+			await flushArtifactIndexRefresh();
+			const files = indexFilesOf(a.data, "workspace-a");
+			const past = new Date(Date.now() - 60_000);
+			for (const file of files) utimesSync(file, past, past);
+			const before = files.map((file) => statSync(file).mtimeMs);
+			scheduleArtifactIndexRefresh(a.scope);
+			await flushArtifactIndexRefresh();
+			expect(files.map((file) => statSync(file).mtimeMs)).toEqual(before);
+		});
+
+		it("picks up what a tool changed after an earlier refresh", async () => {
+			const a = fixture();
+			scheduleArtifactIndexRefresh(a.scope);
+			await flushArtifactIndexRefresh();
+			writeFileSync(join(a.artifacts, "tests", "result.txt"), "result");
+			rmSync(join(a.artifacts, "reports", "report.md"));
+			scheduleArtifactIndexRefresh(a.scope);
+			await flushArtifactIndexRefresh();
+			expect(names(a.data)).toEqual(["session-a:tests/result.txt"]);
 		});
 	});
 

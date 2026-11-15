@@ -16,6 +16,7 @@ import type { ImageContent, Model, Provider, ProviderHeaders } from "@myharness/
 type KeyId = string;
 type KeybindingsConfig = Record<string, string | string[] | undefined>;
 
+import type { AgentRole } from "../../agent/runtime/role.ts";
 import type { ModelRegistry } from "../../providers/models/registry.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import type { BuildSystemPromptOptions } from "../../system-prompts/composer/index.ts";
@@ -280,6 +281,7 @@ export class ExtensionRunner {
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () => ({ cwd: this.cwd });
+	private getAgentRoleFn: () => AgentRole = () => "main";
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -342,6 +344,7 @@ export class ExtensionRunner {
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn = contextActions.getSystemPromptOptions ?? (() => ({ cwd: this.cwd }));
+		this.getAgentRoleFn = contextActions.getAgentRole ?? (() => "main");
 
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
@@ -674,6 +677,10 @@ export class ExtensionRunner {
 			get hasUI() {
 				runner.assertActive();
 				return runner.hasUI();
+			},
+			get agentRole() {
+				runner.assertActive();
+				return runner.getAgentRoleFn();
 			},
 			get cwd() {
 				runner.assertActive();

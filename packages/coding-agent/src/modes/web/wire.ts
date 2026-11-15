@@ -644,13 +644,22 @@ export function messageToWire(
 	}
 }
 
+/**
+ * Whether the data of a RUN_CHANGES_ENTRY is a run's changes held back for the card of its task's last run: a new
+ * message cut that run short, and the card of the run that finishes the task lists these files too. Such an entry is
+ * never drawn; it only keeps the changes in the session until that card exists (session-changes.ts).
+ */
+export function isDeferredRunChanges(data: unknown): boolean {
+	return (data as { deferred?: unknown } | null | undefined)?.deferred === true;
+}
+
 /** The change card kept in a RUN_CHANGES_ENTRY, without the diffs; undefined when the data is not a card with files. */
 export function runChangesToWire(id: string, ts: number, data: unknown): WireItem | undefined {
 	const card = data as
 		| { runId?: unknown; files?: unknown; elsewhere?: unknown; elsewhereTotal?: unknown }
 		| null
 		| undefined;
-	if (!card || !Array.isArray(card.files)) return undefined;
+	if (!card || !Array.isArray(card.files) || isDeferredRunChanges(card)) return undefined;
 	const files: WireChangeFile[] = [];
 	for (const file of card.files as Array<Record<string, unknown> | null>) {
 		if (!file || typeof file.path !== "string") continue;
@@ -721,6 +730,7 @@ export function entryProjectsToWire(entry: SessionEntry): boolean {
 			if (entry.customType === RUN_CHANGES_ENTRY) {
 				const card = entry.data as { files?: unknown } | null | undefined;
 				return (
+					!isDeferredRunChanges(card) &&
 					Array.isArray(card?.files) &&
 					(card.files as Array<Record<string, unknown> | null>).some(
 						(file) => !!file && typeof file.path === "string",

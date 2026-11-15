@@ -16,6 +16,9 @@ import { t, N_, serverText } from "./i18n.js";
 const STATUS_LETTER = { added: "A", modified: "M", deleted: "D", renamed: "R" };
 const STATUS_TITLE = { added: N_("Added"), modified: N_("Modified"), deleted: N_("Deleted"), renamed: N_("Renamed") };
 
+/** How long after a tool call ends the running task's changes are read again. */
+const LIVE_REFRESH_MS = 1200;
+
 /** A slot that cannot serve reads yet: empty or a pending switch target (store.js `api()` throws Loading… for it). */
 const isPendingSlot = (slot) => !slot || String(slot).startsWith("pending:");
 
@@ -87,7 +90,7 @@ function DiffPane({ file, mode, entry, isRefreshing }) {
 			? html`<div class="pad dim"><${Spinner} size=${14} /></div>`
 			: displayData.history
 				? displayData.history.map((part) => html`<section key=${part.entryId}>
-					<div class="hunk-head">${fmtDateTime(part.timestamp)}</div>
+					<div class="hunk-head">${part.live ? t("Running task") : fmtDateTime(part.timestamp)}</div>
 					${part.summary.binary ? html`<div class="pad dim">${t("Binary file — no text diff.")}</div>` : part.summary.unavailable ? html`<div class="pad dim">${serverText(part.summary.unavailable)}</div>` : part.patch ? html`<${DiffView} patch=${part.patch} mode=${mode} language=${languageFor(file.path)} />` : html`<div class="pad dim">${t("No content changes.")}</div>`}
 				</section>`)
 			: displayData.summary.binary
@@ -118,6 +121,7 @@ export function ChangesPanel() {
 	const gitStatus = useStore((s) => s.gitStatus);
 	const lastRunId = snap?.lastRun?.runId;
 	const active = !!snap?.active;
+	const toolEnds = useStore((s) => s.toolEnds);
 	const [loadedData, setData] = useState(null);
 	const dataKey = `${slot}|${sessionId}|${scope}`;
 	const data = loadedData?.key === dataKey ? loadedData.value : null;
@@ -209,6 +213,17 @@ export function ChangesPanel() {
 	useEffect(() => {
 		if (!isPendingSlot(slot)) loadGitStatus();
 	}, [slot, lastRunId, active]);
+	// While a task runs, what it has changed so far is listed as this chat's own: the list is read again shortly after a
+	// tool call ends (the calls of a burst share one read), together with the folder's uncommitted count.
+	useEffect(() => {
+		if (!active || !toolEnds || isPendingSlot(slotRef.current)) return undefined;
+		const timer = setTimeout(() => {
+			if (isPendingSlot(slotRef.current)) return;
+			load(true);
+			loadGitStatus();
+		}, LIVE_REFRESH_MS);
+		return () => clearTimeout(timer);
+	}, [toolEnds, active]);
 	// A commit, a restore or another checkout changes how much of this chat is still uncommitted: re-read the panel when
 	// the folder's uncommitted count moves, so both numbers and the list follow without a manual refresh.
 	const firstDirtyEffect = useRef(true);
@@ -285,7 +300,7 @@ export function ChangesPanel() {
 		</div>
 		${data?.error && scope === "worktree" ? html`<div class="empty">${serverText(data.error)}</div>` : null}
 		${loading && !data ? html`<${ChangesSkeleton} />` : null}
-		${data && !files.length && !data.error ? html`<${Empty} icon="fileDiff" title=${scope === "session" ? (active ? t("The task is still running. Changes appear here when it finishes.") : t("No saved file changes in this conversation.")) : t("No uncommitted changes in the Git working tree.")} />` : null}
+		${data && !files.length && !data.error ? html`<${Empty} icon="fileDiff" title=${scope === "session" ? (active ? t("The task is still running. No file changes of this conversation yet.") : t("No saved file changes in this conversation.")) : t("No uncommitted changes in the Git working tree.")} />` : null}
 		${selected
 			? html`<div class="changes-body" ref=${bodyRef}>
 				<div class="cfiles">

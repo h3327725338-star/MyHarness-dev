@@ -39,6 +39,10 @@ export function createPager(root, { onPane, onPeek, allowBrowser = () => true } 
 	let velocity = 0; // position units per second
 	let frame = 0;
 	let lastTime = 0;
+	// How long one frame of this screen lasts (ms), learned from the frames themselves: 8.3 at 120 Hz, 16.7 at 60 Hz.
+	let frameMs = 1000 / 120;
+	// The spring's first frame after a start moves by one whole frame, whatever the clock says (see step).
+	let firstStep = false;
 	let pane = "chat";
 	let width = root.clientWidth || innerWidth;
 	let drawerWidth = drawer.offsetWidth || Math.min(width * 0.86, 360);
@@ -83,7 +87,14 @@ export function createPager(root, { onPane, onPeek, allowBrowser = () => true } 
 
 	function step(now) {
 		frame = 0;
-		const dt = Math.min(0.032, (now - lastTime) / 1000 || 0.016);
+		// The first frame continues where the last drawn one left off, one frame later. Measured with the clock it would
+		// be only the few milliseconds since the finger lifted (or less than nothing: a frame's time is the moment it
+		// began, before the touch that started the spring was handled), and the pane would stand still for a frame
+		// right when it is let go.
+		const elapsed = firstStep ? frameMs : now - lastTime;
+		if (!firstStep && elapsed > 3 && elapsed < 40) frameMs += (elapsed - frameMs) * 0.2;
+		firstStep = false;
+		const dt = Math.max(0, Math.min(0.032, elapsed / 1000));
 		lastTime = now;
 		const force = -STIFFNESS * (position - target) - DAMPING * velocity;
 		velocity += force * dt;
@@ -114,7 +125,7 @@ export function createPager(root, { onPane, onPeek, allowBrowser = () => true } 
 		}
 		velocity = initialVelocity;
 		if (!frame) {
-			lastTime = performance.now();
+			firstStep = true;
 			frame = requestAnimationFrame(step);
 		}
 	}

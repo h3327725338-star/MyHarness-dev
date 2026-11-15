@@ -9,7 +9,7 @@ import { Markdown } from "./markdown.js";
 import { DiffView, languageFor, parsePatch } from "./diff.js";
 import { buildTurns, buildTurnsAsync, buildTurnsWork, cachedTurns, tailPreviewSlice, changeTotals, groupSteps, groupLabel, nextRound, runForTurn, interruptedByNext, turnDuration, turnOutcome, turnSegments, historySourcesOf } from "./turns.js";
 import { actions, openCommand } from "./actions.js";
-import { KIND_ICON, StatusGlyph, WebSteps } from "./tool-rows.js";
+import { KIND_ICON, StatusGlyph, WebSteps, forgetKeptChoices, keptChoice, useKeptChoice } from "./tool-rows.js";
 import { StepCounts } from "./step-counts.js";
 import { basename, clip, splitFirstSentence, dirname, fmtBytes, fmtDuration, fmtShortDuration, fmtTokens, plural, formatData, ansiSegments } from "./util.js";
 import { count, t, N_, serverText, tNodes, getLang } from "./i18n.js";
@@ -21,7 +21,7 @@ import { afterModeReveal, beforePageCapture, modeRevealActive } from "./mode-tra
 
 import { OUTCOME_ICON, processSummaryState } from "./process-summary.js";
 import { AttachmentList, splitAttachments } from "./attachments.js";
-import { SubAgentProcess, dispatchFor, runningSince, runningTasks, useSubAgents } from "./sub-agents.js";
+import { SubAgentProcess, TaskStatusIcon, dispatchFor, runningSince, runningTasks, useSubAgents } from "./sub-agents.js";
 
 /**
  * Where a transcript image is drawn from: large ones come by address from the server (`src`, same origin, which the
@@ -232,19 +232,33 @@ function RawDetails({ step }) {
 	</div>`;
 }
 
-const TASK_DOT = { running: "accent", completed: "ok", partial: "warn", failed: "danger", timeout: "danger", cancelled: "" };
+/**
+ * The one line a sub-task row says about the task: what it is doing now, or how it ended (the error, the stop reason). A task
+ * that simply completed says nothing (its mark does). The row shows the text on one line cut with an ellipsis; `full` is the
+ * whole text for the row's title, and the opened detail below it carries the task's report.
+ */
+function taskNote(task) {
+	if (task.status === "completed") return null;
+	// Only text can be said: a malformed field (an object) is skipped instead of printing "[object Object]".
+	const said = (...values) => values.find((value) => typeof value === "string" && value.trim());
+	const full = String(serverText(task.status === "running" ? said(task.lastToolInfo) : said(task.error, task.lastToolInfo), "") || "").trim();
+	if (!full) return null;
+	return { line: clip(full.replace(/\s+/g, " "), 200), full: clip(full, 800) };
+}
 
 function TaskResult({ task }) {
 	const [open, setOpen] = useState(false);
 	const cwd = useStore((st) => st.snap?.cwd || "");
 	const toggle = () => setOpen(!open);
-	return html`<div class="sub-task">
+	const note = taskNote(task);
+	const meta = [task.toolUseCount ? plural(task.toolUseCount, "tool call") : "", task.durationMs ? fmtDuration(task.durationMs) : ""].filter(Boolean).join(" · ");
+	return html`<div class=${`sub-task${note ? " noted" : ""}`}>
 		<div class="action-row" onClick=${toggle} role="button" tabindex="0" aria-expanded=${open} onKeyDown=${(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle())}>
-			<span class="action-ico">${task.status === "running" ? html`<${Spinner} />` : html`<span class=${`dot ${TASK_DOT[task.status] ?? ""}`} />`}</span>
+			<span class="action-ico"><${TaskStatusIcon} status=${task.status} /></span>
 			<span class="action-text truncate" title=${task.description || clip(task.prompt || "", 300)}>${task.description || clip(task.prompt || "", 80)}</span>
-			<span class="action-tail dim">${task.toolUseCount ? plural(task.toolUseCount, "tool call") : ""}${task.durationMs ? ` · ${fmtDuration(task.durationMs)}` : ""}<${Fold} /></span>
+			${note ? html`<span class=${`sub-note truncate ${task.status === "failed" || task.status === "timeout" ? "bad" : "dim"}`} title=${note.full}>${note.line}</span>` : null}
+			<span class="action-tail dim">${meta}<${Fold} /></span>
 		</div>
-		${task.status === "running" && task.lastToolInfo ? html`<div class="dim sub-last truncate">${serverText(task.lastToolInfo, task.lastToolInfo)}</div>` : null}
 		<${Collapse} open=${open}>
 			<div class="sub-detail"><${SubAgentProcess} result=${task} running=${task.status === "running"} cwd=${cwd} /></div>
 		<//>
@@ -266,10 +280,10 @@ function AgentDetails({ details }) {
 	if (!details) return null;
 	if (details.phases) {
 		return html`<div class="sub-agent">
-			<div class="dim sub-head">${t("Workflow")} ${details.name ? html`<strong>${details.name}</strong>` : ""} · ${t(details.status)}${details.model ? ` · ${details.model}` : ""}</div>
+			<div class="dim sub-head">${t(details.status)}${details.model ? ` · ${details.model}` : ""}</div>
 			${details.phases.map(
 				(phase, i) => html`<div class="sub-phase" key=${i}>
-				<div class="row"><span class=${`badge ${phase.status === "completed" ? "ok" : phase.status === "running" ? "accent" : ""}`}>${t(phase.status)}</span><strong class="truncate grow">${phase.name}</strong><span class="dim">${phase.completed}/${phase.total}</span></div>
+				<div class="sub-phase-head dim"><span class="action-ico" title=${t(phase.status)}><${TaskStatusIcon} status=${phase.status} /></span><span class="truncate grow">${t("Phase {n}: {name}", { n: i + 1, name: typeof phase.name === "string" ? phase.name : "" })}</span><span class="sub-phase-count">${phase.completed}/${phase.total}</span></div>
 				${phase.results.map((task, j) => html`<${TaskResult} key=${j} task=${task} />`)}
 			</div>`,
 			)}
@@ -283,7 +297,11 @@ function AgentDetails({ details }) {
 
 /** One tool call. Every kind of call has the same row: its glyph, what it did, a real count of lines when it changed a file, how long it took, and the fold arrow. */
 const ActionRow = memo(function ActionRow({ step, defaultOpen }) {
-	const [open, setOpen] = useState(!!defaultOpen);
+	// Open or closed is the user's choice, kept by the call's id: this row is built again when its group forms around it
+	// or its turn folds, and the choice must not be lost with the component.
+	const session = useStore((st) => st.snap?.session?.id);
+	const [chosen, choose] = useKeptChoice(`${session}|${step.key}`);
+	const open = chosen ?? !!defaultOpen;
 	const subAgents = useStore((st) => st.subAgents);
 	const nothingRunning = useStore((st) => !st.snap?.active && !st.snap?.flags?.background);
 	const subAgentState = useSubAgents();
@@ -297,7 +315,7 @@ const ActionRow = memo(function ActionRow({ step, defaultOpen }) {
 	const liveDetails = stale ? settleDetails(rawDetails) : rawDetails;
 	const took = step.startedAt && step.endedAt && step.endedAt - step.startedAt >= 1000 ? fmtDuration(step.endedAt - step.startedAt) : "";
 	const exit = step.result?.details?.exitCode;
-	const toggle = () => setOpen(!open);
+	const toggle = () => choose(!open);
 	return html`<div class=${`action ${step.isError ? "err" : ""} ${step.status}`} data-tool-call=${step.call?.id}>
 		<div class="action-row" onClick=${toggle} role="button" tabindex="0" aria-expanded=${open} onKeyDown=${(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle())}>
 			<span class="action-ico"><${StatusGlyph} step=${step} /></span>
@@ -321,10 +339,26 @@ const ActionRow = memo(function ActionRow({ step, defaultOpen }) {
 
 /** Consecutive calls of one kind. The web (searching and reading pages) is always one aggregate line, even for a single call. */
 function Group({ group, forceOpen }) {
-	const [open, setOpen] = useState(!!forceOpen);
+	const session = useStore((st) => st.snap?.session?.id);
+	const [chosen, choose] = useKeptChoice(`${session}|${group.key}`);
+	const joined = useRef(undefined);
+	// Whether this group was a lone row on screen before, and whether it became a group around a row the user had open.
+	const lone = useRef(false);
+	const grew = useRef(false);
 	const nothingRunning = useStore((st) => !st.snap?.active && !st.snap?.flags?.background);
 	const list = group.actions;
-	if (list.length === 1 && !["web", "edit", "write"].includes(group.kind)) return html`<${ActionRow} step=${list[0]} />`;
+	if (list.length === 1 && !["web", "edit", "write"].includes(group.kind)) {
+		lone.current = true;
+		return html`<${ActionRow} step=${list[0]} />`;
+	}
+	// A lone call the user opened becomes the group's first row when the next call of its kind joins it: the group starts
+	// open (settled once, when it first shows as a group), so the details they were reading stay in view.
+	if (joined.current === undefined) {
+		joined.current = list.some((step) => keptChoice(`${session}|${step.key}`) === true);
+		// The head then slides in above that row and the row moves to its indent (.group.joined), instead of both jumping.
+		grew.current = joined.current && lone.current;
+	}
+	const open = chosen ?? (joined.current || !!forceOpen);
 	const failed = list.filter((a) => a.isError).length;
 	const running = list.some((a) => a.status === "running" || a.status === "pending");
 	let removed = 0;
@@ -337,8 +371,8 @@ function Group({ group, forceOpen }) {
 		return step;
 	});
 	const totals = group.kind === "edit" || group.kind === "write" ? changeTotals(counted) : undefined;
-	return html`<div class="group">
-		<button class="group-head" onClick=${() => setOpen(!open)} aria-expanded=${open}>
+	return html`<div class=${`group ${grew.current ? "joined" : ""}`}>
+		<button class="group-head" onClick=${() => choose(!open)} aria-expanded=${open}>
 			<span class="action-ico">${running ? html`<${Spinner} />` : html`<${Icon} name=${KIND_ICON[group.kind] || "wrench"} size=${14} class="c-dim" />`}</span>
 			<span class=${`group-label truncate ${running ? "shimmer-text" : ""}`}>${groupLabel(group.kind, list)}</span>
 			${group.kind === "edit" || group.kind === "write" ? html`<${StepCounts} ...${totals} removed=${removed} running=${running && !nothingRunning} />` : null}
@@ -504,6 +538,9 @@ function ProcessSummary({ turn, steps = turn.steps, stats = turn.stats, last = t
 	const [open, setOpen] = useState(defaultOpen);
 	const interacted = useRef(false);
 	useEffect(() => { if (!interacted.current) setOpen(defaultOpen); }, [defaultOpen]);
+	// Opening or closing anything inside the block (a tool row, a group, reasoning) is the user reading it: when the
+	// model starts writing text or the turn ends, the block stays as they left it instead of folding under their cursor.
+	const touched = (event) => { if (event.type === "click" || event.key === "Enter" || event.key === " ") interacted.current = true; };
 	const subAgentState = useSubAgents();
 	// While the context is compacted the strip above the input shows it, with its own timer and Cancel: this row stays
 	// still (no working glyph, activity or timer) and is not drawn at all when the turn has no steps yet.
@@ -539,7 +576,7 @@ function ProcessSummary({ turn, steps = turn.steps, stats = turn.stats, last = t
 			<span class="grow" />
 			<${Fold} />
 		</button>
-		<${Collapse} open=${open} keepMounted=${true}><div class="summary-body"><${StepList} steps=${steps} /></div><//>
+		<${Collapse} open=${open} keepMounted=${true}><div class="summary-body" onClickCapture=${touched} onKeyDownCapture=${touched}><${StepList} steps=${steps} /></div><//>
 	</div>`;
 }
 
@@ -863,23 +900,36 @@ function ChangeFile({ card, file }) {
 	</div>`;
 }
 
+/** A card with more files than this shows the first ones and folds the rest behind one row at its bottom. */
+const CHANGE_FILES_SHOWN = 5;
+
 /**
  * What a finished task changed, at the end of its turn: the files it really changed with their added and removed
  * lines. The card is an entry of the session (kind "runChanges"), written when the task ended, so it stays in the
- * conversation when later tasks follow, and each card holds only its own task's changes. A file opens in place to
- * its line diff (added lines green, removed lines red); a Markdown file can also be read as formatted text. The card
- * never opens the Changes panel. A task from before cards were saved has none.
+ * conversation when later tasks follow, and each card holds only its own task's changes. A task that new messages cut
+ * into several rounds is one task: it gets one card after its last round, listing every file once, from before the
+ * first round to the end. A file opens in place to its line diff (added lines green, removed lines red); a Markdown
+ * file can also be read as formatted text. Beyond five files the rest fold behind "Show the other N files" (and fold
+ * back with the same row). The card never opens the Changes panel. A task from before cards were saved has none.
  */
 function ChangeCard({ card }) {
+	const [more, setMore] = useState(false);
 	const files = card.files;
 	if (!files?.length) return null;
 	const counted = files.every((file) => !file.binary && !file.unavailable);
+	const rest = files.slice(CHANGE_FILES_SHOWN);
+	const row = (file) => html`<${ChangeFile} key=${file.path} card=${card} file=${file} />`;
 	return html`<div class="change-card fade-in">
 		<div class="change-head">
 			<span class="grow truncate">${t("Edited {files}", { files: plural(files.length, "file") })}</span>
 			${counted ? html`<${Counts} additions=${files.reduce((n, f) => n + f.additions, 0)} deletions=${files.reduce((n, f) => n + f.deletions, 0)} />` : null}
 		</div>
-		${files.map((file) => html`<${ChangeFile} key=${file.path} card=${card} file=${file} />`)}
+		${files.slice(0, CHANGE_FILES_SHOWN).map(row)}
+		${rest.length ? html`<${Collapse} open=${more}>${rest.map(row)}<//>
+		<button class="change-file change-more" aria-expanded=${more} onClick=${() => setMore(!more)}>
+			<${Icon} name="chevronRight" size=${13} class="disclose" />
+			<span class="truncate">${more ? t("Hide the other {files}", { files: plural(rest.length, "file") }) : t("Show the other {files}", { files: plural(rest.length, "file") })}</span>
+		</button>` : null}
 		${card.elsewhere?.length ? html`<${ChangedElsewhere} files=${card.elsewhere} total=${card.elsewhereTotal} />` : null}
 	</div>`;
 }
@@ -1323,6 +1373,8 @@ export function Transcript() {
 	const prevOwner = useRef({ slot: null, session: null });
 	const turnsSlot = activeSlotId();
 	const session = snap?.session?.id;
+	// The folds the user opened in this chat's tool rows are remembered (tool-rows.js) only while it is on screen.
+	useEffect(() => forgetKeptChoices, [session]);
 	const [asyncTurns, setAsyncTurns] = useState(null);
 	// True while the newest render is the cold-load tail preview instead of a full build. The first full build replaces
 	// it once, and that swap gets the same scroll compensation as "show earlier": the transcript only grows above.

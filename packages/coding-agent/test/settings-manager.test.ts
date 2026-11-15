@@ -114,6 +114,9 @@ describe("SettingsManager", () => {
 				browserFallback: false,
 				browser: "auto",
 				useBrowserCookies: false,
+				extensionSources: ["claude-code", " AGY ", "claude-code"],
+				extensionSourceModels: { "claude-code": "claude-haiku-5-5", agy: " gemini-3.8-flash ", blank: " " },
+				extensionSourceEfforts: { "claude-code": " high ", agy: "", " AGY ": "medium" },
 			});
 			await manager.flush();
 
@@ -127,6 +130,11 @@ describe("SettingsManager", () => {
 				browserFallback: false,
 				browser: "auto",
 				useBrowserCookies: false,
+				// Extension sources are kept by id, whether or not their extension is loaded on this computer.
+				extensionSources: ["claude-code", "agy"],
+				extensionSourceModels: { "claude-code": "claude-haiku-5-5", agy: "gemini-3.8-flash" },
+				// The reasoning level each source searches with, kept the same way.
+				extensionSourceEfforts: { "claude-code": "high", agy: "medium" },
 			};
 			expect(manager.getWebSearchSettings()).toEqual(expected);
 			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
@@ -146,6 +154,9 @@ describe("SettingsManager", () => {
 				browserFallback: true,
 				browser: "auto",
 				useBrowserCookies: false,
+				extensionSources: [],
+				extensionSourceModels: {},
+				extensionSourceEfforts: {},
 			});
 			const manager = SettingsManager.inMemory({
 				webSearch: { enabled: true, pagesPerSearch: 99, maxUrlsPerFetch: 0, fetchConcurrency: 1000 },
@@ -213,6 +224,9 @@ describe("SettingsManager", () => {
 				browserFallback: true,
 				browser: "auto",
 				useBrowserCookies: false,
+				extensionSources: [],
+				extensionSourceModels: {},
+				extensionSourceEfforts: {},
 			});
 
 			manager.setWebSearchSettings(manager.getWebSearchSettings());
@@ -229,7 +243,35 @@ describe("SettingsManager", () => {
 				browserFallback: true,
 				browser: "auto",
 				useBrowserCookies: false,
+				extensionSources: [],
+				extensionSourceModels: {},
+				extensionSourceEfforts: {},
 			});
+		});
+
+		it("ignores extension source settings that are not a list of ids and a map of models", () => {
+			const manager = SettingsManager.inMemory({
+				webSearch: { extensionSources: "claude-code" as never, extensionSourceModels: ["x"] as never },
+			});
+			expect(manager.getWebSearchSettings()).toMatchObject({
+				extensionSources: [],
+				extensionSourceModels: {},
+				extensionSourceEfforts: {},
+			});
+			const mixed = SettingsManager.inMemory({
+				webSearch: {
+					extensionSources: ["agy", 5, ""] as never,
+					extensionSourceModels: { agy: 7, ok: "m" } as never,
+					extensionSourceEfforts: { agy: true, ok: "low" } as never,
+				},
+			});
+			expect(mixed.getWebSearchSettings()).toMatchObject({
+				extensionSources: ["agy"],
+				extensionSourceModels: { ok: "m" },
+				extensionSourceEfforts: { ok: "low" },
+			});
+			// A source is never an engine: the engine list keeps its own rules.
+			expect(mixed.getWebSearchSettings().engines).toEqual(["tavily", "google"]);
 		});
 
 		it("falls back to default engines when a legacy SearXNG list names no built-in engine", () => {
@@ -266,6 +308,9 @@ describe("SettingsManager", () => {
 				browserFallback: true,
 				browser: "auto",
 				useBrowserCookies: false,
+				extensionSources: [],
+				extensionSourceModels: {},
+				extensionSourceEfforts: {},
 			});
 			// Saved once in the new format, the same list is a deliberate choice and stays.
 			manager.setWebSearchSettings({ ...manager.getWebSearchSettings(), engines: ["duckduckgo", "brave"] });

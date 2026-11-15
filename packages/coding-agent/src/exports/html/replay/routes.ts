@@ -165,7 +165,9 @@ export function buildRoutes({ projection, prefs = {}, detailsLimit }: BuildRoute
 
 	for (const entry of projection.entries ?? []) {
 		if (entry.type !== "custom" || entry.customType !== "web-run-changes") continue;
-		const card = (entry.data ?? {}) as { runId?: unknown; files?: unknown[]; patch?: string };
+		const card = (entry.data ?? {}) as { runId?: unknown; files?: unknown[]; patch?: string; deferred?: unknown };
+		// 被新消息打断的那一轮的改动是隐藏条目，不画卡片（总卡里已含这些文件），导出也不带它的 diff
+		if (card.deferred === true) continue;
 		const runId = Number(card.runId) || 0;
 		const files = Array.isArray(card.files) ? card.files : [];
 		for (const file of files) {

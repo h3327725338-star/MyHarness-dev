@@ -25,6 +25,11 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	prepareArguments?: (args: unknown) => Static<TParams>;
 	/** Tool concurrency policy. */
 	executionMode?: ToolExecutionMode;
+	/**
+	 * The extension switches this tool on and off by itself (for example to follow the current model). Tool lists show
+	 * it as automatic and users cannot switch it there. Builds that do not know the field ignore it.
+	 */
+	autoActive?: boolean;
 	/** Execute the tool with a caller-provided context port. */
 	execute(
 		toolCallId: string,

@@ -34,7 +34,8 @@
 | --- | --- |
 | `event-parser.ts` | 解析子进程（Sub-agent）输出的 JSON 事件流，供 `tools/sub-agent.ts` 使用 |
 | `non-git-sandbox.ts` | 非 Git 工作区的委托沙箱镜像：排除规则（`nonGitMirrorExclusion()`）与工作进程登记（`registerDelegatedSandboxWorker()`） |
-| `worker.ts` | 隔离 Explore 子进程入口 `runDelegatedWorker()` 与 stdin 的 `prompt` / `steer` 行协议（`parseDelegatedWorkerLine()`） |
+| `worker.ts` | 隔离 Explore 子进程入口 `runDelegatedWorker()` 与 stdin 的 `prompt` / `steer` 行协议（`parseDelegatedWorkerLine()`）。子进程只加载交给它的扩展（guard，以及子智能体模型所属 Provider 的那一个扩展），任何一个加载失败就不启动；沿用用户的代理与网络超时，结束前向扩展发 `session_shutdown` |
+| `worker-model.ts` | `resolveWorkerModelSupport()`：子智能体模型能否在 worker 里运行，以及要交给 worker 的 Provider 扩展文件。Provider 已停用、模型自己执行工具却没有声明 `delegatedHostTools`、模型来自内嵌扩展时给出拒绝原因 |
 | `worktree-sandbox.ts` | 读写子代理的单任务 Git worktree 沙箱：`prepareDelegatedWorktree()` 建分支并带入工作区快照，`finalizeDelegatedWorktree()` 归档副本（干净时脱离并删除生成的分支），从不删除目录与改动 |
 | `background-work.ts` | `SessionBackgroundWork`：一个会话的主任务启动的后台工作（后台 Explore 批次、运行中的 workflow/ultracode）。登记、进度限流、批次完成后把结果交回模型；主任务失败、被停止时一并取消。主任务想正常收尾而后台 Explore 批次还没回来时，由 `AgentSession`（`_holdForBackgroundExplore`）保持任务打开，等结果回来再跑一轮后才结算 |
 

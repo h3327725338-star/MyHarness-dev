@@ -65,14 +65,18 @@ const GLYPH = {
 };
 const windowButton = (action, label, glyph, id) => `<button id="${id}" aria-label="${escaped(label)}" title="${escaped(label)}" onclick="myHarnessDesktop.windowControls.${action}()"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${glyph}</svg></button>`;
 
-/** A whole host page: the drag strip, the window buttons (they follow the window's maximized state) and `content`. */
+/**
+ * A whole host page: the drag strip, the window buttons (they follow the window's maximized state) and `content`.
+ * The strip and the buttons are stacked above the content: the content's entrance animation keeps a layer of its own
+ * after it ends, and without that order the layer covers the buttons, so a click on them lands on the content.
+ */
 function shellPage({ lang, colors, motion, say, content, script = '' }) {
   const c = colors;
   const style = `:root{color-scheme:${c.scheme};--bg:${c.bg};--text:${c.text};--text-2:${c.text2};--text-3:${c.text3};--line:${c.line};--hover:${c.hover};--accent:${c.accent};--danger:${c.danger};--on-danger:${c.onDanger}}
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow:hidden}
-.drag{position:fixed;top:0;left:0;right:0;height:44px;-webkit-app-region:drag}
-.wc{position:fixed;top:0;right:0;height:44px;display:flex;color:var(--text-2);-webkit-app-region:no-drag}
+.drag{position:fixed;z-index:1;top:0;left:0;right:0;height:44px;-webkit-app-region:drag}
+.wc{position:fixed;z-index:2;top:0;right:0;height:44px;display:flex;color:var(--text-2);-webkit-app-region:no-drag}
 .wc button{width:46px;height:44px;border:0;border-radius:0;background:transparent;color:inherit;display:inline-flex;align-items:center;justify-content:center}
 .wc button:hover{background:var(--hover);color:var(--text)}
 .wc #wc-close:hover{background:var(--danger);color:var(--on-danger)}

@@ -6,6 +6,7 @@
 
 import { dirname, join } from "node:path";
 import type { AuthEvent, AuthInteraction, AuthPrompt } from "@myharness/ai";
+import { getSupportedThinkingLevels } from "@myharness/ai/compat";
 import { NebiusSetupError, NebiusSetupUseCase } from "../../application/use-cases/nebius-setup.ts";
 import { ProviderSettingsUseCase } from "../../application/use-cases/provider-settings.ts";
 import {
@@ -270,17 +271,33 @@ export function registerProviderRoutes(
 						: storedCredential
 							? "stored"
 							: null,
+				// The provider's own name for what signs it in when nothing is stored here (a program's own login).
+				authLabel:
+					!externalLogin && status.configured && status.source === "environment" ? (status.label ?? null) : null,
 				externalLogin: externalLogin ?? null,
 				supportsApiKeyLogin: typeof provider.auth.apiKey?.login === "function",
 				supportsOAuth: provider.auth.oauth !== undefined,
 				/** Defined in models.json: edited, renamed and deleted from its card. */
 				custom: configEntries.has(provider.id),
 				modelCount: provider.getModels().length,
+				// A provider that is not in models.json (it comes from an extension) has no model rows of its own on the
+				// page: its card lists what it offers, and a setting that is for one model sits in that model's row.
+				models: configEntries.has(provider.id)
+					? null
+					: provider.getModels().map((model) => ({
+							id: model.id,
+							name: model.name,
+							contextWindow: model.contextWindow,
+							// The reasoning levels a chat on the model may pick ("off" is no level).
+							levels: getSupportedThinkingLevels(model).filter((level) => level !== "off"),
+							image: model.input.includes("image"),
+						})),
 				settings: (provider.settings ?? []).map((setting) => ({
 					id: setting.id,
 					label: setting.label,
 					description: setting.description ?? null,
 					placeholder: setting.placeholder ?? null,
+					model: setting.model ?? null,
 					value: setting.get(),
 				})),
 				credentials: overview

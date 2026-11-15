@@ -130,6 +130,20 @@ html[data-export-readonly="1"] .transcript img[src^="http"] {
 .meter:hover { background: var(--surface-hover); color: var(--text); }
 .meter.warn { color: var(--warn); } .meter.danger { color: var(--danger); }
 
+/* Plan limits (plan-usage.js), in front of the context ring: two short bars, the five-hour window above the weekly one, each
+   filled to what is left, and the numbers beside them. It has the height, type size and line box of the chips next to it.
+   The fills are the context bars' (.cu-fill and its warn / danger colours). Where the bar is narrow only the glyph stays. */
+.plan-meter { display: inline-flex; align-items: center; gap: 6px; height: var(--h-control-sm); padding: 0 8px 0 6px; border-radius: var(--r-md); color: var(--text-3); font-size: var(--fs-sm); line-height: 20px; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background var(--t-fast), color var(--t-fast); }
+.plan-meter:hover, .plan-meter[aria-expanded="true"] { background: var(--surface-hover); color: var(--text); }
+.plan-meter.warn { color: var(--warn); } .plan-meter.danger { color: var(--danger); }
+.plan-glyph { display: flex; flex-direction: column; gap: 3px; width: 16px; flex: none; }
+.plan-bar { display: block; height: 4px; border-radius: var(--r-pill); overflow: hidden; background: var(--border-strong); }
+.plan-bar > .cu-fill { transition: width var(--t-slow) var(--ease); }
+@container composer-bar (max-width: 460px) {
+	.plan-meter { width: var(--h-control-sm); justify-content: center; padding: 0; }
+	.plan-text { display: none; }
+}
+
 /* One row however many files are attached: it scrolls sideways instead of growing the composer. The top/right padding
    leaves room for each chip's × that sits over its corner. */
 .attachments { display: flex; gap: 8px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; padding: 7px 7px 6px 0; margin-top: -5px; }

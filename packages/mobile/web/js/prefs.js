@@ -21,6 +21,9 @@ const DEFAULTS = {
 	personalPrompt: "",
 	notifyDone: true,
 	desktopSite: false,
+	browserSide: "pc", // with a PC connected directly: "pc" shows the PC's browser, "phone" this phone's own
+	pcBrowserZoom: 1.6,
+	pcRoutes: { lan: true, direct: true, relay: true }, // the ways tried to a PC of the account (link-remote.js: allowedRoutes); this phone's own choice
 	browserSearch: "google", // google | bing | duckduckgo | baidu
 	prefsVersion: 2,
 	sendOnEnter: false,

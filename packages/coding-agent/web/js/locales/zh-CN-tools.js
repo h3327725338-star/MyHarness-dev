@@ -7,7 +7,8 @@
 // This file lives in locales/ on purpose: test/web-i18n.test.ts keeps Chinese characters out of
 // web/js/*.js (it does not descend into locales/), and the translations must not leak into English
 // mode, so the lookup happens behind `isZh()` in panel-context.js. Extension / MCP / third-party
-// tools are never looked up here; they keep the first sentence of their own English description.
+// tools are never looked up in `zhToolDescriptions`; they keep the first sentence of their own English description,
+// except the few MyHarness-carried extension tools listed in `zhExtensionToolDescriptions` below.
 //
 // Every name in packages/coding-agent/src/tools/registry.ts `allToolNames` must have an entry here — test/web-tool-descriptions-zh.test.ts
 // reads that set and fails the build when a new built-in tool is added without a Chinese sentence.
@@ -48,13 +49,22 @@ export const zhToolDescriptions = {
 	web_fetch: "读取网页及文档",
 };
 
+// Extension tools carried by MyHarness itself (examples/extensions/agy-shell.ts, claude-code-shell.ts). Kept apart from
+// `zhToolDescriptions` on purpose: that table is exactly the built-in tool set (test/web-tool-descriptions-zh.test.ts), and
+// an extension tool only reads from this one, so an extension named like a built-in tool never picks up a built-in sentence.
+export const zhExtensionToolDescriptions = {
+	agy_tool: "在对话里显示 agy 自己执行的工具卡片；用 agy 模型时自动开启，其他模型时自动关闭。",
+	claude_code_tool: "在对话里显示 Claude Code 自己执行的工具卡片；用 Claude Code 模型时自动开启，其他模型时自动关闭。",
+};
+
 /**
  * Sidebar text for one tool object from `GET /api/resources` (`{name, description, active, source, extension}`).
- * Returns `undefined` for extension tools and for names that have no entry, which makes the caller fall back to
- * the previous behaviour (the shared English short sentence, or the tool's own description).
+ * Built-in tools read `zhToolDescriptions`; extension tools read only `zhExtensionToolDescriptions`. Returns `undefined`
+ * for any other extension tool and for names that have no entry, which makes the caller fall back to the previous
+ * behaviour (the shared English short sentence, or the tool's own description).
  */
 export function zhToolDescription(tool) {
-	if (!tool || tool.extension) return undefined;
-	const text = zhToolDescriptions[tool.name];
+	if (!tool) return undefined;
+	const text = (tool.extension ? zhExtensionToolDescriptions : zhToolDescriptions)[tool.name];
 	return typeof text === "string" && text.length > 0 ? text : undefined;
 }

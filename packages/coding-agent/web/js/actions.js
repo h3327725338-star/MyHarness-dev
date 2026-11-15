@@ -1,5 +1,5 @@
 // User-level operations. Each maps to a real backend endpoint; nothing here fakes Agent behaviour.
-import { addPendingMessage, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, chatColumnMin, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadScheduled, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
+import { addPendingMessage, applyPlanUsage, planUsageMark, removePendingMessage, GENERAL_KEY, beginSwitch, failSwitch, canSendToActive, activateSlot, activeSlotId, api, attempt, chatColumnMin, emit, flushDrafts, hideWhileDeleting, isLatestSwitch, loadArchived, loadGitStatus, loadResources, loadScheduled, loadSessions, loadSlots, loadUnbound, loadWorkspaces, nextSwitch, noteFreshRow, plainSidebar, post, refreshAll, set, setView, state, switchChatMode, toast, uiMode, verifyLiveUpdates, REQUEST_TIMEOUT } from "./store.js";
 import { chatModeOf, expandedKey } from "./chat-modes.js";
 import { BUILTIN_COMMAND_KINDS } from "./builtin-commands.js";
 import { commitChanges, pushChanges } from "./git-flow.js";
@@ -1071,6 +1071,23 @@ export const actions = {
 	},
 
 	refresh: refreshAll,
+
+	/**
+	 * Ask the server to read the agy / Claude plan limits again: one source (`id`) or all, and nothing when the reading is
+	 * younger than `maxAgeMs`. The answer lists the sources at once (some marked as being read); the new numbers arrive as a
+	 * `plan_usage` event. Background data, so a failure is silent.
+	 */
+	async refreshPlanUsage({ id, maxAgeMs } = {}) {
+		const mark = planUsageMark();
+		const body = {};
+		if (id) body.id = id;
+		if (typeof maxAgeMs === "number") body.maxAgeMs = maxAgeMs;
+		try {
+			applyPlanUsage(await post("/api/plan-usage/refresh", body, "", { timeoutMs: 15_000 }), mark);
+		} catch {
+			// The next event or read fills it in.
+		}
+	},
 };
 
 async function showSlot(slot, seq) {

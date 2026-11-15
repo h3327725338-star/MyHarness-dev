@@ -878,6 +878,79 @@ const parameters = Type.Unsafe<WorkspaceToolInput>({
 	anyOf: workspaceParametersUnion.anyOf,
 });
 
+const OPERATION_NAMES = new Set<string>(
+	workspaceParametersUnion.anyOf.map((branch) => String((branch.properties.operation as { const?: unknown }).const)),
+);
+
+/** A number, or text that spells one (a point copied out of a screenshot's description). */
+function pointNumber(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value !== "string" || !/^-?\d+(\.\d+)?$/.test(value.trim())) return undefined;
+	return Number(value);
+}
+
+/**
+ * Calls that say what they mean in other words than the declared ones, turned into the declared call. Each form is
+ * one models really sent (the counts are from two weeks of the user's chats, where every one was refused and sent
+ * again): a point given to `click` (22), the operation's name used as a key or given as `action` (6), an address
+ * given to `read` (4) or as `url` to `read_many`, and `scroll` told its limit under the name `read` uses (3). A call
+ * that is already a declared one is returned as it is; a call that is still not one is refused as before.
+ */
+export function normalizeWorkspaceArguments(args: unknown): unknown {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+	let fields = args as Record<string, unknown>;
+	// {navigate: "https://…", tabId} and {action: "open", url}: the operation is named, only not under `operation`.
+	if (fields.operation === undefined) {
+		if (typeof fields.action === "string" && OPERATION_NAMES.has(fields.action)) {
+			const { action, ...rest } = fields;
+			fields = { ...rest, operation: action };
+		} else if (typeof fields.navigate === "string" && fields.url === undefined) {
+			const { navigate, ...rest } = fields;
+			fields = { ...rest, operation: "navigate", url: navigate };
+		}
+	}
+	// A click at a point of the screenshot is the mouse's click; `click` itself aims at an element.
+	if (
+		fields.operation === "click" &&
+		fields.selector === undefined &&
+		fields.index === undefined &&
+		fields.label === undefined
+	) {
+		const x = pointNumber(fields.x);
+		const y = pointNumber(fields.y);
+		if (x !== undefined && y !== undefined) {
+			const { double, button, action: _action, x: _x, y: _y, ...rest } = fields;
+			fields = {
+				...rest,
+				operation: "mouse",
+				action: double === true ? "double_click" : button === "right" ? "right_click" : "click",
+				x,
+				y,
+				...(button === "middle" ? { button } : {}),
+			};
+		}
+	}
+	// An address and no tab: reading that page is `read_many` with the one address.
+	if (fields.operation === "read" && fields.tabId === undefined) {
+		const urls = typeof fields.url === "string" ? [fields.url] : Array.isArray(fields.urls) ? fields.urls : undefined;
+		const onlyOfRead = ["selector", "fresh", "maxScrolls", "onUserTab"].some((key) => fields[key] !== undefined);
+		if (urls && !onlyOfRead) {
+			const { url: _url, urls: _urls, ...rest } = fields;
+			fields = { ...rest, operation: "read_many", urls };
+		}
+	}
+	if (fields.operation === "read_many" && fields.urls === undefined && typeof fields.url === "string") {
+		const { url, ...rest } = fields;
+		fields = { ...rest, urls: [url] };
+	}
+	// `read` calls its limit maxScrolls, `scroll` calls it maxSteps.
+	if (fields.operation === "scroll" && fields.maxSteps === undefined && typeof fields.maxScrolls === "number") {
+		const { maxScrolls, ...rest } = fields;
+		fields = { ...rest, maxSteps: maxScrolls };
+	}
+	return fields;
+}
+
 type WorkspaceResult = {
 	content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
 	details: WorkspaceToolDetails;
@@ -2526,7 +2599,9 @@ export function createWorkspaceToolDefinition(
 		const images: WorkspaceResult["content"] = [];
 		let lastId: string | undefined = tabId;
 		for (const [index, raw] of steps.entries()) {
-			const step = { ...(raw && typeof raw === "object" ? raw : {}) } as Record<string, unknown>;
+			const step = {
+				...(normalizeWorkspaceArguments(raw && typeof raw === "object" ? raw : {}) as object),
+			} as Record<string, unknown>;
 			const operation = String(step.operation || "");
 			if (!BATCH_OPERATIONS.has(operation))
 				throw new Error(
@@ -2587,6 +2662,7 @@ export function createWorkspaceToolDefinition(
 		].join("\n"),
 		promptSnippet: loadSystemPrompt("tools/workspace/snippet.md"),
 		parameters,
+		prepareArguments: (args) => normalizeWorkspaceArguments(args) as WorkspaceToolInput,
 		async execute(_toolCallId, input: WorkspaceToolInput, signal): Promise<WorkspaceResult> {
 			const fields = input as Record<string, unknown>;
 			if (String(fields?.operation || "") === "batch") return runBatch(fields, signal);

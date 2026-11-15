@@ -21,7 +21,7 @@ import { duplicateToolResultText, idempotencyKey, toolIdempotency } from "../too
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult } from "../truncate.ts";
 import { backgroundJobManager } from "./job-manager.ts";
 import { findBashNullDeviceRedirect } from "./null-redirect-guard.ts";
-import { resolveSessionScope } from "./session-scope.ts";
+import { readSessionId, resolveSessionScope } from "./session-scope.ts";
 import {
 	buildBashProbeSuffix,
 	resolvePreservedSpawnTarget,
@@ -337,17 +337,25 @@ export function createBashToolDefinition(
 			}
 
 			const execCommand = keepState ? `${spawnContext.command}${buildBashProbeSuffix()}` : spawnContext.command;
-			// P2-11 idempotency (foreground only): same session + same cwd + same logical
-			// command replays a duplicate refusal instead of respawning. Background jobs
+			// P2-11 idempotency (foreground only): same session + same reply + same cwd + same
+			// logical command replays a duplicate refusal instead of respawning. Background jobs
 			// always start fresh above and never touch the key. Only a successful run marks
 			// it; abort / timeout / non-zero exit throw below and stay retryable, so a
 			// TOOL_ABORT_TIMEOUT keeps counting as a failure while a user cancel does not.
-			const idempotencyScopeKey = idempotencyKey("bash", sessionKey, {
-				cwd: spawnTarget.cwd,
-				command: resolvedCommand,
-				keepState,
-			});
-			if (toolIdempotency.has(idempotencyScopeKey)) {
+			// A repeat counts only within one reply of the model: in a later reply the same command is asked for on
+			// purpose (the state it reads or waits for has moved on). Without a session nothing tells replies apart,
+			// so nothing is treated as a repeat there.
+			const sessionId = readSessionId(_ctx);
+			const idempotencyScopeKey = idempotencyKey(
+				"bash",
+				`${sessionKey}#reply:${sessionId ? toolIdempotency.replyOf(sessionId) : "none"}`,
+				{
+					cwd: spawnTarget.cwd,
+					command: resolvedCommand,
+					keepState,
+				},
+			);
+			if (sessionId && toolIdempotency.has(idempotencyScopeKey)) {
 				return {
 					content: [{ type: "text", text: duplicateToolResultText("bash") }],
 					details: { idempotentDuplicate: true as const },
@@ -498,7 +506,7 @@ export function createBashToolDefinition(
 					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
 				}
 				// Mark only after success: aborts, timeouts and non-zero exits throw above.
-				toolIdempotency.set(idempotencyScopeKey, true);
+				if (sessionId) toolIdempotency.set(idempotencyScopeKey, true);
 				return { content: [{ type: "text", text: outputText }], details: { ...details, exitCode } };
 			} finally {
 				clearUpdateTimer();

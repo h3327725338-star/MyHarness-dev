@@ -102,6 +102,11 @@ export const SETTINGS_DEFAULTS = {
 		browserFallback: true,
 		browser: "auto",
 		useBrowserCookies: false,
+		// Other programs' own search (the Claude Code and agy plugins) costs their plan's quota and takes far longer than
+		// an engine, so none is on until the user switches it on.
+		extensionSources: [] as string[],
+		extensionSourceModels: {} as Record<string, string>,
+		extensionSourceEfforts: {} as Record<string, string>,
 	},
 } as const;
 

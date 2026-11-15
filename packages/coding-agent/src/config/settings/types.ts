@@ -281,6 +281,15 @@ export interface WebSearchSettings extends LegacyWebSearchSettings {
 	browser?: string;
 	/** Copy the cookies of the user's daily profile of that browser into MyHarness' profile, so logins carry over. */
 	useBrowserCookies?: boolean;
+	/**
+	 * Enabled search sources that extensions provide (another program's own search, see tools/web-search/sources.ts),
+	 * by id. Kept apart from `engines`: an id stays saved while its extension or program is missing on this computer.
+	 */
+	extensionSources?: string[];
+	/** The model each extension source searches with, by source id; a source without an entry uses its default. */
+	extensionSourceModels?: Record<string, string>;
+	/** The reasoning level each extension source searches with, by source id; a source without an entry uses its default. */
+	extensionSourceEfforts?: Record<string, string>;
 }
 
 export interface ResolvedWebSearchSettings {
@@ -293,6 +302,9 @@ export interface ResolvedWebSearchSettings {
 	browserFallback: boolean;
 	browser: WebSearchBrowserId;
 	useBrowserCookies: boolean;
+	extensionSources: string[];
+	extensionSourceModels: Record<string, string>;
+	extensionSourceEfforts: Record<string, string>;
 }
 
 export interface GitIntegrationSettings {

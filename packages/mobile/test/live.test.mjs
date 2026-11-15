@@ -1,7 +1,7 @@
 // The reducer that turns the event stream (from the PC, or from the phone's own agent) into what the page shows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addPending, applyEvent, awaitingFirstReply, markDelivered, removePending } from "../web/js/live.js";
+import { addPending, applyEvent, awaitingFirstReply, lastingKey, markDelivered, removePending } from "../web/js/live.js";
 
 const chat = () => ({ items: [], toolRuns: {}, runs: {}, queue: [], dialogs: [], running: false, title: "" });
 const assistant = (text, ts = 100) => ({ kind: "assistant", ts, model: "m", blocks: [{ type: "text", text }] });
@@ -138,4 +138,55 @@ test("a sent message stops showing as being sent once the PC says it has it", ()
 	applyEvent(c, "message_start", { clientMessageId: "c7", item: { kind: "user", ts: 9, text: "hello" } });
 	assert.equal(c.items.length, 1);
 	assert.equal(c.items[0].pending, undefined);
+});
+
+test("a chat read again from the PC does not show a sent message twice", async () => {
+	const { mergeReloaded } = await import("../web/js/live.js");
+	const saved = [
+		{ kind: "user", id: "u1", ts: 1, text: "继续" },
+		{ kind: "assistant", id: "a1", ts: 2, blocks: [] },
+		{ kind: "user", id: "u2", ts: 3, text: "看这两张图\n" },
+		{ kind: "assistant", id: "a2", ts: 4, blocks: [] },
+	];
+	const picture = { mimeType: "image/png", data: "AAAA" };
+	const mine = { kind: "user", ts: 3, text: "看这两张图", images: [picture], pending: true, delivered: true, clientMessageId: "c1" };
+	// The PC saved it while its event was missed: one copy, with the phone's pictures and its message id.
+	const merged = mergeReloaded(saved, [mine], new Set(["u1", "a1"]));
+	assert.equal(merged.length, 4);
+	assert.deepEqual(merged[2], { kind: "user", id: "u2", ts: 3, text: "看这两张图\n", clientMessageId: "c1", images: [picture], attachments: undefined });
+	// Not saved yet: it stays after the saved messages. An older message with the same words is not taken for it.
+	const again = { kind: "user", ts: 9, text: "继续", pending: true, clientMessageId: "c2" };
+	assert.deepEqual(mergeReloaded(saved, [again], new Set(["u1", "a1", "u2", "a2"])).at(-1), again);
+	// The same words sent twice: the saved one settles the first, the second is still on its way.
+	const twice = mergeReloaded([...saved, { kind: "user", id: "u3", ts: 10, text: "继续" }], [again, { ...again, clientMessageId: "c3" }], new Set(["u1", "a1", "u2", "a2"]));
+	assert.equal(twice.length, 6);
+	assert.equal(twice[4].clientMessageId, "c2");
+	assert.equal(twice[5].clientMessageId, "c3");
+	assert.equal(twice[5].pending, true);
+});
+
+test("the agent's copy without an id settles the message on its way with the same words", () => {
+	const c = chat();
+	addPending(c, { clientMessageId: "c1", text: "补充一句", images: [{ data: "AAA", mimeType: "image/png" }] });
+	applyEvent(c, "message_start", { item: { kind: "user", ts: 5, text: "补充一句\n" } });
+	assert.equal(c.items.length, 1);
+	assert.equal(c.items[0].pending, undefined);
+	assert.equal(c.items[0].images.length, 1);
+	// A message typed on the PC is simply added.
+	applyEvent(c, "message_start", { item: { kind: "user", ts: 6, text: "电脑上打的" } });
+	assert.equal(c.items.length, 2);
+});
+
+test("a turn keeps its place on the page while its message is renamed by the PC", () => {
+	const names = new Map();
+	// As buildTurns names them: by the phone's time, then by the PC's time, then by the saved id.
+	const sent = lastingKey(names, { key: "t-1000", user: { clientMessageId: "c1" } });
+	assert.equal(sent, "t-1000");
+	assert.equal(lastingKey(names, { key: "t-2000", user: { clientMessageId: "c1" } }), sent, "the PC took the message: its own time");
+	assert.equal(lastingKey(names, { key: "t-abc", user: { clientMessageId: "c1" } }), sent, "the message was saved: its id");
+	assert.equal(lastingKey(names, { key: "t-abc", user: {} }), sent, "the chat was read again: the id alone is enough");
+	// Another turn is another place; a turn that was never sent from here keeps the name it has.
+	assert.equal(lastingKey(names, { key: "t-3000", user: { clientMessageId: "c2" } }), "t-3000");
+	assert.equal(lastingKey(names, { key: "t-old", user: {} }), "t-old");
+	assert.equal(lastingKey(names, { key: "t-none" }), "t-none");
 });

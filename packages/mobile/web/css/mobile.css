@@ -287,6 +287,14 @@ textarea.field { padding: 11px 14px; }
 .address .lock.insecure { color: var(--warn); }
 .browser-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; overflow: hidden; pointer-events: none; }
 .browser-progress i { display: block; height: 100%; background: var(--accent); transform-origin: left; transition: transform 240ms var(--ease), opacity 300ms var(--ease) 200ms; }
+/* The PC's browser lies over this phone's: a picture of the PC's tab, as wide as the screen or enlarged (then it is
+   moved sideways with the finger, while up and down scrolls the page on the PC). */
+.pc-browser { z-index: 2; background: var(--bg-panel); }
+.pc-page { position: absolute; inset: 0; overflow-x: auto; overflow-y: hidden; overscroll-behavior: contain; background: #fff; }
+.pc-picture { display: block; max-width: none; height: auto; user-select: none; -webkit-user-drag: none; touch-action: pan-x; will-change: transform; }
+.pc-wait { position: absolute; top: 10px; right: 10px; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-raised); box-shadow: var(--shadow-pop); }
+.pc-error { background: var(--bg-app); }
+.address .pc-mark { color: var(--accent); }
 .browser-view { flex: 1 1 auto; min-height: 0; position: relative; background: var(--bg-app); overflow: hidden; }
 .browser-nav { flex: none; display: flex; align-items: center; justify-content: space-around; height: calc(48px + var(--inset-bottom)); padding: 0 calc(8px + var(--inset-right)) var(--inset-bottom) calc(8px + var(--inset-left)); background: var(--bg-panel); border-top: 1px solid var(--border-soft); }
 .tab-count { min-width: 22px; height: 22px; padding: 0 5px; border-radius: 7px; border: 1.75px solid currentColor; font-size: 11px; font-weight: 700; line-height: 18.5px; text-align: center; }

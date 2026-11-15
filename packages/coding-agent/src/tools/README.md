@@ -27,7 +27,7 @@
 | `agent-tasks.ts` | `agent_tasks` 工具：主智能体查看并停止本会话的多智能体派发（`agent` 批次、`workflow`、`ultracode`）；停止会返回任务已经产出的部分结果，工具只负责格式化，派发由会话（`agent/delegation/background-work.ts`）持有 |
 | `dispatch-control.ts` | 多智能体派发工具与会话之间的契约：登记派发、停止单个任务或整次派发、主运行被中断时把仍在工具调用里的派发改到后台 |
 | `symbols-output.ts` | `SymbolsOutputPages`：`symbols` 工具大结果的有界快照分页（最多 8 份、5 分钟过期），续读用快照而不是重跑昂贵的 LSP 查询 |
-| `tool-idempotency.ts` | 变更类工具（`write`/`edit`/`bash`）的幂等键：键是 tool + 会话作用域 + 规范化参数的哈希，在同一会话内重放上一次结果而不重复执行 |
+| `tool-idempotency.ts` | 变更类工具（`write`/`edit`/`bash`）的幂等键：键是 tool + 会话作用域 + 规范化参数的哈希。只在"跳过不会改变结果"时才跳过重复调用：`bash` 只认同一轮回复里的重复（会话在每轮回复开始时调用 `beginReply`，之后的回复里同一条命令照常执行）；`write`/`edit` 只在文件仍是那次调用留下的样子（mtime 和大小未变）时重放或拒绝，文件被别的操作动过就照常执行 |
 
 ### contracts/
 

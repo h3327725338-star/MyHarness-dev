@@ -86,6 +86,16 @@ button.summary-head:hover { background: var(--surface-hover); color: var(--text-
 .group-head:disabled { cursor: default; }
 .group-label { font-size: var(--fs-body); }
 .group-body { margin-left: 18px; }
+/* A row the user had open is joined by the next call of its kind and becomes the first row of a group (transcript.js
+   Group): the group's head opens above it and the row slides to its indent, so neither jumps. Played once, on insertion;
+   the head ends at its own height (min-height 26px, border-box), and nothing is held after the animation. */
+.group.joined > .group-head { overflow: hidden; animation: group-join-head var(--t-slow) var(--ease) backwards; }
+@keyframes group-join-head { from { min-height: 0; height: 0; padding-block: 0; opacity: 0; } to { min-height: 26px; height: 26px; opacity: 1; } }
+/* The fold clips its content (.collapse-inner overflow: hidden): it reaches 18px further left, padded by as much, so the
+   row sliding in from there is not cut while its place at rest stays where it was. */
+.group.joined > .collapse > .collapse-inner { margin-left: -18px; padding-left: 18px; }
+.group.joined > .collapse > .collapse-inner > .group-body { animation: group-join-indent var(--t-slow) var(--ease) backwards; }
+@keyframes group-join-indent { from { transform: translateX(-18px); } to { transform: none; } }
 /* Thinking card owns its layout/paint: streaming reflow stays inside the card and never forces the outer transcript to re-layout. layout paint (not content) so intrinsic height still grows while streaming. */
 .thinking { contain: layout paint; }
 .thinking-text { margin: 2px 0 6px 24px; padding: 8px 10px; background: var(--bg-inset); border-radius: var(--r-md); color: var(--text-2); font-size: var(--fs-body); line-height: 1.6; overflow-wrap: anywhere; max-height: 360px; overflow: auto; overscroll-behavior: contain; contain: layout paint; }
@@ -197,8 +207,9 @@ button.summary-head:hover { background: var(--surface-hover); color: var(--text-
 .md-diff-block.del .md { opacity: 0.8; }
 .change-card .counts { font-weight: 400; }
 .change-eol { flex: none; font-size: var(--fs-sm); }
-/* Files changed elsewhere while the task ran: a quiet last row that opens their list; never counted. */
-.change-elsewhere-head { color: var(--text-3); }
+/* Files changed elsewhere while the task ran: a quiet last row that opens their list; never counted. The row that
+   folds the files beyond the first five ("Show the other N files") is as quiet. */
+.change-elsewhere-head, .change-more { color: var(--text-3); }
 .change-elsewhere-list { border-top: 1px solid var(--border); background: var(--bg-panel); max-height: 240px; overflow: auto; overscroll-behavior: contain; padding: 4px 0; }
 .change-elsewhere-row { display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 14px 0 35px; color: var(--text-2); font-size: var(--fs-code); }
 .change-elsewhere-by { flex: none; font-size: var(--fs-sm); }
@@ -415,10 +426,20 @@ button.status-pill { cursor: pointer; }
 .title-input { width: min(46%, 420px); height: var(--h-control-sm); padding: 0 5px; font-size: var(--fs-title-xs); font-weight: 600; }
 
 /* Sub-agent / workflow progress */
-.sub-agent { margin: 2px 0 6px 24px; padding-left: 10px; border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
-.sub-head { font-size: var(--fs-sm); padding: 2px 0; }
-.sub-phase { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
-.sub-last { font-size: var(--fs-xs); padding-left: 28px; }
+/* The dispatch card under its call's row is as light as a tool row: no rule at the side, a small grey phase row with the thin
+   status mark of the sub-agent list (composer.css .sa-*), and one line per sub-task (name, then what it does or how it ended). */
+.sub-agent { margin: 0 0 4px 24px; display: flex; flex-direction: column; gap: 0; }
+.sub-head { font-size: var(--fs-xs); padding: 0 4px 2px; }
+.sub-phase { display: flex; flex-direction: column; padding-top: 2px; }
+.sub-phase-head { display: flex; align-items: center; gap: 8px; min-height: 22px; padding: 0 4px; font-size: var(--fs-xs); }
+.sub-phase-count { flex: none; font-variant-numeric: tabular-nums; }
+.sub-phase > .sub-task { padding-left: 16px; }
+.sub-task .action-row { min-height: 24px; font-size: var(--fs-sm); }
+.sub-task .action-text { color: var(--text); }
+.sub-task.noted .action-text { flex: 0 1 auto; max-width: 55%; }
+/* Basis 0: a long note takes only what the name and the count leave, it never squeezes the name. */
+.sub-note { flex: 1 1 0; min-width: 0; font-size: var(--fs-xs); }
+.sub-note.bad { color: var(--danger); }
 .sub-detail { margin: 2px 0 6px 24px; padding: 8px 10px; background: var(--bg-inset); border-radius: var(--r-md); font-size: var(--fs-body); max-height: 360px; overflow: auto; overscroll-behavior: contain; }
 .sub-list { margin: 0; padding-left: 18px; }
 

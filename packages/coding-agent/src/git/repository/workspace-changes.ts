@@ -515,8 +515,20 @@ export async function collectFinalWorkspaceChanges(
 ): Promise<ChangeDetectionResult> {
 	const { cwd, checkpoint, baseline, baselineFailureReason, auditMutations, excludeExternalCommits } = options;
 	if (checkpoint && checkpoint.status === "created") {
-		const workingChanges = await collectCheckpointChanges({ cwd, checkpoint });
-		const current = await observeGitCheckpointFinalState(checkpoint);
+		// These six only read the repository and do not depend on one another, so they run side by side: this is the
+		// wait between the end of a reply and the next message, and each Git process costs tens of milliseconds to start.
+		// The checks below still read their results in the order they used to run in.
+		const [workingChanges, current, head, pending, currentIndexTree, localRefChanges] = await Promise.all([
+			collectCheckpointChanges({ cwd, checkpoint }),
+			observeGitCheckpointFinalState(checkpoint),
+			collectGitCheckpointHeadChangesAsync(checkpoint),
+			// Final ChangeSet 决定提交/恢复语义：必须读最新状态，绕过短 TTL 缓存。
+			getGitCheckpointPendingTaskPathsAsync(checkpoint, undefined, { fresh: true }),
+			// checkpoint 保存的是任务开始时的 write-tree oid；当前 index 同样用
+			// write-tree 取内容指纹比较（比旧的 staged diff patch hash 更精确、零临时文件）。
+			runGit(["write-tree"], { cwd: checkpoint.repositoryRoot }),
+			collectGitCheckpointLocalRefChangesAsync(checkpoint),
+		]);
 		if (!current.observation) {
 			return {
 				status: "indeterminate",
@@ -527,7 +539,6 @@ export async function collectFinalWorkspaceChanges(
 			};
 		}
 
-		const head = await collectGitCheckpointHeadChangesAsync(checkpoint);
 		// 外部分支切换防护：任务窗口外 HEAD 移到了基线历史之外的提交（例如用户在界面切到
 		// 另一个分支，整个工作区内容被替换），此时 workingChanges 是两个分支的内容差，
 		// 不是本轮编辑，不得归属。本轮自己提交的后代（headCommit 是其祖先）不受影响。
@@ -571,8 +582,6 @@ export async function collectFinalWorkspaceChanges(
 			effectiveWorkingChanges = workingChanges.filter((change) => !foreignPaths.has(pathCompareKey(change.path)));
 		}
 		const changes = mergeReviewChanges(effectiveWorkingChanges, ownCommittedChanges);
-		// Final ChangeSet 决定提交/恢复语义：必须读最新状态，绕过短 TTL 缓存。
-		const pending = await getGitCheckpointPendingTaskPathsAsync(checkpoint, undefined, { fresh: true });
 		if (!pending.paths) {
 			return {
 				status: "indeterminate",
@@ -581,9 +590,6 @@ export async function collectFinalWorkspaceChanges(
 			};
 		}
 		const contentChanges = changes.length > 0;
-		// checkpoint 保存的是任务开始时的 write-tree oid；当前 index 同样用
-		// write-tree 取内容指纹比较（比旧的 staged diff patch hash 更精确、零临时文件）。
-		const currentIndexTree = await runGit(["write-tree"], { cwd: checkpoint.repositoryRoot });
 		// 异步 runGit 不裁剪 stdout（同步版本默认 trim）：比较前必须 trim，
 		// 否则换行符会导致 indexChanged 恒为 true，破坏 checkpoint 准确性。
 		const currentIndexTreeOid = currentIndexTree.stdout.trim();
@@ -597,7 +603,6 @@ export async function collectFinalWorkspaceChanges(
 		const indexChanged = checkpoint.indexTree !== currentIndexTreeOid;
 		const headChanged = checkpoint.headCommit !== current.observation.headCommit;
 		const headRefChanged = checkpoint.headRef !== current.observation.headRef;
-		const localRefChanges = await collectGitCheckpointLocalRefChangesAsync(checkpoint);
 		const remoteSideEffects = false;
 		// 与 restore 后的提示保持一致：任务执行过不透明 Bash 时，Final ChangeSet
 		// 也如实报告外部/远端副作用未知，而不是硬编码为“没有”。

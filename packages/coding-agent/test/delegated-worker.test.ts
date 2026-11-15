@@ -12,6 +12,11 @@ const fx = vi.hoisted(() => ({
 	write: vi.fn(),
 	flush: vi.fn(),
 	restore: vi.fn(),
+	mute: vi.fn(),
+	proxy: vi.fn(),
+	dispatcher: vi.fn(),
+	shutdown: vi.fn(),
+	extensionErrors: [] as Array<{ path: string; error: string }>,
 }));
 vi.mock("../src/platform/process/output-guard.ts", () => ({
 	takeOverStdout: fx.take,
@@ -19,7 +24,24 @@ vi.mock("../src/platform/process/output-guard.ts", () => ({
 	flushRawStdout: fx.flush,
 	restoreStdout: fx.restore,
 }));
-vi.mock("../src/config/settings/index.ts", () => ({ SettingsManager: { create: vi.fn(() => ({})) } }));
+vi.mock("../src/config/settings/index.ts", () => ({
+	muteRemovedSettingNotices: fx.mute,
+	SettingsManager: {
+		create: vi.fn(() => ({
+			getGlobalSettings: () => ({ httpProxy: "http://proxy.test:8080" }),
+			getNetworkTimeouts: () => ({
+				connectTimeoutMs: 120_000,
+				firstByteTimeoutMs: 120_000,
+				streamIdleTimeoutMs: 300_000,
+			}),
+		})),
+	},
+}));
+vi.mock("../src/platform/process/http-dispatcher.ts", () => ({
+	applyHttpProxySettings: fx.proxy,
+	configureHttpDispatcher: fx.dispatcher,
+}));
+vi.mock("../src/extensions/runtime/runner.ts", () => ({ emitSessionShutdownEvent: fx.shutdown }));
 vi.mock("../src/providers/runtime/model-resolver.ts", () => ({
 	resolveCliModel: () => ({ model: { id: "fixture" } }),
 }));
@@ -33,6 +55,7 @@ vi.mock("../src/agent/runtime/services.ts", () => ({
 			dispose: fx.sessionDispose,
 			bindExtensions: fx.bind,
 			subscribe: fx.subscribe,
+			extensionRunner: { name: "runner" },
 		},
 	}),
 }));
@@ -44,7 +67,14 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 function prepare(stdinLines: string[]) {
-	fx.create.mockResolvedValue({ modelRuntime: {}, dispose: fx.servicesDispose });
+	fx.extensionErrors = [];
+	fx.create.mockImplementation(async () => ({
+		modelRuntime: {},
+		diagnostics: [],
+		resourceLoader: { getExtensions: () => ({ errors: fx.extensionErrors }) },
+		dispose: fx.servicesDispose,
+	}));
+	fx.shutdown.mockResolvedValue(true);
 	fx.prompt.mockResolvedValue(undefined);
 	fx.steer.mockResolvedValue(undefined);
 	vi.spyOn(process.stdin, "setEncoding").mockReturnValue(process.stdin);
@@ -106,5 +136,53 @@ describe("internal delegated worker", () => {
 		expect(fx.sessionDispose).toHaveBeenCalledOnce();
 		expect(fx.servicesDispose).toHaveBeenCalledOnce();
 		expect(fx.restore).toHaveBeenCalledOnce();
+	});
+	it("loads the extension that registers the model next to its guard, and no other", async () => {
+		prepare([promptLine("delegated prompt")]);
+		await runDelegatedWorker([
+			"--no-extensions",
+			"--extension",
+			"guard.js",
+			"--extension",
+			"provider-extension.ts",
+			"--model",
+			"fixture",
+		]);
+		expect(fx.create.mock.calls[0][0].resourceLoaderOptions).toMatchObject({
+			noExtensions: true,
+			additionalExtensionPaths: ["guard.js", "provider-extension.ts"],
+		});
+	});
+	it("does not start when one of its extensions failed to load", async () => {
+		prepare([promptLine("delegated prompt")]);
+		fx.extensionErrors = [{ path: "guard.js", error: "Failed to load extension: boom" }];
+		await expect(runDelegatedWorker(["--extension", "guard.js", "--model", "fixture"])).rejects.toThrow(
+			"子智能体进程未能加载扩展：guard.js：Failed to load extension: boom",
+		);
+		expect(fx.prompt).not.toHaveBeenCalled();
+		expect(fx.restore).toHaveBeenCalledOnce();
+	});
+	it("applies the user's proxy and network time limits and keeps removed-setting notices out of its output", async () => {
+		prepare([promptLine("delegated prompt")]);
+		await runDelegatedWorker(["--model", "fixture"]);
+		expect(fx.mute).toHaveBeenCalledOnce();
+		expect(fx.proxy).toHaveBeenCalledWith("http://proxy.test:8080");
+		expect(fx.dispatcher).toHaveBeenCalledWith({
+			connectTimeoutMs: 120_000,
+			firstByteTimeoutMs: 120_000,
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+	it("tells extensions the session is over before it is disposed, also when their handler fails", async () => {
+		prepare([promptLine("delegated prompt")]);
+		const order: string[] = [];
+		fx.shutdown.mockImplementation(async () => {
+			order.push("shutdown");
+			throw new Error("handler failed");
+		});
+		fx.sessionDispose.mockImplementation(() => order.push("dispose"));
+		await runDelegatedWorker(["--model", "fixture"]);
+		expect(fx.shutdown).toHaveBeenCalledWith({ name: "runner" }, { type: "session_shutdown", reason: "quit" });
+		expect(order).toEqual(["shutdown", "dispose"]);
 	});
 });

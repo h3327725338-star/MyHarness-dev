@@ -4,6 +4,7 @@ import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fauxAssistantMessage, fauxText, fauxToolCall, registerFauxProvider } from "@myharness/ai/compat";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -12,6 +13,7 @@ import {
 	createAgentSessionServices,
 } from "../src/agent/runtime/session-runtime.ts";
 import type { SettingsManager } from "../src/config/settings/index.ts";
+import type { InlineExtension } from "../src/extensions/runtime/types.ts";
 import {
 	createInitialGitBaseline,
 	initializeGitRepository,
@@ -35,6 +37,7 @@ import { SessionManager } from "../src/session/manager/index.ts";
 import { flushSessionWrites } from "../src/session/storage/jsonl/write-batch.ts";
 import { SCHEDULED_RUN_ENTRY } from "../src/session/types.ts";
 import { backgroundJobManager } from "../src/tools/shell/job-manager.ts";
+import { registerWebSearchSource, unregisterWebSearchSource } from "../src/tools/web-search/sources.ts";
 import { showPopupNotification } from "../src/utils/popup-notification.ts";
 import { startBackgroundBatch } from "./suite/background-batch.ts";
 import { getMessageText, type Harness } from "./suite/harness.ts";
@@ -93,6 +96,153 @@ describe("Web host (real runtime with a faux provider)", () => {
 		});
 		return dir;
 	}
+
+	it("offers an extension search source beside the engines while this computer can use it, and saves its model", async () => {
+		const fx = await start();
+		const settings = () => fx.hub.host.session.settingsManager.getWebSearchSettings();
+		const row = async (id: string) => (await fx.get("/api/settings")).items.find((item: any) => item.id === id);
+		const engineIds = ["google", "bing", "duckduckgo", "brave", "tavily"];
+		expect((await row("webSearch.engines")).options.map((option: any) => option.value)).toEqual(engineIds);
+
+		let usable = true;
+		registerWebSearchSource({
+			id: "prog",
+			label: "Prog",
+			models: () => [
+				{ id: "fast", label: "Fast" },
+				{ id: "big", label: "Big" },
+			],
+			defaultModel: "fast",
+			unavailable: () => (usable ? undefined : "the program is not installed"),
+			search: async () => [],
+		});
+		cleanups.push(() => unregisterWebSearchSource("prog"));
+
+		// Offered, and off until the user switches it on; its model is only asked for once it is on.
+		let engines = await row("webSearch.engines");
+		expect(engines.options.at(-1)).toEqual({ value: "prog", label: "Prog" });
+		expect(engines.value).toEqual(["tavily", "google"]);
+		expect(await row("webSearch.sourceModel.prog")).toBeUndefined();
+
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["tavily", "prog"] });
+		expect(settings()).toMatchObject({ engines: ["tavily"], extensionSources: ["prog"] });
+		expect((await row("webSearch.engines")).value).toEqual(["tavily", "prog"]);
+		expect(await row("webSearch.sourceModel.prog")).toMatchObject({
+			section: "Tools",
+			label: "Prog search model",
+			type: "enum",
+			value: "fast",
+			options: [
+				{ value: "fast", label: "Fast" },
+				{ value: "big", label: "Big" },
+			],
+		});
+		// The model row follows the engines row, inside the Web search card.
+		const ids = (await fx.get("/api/settings")).items.map((item: any) => item.id);
+		expect(ids.indexOf("webSearch.sourceModel.prog")).toBe(ids.indexOf("webSearch.engines") + 1);
+
+		await fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "big" });
+		expect(settings().extensionSourceModels).toEqual({ prog: "big" });
+		expect((await row("webSearch.sourceModel.prog")).value).toBe("big");
+		await expect(fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "gone" })).rejects.toThrow(
+			/^400:/,
+		);
+		await expect(fx.post("/api/settings", { id: "webSearch.sourceModel.nope", value: "big" })).rejects.toThrow(
+			/^400:/,
+		);
+
+		// A source alone is a valid choice: no engine has to stay selected.
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["prog"] });
+		expect(settings()).toMatchObject({ engines: [], extensionSources: ["prog"] });
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["tavily", "prog"] });
+
+		// The program is gone: the source is not shown at all, and what the user chose stays saved.
+		usable = false;
+		engines = await row("webSearch.engines");
+		expect(engines.options.map((option: any) => option.value)).toEqual(engineIds);
+		expect(engines.value).toEqual(["tavily"]);
+		expect(await row("webSearch.sourceModel.prog")).toBeUndefined();
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["tavily", "google"] });
+		expect(settings()).toMatchObject({
+			engines: ["google", "tavily"],
+			extensionSources: ["prog"],
+			extensionSourceModels: { prog: "big" },
+		});
+		usable = true;
+		expect((await row("webSearch.engines")).value).toEqual(["google", "tavily", "prog"]);
+		expect((await row("webSearch.sourceModel.prog")).value).toBe("big");
+
+		// Switched off again by leaving it out of the list.
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["tavily"] });
+		expect(settings()).toMatchObject({ engines: ["tavily"], extensionSources: [] });
+		expect(await row("webSearch.sourceModel.prog")).toBeUndefined();
+	});
+
+	it("offers a search source's reasoning level for the model it searches with, and saves the choice", async () => {
+		const fx = await start();
+		const settings = () => fx.hub.host.session.settingsManager.getWebSearchSettings();
+		const row = async (id: string) => (await fx.get("/api/settings")).items.find((item: any) => item.id === id);
+		registerWebSearchSource({
+			id: "prog",
+			label: "Prog",
+			models: () => [
+				{ id: "fast", label: "Fast", efforts: ["low", "medium", "high"] },
+				{ id: "deep", label: "Deep", efforts: ["medium", "high", "xhigh"] },
+				{ id: "fixed", label: "Fixed", efforts: ["medium"] },
+				{ id: "plain", label: "Plain", efforts: [] },
+			],
+			defaultModel: "fast",
+			defaultEffort: "low",
+			search: async () => [],
+		});
+		cleanups.push(() => unregisterWebSearchSource("prog"));
+
+		// Like the model row: only while the source is switched on.
+		expect(await row("webSearch.sourceEffort.prog")).toBeUndefined();
+		await fx.post("/api/settings", { id: "webSearch.engines", value: ["tavily", "prog"] });
+		expect(await row("webSearch.sourceEffort.prog")).toMatchObject({
+			section: "Tools",
+			label: "Prog search reasoning level",
+			type: "enum",
+			value: "low",
+			options: ["low", "medium", "high"].map((level) => ({ value: level, label: level })),
+		});
+		// Right under the source's model row, inside the Web search card.
+		const ids = (await fx.get("/api/settings")).items.map((item: any) => item.id);
+		expect(ids.indexOf("webSearch.sourceEffort.prog")).toBe(ids.indexOf("webSearch.sourceModel.prog") + 1);
+
+		await fx.post("/api/settings", { id: "webSearch.sourceEffort.prog", value: "high" });
+		expect(settings().extensionSourceEfforts).toEqual({ prog: "high" });
+		expect((await row("webSearch.sourceEffort.prog")).value).toBe("high");
+		// Only a level the model in use has, and only for a source that exists.
+		for (const [id, value] of [
+			["webSearch.sourceEffort.prog", "xhigh"],
+			["webSearch.sourceEffort.prog", ""],
+			["webSearch.sourceEffort.prog", 3],
+			["webSearch.sourceEffort.nope", "high"],
+		]) {
+			await expect(fx.post("/api/settings", { id, value })).rejects.toThrow(/^400:/);
+		}
+		expect(settings().extensionSourceEfforts).toEqual({ prog: "high" });
+
+		// Another model has other levels: the row follows it, and shows what a search would really use.
+		await fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "deep" });
+		expect(await row("webSearch.sourceEffort.prog")).toMatchObject({
+			value: "high",
+			options: ["medium", "high", "xhigh"].map((level) => ({ value: level, label: level })),
+		});
+		await fx.post("/api/settings", { id: "webSearch.sourceEffort.prog", value: "xhigh" });
+		await fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "fast" });
+		expect((await row("webSearch.sourceEffort.prog")).value).toBe("low");
+		// A model with one level, or none, leaves nothing to pick.
+		await fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "fixed" });
+		expect(await row("webSearch.sourceEffort.prog")).toBeUndefined();
+		await fx.post("/api/settings", { id: "webSearch.sourceModel.prog", value: "plain" });
+		expect(await row("webSearch.sourceEffort.prog")).toBeUndefined();
+		await expect(fx.post("/api/settings", { id: "webSearch.sourceEffort.prog", value: "low" })).rejects.toThrow(
+			/^400:/,
+		);
+	});
 
 	it("exposes the Memory picker setting, off by default, and saves the model chosen for it", async () => {
 		const fx = await start();
@@ -726,7 +876,12 @@ describe("Web host (real runtime with a faux provider)", () => {
 	});
 
 	async function start(
-		options: { authFile?: boolean; nebiusBaseUrl?: string; runtimePerChat?: boolean } = {},
+		options: {
+			authFile?: boolean;
+			nebiusBaseUrl?: string;
+			runtimePerChat?: boolean;
+			extensionFactories?: InlineExtension[];
+		} = {},
 	): Promise<Fixture> {
 		const project = tempDir("myharness-web-project");
 		const dataRoot = tempDir("myharness-web-data");
@@ -770,7 +925,12 @@ describe("Web host (real runtime with a faux provider)", () => {
 			agentDir,
 			modelRuntime,
 			model: faux.getModel(),
-			resourceLoaderOptions: { noSkills: true, noPromptTemplates: true, noThemes: true },
+			resourceLoaderOptions: {
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				extensionFactories: options.extensionFactories,
+			},
 		};
 		// Settings are written a moment after they change. Every runtime's writes finish in the cleanup, before the
 		// directories are removed; a later write put the agent directory back, or held its lock while it was removed.
@@ -943,6 +1103,83 @@ describe("Web host (real runtime with a faux provider)", () => {
 		const activeNames = resources.tools.filter((tool: any) => tool.active).map((tool: any) => tool.name);
 		const updated = await fx.post("/api/tools/active", { names: activeNames }, fresh.slot);
 		expect(updated.active).toContain("symbols");
+	});
+
+	it("shows a tool its extension switches as automatic, keeps it out of manual switching, and refreshes the panel when it changes", async () => {
+		const tool = (name: string, autoActive?: boolean) => ({
+			name,
+			label: name,
+			description: `${name} for the test`,
+			parameters: Type.Object({}),
+			...(autoActive ? { autoActive } : {}),
+			execute: async () => ({ content: [{ type: "text" as const, text: name }], details: {} }),
+		});
+		const fx = await start({
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool(tool("follow_tool", true));
+					pi.registerTool(tool("manual_tool"));
+					// Like the Claude Code and agy plugins: the card tool follows the model, switched on each model change.
+					pi.on("model_select", async () => {
+						const active = pi.getActiveTools();
+						pi.setActiveTools(
+							active.includes("follow_tool")
+								? active.filter((name) => name !== "follow_tool")
+								: [...active, "follow_tool"],
+						);
+					});
+				},
+			],
+		});
+		const toolState = async () => {
+			const resources = await fx.get("/api/resources");
+			const pick = (name: string) => resources.tools.find((entry: any) => entry.name === name);
+			return { follow: pick("follow_tool"), manual: pick("manual_tool"), resources };
+		};
+		const activeNames = (resources: any) =>
+			resources.tools.filter((entry: any) => entry.active).map((entry: any) => entry.name);
+		const refreshes = () => fx.events.filter((entry) => entry.event === "resources_changed").length;
+
+		const initial = await toolState();
+		expect(initial.follow).toMatchObject({ autoActive: true, extension: true });
+		expect(initial.manual).toMatchObject({ autoActive: false, extension: true });
+		const followOnAtStart = initial.follow.active === true;
+
+		// A switch to another model makes the extension switch the tool; the panel is told to read the switches again.
+		// (Choosing the model already in use is no switch: extensions are not told about it.)
+		const model = fx.faux.getModel();
+		const entry = (id: string, name: string) => ({
+			id,
+			name,
+			api: model.api,
+			reasoning: model.reasoning,
+			input: model.input,
+			cost: model.cost,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			baseUrl: model.baseUrl,
+		});
+		fx.hub.host.session.modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [entry(model.id, model.name), entry(`${model.id}-other`, "Other faux model")],
+		});
+		const before = refreshes();
+		await fx.post("/api/model", { provider: model.provider, id: `${model.id}-other` });
+		await vi.waitFor(() => expect(refreshes()).toBeGreaterThan(before), { timeout: 5_000 });
+		const switched = await toolState();
+		expect(switched.follow.active).toBe(!followOnAtStart);
+
+		// The panel cannot switch it either way; other tools still switch as before.
+		const followOn = switched.follow.active === true;
+		const others = activeNames(switched.resources).filter((name: string) => name !== "follow_tool");
+		const requested = followOn ? [...others, "manual_tool"] : [...others, "manual_tool", "follow_tool"];
+		const answer = await fx.post("/api/tools/active", { names: [...new Set(requested)] });
+		expect(answer.active.includes("follow_tool")).toBe(followOn);
+		expect(answer.active).toContain("manual_tool");
+		const after = await toolState();
+		expect(after.follow.active).toBe(followOn);
+		expect(after.manual.active).toBe(true);
 	});
 
 	it("archives and restores a saved chat, then physically deletes it and resets the active view", async () => {
@@ -1703,6 +1940,103 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(byPath(saved.data.elsewhere)).toEqual(elsewhere);
 	}, 60_000);
 
+	it("lists what a running task has changed as the chat's own before the task ends", async () => {
+		const fx = await start();
+		writeFileSync(join(fx.project, "notes.txt"), "alpha\n");
+		expect(initializeGitRepository(fx.project).ok).toBe(true);
+		expect(setLocalGitIdentity(fx.project, { name: "Web test", email: "web@example.invalid" }).ok).toBe(true);
+		expect(createInitialGitBaseline(fx.project).ok).toBe(true);
+		const owner = fx.hub.get((await fx.get("/api/state")).slot)!;
+		owner.session.settingsManager.setGitIntegrationEnabled(true);
+		await owner.session.settingsManager.flush();
+		// Nothing saved and nothing running: the list is empty and Git is not read.
+		expect(await fx.get("/api/changes?scope=session")).toMatchObject({ files: [], total: 0, uncommitted: 0 });
+
+		let during: any;
+		let duringWorktree: any;
+		let duringDiff: any;
+		fx.faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+			async () => {
+				// Another program writes a file well before the task's own first call (more than the 2 s slack).
+				writeFileSync(join(fx.project, "outside.txt"), "made by another program\n");
+				await new Promise((resolve) => setTimeout(resolve, 2_600));
+				return fauxAssistantMessage([fauxToolCall("write", { path: "notes.txt", content: "alpha\nbeta\n" })], {
+					stopReason: "toolUse",
+				});
+			},
+			fauxAssistantMessage(
+				[fauxToolCall("bash", { command: `node -e "require('fs').writeFileSync('mine.txt', 'mine')"` })],
+				{ stopReason: "toolUse" },
+			),
+			async () => {
+				// The task is still running: its write and its command's file are already the chat's own.
+				during = await fx.get("/api/changes?scope=session&fresh=1");
+				duringWorktree = await fx.get("/api/changes?scope=worktree&fresh=1");
+				duringDiff = await fx.get("/api/changes/diff?scope=session&path=notes.txt");
+				return fauxAssistantMessage([fauxText("Done.")]);
+			},
+		]);
+		await fx.post("/api/prompt", { text: "append beta, then make mine.txt" });
+		await fx.waitFor("run_finished", () => true, 30_000);
+
+		const byPath = (files: any[]) => [...files].sort((a, b) => a.path.localeCompare(b.path));
+		expect(byPath(during.files)).toMatchObject([
+			{ path: "mine.txt", status: "added", live: true },
+			{ path: "notes.txt", status: "modified", additions: 1, deletions: 0, live: true },
+		]);
+		expect(during.files).toHaveLength(2);
+		// Both numbers are known while the task runs: the chat's two files, and the folder's four (the other program's
+		// file and the project settings written above are nobody's).
+		expect(during.uncommitted).toBe(2);
+		expect(duringWorktree).toMatchObject({ total: 4, uncommitted: 2 });
+		expect(duringDiff.history).toHaveLength(1);
+		expect(duringDiff.history[0]).toMatchObject({ live: true, summary: { path: "notes.txt", additions: 1 } });
+		expect(duringDiff.history[0].patch).toContain("+beta");
+
+		// Once the task has ended, the same files are its saved card's, no longer marked as running.
+		const after = await fx.get("/api/changes?scope=session&fresh=1");
+		expect(byPath(after.files).map((file: any) => [file.path, file.live])).toEqual([
+			["mine.txt", undefined],
+			["notes.txt", undefined],
+		]);
+		expect(after.uncommitted).toBe(2);
+		const afterDiff = await fx.get("/api/changes/diff?scope=session&path=notes.txt");
+		expect(afterDiff.history).toHaveLength(1);
+		expect(afterDiff.history[0].live).toBeUndefined();
+	}, 60_000);
+
+	it("takes the checkpoint when the task starts for a model whose program runs its own tools", async () => {
+		const fx = await start();
+		writeFileSync(join(fx.project, "notes.txt"), "alpha\n");
+		expect(initializeGitRepository(fx.project).ok).toBe(true);
+		expect(setLocalGitIdentity(fx.project, { name: "Web test", email: "web@example.invalid" }).ok).toBe(true);
+		expect(createInitialGitBaseline(fx.project).ok).toBe(true);
+		const owner = fx.hub.get((await fx.get("/api/state")).slot)!;
+		owner.session.settingsManager.setGitIntegrationEnabled(true);
+		await owner.session.settingsManager.flush();
+		(owner.session.model as { runsOwnTools?: boolean }).runsOwnTools = true;
+
+		fx.faux.setResponses([
+			async () => {
+				// The checkpoint exists before the model has answered, with no tool call seen yet.
+				await vi.waitFor(() => expect(owner.session.getGitCheckpoint()?.status).toBe("created"), {
+					timeout: 15_000,
+				});
+				// The program's own tool writes a file; the call this session then sees only reads.
+				writeFileSync(join(fx.project, "own.txt"), "written by the program itself\n");
+				return fauxAssistantMessage([fauxToolCall("bash", { command: "ls" })], { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage([fauxText("Done.")]),
+		]);
+		await fx.post("/api/prompt", { text: "let the program write a file" });
+		const finished = await fx.waitFor("run_finished", () => true, 30_000);
+		// The file is the task's change: it differs from the checkpoint and was written beside the task's own call.
+		expect(finished.changeCount).toBe(1);
+		const card = (await fx.get("/api/transcript")).items.filter((item: any) => item.kind === "runChanges").at(-1);
+		expect(card.files.map((file: any) => file.path)).toEqual(["own.txt"]);
+	}, 60_000);
+
 	for (const gitIntegration of [false, true]) {
 		it(`shows what the task's own commands changed in a folder without Git (Git integration ${gitIntegration ? "on" : "off"})`, async () => {
 			const fx = await start();
@@ -2124,6 +2458,404 @@ describe("Web host (real runtime with a faux provider)", () => {
 		).toBe(true);
 	});
 
+	it("gives a task that an Interrupt message cut into runs one card, after its last reply, with each file once", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const session = fx.hub.get(first.slot)!.session;
+		writeFileSync(join(fx.project, "notes.txt"), "alpha\n");
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const write = (path: string, content: string) =>
+			fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" });
+		fx.faux.setResponses([
+			// Run 1: reads and rewrites notes.txt, creates one.txt, and is still answering when the new message comes.
+			fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+			write("notes.txt", "alpha\nbeta\n"),
+			write("one.txt", "one\n"),
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("still going")]);
+			},
+			// Run 2, the new message: rewrites notes.txt again and creates two.txt.
+			write("notes.txt", "alpha\nbeta\ngamma\n"),
+			write("two.txt", "two\n"),
+			fauxAssistantMessage([fauxText("all done")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "one.txt"))).toBe(true), { timeout: 15_000 });
+
+		const interrupted = fx.post("/api/prompt", { text: "also add two.txt", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release();
+		await interrupted;
+		const outcomes = () =>
+			fx.events
+				.filter((event) => event.event === "run_finished" && event.data.slot === first.slot)
+				.map((event) => event.data.outcome);
+		await vi.waitFor(() => expect(outcomes()).toEqual(["redirected", "completed"]), { timeout: 30_000 });
+		await fx.hub.get(first.slot)!.waitForCompletion();
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+
+		// The page was told about the task's one card, once, and not when the first run was cut short.
+		const appendedCards = fx.events.filter(
+			(event) => event.event === "entry_appended" && event.data.item?.kind === "runChanges",
+		);
+		expect(appendedCards).toHaveLength(1);
+		const marker = fx.events.findIndex(
+			(event) => event.event === "entry_appended" && event.data.item?.customType === "web-interrupt",
+		);
+		expect(marker).toBeGreaterThanOrEqual(0);
+		expect(fx.events.indexOf(appendedCards[0]!)).toBeGreaterThan(marker);
+
+		// The conversation shows it after the last reply, listing every file once.
+		const items = (await fx.get("/api/transcript", first.slot)).items;
+		const cards = items.filter((item: any) => item.kind === "runChanges");
+		expect(cards).toHaveLength(1);
+		expect(items.at(-1)).toBe(cards[0]);
+		expect(items.findIndex((item: any) => item.kind === "user" && item.text === "also add two.txt")).toBeLessThan(
+			items.indexOf(cards[0]),
+		);
+		expect(cards[0].files.map((file: any) => file.path).sort()).toEqual(["notes.txt", "one.txt", "two.txt"]);
+		const diff = await fx.get(`/api/changes/card-diff?id=${cards[0].id}&path=notes.txt`, first.slot);
+		// From before the first run ("alpha") to the end of the last: not from the file as the first run left it.
+		expect(diff.summary).toMatchObject({ additions: 2, deletions: 0 });
+		expect(diff.patch).toContain("+beta");
+		expect(diff.patch).toContain("+gamma");
+
+		// The session holds the first run's changes as a hidden entry before the message, and the card after the reply.
+		const cardEntries = session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "web-run-changes") as Array<{
+			data: { deferred?: boolean; chain?: boolean; files: Array<{ path: string }> };
+		}>;
+		expect(cardEntries.map((entry) => entry.data.deferred === true)).toEqual([true, false]);
+		expect(cardEntries[1]!.data.chain).toBe(true);
+		// Counted once: the Changes panel does not add the held-back run to the card that lists its files.
+		const panel = await fx.get("/api/changes?scope=session", first.slot);
+		expect(panel.files.find((file: any) => file.path === "notes.txt")).toMatchObject({ additions: 2, deletions: 0 });
+		expect(panel.files).toHaveLength(3);
+	}, 60_000);
+
+	it("shows a held-back run's changes as its own card when its task never got one (recovered when the chat is opened)", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const host = fx.hub.get(first.slot)!;
+		const held = {
+			runId: 4,
+			deferred: true,
+			files: [
+				{
+					path: "a.ts",
+					status: "modified",
+					additions: 1,
+					deletions: 0,
+					binary: false,
+					patch: "@@ -1 +1,2 @@\n x\n+y\n",
+				},
+			],
+		};
+		host.session.sessionManager.appendCustomEntry("web-run-changes", held);
+		// While held back it is no card.
+		expect(
+			(await fx.get("/api/transcript", first.slot)).items.filter((item: any) => item.kind === "runChanges"),
+		).toEqual([]);
+		(host as unknown as { recoverDeferredRunChanges(generation: number): void }).recoverDeferredRunChanges(
+			(host as unknown as { generation: number }).generation,
+		);
+		const cards = (await fx.get("/api/transcript", first.slot)).items.filter(
+			(item: any) => item.kind === "runChanges",
+		);
+		expect(cards).toHaveLength(1);
+		expect(cards[0].files.map((file: any) => file.path)).toEqual(["a.ts"]);
+		// Recovered once: it closed the task, so the held entry no longer counts and opening the chat again adds nothing.
+		(host as unknown as { recoverDeferredRunChanges(generation: number): void }).recoverDeferredRunChanges(
+			(host as unknown as { generation: number }).generation,
+		);
+		expect(
+			(await fx.get("/api/transcript", first.slot)).items.filter((item: any) => item.kind === "runChanges"),
+		).toHaveLength(1);
+		const panel = await fx.get("/api/changes?scope=session", first.slot);
+		expect(panel.files.map((file: any) => [file.path, file.additions])).toEqual([["a.ts", 1]]);
+	});
+
+	it("shows a run that an Interrupt message ends as switched to the message, never with cancelled wording or a task notice", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const session = fx.hub.get(first.slot)!.session;
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("还在回答")]);
+			},
+			fauxAssistantMessage([fauxText("新回答")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+
+		const interrupted = fx.post("/api/prompt", { text: "换个问题", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release();
+		await interrupted;
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		const mine = () => fx.events.filter((entry) => entry.data.slot === first.slot);
+		await vi.waitFor(() =>
+			expect(
+				mine()
+					.filter((entry) => entry.event === "run_finished")
+					.map((entry) => entry.data.outcome),
+			).toEqual(["redirected", "completed"]),
+		);
+
+		// The page is told before the stop starts, and by the very run numbers its own record will carry: the stopped turn
+		// reads "switched to your new message" from the first moment instead of cancelled.
+		const redirecting = mine().findIndex((entry) => entry.event === "run_redirecting");
+		const stopped = mine().find((entry) => entry.event === "run_finished")!.data;
+		const firstTerminal = mine().findIndex(
+			(entry) => entry.event === "run_state" && ["cancelled", "interrupted"].includes(entry.data.state),
+		);
+		const abortedReply = mine().findIndex(
+			(entry) => entry.event === "message_end" && entry.data.item?.stopReason === "aborted",
+		);
+		expect(redirecting).toBeGreaterThanOrEqual(0);
+		expect(firstTerminal).toBeGreaterThan(redirecting);
+		expect(abortedReply).toBeGreaterThan(redirecting);
+		expect(mine()[redirecting]!.data).toMatchObject({ runId: stopped.runId, startedAt: stopped.startedAt });
+		expect(mine().filter((entry) => entry.event === "run_redirecting")).toHaveLength(1);
+
+		// The stopped run's terminal state goes out neutral and says why; its record carries no "cancelled" error.
+		const terminal = mine()[firstTerminal]!.data;
+		expect(terminal).toMatchObject({ redirected: true, activity: "" });
+		expect(terminal.error).toBeUndefined();
+		expect(stopped.error).toBeUndefined();
+		const wording = mine()
+			.filter((entry) => ["run_state", "run_finished", "task_notification", "auto_retry_end"].includes(entry.event))
+			.map((entry) => JSON.stringify(entry.data))
+			.join("\n");
+		expect(wording).not.toMatch(/已取消|Request was aborted|Retry cancelled/);
+
+		// No task-end notice for the stopped run: the only one is the answer to the new message.
+		await fx.waitFor("task_notification", (data) => data.slot === first.slot && data.state === "completed");
+		expect(
+			mine()
+				.filter((entry) => entry.event === "task_notification")
+				.map((entry) => entry.data.state),
+		).toEqual(["completed"]);
+		expect(showPopupMock.mock.calls.filter(([, content]) => content.kind === "interrupted")).toHaveLength(0);
+	});
+
+	it("still reports a run stopped with Stop as cancelled, with its wording and a task notice", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const session = fx.hub.get(first.slot)!.session;
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("还在回答")]);
+			},
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+
+		const stop = fx.post("/api/abort", {}, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release();
+		await stop;
+		const finished = await fx.waitFor("run_finished", (data) => data.slot === first.slot);
+		expect(finished.outcome).toBe("cancelled");
+		expect(finished.error).toBeTruthy();
+		expect(fx.events.some((entry) => entry.event === "run_redirecting")).toBe(false);
+		const terminal = fx.events.find(
+			(entry) => entry.event === "run_state" && entry.data.slot === first.slot && entry.data.state === "cancelled",
+		)!.data;
+		expect(terminal.activity).toBe("任务已取消");
+		expect(terminal.redirected).toBeUndefined();
+		// The notice says the task was stopped (the page titles it "Task cancelled").
+		const notice = await fx.waitFor("task_notification", (data) => data.slot === first.slot);
+		expect(notice).toMatchObject({ kind: "interrupted", state: "cancelled" });
+	});
+
+	/** Review helpers for the merged card of a task an Interrupt message cut into runs. */
+	const reviewCards = (host: any) =>
+		(
+			host.session.sessionManager
+				.getBranch()
+				.filter((entry: any) => entry.type === "custom" && entry.customType === "web-run-changes") as Array<{
+				data: { deferred?: boolean; chain?: boolean; runId: number; files: Array<{ path: string }> };
+			}>
+		).map((entry) => ({
+			deferred: entry.data.deferred === true,
+			chain: entry.data.chain === true,
+			runs: entry.data.runId,
+			files: entry.data.files.map((file) => file.path).sort(),
+		}));
+	const reviewWrite = (path: string, content: string) =>
+		fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" });
+
+	it("Stop in the middle of a cut task closes it with the one card of both runs", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const host = fx.hub.get(first.slot)!;
+		const session = host.session;
+		let release1: () => void = () => {};
+		const gate1 = new Promise<void>((resolve) => {
+			release1 = resolve;
+		});
+		let release2: () => void = () => {};
+		const gate2 = new Promise<void>((resolve) => {
+			release2 = resolve;
+		});
+		fx.faux.setResponses([
+			reviewWrite("one.txt", "one\n"),
+			async () => {
+				await gate1;
+				return fauxAssistantMessage([fauxText("still going")]);
+			},
+			reviewWrite("two.txt", "two\n"),
+			async () => {
+				await gate2;
+				return fauxAssistantMessage([fauxText("never")]);
+			},
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "one.txt"))).toBe(true), { timeout: 15_000 });
+		const interrupted = fx.post("/api/prompt", { text: "also two", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release1();
+		await interrupted;
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "two.txt"))).toBe(true), { timeout: 15_000 });
+		// Stop waits for the stopped reply, which waits for the gate: release it without waiting for Stop first.
+		const stopped = fx.post("/api/abort", {}, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release2();
+		await stopped;
+		const outcomes = () =>
+			fx.events
+				.filter((event) => event.event === "run_finished" && event.data.slot === first.slot)
+				.map((event) => event.data.outcome);
+		await vi.waitFor(() => expect(outcomes()).toEqual(["redirected", "cancelled"]), { timeout: 30_000 });
+		await host.waitForCompletion();
+		const cards = reviewCards(host);
+		expect(cards.map((card) => [card.deferred, card.chain])).toEqual([
+			[true, false],
+			[false, true],
+		]);
+		expect(cards[1]!.files).toEqual(["one.txt", "two.txt"]);
+		const panel = await fx.get("/api/changes?scope=session", first.slot);
+		expect(panel.files.map((file: any) => file.path).sort()).toEqual(["one.txt", "two.txt"]);
+	}, 60_000);
+
+	it("an Interrupt message that gets no run writes the cut run's card at once", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const host = fx.hub.get(first.slot)!;
+		const session = host.session;
+		let release1: () => void = () => {};
+		const gate1 = new Promise<void>((resolve) => {
+			release1 = resolve;
+		});
+		fx.faux.setResponses([
+			reviewWrite("one.txt", "one\n"),
+			async () => {
+				await gate1;
+				return fauxAssistantMessage([fauxText("still going")]);
+			},
+		]);
+		const realPrompt = session.prompt.bind(session) as (...args: unknown[]) => Promise<void>;
+		vi.spyOn(session, "prompt").mockImplementation((async (...args: unknown[]) => {
+			if (args[0] === "refused") throw new Error("refused");
+			return realPrompt(...args);
+		}) as never);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "one.txt"))).toBe(true), { timeout: 15_000 });
+		const interrupted = fx.post("/api/prompt", { text: "refused", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release1();
+		await expect(interrupted).rejects.toThrow("refused");
+		await host.waitForCompletion();
+		const cards = reviewCards(host);
+		expect(cards.map((card) => [card.deferred, card.chain, card.files])).toEqual([
+			[true, false, ["one.txt"]],
+			[false, true, ["one.txt"]],
+		]);
+	}, 60_000);
+
+	it("checkpoint bookkeeping that throws in the task's last run still closes the task with its one card", async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const host = fx.hub.get(first.slot)!;
+		const session = host.session;
+		let release1: () => void = () => {};
+		const gate1 = new Promise<void>((resolve) => {
+			release1 = resolve;
+		});
+		let release2: () => void = () => {};
+		const gate2 = new Promise<void>((resolve) => {
+			release2 = resolve;
+		});
+		fx.faux.setResponses([
+			reviewWrite("one.txt", "one\n"),
+			async () => {
+				await gate1;
+				return fauxAssistantMessage([fauxText("still going")]);
+			},
+			reviewWrite("two.txt", "two\n"),
+			async () => {
+				await gate2;
+				return fauxAssistantMessage([fauxText("never")]);
+			},
+			// The next, unrelated task
+			reviewWrite("three.txt", "three\n"),
+			fauxAssistantMessage([fauxText("task 3 done")]),
+		]);
+		// A stopped run settles its checkpoint (settleFailedCheckpoint); the call of the second run throws.
+		const realSettle = host.settleFailedCheckpoint.bind(host);
+		let settles = 0;
+		vi.spyOn(host, "settleFailedCheckpoint").mockImplementation((async (...args: Parameters<typeof realSettle>) => {
+			settles += 1;
+			if (settles === 2) throw new Error("settling the checkpoint failed");
+			return realSettle(...args);
+		}) as never);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "one.txt"))).toBe(true), { timeout: 15_000 });
+		const interrupted = fx.post("/api/prompt", { text: "also two", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release1();
+		await interrupted;
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "two.txt"))).toBe(true), { timeout: 15_000 });
+		const stopped = fx.post("/api/abort", {}, first.slot);
+		await vi.waitFor(() => expect((session as unknown as { _abortRequested: boolean })._abortRequested).toBe(true));
+		release2();
+		await stopped;
+		await vi.waitFor(() => expect(settles).toBe(2), { timeout: 30_000 });
+		await host.waitForCompletion();
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		// The task is closed with one card of both runs although the bookkeeping failed...
+		expect(reviewCards(host).map((card) => [card.deferred, card.chain, card.files])).toEqual([
+			[true, false, ["one.txt"]],
+			[false, true, ["one.txt", "two.txt"]],
+		]);
+		// ...so an unrelated task after it lists only its own file.
+		await fx.post("/api/prompt", { text: "something else" }, first.slot);
+		await vi.waitFor(() => expect(existsSync(join(fx.project, "three.txt"))).toBe(true), { timeout: 15_000 });
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await host.waitForCompletion();
+		expect(
+			reviewCards(host)
+				.filter((card) => !card.deferred)
+				.at(-1),
+		).toMatchObject({ chain: false, files: ["three.txt"] });
+	}, 60_000);
+
 	it("does not mark a run that was idle when an Interrupt message arrives", async () => {
 		const fx = await start();
 		const first = await fx.get("/api/state");
@@ -2136,6 +2868,426 @@ describe("Web host (real runtime with a faux provider)", () => {
 				.getBranch()
 				.some((entry) => entry.type === "custom" && entry.customType === "web-interrupt"),
 		).toBe(false);
+	});
+
+	// ---- Review repros for the Interrupt "redirected" fix (they document counterexamples; see the review report) ----
+	const interruptHarness = async () => {
+		const fx = await start();
+		const first = await fx.get("/api/state");
+		const host = fx.hub.get(first.slot)!;
+		const session = host.session;
+		const mine = () => fx.events.filter((entry) => entry.data.slot === first.slot);
+		const abortRequested = () => (session as unknown as { _abortRequested: boolean })._abortRequested;
+		return { fx, first, host, session, mine, abortRequested };
+	};
+
+	it("an Interrupt while the run is still starting announces the id of the run that ends up redirected", async () => {
+		const { fx, first, session, mine, abortRequested } = await interruptHarness();
+		fx.faux.setResponses([
+			fauxAssistantMessage([fauxText("answer one")]),
+			fauxAssistantMessage([fauxText("answer two (should not be used)")]),
+			fauxAssistantMessage([fauxText("new answer")]),
+		]);
+		await fx.post("/api/prompt", { text: "one" }, first.slot);
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 1);
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+
+		// Run 2 is held in its preparation (the memory lookup): isStreaming is true and the snapshot already holds run 2,
+		// but the host has not seen agent_start for it, so its currentRunId is still run 1.
+		let releaseRecall: () => void = () => {};
+		const recallGate = new Promise<void>((resolve) => {
+			releaseRecall = resolve;
+		});
+		(session as unknown as { _autoMemory: { recall: () => Promise<undefined> } })._autoMemory.recall = async () => {
+			await recallGate;
+			return undefined;
+		};
+		void fx.post("/api/prompt", { text: "two" }, first.slot);
+		await vi.waitFor(() => expect(session.getRunStateSnapshot().state).toBe("starting"));
+		expect(session.isStreaming).toBe(true);
+		const run2 = session.getRunStateSnapshot();
+
+		const interrupted = fx.post("/api/prompt", { text: "three", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		releaseRecall();
+		await interrupted;
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.hub.get(first.slot)!.waitForCompletion();
+
+		const redirecting = mine().filter((entry) => entry.event === "run_redirecting");
+		const finished = mine().filter((entry) => entry.event === "run_finished");
+		// Observed: run 2 was the stopped run (run_finished 2 is "redirected" with run 2's startedAt) ...
+		expect(finished.map((entry) => `${entry.data.runId}:${entry.data.outcome}`)).toEqual([
+			"1:completed",
+			"2:redirected",
+		]);
+		expect(finished[1]!.data.startedAt).toBe(run2.startedAt);
+		expect(redirecting).toHaveLength(1);
+		// The stopped run 2 did put a stopped reply on the page, which reads as cancelled until run_finished 2 arrives.
+		expect(
+			mine().filter((entry) => entry.event === "message_end" && entry.data.item?.stopReason === "aborted"),
+		).toHaveLength(1);
+		// ... but run_redirecting said runId 1 (run 1 had finished long before; host.currentRunId only moves on agent_start).
+		expect(redirecting[0]!.data.startedAt).toBe(run2.startedAt);
+		expect(redirecting[0]!.data.runId).toBe(2);
+	});
+
+	it("in the window before run_finished, /api/state (a page that reloads) is told the run was redirected, not stopped", async () => {
+		const { fx, first, host, mine, abortRequested } = await interruptHarness();
+		let releaseReply: () => void = () => {};
+		const replyGate = new Promise<void>((resolve) => {
+			releaseReply = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await replyGate;
+				return fauxAssistantMessage([fauxText("still answering")]);
+			},
+			fauxAssistantMessage([fauxText("new answer")]),
+		]);
+		// Hold the run's completion (change detection) open, the way a big folder does.
+		let releaseCompletion: () => void = () => {};
+		const completionGate = new Promise<void>((resolve) => {
+			releaseCompletion = resolve;
+		});
+		const internals = host as unknown as { runCompletion(runId: number | undefined): Promise<void> };
+		const original = internals.runCompletion.bind(host);
+		let held = false;
+		internals.runCompletion = async (runId) => {
+			if (!held) {
+				held = true;
+				await completionGate;
+			}
+			return original(runId);
+		};
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+		const interrupted = fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		releaseReply();
+		await fx.waitFor("completion", (data) => data.slot === first.slot && data.active === true);
+
+		// The window: the stopped reply is saved, the run's record is not out yet, and the marker is not written yet.
+		const state = await fx.get("/api/state", first.slot);
+		const transcript = await fx.get("/api/transcript", first.slot);
+		const aborted = transcript.items.filter(
+			(item: any) => item.kind === "assistant" && item.stopReason === "aborted",
+		);
+		const marker = transcript.items.filter(
+			(item: any) => item.kind === "custom" && item.customType === "web-interrupt",
+		);
+		// What a reloaded page can read in the window (it missed the live run_redirecting): the stopped reply, no marker, no
+		// run record (the live run_redirecting is gone for it).
+		expect(aborted).toHaveLength(1);
+		expect(marker).toHaveLength(0);
+		expect(mine().some((entry) => entry.event === "run_finished")).toBe(false);
+		expect(state.lastRun).toBeNull();
+		expect(state.flags.completion).toBe(true);
+		// The snapshot goes through publishedRunState like the run_state event, so a page that reloads in the window is told
+		// the same thing the live page was: neutral wording, and that the run was redirected.
+		expect(state.run).toMatchObject({ terminalReason: "user-cancelled", redirected: true, activity: "" });
+		expect(state.run.error).toBeUndefined();
+		releaseCompletion();
+		await interrupted;
+		// Once the interrupting message has its own run the snapshot is plain again.
+		await vi.waitFor(async () => expect((await fx.get("/api/state", first.slot)).run.redirected).toBeUndefined());
+	});
+
+	const cancelWording = (events: Array<{ event: string; data: any }>) =>
+		events
+			.map((entry) => ({ event: entry.event, text: JSON.stringify(entry.data) }))
+			.filter((entry) => /已取消|cancel|Cancel|abort|Abort|已中断|interrupted/.test(entry.text))
+			.map(
+				(entry) =>
+					`${entry.event}: ${entry.text.match(/.{0,50}(已取消|cancel|Cancel|abort|Abort|已中断|interrupted).{0,50}/)?.[0]}`,
+			);
+
+	it("every event of a plain Interrupt that carries cancel-like wording", async () => {
+		const { fx, first, session, mine, abortRequested } = await interruptHarness();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("still answering")]);
+			},
+			fauxAssistantMessage([fauxText("new answer")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+		const interrupted = fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		release();
+		await interrupted;
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 2);
+		const transcript = await fx.get("/api/transcript", first.slot);
+		// No Chinese "cancelled" wording anywhere, on any event or in the saved transcript ...
+		const transcriptWording = cancelWording(transcript.items.map((item: any) => ({ event: item.kind, data: item })));
+		expect([...cancelWording(mine()), ...transcriptWording].filter((line) => /已取消/.test(line))).toEqual([]);
+		// ... but the stopped reply itself still says "Request was aborted" (message_start / message_end / transcript), and the
+		// neutral run_state / run_finished still carry state "cancelled" and terminalReason "user-cancelled" as data.
+		expect(
+			cancelWording(mine())
+				.filter((line) => line.includes("Request was aborted"))
+				.map((line) => line.split(":")[0]),
+		).toEqual(["message_start", "message_end"]);
+		expect(transcriptWording.some((line) => line.includes("Request was aborted"))).toBe(true);
+		expect(mine().find((entry) => entry.event === "run_finished")!.data).toMatchObject({
+			outcome: "redirected",
+			state: "cancelled",
+			terminalReason: "user-cancelled",
+		});
+	});
+
+	it("an Interrupt while a shell command runs (tool rows)", async () => {
+		const { fx, first, session, mine } = await interruptHarness();
+		fx.faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("bash", { command: "sleep 30" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxText("new answer")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("tool_start", (data) => data.slot === first.slot);
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		await fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 2);
+		const transcript = await fx.get("/api/transcript", first.slot);
+		// The interrupted command's row is an error result "Command aborted" (the page counts it as a failed action in the
+		// turn's summary). Not “task cancelled” wording, but a cancel-like leftover the fix does not touch.
+		expect(
+			transcript.items
+				.filter((item: any) => item.kind === "toolResult")
+				.map((item: any) => [item.isError, item.text]),
+		).toEqual([[true, "Command aborted"]]);
+		expect(mine().filter((entry) => entry.event === "task_notification")).toHaveLength(1);
+	});
+
+	it("Stop pressed on the run that the Interrupt message started is a real Stop", async () => {
+		const { fx, first, mine, abortRequested } = await interruptHarness();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let releaseSecond: () => void = () => {};
+		const secondGate = new Promise<void>((resolve) => {
+			releaseSecond = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("still answering")]);
+			},
+			async () => {
+				await secondGate;
+				return fauxAssistantMessage([fauxText("the new answer")]);
+			},
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+		const interrupted = fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		release();
+		await interrupted;
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot && data.runId === 2);
+		const stop = fx.post("/api/abort", {}, first.slot);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		releaseSecond();
+		await stop;
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 2);
+		await fx.waitFor("task_notification", (data) => data.slot === first.slot);
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		// Run 1 was redirected; run 2 (started by the Interrupt message, after the counter went back to 0) is a plain Stop.
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_finished")
+				.map((entry) => `${entry.data.runId}:${entry.data.outcome}`),
+		).toEqual(["1:redirected", "2:cancelled"]);
+		const stopped = mine().find(
+			(entry) => entry.event === "run_state" && entry.data.runId === 2 && entry.data.state === "cancelled",
+		)!.data;
+		expect(stopped).toMatchObject({ activity: "任务已取消" });
+		expect(stopped.redirected).toBeUndefined();
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_redirecting")
+				.map((entry) => entry.data.runId),
+		).toEqual([1]);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "task_notification")
+				.map((entry) => `${entry.data.kind}:${entry.data.state}`),
+		).toEqual(["interrupted:cancelled"]);
+	});
+
+	it("two Interrupt messages sent at once", async () => {
+		const { fx, first, session, mine, abortRequested } = await interruptHarness();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("still answering")]);
+			},
+			fauxAssistantMessage([fauxText("answer A")]),
+			fauxAssistantMessage([fauxText("answer B")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("agent_start", (data) => data.slot === first.slot);
+		const a = fx.post("/api/prompt", { text: "A", mode: "interrupt" }, first.slot).then(
+			() => "ok",
+			(error) => `rejected: ${error.message}`,
+		);
+		const b = fx.post("/api/prompt", { text: "B", mode: "interrupt" }, first.slot).then(
+			() => "ok",
+			(error) => `rejected: ${error.message}`,
+		);
+		await vi.waitFor(() => expect(abortRequested()).toBe(true));
+		release();
+		const answers = await Promise.all([a, b]);
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		const branch = session.sessionManager.getBranch();
+		// Two Interrupts at once: the stopped run is announced twice and marked twice (both harmless on the page: the second
+		// announcement is ignored once a record exists, a repeated marker only sets the same flag), and the run is redirected,
+		// not cancelled, with no "interrupted" notice.
+		expect(answers).toEqual(["ok", "ok"]);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_redirecting")
+				.map((entry) => entry.data.runId),
+		).toEqual([1, 1]);
+		expect(branch.filter((entry) => entry.type === "custom" && entry.customType === "web-interrupt")).toHaveLength(2);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_finished")
+				.map((entry) => `${entry.data.runId}:${entry.data.outcome}`),
+		).toEqual(["1:redirected", "2:completed"]);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "task_notification")
+				.map((entry) => `${entry.data.kind}:${entry.data.state}`),
+		).toEqual(["completed:completed"]);
+	});
+
+	it("an Interrupt message while the task only waits for background sub-agents is steered in, flags nothing, and a later Stop is a real Stop", async () => {
+		const { fx, first, session, mine } = await interruptHarness();
+		const batch = startBackgroundBatch({ session, tempDir: fx.project } as unknown as Harness);
+		fx.faux.setResponses([
+			fauxAssistantMessage([fauxText("first answer")]),
+			fauxAssistantMessage([fauxText("steered answer")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(session.isWaitingForBackground).toBe(true));
+		await fx.post("/api/prompt", { text: "one more thing", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() =>
+			expect(session.messages.some((message) => getMessageText(message) === "steered answer")).toBe(true),
+		);
+		await vi.waitFor(() => expect(session.isWaitingForBackground).toBe(true));
+		// Nothing was cut short: no announcement, no neutral state, no marker, and the batch still runs.
+		expect(mine().some((entry) => entry.event === "run_redirecting")).toBe(false);
+		expect(mine().some((entry) => entry.event === "run_state" && entry.data.redirected)).toBe(false);
+		expect(
+			session.sessionManager
+				.getBranch()
+				.some((entry) => entry.type === "custom" && entry.customType === "web-interrupt"),
+		).toBe(false);
+		expect(batch.aborted()).toBe(0);
+		// A real Stop while it waits is untouched: cancelled, with its wording and its notice.
+		await fx.post("/api/abort", {}, first.slot);
+		const finished = await fx.waitFor("run_finished", (data) => data.slot === first.slot);
+		expect(finished.outcome).toBe("cancelled");
+		const stopped = mine().find((entry) => entry.event === "run_state" && entry.data.state === "cancelled")!.data;
+		expect(stopped).toMatchObject({ activity: "任务已取消" });
+		expect(stopped.redirected).toBeUndefined();
+		await fx.waitFor("task_notification", (data) => data.slot === first.slot);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "task_notification")
+				.map((entry) => entry.data.kind),
+		).toEqual(["interrupted"]);
+	});
+
+	it("an Interrupt that arrives after the final reply but before the run settles announces a redirect for a run that ends completed", async () => {
+		const { fx, first, session, mine } = await interruptHarness();
+		fx.faux.setResponses([fauxAssistantMessage([fauxText("done")]), fauxAssistantMessage([fauxText("new answer")])]);
+		// Hold the post-run step (compaction check, queued messages...) open: the reply is complete, the run is not settled.
+		const internals = session as unknown as { _handlePostAgentRun(): Promise<boolean> };
+		const original = internals._handlePostAgentRun.bind(session);
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let held = false;
+		internals._handlePostAgentRun = async () => {
+			if (!held) {
+				held = true;
+				await gate;
+			}
+			return original();
+		};
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await vi.waitFor(() => expect(held).toBe(true));
+		const interrupted = fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await fx.waitFor("run_redirecting", (data) => data.slot === first.slot);
+		release();
+		await interrupted;
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 2);
+		// The page drew run 1 as "switched to your new message" from run_redirecting until run_finished said "completed".
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_finished")
+				.map((entry) => `${entry.data.runId}:${entry.data.outcome}`),
+		).toEqual(["1:completed", "2:completed"]);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_redirecting")
+				.map((entry) => entry.data.runId),
+		).toEqual([1]);
+	});
+
+	it("an Interrupt message sent while nothing runs announces nothing", async () => {
+		const { fx, first, session, mine } = await interruptHarness();
+		fx.faux.setResponses([fauxAssistantMessage([fauxText("answer")])]);
+		await fx.post("/api/prompt", { text: "hi", mode: "interrupt" }, first.slot);
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot);
+		expect(mine().some((entry) => entry.event === "run_redirecting")).toBe(false);
+		expect(mine().some((entry) => entry.event === "run_state" && entry.data.redirected)).toBe(false);
+	});
+
+	it("an Interrupt during the automatic retry wait", async () => {
+		const { fx, first, session, mine } = await interruptHarness();
+		fx.faux.setResponses([
+			fauxAssistantMessage([], { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage([fauxText("recovered (should not be used)")]),
+			fauxAssistantMessage([fauxText("new answer")]),
+		]);
+		void fx.post("/api/prompt", { text: "go" }, first.slot);
+		await fx.waitFor("auto_retry_start", (data) => data.slot === first.slot);
+		const interrupted = fx.post("/api/prompt", { text: "switch", mode: "interrupt" }, first.slot);
+		await interrupted;
+		await vi.waitFor(() => expect(session.isIdle).toBe(true));
+		await fx.waitFor("run_finished", (data) => data.slot === first.slot && data.runId === 2);
+		// The retry wait is cut short by the message: no "重试已取消" / "Retry cancelled" anywhere, no failed-retry error, the
+		// run is redirected, and no task notice for it.
+		expect(cancelWording(mine()).filter((line) => /已取消|Retry cancelled/.test(line))).toEqual([]);
+		expect(mine().find((entry) => entry.event === "auto_retry_end")!.data.finalError).toBeUndefined();
+		expect(
+			mine()
+				.filter((entry) => entry.event === "run_finished")
+				.map((entry) => `${entry.data.runId}:${entry.data.outcome}`),
+		).toEqual(["1:redirected", "2:completed"]);
+		expect(
+			mine()
+				.filter((entry) => entry.event === "task_notification")
+				.map((entry) => `${entry.data.kind}:${entry.data.state}`),
+		).toEqual(["completed:completed"]);
 	});
 
 	it("keeps the sub-agents running when Interrupt mode stops a run whose main agent is answering", async () => {
@@ -2914,6 +4066,111 @@ describe("Web host (real runtime with a faux provider)", () => {
 		await expect(fx.post("/api/providers/auth/check", { id: "unknown-provider" })).rejects.toThrow(/^404:/);
 		await expect(fx.post("/api/providers/auth/check", { id: fx.faux.getModel().provider })).rejects.toThrow(/^400:/);
 		expect(fx.events.some((event) => event.event === "models_changed")).toBe(true);
+	});
+
+	it("lists what a provider from an extension offers: its models, the settings of single models and what signs it in", async () => {
+		const fx = await start();
+		const runtime = fx.hub.host.session.modelRuntime;
+		const id = "own-program-fixture";
+		const base = fx.faux.getModel();
+		const models = [
+			{
+				...base,
+				provider: id,
+				id: "big",
+				name: "Own · Big",
+				contextWindow: 1_000_000,
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh" },
+				input: ["text", "image"],
+			},
+			{
+				...base,
+				provider: id,
+				id: "plain",
+				name: "Own · Plain",
+				contextWindow: 200_000,
+				reasoning: false,
+				input: ["text"],
+			},
+		];
+		const lengths: Record<string, string> = {};
+		let shared = "on";
+		runtime.registerNativeProvider({
+			id,
+			name: "Own program fixture",
+			auth: {
+				apiKey: {
+					name: "Own program",
+					resolve: async () => ({ auth: { apiKey: "own" }, source: "the program's own login" }),
+				},
+			},
+			getModels: () => models,
+			// Read each time it is asked for: the list of models, and so of their settings, can grow while the app runs.
+			get settings() {
+				return [
+					{
+						id: "shared",
+						label: "Shared",
+						get: () => shared,
+						set: (value: string) => {
+							shared = value;
+						},
+					},
+					...models.map((model) => ({
+						id: `length:${model.id}`,
+						model: model.id,
+						label: "Length",
+						placeholder: "1M",
+						get: () => lengths[model.id] ?? "",
+						set: (value: string) => {
+							if (value === "bad") throw new Error("Too short.");
+							lengths[model.id] = value.toUpperCase();
+						},
+					})),
+				];
+			},
+			stream: () => {
+				throw new Error("No inference expected");
+			},
+			streamSimple: () => {
+				throw new Error("No inference expected");
+			},
+		} as any);
+		await runtime.refresh({ allowNetwork: false });
+		const find = async () => (await fx.get("/api/providers")).providers.find((p: any) => p.id === id);
+		const listed = await find();
+		expect(listed).toMatchObject({ custom: false, configured: true, authLabel: "the program's own login" });
+		expect(listed.models).toEqual([
+			{
+				id: "big",
+				name: "Own · Big",
+				contextWindow: 1_000_000,
+				levels: ["low", "medium", "high", "xhigh"],
+				image: true,
+			},
+			{ id: "plain", name: "Own · Plain", contextWindow: 200_000, levels: [], image: false },
+		]);
+		expect(listed.settings.map((setting: any) => [setting.id, setting.model, setting.value])).toEqual([
+			["shared", null, "on"],
+			["length:big", "big", ""],
+			["length:plain", "plain", ""],
+		]);
+		// A model's setting is saved like any other, by its id, and the provider's own refusal is passed on.
+		expect(await fx.post("/api/providers/setting", { id, setting: "length:big", value: "300k" })).toEqual({
+			ok: true,
+			value: "300K",
+		});
+		expect((await find()).settings.find((setting: any) => setting.id === "length:big").value).toBe("300K");
+		await expect(fx.post("/api/providers/setting", { id, setting: "length:plain", value: "bad" })).rejects.toThrow(
+			/^400: Too short\./,
+		);
+		await expect(fx.post("/api/providers/setting", { id, setting: "length:gone", value: "1m" })).rejects.toThrow(
+			/^404:/,
+		);
+		// A provider defined in models.json has its model rows in its own form: none are listed here.
+		const own = (await fx.get("/api/providers")).providers.filter((p: any) => p.custom);
+		expect(own.every((p: any) => p.models === null)).toBe(true);
 	});
 
 	it("removes credentials for real, including a key written into models.json", async () => {

@@ -17,7 +17,15 @@ import android.os.IBinder;
  * does no work itself and ends as soon as the page says nothing is running any more.
  */
 public final class RunService extends Service {
-	static final String RUN_CHANNEL = "run";
+	// A service that keeps the app alive in the background must hand Android a notification; without the service the
+	// system freezes the app and the end of the reply goes unnoticed. The app asks for the quietest kind (no sound, no
+	// banner). It cannot ask for none: Android raises the channel of a service's notification again when the app itself
+	// made it silent or switched it off (seen on Android 15: a channel created switched off came back as "low").
+	// Only the owner can hide it, by switching this one channel off in the system's settings. From Android 13 on the
+	// service runs all the same then, and the notification that a reply is ready is another channel. The app's settings
+	// lead there (MainActivity: openWaitingSettings) and show whether it is hidden (waitingHidden).
+	// "waiting", not the "run" and "working" of earlier versions: a channel keeps the importance it was made with.
+	static final String RUN_CHANNEL = "waiting";
 	// "reply", not the "done" of the first versions: a channel keeps the importance it was made with, and that one was
 	// made too low to show a banner when a reply ends.
 	static final String DONE_CHANNEL = "reply";
@@ -27,11 +35,23 @@ public final class RunService extends Service {
 	static void ensureChannels(Context context) {
 		NotificationManager manager = context.getSystemService(NotificationManager.class);
 		if (manager == null) return;
-		NotificationChannel run = new NotificationChannel(RUN_CHANNEL, context.getString(R.string.run_channel), NotificationManager.IMPORTANCE_LOW);
+		NotificationChannel run = new NotificationChannel(RUN_CHANNEL, context.getString(R.string.run_channel), NotificationManager.IMPORTANCE_MIN);
 		run.setShowBadge(false);
+		run.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
 		manager.createNotificationChannel(run);
+		manager.deleteNotificationChannel("run");
+		manager.deleteNotificationChannel("working");
 		manager.deleteNotificationChannel("done");
 		manager.createNotificationChannel(new NotificationChannel(DONE_CHANNEL, context.getString(R.string.done_channel), NotificationManager.IMPORTANCE_HIGH));
+	}
+
+	/** The owner switched the "waiting" notification off in the system's settings: nothing is shown while a reply is awaited. */
+	static boolean waitingHidden(Context context) {
+		NotificationManager manager = context.getSystemService(NotificationManager.class);
+		if (manager == null) return false;
+		if (!manager.areNotificationsEnabled()) return true;
+		NotificationChannel channel = manager.getNotificationChannel(RUN_CHANNEL);
+		return channel != null && channel.getImportance() == NotificationManager.IMPORTANCE_NONE;
 	}
 
 	static void start(Context context, String title) {

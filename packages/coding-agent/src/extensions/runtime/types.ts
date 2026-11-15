@@ -43,9 +43,11 @@ export interface AutocompleteItem {
 
 import type { TSchema } from "typebox";
 import type { CustomMessage } from "../../agent/runtime/messages.ts";
+import type { AgentRole } from "../../agent/runtime/role.ts";
 import type { CompactionPreparation, CompactionResult } from "../../context/compact/index.ts";
 import type { ExecOptions, ExecResult } from "../../platform/process/exec.ts";
 import type { ModelRegistry } from "../../providers/models/registry.ts";
+import type { PlanUsageSource } from "../../providers/plan-usage/sources.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import type {
 	BranchSummaryEntry,
@@ -73,6 +75,7 @@ import type {
 } from "../../tools/registry.ts";
 import type { BashOperations } from "../../tools/shell/bash.ts";
 import type { BashResult } from "../../tools/shell/executor.ts";
+import type { WebSearchSource } from "../../tools/web-search/sources.ts";
 import type { ExtensionEventHandler as ContractExtensionEventHandler } from "../contracts/events.ts";
 import type {
 	ExtensionFactory as ContractExtensionFactory,
@@ -213,6 +216,13 @@ export interface ExtensionContext {
 	mode: ExtensionMode;
 	/** Whether the host supplied a dialog-capable UI implementation. */
 	hasUI: boolean;
+	/**
+	 * The role of this session: "main" for a chat, "delegated" for a sub-agent's worker. A delegated session has only
+	 * the tools of its role, none an extension registers, and MyHarness checks every call it runs against the
+	 * sub-agent's limits (read-only, or its own sandbox folder). A provider whose program runs tools by itself
+	 * (`Model.runsOwnTools`) must leave every tool to MyHarness there; see `Model.delegatedHostTools`.
+	 */
+	agentRole: AgentRole;
 	/** Current working directory */
 	cwd: string;
 	/** Session manager (read-only) */
@@ -1233,6 +1243,49 @@ export interface ExtensionAPI {
 	 */
 	unregisterProvider(name: string): void;
 
+	/**
+	 * Register a web search source: another program's own search, offered in Web Search settings beside the built-in
+	 * engines once it is registered and usable on this computer. The user switches it on there and picks its model.
+	 *
+	 * The source only names pages for each query (title, URL, an optional snippet). MyHarness merges them with the other
+	 * sources' results and reads the pages itself, as for a built-in engine. Sources are per process, not per chat:
+	 * registering the same id again replaces the earlier one.
+	 *
+	 * @example
+	 * pi.registerWebSearchSource({
+	 *   id: "my-search",
+	 *   label: "My Search",
+	 *   async search({ queries }) {
+	 *     return Promise.all(queries.map(async (query) => ({ query, results: await mySearch(query) })));
+	 *   },
+	 * });
+	 */
+	registerWebSearchSource(source: WebSearchSource): void;
+
+	/**
+	 * Register a plan usage source: what is left of the subscription plan behind a provider (the 5-hour window and the
+	 * weekly window, and when each resets), shown in the Web UI beside that provider's models.
+	 *
+	 * `snapshot()` answers at once with what is known; `refresh()` reads the numbers again from the program and must
+	 * never reject. Sources are per process, not per chat: registering the same id again replaces the earlier one. The
+	 * returned function is the source's notifier: call it whenever the snapshot changed, so the browser is told (it
+	 * stays valid after the chat that registered it is gone).
+	 *
+	 * @example
+	 * const changed = pi.registerPlanUsageSource({
+	 *   id: "my-plan",
+	 *   label: "My Plan",
+	 *   snapshot: () => ({
+	 *     groups: [{ label: "", windows: [{ kind: "five_hour", leftPercent: 80, resetsAt: Date.now() + 3_600_000 }] }],
+	 *   }),
+	 *   async refresh() {
+	 *     await readNumbersFromMyProgram();
+	 *     changed();
+	 *   },
+	 * });
+	 */
+	registerPlanUsageSource(source: PlanUsageSource): () => void;
+
 	/** Shared event bus for extension communication. */
 	events: EventBus;
 }
@@ -1427,6 +1480,8 @@ export interface ExtensionContextActions {
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
+	/** The session's role; a host that does not say is a main session. */
+	getAgentRole?: () => AgentRole;
 }
 
 /**
@@ -1474,6 +1529,12 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/**
+	 * Ids of the model providers this extension registered. A sub-agent's worker is a process of its own that loads no
+	 * extensions; when the sub-agent's model comes from one, this is how the dispatching session finds the file to hand
+	 * the worker.
+	 */
+	providers?: Set<string>;
 }
 
 /** Result of loading extensions. */

@@ -14,8 +14,10 @@ import { committedAfterCancel, type FileMutationDetails } from "./mutation-resul
 import {
 	assertFileWasReadBefore,
 	canonicalFilePathKey,
+	type FileReadState,
 	recordFileStateAfterMutation,
 	resolveFileStateScope,
+	statFileReadState,
 } from "./read-state.ts";
 
 const writeSchema = Type.Object({
@@ -110,16 +112,27 @@ export function createWriteToolDefinition(
 			const localFileSystem = ops === defaultWriteOperations;
 			const scope = resolveFileStateScope(ctx);
 			// P2-11 idempotency: same session + same absolute file + same bytes replays the
-			// stored success instead of mutating again. Checked before the mutation queue
-			// so a repeat never waits on, or redoes, the first write. Thrown outcomes
-			// (abort, read-gate refusal, IO error) are never stored and stay retryable.
+			// stored success instead of mutating again, as long as the file is still exactly
+			// as that write left it (anything that touched it since makes this a real write
+			// again). Checked before the mutation queue so a repeat never waits on, or redoes,
+			// the first write. Thrown outcomes (abort, read-gate refusal, IO error) are never
+			// stored and stay retryable.
 			const key = idempotencyKey("write", scope, {
 				path: canonicalFilePathKey(absolutePath),
 				content,
 			});
-			const replayed = toolIdempotency.get(key) as
-				| { content: { type: "text"; text: string }[]; details?: WriteToolDetails }
+			const stored = toolIdempotency.get(key) as
+				| {
+						result: { content: { type: "text"; text: string }[]; details?: WriteToolDetails };
+						state: FileReadState;
+				  }
 				| undefined;
+			const current = stored ? await statFileReadState(absolutePath) : undefined;
+			const replayed =
+				stored && current && current.mtimeMs === stored.state.mtimeMs && current.size === stored.state.size
+					? stored.result
+					: undefined;
+			if (stored && !replayed) toolIdempotency.delete(key);
 			if (replayed) {
 				// P2-11 replay: these bytes were already written by an earlier call, so this call changed nothing and
 				// reports no line counts of its own (the front end sums them per turn); the marker says the mutation
@@ -176,8 +189,11 @@ export function createWriteToolDefinition(
 						],
 						details: Object.keys(details).length > 0 ? details : undefined,
 					};
-					// Only successes are stored: the same bytes always produce the same file.
-					toolIdempotency.set(key, result);
+					// Only successes are stored, with the shape the file has now: the same bytes produce the same
+					// file, and a repeat is a replay only while that shape is still on disk. A file this process
+					// cannot look at (a custom operation set) is written every time.
+					const state = localFileSystem ? await statFileReadState(absolutePath) : undefined;
+					if (state) toolIdempotency.set(key, { result, state });
 					return result;
 				},
 				signal,

@@ -20,6 +20,9 @@ android {
 		targetSdk 36
 		versionCode((providers.gradleProperty("myharnessVersionCode").orNull ?: "1") as Integer)
 		versionName(providers.gradleProperty("myharnessVersionName").orNull ?: "0.0.0")
+		// `build.mjs --apk --inspect`: a release-signed build whose page can be inspected over adb (chrome://inspect),
+		// for measuring on a real phone with the real app's data. Never the build that is handed out.
+		buildConfigField "boolean", "INSPECT", (providers.gradleProperty("myharnessInspect").orNull == "true") ? "true" : "false"
 	}
 
 	signingConfigs {
@@ -34,6 +37,10 @@ android {
 	}
 
 	buildTypes {
+		debug {
+			// A test build is an app of its own: installing it never replaces the real app or touches its chats and sign-in.
+			applicationIdSuffix ".debug"
+		}
 		release {
 			minifyEnabled false
 			signingConfig signing.getProperty("storeFile") ? signingConfigs.release : signingConfigs.debug
