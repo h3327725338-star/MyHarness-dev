@@ -47,7 +47,20 @@ it.each([
 	{ repair: true, terminalReason: "user-cancelled" },
 	{ repair: true, terminalReason: "tool-error" },
 	{ repair: true, terminalReason: undefined },
-])("uses the settled repair outcome ($repair, $terminalReason)", async ({ repair, terminalReason }) => {
+	{ repair: true, terminalReason: "completed", ownModel: true },
+	{ repair: true, terminalReason: "user-cancelled", ownModel: true },
+	{ repair: true, terminalReason: "tool-error", ownModel: true },
+	{ repair: true, terminalReason: "completed", ownModel: true, throws: true },
+	{ repair: true, terminalReason: "completed", ownModel: true, userSwitch: true },
+	{ repair: true, terminalReason: "completed", ownModel: true, unavailable: true },
+	{ repair: true, terminalReason: "completed", ownModel: true, switchThrows: true },
+])("uses the settled repair outcome ($repair, $terminalReason, $ownModel)", async (scenario) => {
+	const { repair, terminalReason } = scenario;
+	const ownModel = "ownModel" in scenario && scenario.ownModel;
+	const throws = "throws" in scenario && scenario.throws;
+	const userSwitch = "userSwitch" in scenario && scenario.userSwitch;
+	const unavailable = "unavailable" in scenario && scenario.unavailable;
+	const switchThrows = "switchThrows" in scenario && scenario.switchThrows;
 	mocks.repair = repair;
 	const completeSimple = vi.fn().mockResolvedValue({
 		stopReason: "stop",
@@ -61,7 +74,20 @@ it.each([
 			},
 		],
 	});
-	const sendCustomMessage = vi.fn();
+	const mainModel = { id: "selected-model", provider: "main", reasoning: true };
+	const commitModel = { id: "commit-model", provider: "commit", reasoning: true };
+	const sendCustomMessage = vi.fn(async (_entry: { customType: string; content: string }, _options: unknown) => {
+		expect(host.session.model).toBe(ownModel ? commitModel : mainModel);
+		if (ownModel) expect(host.session.thinkingLevel).toBe("high");
+		if (userSwitch) {
+			Object.assign(host.session, { model: mainModel, thinkingLevel: "low" });
+		}
+		if (throws) throw new Error("Repair failed");
+	});
+	const useModelInThisSession = vi.fn(async (model, thinkingLevel) => {
+		Object.assign(host.session, { model, thinkingLevel });
+		if (switchThrows && model === commitModel) throw new Error("Model extension failed");
+	});
 	const host = {
 		session: {
 			isStreaming: false,
@@ -69,7 +95,8 @@ it.each([
 			sessionManager: { getCwd: () => "repo" },
 			settingsManager: {
 				isProjectTrusted: () => true,
-				getCommitDescriptionSettings: () => ({}),
+				getCommitDescriptionSettings: () =>
+					ownModel ? { provider: "commit", model: "commit-model", thinkingLevel: "high" } : {},
 				getGitCommitSettings: () => ({ mode: "instructions", skipHooks: false, instructions: "" }),
 				getNetworkTimeouts: () => ({
 					connectTimeoutMs: 10_000,
@@ -81,8 +108,14 @@ it.each([
 				getRetrySettings: () => ({ enabled: true, maxRetries: 3, baseDelayMs: 2_000 }),
 				getProviderRetrySettings: () => ({ maxRetries: undefined, maxRetryDelayMs: 60_000 }),
 			},
-			model: { id: "selected-model" },
-			modelRuntime: { completeSimple },
+			model: mainModel,
+			thinkingLevel: "low",
+			modelRuntime: {
+				completeSimple,
+				isProviderEnabled: () => !unavailable || completeSimple.mock.calls.length === 0,
+				getModel: () => commitModel,
+			},
+			useModelInThisSession,
 			sendCustomMessage,
 			abort: vi.fn(),
 			waitForIdle: vi.fn(),
@@ -111,9 +144,16 @@ it.each([
 		});
 		expect(response.ok).toBe(true);
 		expect(((await response.json()) as { failure: string }).failure).toContain("hook diagnostic\ncheck failed");
-		if (repair) {
+		if (unavailable) {
+			expect(sendCustomMessage).not.toHaveBeenCalled();
+			expect(useModelInThisSession).not.toHaveBeenCalled();
+			expect(mocks.repairResult).toBe(false);
+		} else if (switchThrows) {
+			expect(sendCustomMessage).not.toHaveBeenCalled();
+			expect(mocks.repairResult).toBe(false);
+		} else if (repair) {
 			expect(sendCustomMessage).toHaveBeenCalledTimes(1);
-			expect(mocks.repairResult).toBe(terminalReason === "completed");
+			expect(mocks.repairResult).toBe(!throws && terminalReason === "completed");
 			const [entry, options] = sendCustomMessage.mock.calls[0]!;
 			expect(entry.customType).toBe("git-commit-repair");
 			expect(entry.content).toContain("Do not bypass");
@@ -124,6 +164,13 @@ it.each([
 			expect(entry.content).toContain("type error");
 			expect(options).toEqual({ triggerTurn: true });
 		} else expect(sendCustomMessage).not.toHaveBeenCalled();
+		if (ownModel && !unavailable) {
+			expect(useModelInThisSession).toHaveBeenNthCalledWith(1, commitModel, "high");
+			expect(useModelInThisSession).toHaveBeenCalledTimes(userSwitch ? 1 : 2);
+			if (!userSwitch) expect(useModelInThisSession).toHaveBeenLastCalledWith(mainModel, "low");
+		} else expect(useModelInThisSession).not.toHaveBeenCalled();
+		expect(host.session.model).toBe(mainModel);
+		expect(host.session.thinkingLevel).toBe("low");
 		expect(completeSimple).toHaveBeenCalledTimes(1);
 		const [, request] = completeSimple.mock.calls[0]!;
 		expect(request.tools).toBeUndefined();

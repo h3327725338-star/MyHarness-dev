@@ -573,7 +573,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				section: "Assistants",
 				label: "Commit description",
 				description:
-					"Model that writes AI commit messages. “Use the main model” follows the main chat's model and effort.",
+					"Model that writes AI commit messages and repairs failed pre-commit checks. “Use the main model” follows the main chat's model and effort.",
 				type: "modelRef",
 				value: { ...modelRef(commitDescription) },
 			},

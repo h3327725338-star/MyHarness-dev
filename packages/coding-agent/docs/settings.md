@@ -518,7 +518,7 @@ Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆�
 
 #### commitDescription（AI 提交描述）与 worktreeNaming（副本命名）
 
-两个都是 global 设置，默认都为空，即“使用主模型”：运行时使用当前主对话模型并继承它当前的 Thinking Effort，与改动前的行为完全一致；显式配置 `provider` + `model` 后改用独立模型，此时没写 `thinkingLevel`（Web UI 里的“默认”）表示用这个模型支持的最高档，只写其中一个视为没有配置。思考档位透传为一次性模型请求的 `reasoning` 参数（`off` 则不传）。两个请求都不再设置 `maxTokens`，输出上限走 Provider 默认。提交描述用于 `/commit` 从 diff 生成标题与正文，副本命名用于工作区副本的 AI 命名（2–5 词的展示名，只返回名称本身）。配置删除或 Provider 停用时回退到主模型；删除 Provider/模型时会清理指向它的引用。
+两个都是 global 设置，默认都为空，即“使用主模型”：运行时使用当前主对话模型并继承它当前的 Thinking Effort，与改动前的行为完全一致；显式配置 `provider` + `model` 后改用独立模型，此时没写 `thinkingLevel`（Web UI 里的“默认”）表示用这个模型支持的最高档，只写其中一个视为没有配置。思考档位透传为一次性模型请求的 `reasoning` 参数（`off` 则不传）。两个请求都不再设置 `maxTokens`，输出上限走 Provider 默认。提交描述用于 `/commit` 从 diff 生成标题与正文，以及提交前 hook 检查失败后的 Agent 自动修复；修复使用同一项设置的模型和 Thinking Effort，正常结束、失败或取消后恢复聊天原来的模型与档位（用户在修复期间另行切换时保留用户的选择）。修复期间临时切换会记录在 Session 中；进程异常退出时不能保证执行恢复。副本命名用于工作区副本的 AI 命名（2–5 词的展示名，只返回名称本身）。显式配置的模型不可用或 Provider 停用时会报错，不静默改用主模型；删除 Provider/模型时会清理指向它的引用。
 
 #### gitCommit 与 gitPush（Commit 和 Push 的模式与提示词）
 

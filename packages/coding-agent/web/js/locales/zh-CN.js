@@ -2219,7 +2219,7 @@ export const zhCN = {
 	"Show the running state in the terminal's progress indicator.": "在终端的进度指示器中显示运行状态。",
 	"Model used to summarize context. “Use the main model” follows the main chat's model and effort.": "用来总结上下文的模型。选“使用主模型”时跟随主对话的模型和 Thinking Effort。",
 	"Commit description": "提交描述",
-	"Model that writes AI commit messages. “Use the main model” follows the main chat's model and effort.": "写 AI 提交描述的模型。选“使用主模型”时跟随主对话的模型和 Thinking Effort。",
+	"Model that writes AI commit messages and repairs failed pre-commit checks. “Use the main model” follows the main chat's model and effort.": "写 AI 提交描述并修复提交前检查失败的模型。选“使用主模型”时跟随主对话的模型和 Thinking Effort。",
 	"Worktree naming": "副本命名",
 	"Model that names worktree copies. “Use the main model” follows the main chat's model and effort.": "给工作区副本命名的模型。选“使用主模型”时跟随主对话的模型和 Thinking Effort。",
 	"Branch summary": "分支摘要",

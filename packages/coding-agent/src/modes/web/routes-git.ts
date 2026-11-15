@@ -528,11 +528,34 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 						? undefined
 						: async (failure) => {
 								const controller = task.controller;
-								const abort = () => void host.session.abort();
+								const session = host.session;
+								const previousModel = session.model;
+								const previousThinking = session.thinkingLevel;
+								let repairModel: typeof previousModel;
+								let repairThinking = previousThinking;
+								let switched = false;
+								const abort = () => void session.abort();
 								controller.signal.addEventListener("abort", abort, { once: true });
 								try {
 									controller.signal.throwIfAborted();
-									await host.session.sendCustomMessage(
+									const selected = resolveHelperModel(
+										host,
+										session.settingsManager.getCommitDescriptionSettings(),
+										"Select a main Agent model before committing.",
+									);
+									repairModel = selected.model;
+									repairThinking = selected.thinkingLevel;
+									if (
+										previousModel?.provider !== repairModel.provider ||
+										previousModel?.id !== repairModel.id ||
+										previousThinking !== repairThinking
+									) {
+										// Mark before awaiting: an extension may fail after the live model was changed.
+										switched = true;
+										await session.useModelInThisSession(repairModel, repairThinking);
+									}
+									controller.signal.throwIfAborted();
+									await session.sendCustomMessage(
 										{
 											customType: "git-commit-repair",
 											display: false,
@@ -540,11 +563,10 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 										},
 										{ triggerTurn: true },
 									);
-									await host.session.waitForIdle();
+									await session.waitForIdle();
 									await host.waitForCompletion();
 									return (
-										!controller.signal.aborted &&
-										host.session.getRunStateSnapshot().terminalReason === "completed"
+										!controller.signal.aborted && session.getRunStateSnapshot().terminalReason === "completed"
 									);
 								} catch (error) {
 									host.broadcast("notice", {
@@ -554,6 +576,16 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 									return false;
 								} finally {
 									controller.signal.removeEventListener("abort", abort);
+									// Do not overwrite a model or effort the user selected during the repair.
+									if (
+										switched &&
+										previousModel &&
+										session.model?.provider === repairModel?.provider &&
+										session.model?.id === repairModel?.id &&
+										session.thinkingLevel === repairThinking
+									) {
+										await session.useModelInThisSession(previousModel, previousThinking);
+									}
 								}
 							},
 				generateMessage: async (context) => {
