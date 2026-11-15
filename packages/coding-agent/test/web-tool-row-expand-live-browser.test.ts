@@ -143,6 +143,85 @@ try{
     const seen=w.stop();
     out.s5={shown:shown('c1'),lost:seen.lost};
   }
+  // Current choices, rather than a history of clicks, decide whether completion may fold the chain.
+  out.autoFold=[];
+  for(const kind of ['tool','thinking']){
+    for(const keepOpen of [false,true]){
+      const name='fold-'+kind+'-'+keepOpen;
+      const block=kind==='tool'?readA:{type:'thinking',text:'Reasoning body to inspect.'};
+      const items=[user,reply('a1',[block]),...(kind==='tool'?[result('c1','alpha')]:[])];
+      start(name,items,runsFor(['c1']));
+      const target=()=>kind==='tool'?row('c1'):document.querySelector('.thinking .group-head');
+      if(!(await until(()=>target())))throw Error(name+': missing fold');
+      target().click();
+      if(!(await until(()=>target().getAttribute('aria-expanded')==='true')))throw Error(name+': did not open');
+      if(!keepOpen){
+        target().click();
+        if(!(await until(()=>target().getAttribute('aria-expanded')==='false')))throw Error(name+': did not close');
+      }
+      await push([...items,reply('end',[{type:'text',text:'Done.'}])],runsFor(['c1']),snapOf(name,false));
+      out.autoFold.push({kind:kind,keepOpen:keepOpen,summary:document.querySelector('.summary-head').getAttribute('aria-expanded'),child:target()?.getAttribute('aria-expanded')});
+    }
+  }
+
+  // Two expanded calls: closing only one must not hide the other at completion.
+  {
+    const name='two-open';
+    const items=[user,reply('a1',[readA,call('c2','bash',{command:'ls'})]),result('c1','alpha'),result('c2','listing')];
+    start(name,items,runsFor(['c1','c2']));
+    await until(()=>row('c2'));
+    row('c1').click();row('c2').click();
+    await until(()=>shown('c1')&&shown('c2'));
+    row('c1').click();
+    await until(()=>row('c1').getAttribute('aria-expanded')==='false');
+    await push([...items,reply('end',[{type:'text',text:'Done.'}])],runsFor(['c1','c2']),snapOf(name,false));
+    out.twoOpen={summary:document.querySelector('.summary-head').getAttribute('aria-expanded'),remaining:shown('c2')};
+  }
+
+  // A second block is merged into the first at completion, including its manually opened reasoning or tool row.
+  out.merged=[];
+  for(const kind of ['tool','thinking']){
+    const name='merge-'+kind;
+    const block=kind==='tool'?call('c2','bash',{command:'ls'}):{type:'thinking',text:'Later reasoning body.'};
+    const items=[user,reply('a1',[readA]),result('c1','alpha'),reply('note',[{type:'text',text:'Next step.'}],{final:false}),reply('a2',[block]),...(kind==='tool'?[result('c2','listing')]:[])];
+    start(name,items,runsFor(['c1','c2']));
+    const target=()=>kind==='tool'?row('c2'):document.querySelector('.thinking .group-head');
+    if(!(await until(()=>target())))throw Error(name+': missing second block');
+    target().click();
+    await until(()=>target().getAttribute('aria-expanded')==='true');
+    await push([...items,reply('end',[{type:'text',text:'Done.'}])],runsFor(['c1','c2']),snapOf(name,false));
+    out.merged.push({kind:kind,count:document.querySelectorAll('.summary').length,summary:document.querySelector('.summary-head').getAttribute('aria-expanded'),child:target()?.getAttribute('aria-expanded')});
+  }
+
+  // A group automatically formed around an open lone row is not an extra manual expansion.
+  for(const closeGroup of [false,true]){
+    const name='joined-close-'+closeGroup;
+    const first=[user,reply('a1',[readA]),result('c1','alpha')];
+    await expandFirst(name,first,runsFor(['c1']));
+    const items=[...first,reply('a2',[readB]),result('c2','beta')];
+    await push(items,runsFor(['c1','c2']));
+    if(closeGroup)document.querySelector('.group > .group-head').click();
+    else row('c1').click();
+    await until(()=>closeGroup?document.querySelector('.group > .group-head').getAttribute('aria-expanded')==='false':row('c1').getAttribute('aria-expanded')==='false');
+    await push([...items,reply('end',[{type:'text',text:'Done.'}])],runsFor(['c1','c2']),snapOf(name,false));
+    out[name]=document.querySelector('.summary-head').getAttribute('aria-expanded');
+  }
+  // Explicit chain-header choices still win, and the expanded default must remain expanded.
+  out.defaults=[];
+  for(const closeHeader of [false,true]){
+    const name='defaults-'+closeHeader;
+    setView({processDefault:'expanded'});
+    const items=[user,reply('a1',[readA]),result('c1','alpha')];
+    await expandFirst(name,items,runsFor(['c1']));
+    row('c1').click();
+    await until(()=>row('c1').getAttribute('aria-expanded')==='false');
+    if(closeHeader){
+      document.querySelector('.summary-head').click();
+      await until(()=>document.querySelector('.summary-head').getAttribute('aria-expanded')==='false');
+    }
+    await push([...items,reply('end',[{type:'text',text:'Done.'}])],runsFor(['c1']),snapOf(name,false));
+    out.defaults.push(document.querySelector('.summary-head').getAttribute('aria-expanded'));
+  }
   document.getElementById('boot').textContent='done '+JSON.stringify(out);
 }catch(error){
   document.getElementById('boot').textContent='done '+JSON.stringify({error:String((error&&error.message)||error),partial:out});
@@ -223,6 +302,22 @@ it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.lengt
 			// S5: the transcript read again.
 			expect(stats.s5.shown, "S5: row still expanded after the transcript was read again").toBe(true);
 			expect(stats.s5.lost, "S5: mutations that saw the row folded or gone").toBe(0);
+			for (const item of stats.autoFold) {
+				expect(item.summary, `${item.kind}: completion respects current expansion`).toBe(String(item.keepOpen));
+				if (item.keepOpen) expect(item.child, `${item.kind}: opened child stays expanded`).toBe("true");
+			}
+			expect(stats.twoOpen).toEqual({ summary: "true", remaining: true });
+			expect(stats.defaults, "expanded default and explicit chain-header fold remain respected").toEqual([
+				"true",
+				"false",
+			]);
+			for (const item of stats.merged) {
+				expect(item.count, `${item.kind}: completed blocks merged`).toBe(1);
+				expect(item.summary, `${item.kind}: merged chain stays expanded`).toBe("true");
+				expect(item.child, `${item.kind}: later expanded child survives merge`).toBe("true");
+			}
+			expect(stats["joined-close-false"], "closing the row releases its automatically opened group").toBe("false");
+			expect(stats["joined-close-true"], "a closed group masks its expanded children").toBe("false");
 		} finally {
 			await browser.shutdown();
 			await server.close();

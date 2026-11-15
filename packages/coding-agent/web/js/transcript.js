@@ -457,7 +457,9 @@ function ThinkingTail({ text }) {
 }
 
 function Thinking({ step }) {
-	const [open, setOpen] = useState(false);
+	const session = useStore((st) => st.snap?.session?.id);
+	const [chosen, setOpen] = useKeptChoice(`${session}|${step.key}`);
+	const open = chosen ?? false;
 	const buffered = useRafBufferedText(step.text, step.live);
 	const { title, body } = useMemo(() => splitThinking(buffered), [buffered]);
 	const { stable, tail } = useMemo(() => splitStableTail(body), [body]);
@@ -477,7 +479,9 @@ function Thinking({ step }) {
 
 function CustomStep({ step }) {
 	const item = step.item;
-	const [open, setOpen] = useState(false);
+	const session = useStore((st) => st.snap?.session?.id);
+	const [chosen, setOpen] = useKeptChoice(`${session}|${step.key}`);
+	const open = chosen ?? false;
 	const label = item.customType.replace(/[-_]/g, " ");
 	return html`<div class="thinking">
 		<button class="group-head" onClick=${() => setOpen(!open)} aria-expanded=${open}>
@@ -532,15 +536,27 @@ function currentActivity(turn, run) {
  * One foldable block of reasoning and tool calls. A turn has one block per stretch of work between the texts the model
  * wrote (see turnSegments); the last block carries the turn's state: working (glyph, current action, timer) or how it
  * ended. An earlier block says what it did. A block opens while output goes into it and folds when it is done, unless
- * the user opened or folded it, which then stays.
+ * its header was chosen manually or a step is still manually expanded.
  */
+function hasExpandedSteps(session, steps) {
+	return groupSteps(steps).some((entry) => {
+		const choice = keptChoice(`${session}|${entry.key}`);
+		if (entry.type !== "group") return choice === true;
+		const grouped = entry.actions.length > 1 || ["web", "edit", "write"].includes(entry.kind);
+		if (grouped && choice !== undefined) return choice;
+		return entry.actions.some((step) => keptChoice(`${session}|${step.key}`) === true);
+	});
+}
+
 function ProcessSummary({ turn, steps = turn.steps, stats = turn.stats, last = true, outcome, live: running, compacting, run, changeCount, duration, snapRun, defaultOpen }) {
-	const [open, setOpen] = useState(defaultOpen);
-	const interacted = useRef(false);
-	useEffect(() => { if (!interacted.current) setOpen(defaultOpen); }, [defaultOpen]);
-	// Opening or closing anything inside the block (a tool row, a group, reasoning) is the user reading it: when the
-	// model starts writing text or the turn ends, the block stays as they left it instead of folding under their cursor.
-	const touched = (event) => { if (event.type === "click" || event.key === "Enter" || event.key === " ") interacted.current = true; };
+	const session = useStore((st) => st.snap?.session?.id);
+	const [open, setOpen] = useState(() => defaultOpen || hasExpandedSteps(session, steps));
+	const headChosen = useRef(false);
+	// Read choices by step id, not old DOM: completion can merge several blocks into this one. A closed group masks
+	// its children, and a group opened automatically around a lone row does not itself count as a manual choice.
+	useLayoutEffect(() => {
+		if (!headChosen.current) setOpen(defaultOpen || hasExpandedSteps(session, steps));
+	}, [defaultOpen, session, steps]);
 	const subAgentState = useSubAgents();
 	// While the context is compacted the strip above the input shows it, with its own timer and Cancel: this row stays
 	// still (no working glyph, activity or timer) and is not drawn at all when the turn has no steps yet.
@@ -571,12 +587,12 @@ function ProcessSummary({ turn, steps = turn.steps, stats = turn.stats, last = t
 	// happening and the timer (no arrow, and no empty area under it).
 	if (!steps.length) return html`<div class=${`summary live o-${outcome}`}><div class="summary-head" role="status">${head}</div></div>`;
 	return html`<div class=${`summary ${live ? "live" : ""} o-${summary.outcome}`}>
-		<button class="summary-head" onClick=${() => { interacted.current = true; setOpen(!open); }} aria-expanded=${open} title=${`${label} · ${open ? t("Hide steps") : t("Show what the agent did")}`}>
+		<button class="summary-head" onClick=${() => { headChosen.current = true; setOpen(!open); }} aria-expanded=${open} title=${`${label} · ${open ? t("Hide steps") : t("Show what the agent did")}`}>
 			${head}
 			<span class="grow" />
 			<${Fold} />
 		</button>
-		<${Collapse} open=${open} keepMounted=${true}><div class="summary-body" onClickCapture=${touched} onKeyDownCapture=${touched}><${StepList} steps=${steps} /></div><//>
+		<${Collapse} open=${open} keepMounted=${true}><div class="summary-body"><${StepList} steps=${steps} /></div><//>
 	</div>`;
 }
 
