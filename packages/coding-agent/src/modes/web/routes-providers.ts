@@ -4,10 +4,8 @@
  * server: the browser only receives labels and the last four characters.
  */
 
-import { dirname, join } from "node:path";
 import type { AuthEvent, AuthInteraction, AuthPrompt } from "@myharness/ai";
 import { getSupportedThinkingLevels } from "@myharness/ai/compat";
-import { NebiusSetupError, NebiusSetupUseCase } from "../../application/use-cases/nebius-setup.ts";
 import { ProviderSettingsUseCase } from "../../application/use-cases/provider-settings.ts";
 import {
 	DEFAULT_IP_FAMILY,
@@ -25,6 +23,7 @@ import {
 	detectSpecifiedModels,
 	ProviderModelDiscoveryError,
 } from "../../providers/models/custom-provider-manager.ts";
+import { resolveEffortConfiguration } from "../../providers/models/effort-catalog.ts";
 import {
 	groupCredentialId,
 	type MergeCandidate,
@@ -32,8 +31,6 @@ import {
 	suggestProviderMerges,
 	toLayeredEntry,
 } from "../../providers/models/layers.ts";
-import { NEBIUS_API_KEYS_URL, NEBIUS_CONSOLE_URL, NEBIUS_PROVIDER_ID } from "../../providers/models/nebius-preset.ts";
-import { providerSpendLedger } from "../../providers/runtime/provider-spend.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import type { WebHost } from "./host.ts";
 import { HttpError, type WebHttpServer } from "./http-server.ts";
@@ -131,12 +128,7 @@ function restoreSecrets(incoming: ModelsJsonProvider, stored: ModelsJsonProvider
 	return copy;
 }
 
-export function registerProviderRoutes(
-	server: WebHttpServer,
-	host: WebHost,
-	hub?: WebHostHub,
-	options: { nebiusBaseUrl?: string } = {},
-): void {
+export function registerProviderRoutes(server: WebHttpServer, host: WebHost, hub?: WebHostHub): void {
 	const runtime = () => host.session.modelRuntime;
 	const manager = () => new CustomProviderManager(runtime().getModelsConfigPath());
 	const providerSettings = new ProviderSettingsUseCase({
@@ -504,11 +496,9 @@ export function registerProviderRoutes(
 	/** An entry that extends a provider an extension registered: its address also covers models the file does not list. */
 	const overlaysRegisteredProvider = (id: string) => runtime().getRegisteredProviderIds().includes(id);
 
-	/** A login, the ready-made Nebius entry and an extension's provider stay as they are: the layers do not apply to them. */
+	/** A login and an extension's provider stay as they are: the layers do not apply to them. */
 	const staysOutOfLayers = async (id: string) =>
-		id === NEBIUS_PROVIDER_ID ||
-		overlaysRegisteredProvider(id) ||
-		(await runtime().getProviderCredentialOverview(id)).hasOAuth;
+		overlaysRegisteredProvider(id) || (await runtime().getProviderCredentialOverview(id)).hasOAuth;
 
 	/** Entries that could be the same service as another. */
 	const mergeCandidates = async (): Promise<MergeCandidate[]> => {
@@ -669,14 +659,29 @@ export function registerProviderRoutes(
 		return { ok: true };
 	});
 
-	/**
-	 * Checks the models the user named (`modelIds`) and nothing else, with exactly what the edit form holds right now,
-	 * saved or not: API format, Base URL, authentication mode and a key that was just typed. Without a typed key the key
-	 * already stored for the provider being edited is used. It only runs when the user asks for it: the model list is a
-	 * free GET, and every thinking effort is tested with minimal real requests for these models (each level on its own,
-	 * an undecided answer is tried up to three more times). Nothing is written; the form applies the answer. A model list
-	 * that cannot be read is reported next to the result and does not stop the test.
-	 */
+	/** Local exact-model preset lookup and conservative interpretation of legacy configuration. No model requests. */
+	server.route("POST", "/api/providers/custom/effort-preset", ({ body }) => {
+		const payload = asObject(body);
+		if (typeof payload.modelId !== "string") return { preset: null };
+		const model =
+			payload.model && typeof payload.model === "object" && !Array.isArray(payload.model)
+				? (payload.model as Record<string, unknown>)
+				: {};
+		const result = resolveEffortConfiguration({
+			id: payload.modelId,
+			...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
+			...(model.thinkingLevelMode === "catalog" || model.thinkingLevelMode === "manual"
+				? { thinkingLevelMode: model.thinkingLevelMode }
+				: {}),
+			...(model.thinkingLevelMap &&
+			typeof model.thinkingLevelMap === "object" &&
+			!Array.isArray(model.thinkingLevelMap)
+				? { thinkingLevelMap: model.thinkingLevelMap }
+				: {}),
+		});
+		return { mode: result.mode, preset: result.preset ?? null };
+	});
+
 	server.route("POST", "/api/providers/custom/detect", async ({ body }) => {
 		const payload = asObject(body);
 		const baseUrl = typeof payload.baseUrl === "string" ? payload.baseUrl.trim() : "";
@@ -863,56 +868,6 @@ export function registerProviderRoutes(
 				const status = candidate.status;
 				return { slot: candidate.slotId, name: status.name, firstMessage: status.firstMessage, cwd: status.cwd };
 			});
-
-	// ---- Nebius Token Factory, ready-made (providers/models/nebius-preset.ts) ------------------------------
-	const nebiusSetup = new NebiusSetupUseCase({
-		getSession: () => host.session,
-		saveApiKey: (providerId, key) => saveFormProviderKey(providerId, "Token Factory", key),
-		deleteApiKey: (providerId, keyId) => runtime().deleteProviderApiKey(providerId, keyId),
-		refreshConversationNaming: () => host.refreshConversationNaming(),
-		refreshSessionHandoff: () => host.refreshSessionHandoff(),
-		baseUrl: options.nebiusBaseUrl,
-	});
-	const spendFile = () => {
-		const modelsPath = runtime().getModelsConfigPath();
-		return modelsPath ? join(dirname(modelsPath), "provider-spend.json") : undefined;
-	};
-
-	/** The Nebius card: whether it is set up, the console links and what this computer estimates it has spent there. */
-	server.route("GET", "/api/providers/nebius", async () => {
-		const entry = await manager()
-			.get(NEBIUS_PROVIDER_ID)
-			.catch(() => undefined);
-		const file = spendFile();
-		return {
-			id: NEBIUS_PROVIDER_ID,
-			configured: !!entry,
-			hasKey: entry
-				? !!(await runtime()
-						.checkAuth(NEBIUS_PROVIDER_ID)
-						.catch(() => undefined))
-				: false,
-			apiKeysUrl: NEBIUS_API_KEYS_URL,
-			consoleUrl: NEBIUS_CONSOLE_URL,
-			spend: file ? (providerSpendLedger(file).get(NEBIUS_PROVIDER_ID) ?? null) : null,
-		};
-	});
-
-	/** Paste a key (or reuse the saved one) and set everything up; see NebiusSetupUseCase. */
-	server.route("POST", "/api/providers/nebius/setup", async ({ body }) => {
-		const payload = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
-		const apiKey = typeof payload.apiKey === "string" ? payload.apiKey : undefined;
-		try {
-			const result = await nebiusSetup.setup({ apiKey });
-			host.broadcast("models_changed", {});
-			host.broadcast("settings_changed", {});
-			host.broadcast("usage", host.usage());
-			return { ok: true, ...result };
-		} catch (error) {
-			if (error instanceof NebiusSetupError) return { ok: false, code: error.code, message: error.message };
-			throw new HttpError(400, error instanceof Error ? error.message : String(error));
-		}
-	});
 
 	server.route("GET", "/api/providers/custom/usage", ({ url }) => {
 		const id = str(url.searchParams.get("id") ?? undefined, "id");

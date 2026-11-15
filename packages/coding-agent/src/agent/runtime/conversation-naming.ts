@@ -11,7 +11,7 @@
  */
 import type { SessionManager } from "../../session/manager/index.ts";
 import type { AgentSession } from "./agent-session.ts";
-import { resolveAssistantModel } from "./assistant-model.ts";
+import { resolveAssistantModel, withSupportedEffort } from "./assistant-model.ts";
 import { generateConversationTitle, gitCommitNamingText } from "./conversation-title.ts";
 
 export const CONVERSATION_NAMING_INTERVAL_MS = 10 * 60_000;
@@ -194,7 +194,7 @@ export class ConversationNaming {
 				modelRuntime: this.session.modelRuntime,
 				settingsManager: this.session.settingsManager,
 				model,
-				thinkingLevel: ref?.thinkingLevel,
+				thinkingLevel: ref && withSupportedEffort(ref, model).thinkingLevel,
 				currentTitle: this.session.sessionName,
 				sessionId: this.session.sessionManager.getSessionId(),
 				signal: controller.signal,

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  MyHarness 是装在你自己 Windows 电脑上的个人 AI，在你已经登录的网站里直接干活，记得你在意的事，聊天和定时任务在你的几台电脑之间同步，写代码也照样能做。装好就能用 Nebius Token Factory 上的 NVIDIA Nemotron 和 DeepSeek V4.1 Flash：粘贴一个 API Key，每项工作都配好模型。
+  MyHarness 是装在你自己 Windows 电脑上的个人 AI，在你已经登录的网站里直接干活，记得你在意的事，聊天和定时任务在你的几台电脑之间同步，写代码也照样能做。模型自己带：添加任何兼容 OpenAI、Anthropic、Gemini 或 Mistral 的 Provider，每项工作都可以配自己的模型。
 </p>
 
 <p align="center">
@@ -126,7 +126,7 @@ MyHarness 起初是一名计算机专业学生为解决这些问题给自己做�
 
 ### 多智能体并行
 
-- **子智能体分工。** 做调研或其他大任务时，助手会把任务拆给并行运行的子智能体（默认用 Nemotron 3 Ultra），你可以单独停止其中任何一个。更长的任务用分阶段的工作流一步步完成。
+- **子智能体分工。** 做调研或其他大任务时，助手会把任务拆给并行运行的子智能体，你可以单独停止其中任何一个。更长的任务用分阶段的工作流一步步完成。
 
 ### 日常使用体验
 
@@ -143,77 +143,22 @@ MyHarness 起初是一名计算机专业学生为解决这些问题给自己做�
 
 ### 模型与数据
 
-- **每项工作配自己的模型。** 子智能体、记忆、对话命名、翻译、识图、定时任务等辅助工作，都可以各自设置模型和思考强度，一个 Nebius Token Factory Key 就能全部配好。
-- **数据留在你的电脑上。** 界面只监听 `127.0.0.1`；安卓 App 有两种方式连到电脑：打开“手机连接”后在局域网里扫码配对，或者手机登录同一个 Google 账号后在任何网络下连接（连接信息、以及没有直连时的消息本身，都作为加密文件经你自己的云端硬盘传递；Google 的公共 STUN 服务器会看到两台设备的地址），每条消息都用这台手机自己的密钥加密。聊天、记忆、设置和 Key 都在 `%USERPROFILE%\.myharness`（从源码 checkout 运行时，聊天和记忆放在该 checkout 的 `data` 文件夹里），没有 MyHarness 服务器。模型请求只发给你选的 Provider（默认 Nebius Token Factory），同步走你自己的 Google Drive。同步没有端到端加密，只有浏览器的登录数据会在上传前用你的口令加密。
+- **每项工作配自己的模型。** 子智能体、记忆、对话命名、翻译、识图、定时任务等辅助工作，都可以各自设置模型和思考强度。
+- **数据留在你的电脑上。** 界面只监听 `127.0.0.1`；安卓 App 有两种方式连到电脑：打开“手机连接”后在局域网里扫码配对，或者手机登录同一个 Google 账号后在任何网络下连接（连接信息、以及没有直连时的消息本身，都作为加密文件经你自己的云端硬盘传递；Google 的公共 STUN 服务器会看到两台设备的地址），每条消息都用这台手机自己的密钥加密。聊天、记忆、设置和 Key 都在 `%USERPROFILE%\.myharness`（从源码 checkout 运行时，聊天和记忆放在该 checkout 的 `data` 文件夹里），没有 MyHarness 服务器。模型请求只发给你选的 Provider，同步走你自己的 Google Drive。同步没有端到端加密，只有浏览器的登录数据会在上传前用你的口令加密。
 
 ### 同样支持编程
 
 - **Coding 模式**在代码仓库里工作，有 Git、worktree、按轮次查看改动和子智能体。
 
-> 当前状态：在 Windows x64 上可用，桌面端和源码 checkout 两条路径都维护。Nebius Token Factory 已经内置（设置 → Providers → **Nebius Token Factory**：粘贴 Key，DeepSeek V4.1 Flash 和 Nemotron 模型按分工自动配好）；其他兼容 OpenAI、Anthropic、Gemini 或 Mistral 的 Provider 可以手动添加。已经验证过的边界写在 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
+> 当前状态：在 Windows x64 上可用，桌面端和源码 checkout 两条路径都维护。没有内置任何模型 Provider：兼容 OpenAI、Anthropic、Gemini 或 Mistral 的 Provider 都可以手动添加（设置 → Providers → **添加 Provider**）。已经验证过的边界写在 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
 
-## NVIDIA Nemotron on Nebius Token Factory
+## 每项工作配自己的模型
 
 ![每项工作配自己的模型：设置 → 智能体里为对话命名、自动记忆、子智能体、视觉助手等工作各选一个模型](packages/coding-agent/docs/images/readme-models.png)
 
-*设置 → 智能体。每项工作都可以换模型，默认分工见下表。*
+*设置 → 智能体。每项工作都可以换模型，并各有自己的思考强度。*
 
-内置的模型后端是 **[Nebius Token Factory](https://api.tokenfactory.nebius.com/v1/)**，提供 **NVIDIA Nemotron** 和 DeepSeek V4.1 Flash。设置 → Providers 一打开就是 **Nebius Token Factory**。点 **获取 API Key** 会在内置浏览器里打开 Token Factory 控制台；粘贴到网页上方细栏（或设置里）的 Key 会先读取账户的模型列表确认可用，再作为普通的 `openai-completions` Provider 写入 `models.json`，所有还没有自己模型的工作都会配上对应的模型：
-
-| 模型 | 负责 |
-|------|------|
-| DeepSeek V4.1 Flash 1017 | 主模型、提交说明（账户没有 DeepSeek 时由 Ultra 接手） |
-| Nemotron 3 Ultra | 子智能体、对话命名、翻译 |
-| Nemotron 3.5 Lightning | 压缩上下文、备用模型、自动记忆、交接摘要、书签用途、定时任务、工作副本命名、分支摘要 |
-| Nemotron 3.5 Super VL | 视觉助手（识图） |
-
-**为什么选 Token Factory。** Nebius Token Factory 很适合做个人助手的底座。一个兼容 OpenAI 的接口提供大量开源模型，一个 Key 就能给每项工作挑出性价比最高、最合适的模型，而每个 NVIDIA 模型都有自己最能发挥的位置：
-
-- **Nemotron 3 Ultra，负责深度思考：** 跑做调研、并行干活的子智能体，也负责对话命名和翻译。
-- **Nemotron 3.5 Lightning，负责快手活：** 承担一整天都在跑的大量零碎后台工作（记忆、定时任务、书签用途、摘要和压缩上下文）。
-- **Nemotron 3.5 Super VL，负责看：** 读截图和图片，把看到的内容报告给主模型。
-- **长任务放得下：** 每个内置模型的上下文窗口都约有一百万 token，请求和其他 Provider 走同一条兼容 OpenAI 的路径。
-
-主对话用 DeepSeek V4.1 Flash，因为测试中 Nemotron 模型当主智能体时调用工具有问题。不过它们响应快，正适合交给它们的子智能体、命名、翻译、后台工作和识图。主模型、子智能体和提交说明会设成所用模型最高的思考强度（DeepSeek 是 max，Ultra 是高）。每个 Nemotron 模型只提供 NVIDIA 为它写明的思考档位：Ultra 有关闭、中、高三档，Lightning 只有关闭和高；DeepSeek 有关闭、低、高和 max。
-
-Token Factory 没有余额查询接口，所以 Nebius 卡片提供控制台链接（查看余额、充值），显示这台电脑按模型标价估算的花费；请求因余额问题被拒（HTTP 402 或错误信息提到余额）时会明确说明是余额问题。
-
-![设置 → Providers 里的 Nebius Token Factory，可见余额链接和这台电脑估算的花费](packages/coding-agent/docs/images/nebius-provider-settings.png)
-
-<details>
-<summary>Model ID、上下文窗口和不用界面的配置方法</summary>
-
-| Model ID | 上下文 | 最大输出 | 由谁添加 |
-|----------|--------|----------|----------|
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 1,048,576 | 未公布（设为 65,536） | 内置配置和示例文件 |
-| `nvidia/Nemotron-3-Ultra-550b-a55b` | 1,048,576 | 65,536 | 内置配置和示例文件 |
-| `nvidia/Nemotron-3_5-Lightning` | 1,048,576 | 65,536 | 内置配置和示例文件 |
-| `nvidia/Nemotron-3.5-Super-VL` | 1,048,576 | 未公布（设为 4,096） | 内置配置和示例文件 |
-| `nvidia/nemotron-3-super-120b-a12b` | 262,144 | 65,536 | 只在示例文件里 |
-
-内置配置按账户模型列表里的写法取用每个 ID。旧版本还会添加 Nemotron 3 Nano 负责命名和翻译，现在改由 Ultra 负责，已经添加过的 Nano 保持不动。DeepSeek V4.1 Flash 1017 和 Super-VL 能接图像；视觉助手开着时（默认开启），图片交给 Super-VL，主模型收到它的识图报告。Nemotron 的文本模型都是纯文本。2026-10-25 实测：一张含随机字符串、红色圆形和蓝色矩形的生成图片，约 1.3 秒被正确读出。给它留几千个输出 token——它先推理再回答。
-
-![在模型选择器中挑选 Nemotron 模型，上方是 Nemotron 3.5 Lightning 刚完成的一次对话](packages/coding-agent/docs/images/nebius-model-picker.png)
-
-不用界面的话，同一个 Provider 也可以用一个文件配好：
-
-```powershell
-# 1. 复制现成的 Provider 配置
-Copy-Item packages\coding-agent\docs\examples\nebius-models.json "$env:USERPROFILE\.myharness\agent\models.json"
-
-# 2. 通过环境变量提供 Token Factory key
-$env:NEBIUS_TOKEN_FACTORY_API_KEY = "<your-token-factory-key>"
-
-# 3. 启动后在 /model 里选择 “Nemotron 3 Ultra”
-.\dev-desktop.cmd
-```
-
-也可以在设置 → **Providers** → **添加 Provider** 中手动创建：Base URL 填 `https://api.tokenfactory.nebius.com/v1/`，API type 选 OpenAI Chat Completions。示例里的纯文本模型声明 `text` 输入，只提供各自写明的 thinking 档位，通过 `reasoning_effort` 发送（Ultra：off / medium / high；Super：off / low / high；Lightning：off / high；`off` 发送为 `none`）；Super-VL 声明 `text` 和 `image` 输入，不发送 `reasoning_effort`，始终会推理。
-
-</details>
-
-- 完整配置、验证步骤和限制：[NVIDIA Nemotron on Nebius Token Factory](packages/coding-agent/docs/nebius-token-factory.md)。
-- 可直接复制的配置：[`examples/nebius-models.json`](packages/coding-agent/docs/examples/nebius-models.json)。
+没有内置任何模型 Provider。先在设置 → **Providers** → **添加 Provider** 里添加一个（见 [Providers](packages/coding-agent/docs/providers.md)），再在输入框里选主模型，需要的话在设置 → 智能体里给各项辅助工作单独选模型。
 
 ## 记忆、用户画像与多端同步
 
@@ -236,7 +181,7 @@ $env:NEBIUS_TOKEN_FACTORY_API_KEY = "<your-token-factory-key>"
 - Windows 10 或 11，x64；
 - Node.js `>=22.19.0`；
 - 如果要在 Windows 使用 `bash` tool，需要安装 Git for Windows；
-- 一个模型 Provider 的 Key：Nebius Token Factory 已内置，其他 Provider 可以手动添加。
+- 一个模型 Provider 的 Key：没有内置 Provider，需要手动添加。
 
 ```powershell
 git clone https://github.com/h3327725338-star/MyHarness.git
@@ -248,7 +193,7 @@ npm.cmd run build
 
 `dev-desktop.cmd` 会构建并启动 Electron 桌面端，这是日常使用 MyHarness 的方式。需要在命令行直接跑源码时，在仓库根目录执行 `node --import ./scripts/dev-fast-loader.mjs ./packages/coding-agent/src/web.ts`；它不会打开浏览器，会在日志中打印实际地址 `MyHarness Web UI: <url>`。
 
-启动后，开始页面会链接到内置的 Nebius Token Factory 配置（设置 → Providers）。在那里粘贴 Token Factory 的 Key，DeepSeek V4.1 Flash 和 Nemotron 模型就配好了。其他 Provider 的说明见 [Providers](packages/coding-agent/docs/providers.md) 和 [Settings](packages/coding-agent/docs/settings.md)。
+启动后，开始页面会链接到设置 → Providers，在那里添加 Provider。Provider 的说明见 [Providers](packages/coding-agent/docs/providers.md) 和 [Settings](packages/coding-agent/docs/settings.md)。
 
 没有 Provider 凭据时，可以先检查 Web 源码入口是否能够启动：
 
@@ -270,7 +215,7 @@ node --import ./scripts/dev-fast-loader.mjs ./packages/coding-agent/src/web.ts -
   <img src="packages/coding-agent/docs/images/readme-eval-workflows.png" alt="核心工作流给出正确结果的次数：看图 15 次中 15 次；已登录网站任务 3 次中 3 次、3 次中 3 次、3 次中 2 次；把人机验证交给真人 3 次中 3 次；定时任务 3 次中 3 次、3 次中 2 次、3 次中 2 次、6 次中 6 次；子智能体报告 5 次中 4 次；新对话里的记忆 60 题中 55 题、60 题中 56 题、24 题中 24 题。" width="640">
 </p>
 
-[Judge testing guide](docs/JUDGE_TESTING.md) 写了“安装或从源码构建”、如何挂上 Nebius Token Factory 凭据、五分钟测试脚本、源码该看哪里，以及已知限制。
+[Judge testing guide](docs/JUDGE_TESTING.md) 写了“安装或从源码构建”、如何添加评委用的 Provider、五分钟测试脚本、源码该看哪里，以及已知限制。
 
 ## 给开发者
 
@@ -303,7 +248,6 @@ node --import ./scripts/dev-fast-loader.mjs ./packages/coding-agent/src/web.ts -
 - [Quickstart](packages/coding-agent/docs/quickstart.md)
 - [使用说明与 Web 启动](packages/coding-agent/docs/usage.md)
 - [Provider 与 model](packages/coding-agent/docs/providers.md)
-- [NVIDIA Nemotron on Nebius Token Factory](packages/coding-agent/docs/nebius-token-factory.md)
 - [Google Drive sync](packages/coding-agent/docs/google-drive-sync.md)
 - [Windows 设置](packages/coding-agent/docs/windows.md)
 - [当前项目状态与验证边界](PROJECT_STATUS.md)

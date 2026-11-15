@@ -9,7 +9,7 @@
 import type { Agent, ThinkingLevel } from "@myharness/agent-core";
 import { clampThinkingLevel, contentText } from "@myharness/ai";
 import type { Model, Usage } from "@myharness/ai/compat";
-import { resolveAssistantModel } from "../../agent/runtime/assistant-model.ts";
+import { resolveAssistantModel, withSupportedEffort } from "../../agent/runtime/assistant-model.ts";
 import type { SettingsManager } from "../../config/settings/index.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import type { BranchSummaryEntry, SessionEntry } from "../../session/types.ts";
@@ -105,7 +105,7 @@ export function resolveBranchSummaryModel(host: TreeNavigationHost): {
 	});
 	const selected = ref ? host.findBranchSummaryModel?.(ref.provider, ref.model) : undefined;
 	if (!selected) throw new Error(`Branch summary model unavailable: ${configured.provider}/${configured.model}`);
-	return { model: selected, thinkingLevel: clampThinkingLevel(selected, ref!.thinkingLevel) as ThinkingLevel };
+	return { model: selected, thinkingLevel: withSupportedEffort(ref!, selected).thinkingLevel };
 }
 
 /**

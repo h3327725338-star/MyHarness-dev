@@ -4,6 +4,7 @@ import type { ThinkingLevelMap } from "@myharness/ai";
 import { stripJsonComments } from "../../utils/json.ts";
 import type { ModelsJsonModel, ModelsJsonProvider, ModelsJsonProviderGroup } from "./config.ts";
 import { ModelConfig } from "./config.ts";
+import { resolveEffortPreset } from "./effort-catalog.ts";
 import { newGroupId, resolveProviderLayers, withGroupValues } from "./layers.ts";
 import { resolveThinkingCapability, type ThinkingSource } from "./thinking-capability.ts";
 
@@ -814,7 +815,9 @@ export class CustomProviderManager {
 		// levels (catalog or official documentation); an unconfirmed capability never overwrites anything.
 		const updatedModels = existingModels.map((existing) => {
 			const found = discoveredById.get(existing.id);
-			if (!found) return existing;
+			// Only a manual override the user chose is left alone. An older entry without a mode keeps being brought in
+			// line with what the sources state, as before.
+			if (!found || existing.thinkingLevelMode === "manual") return existing;
 			if (found.thinkingSource === "official" && found.thinkingLevelMap) {
 				const merged = mergeOfficialEffort(existing, found.thinkingLevelMap, found.thinkingLevelAliases);
 				if (merged === existing) return existing;
@@ -841,13 +844,24 @@ export class CustomProviderManager {
 			const id = model.id.trim();
 			if (!id || seen.has(id)) continue;
 			seen.add(id);
+			// The built-in table states the vendor's levels for this exact model. A model list that says "does not reason"
+			// (relays often leave the capability out) does not outweigh it, so such a model starts on the preset. The two
+			// legacy fields are written as well, as the form does, for a version that does not know `thinkingLevelMode`.
+			const preset = resolveEffortPreset(id);
 			additions.push({
 				id,
 				...(model.name.trim() && model.name.trim() !== id ? { name: model.name.trim() } : {}),
 				api,
-				...(model.reasoning !== undefined ? { reasoning: model.reasoning } : {}),
-				...(model.reasoning === true && model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-				...(model.thinkingLevelAliases ? { thinkingLevelAliases: model.thinkingLevelAliases } : {}),
+				thinkingLevelMode: model.reasoning === false && !preset ? "manual" : "catalog",
+				...(preset
+					? { reasoning: true, thinkingLevelMap: preset.thinkingLevelMap }
+					: {
+							...(model.reasoning !== undefined ? { reasoning: model.reasoning } : {}),
+							...(model.reasoning === true && model.thinkingLevelMap
+								? { thinkingLevelMap: model.thinkingLevelMap }
+								: {}),
+							...(model.thinkingLevelAliases ? { thinkingLevelAliases: model.thinkingLevelAliases } : {}),
+						}),
 			});
 		}
 

@@ -10,21 +10,22 @@ works on every machine. What has not been run is listed under
 MyHarness is **actively developed and usable on Windows x64**. The maintained
 paths are the Windows desktop app (Electron plus a loopback-only Web UI) and a
 source checkout of the same code. The `@myharness/ai` Provider catalog is empty
-by design; the app offers Nebius Token Factory ready-made, so one Token Factory
-API key (or another Provider configured by hand) is needed before the first
+by design and no Provider is built in, so a Provider configured by hand
+(Settings → Providers or `models.json`) is needed before the first
 model-backed session. No credential is stored in this repository.
 
 ## Verified in real use
 
 The maintainer uses MyHarness every day and has tested it on at least four
 Windows PCs, including PCs set up from the installer. As of October 2026 the
-following has been run on them for real, with real accounts and a real Nebius
-Token Factory key, and works stably in that use:
+following has been run on them for real, with real accounts and a real model
+Provider key (Nebius Token Factory, which was built in at the time and is now
+added by hand like any other Provider), and works stably in that use:
 
 - **Install and models.** The Windows installer (NSIS, not code-signed) on a
-  fresh PC; the one-key Token Factory setup; DeepSeek V4.1 Flash 1017 as the
-  main chat, including tool calls and its thinking levels; NVIDIA Nemotron
-  models for sub-agents, naming, translation, background jobs and images.
+  fresh PC; DeepSeek V4.1 Flash 1017 as the main chat, including tool calls and
+  its thinking levels; NVIDIA Nemotron models for sub-agents, naming,
+  translation, background jobs and images.
 - **Built-in browser.** The agent works in sites the user is signed into: it
   reads full pages, clicks and types, uses bookmarks and their purpose notes,
   and hands control back at sign-in pages and human checks.
@@ -85,10 +86,8 @@ cause, are in the [evaluation](docs/evaluation/README.md).
 ## Defaults and optional parts
 
 - Sub-agents (`agent`, `workflow`, `ultracode`, `agent_tasks`) are off in the
-  factory settings. The Nebius Token Factory one-key setup, which is the normal
-  first-run path, turns them on with Nemotron 3 Ultra unless the user turned
-  them off first; with a Provider configured by hand they stay off until the
-  user turns them on. Their child Bash guard is not a security sandbox.
+  factory settings and stay off until the user turns them on. Their child Bash
+  guard is not a security sandbox.
 - Web Search is on by default with Tavily API and Google. Without a user key Tavily is called through its free
   keyless access (`X-Tavily-Access-Mode: keyless`, rate limited by Tavily); a free key adds 1,000 searches a month.
   Optional selections include Bing, DuckDuckGo and Brave. Google/Bing use lightweight HTTP first and may
@@ -105,10 +104,8 @@ cause, are in the [evaluation](docs/evaluation/README.md).
 
 ## Current limits
 
-- Token Factory's real low-balance error has not been seen, because the
-  maintainer's balance has never run out, and how far each thinking level of
-  DeepSeek V4.1 Flash 1017 changes the amount of reasoning has not been measured.
-  The setup's automated tests run against a local stub endpoint.
+- How far each thinking level of DeepSeek V4.1 Flash 1017 changes the amount of
+  reasoning has not been measured.
 - Running out of Google Drive quota has not come up in real use.
 - A fresh Linux/macOS checkout was not run in this Windows audit.
 - The local public-release validation covered the Windows Coding Agent suite and

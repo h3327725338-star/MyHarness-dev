@@ -3063,12 +3063,13 @@ describe("Web UI: the three layers of a provider", () => {
 		expect(rows[0].group).toBeNull();
 	});
 
-	it("applies the layers only to entries with the layered rule, and never to a login or Nebius", () => {
+	it("applies the layers only to entries with the layered rule, and never to a login", () => {
 		const layered = { config: { layered: true } };
 		expect(models.isLayeredMember({ provider: providerOf("a"), entry: layered })).toBe(true);
 		expect(models.isLayeredMember({ provider: providerOf("a"), entry: { config: {} } })).toBe(false);
 		expect(models.isLayeredMember({ provider: providerOf("a"), entry: undefined })).toBe(false);
-		expect(models.isLayeredMember({ provider: providerOf("nebius"), entry: layered })).toBe(false);
+		// No provider id is special: a custom provider that happens to be called nebius is layered like any other.
+		expect(models.isLayeredMember({ provider: providerOf("nebius"), entry: layered })).toBe(true);
 		expect(models.isLayeredMember({ provider: providerOf("a", { supportsOAuth: true }), entry: layered })).toBe(
 			false,
 		);

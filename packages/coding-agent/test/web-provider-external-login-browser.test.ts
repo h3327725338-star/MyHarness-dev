@@ -94,7 +94,6 @@ it.skipIf(process.env.MYHARNESS_TARGETED_BROWSER_E2E !== "1" || !installed.lengt
 				mergeSuggestions: [],
 				hiddenPlaceholder: "",
 			}));
-			server.route("GET", "/api/providers/nebius", () => ({ configured: false, spend: null }));
 			server.route("GET", "/api/models", () => {
 				reads.push({ resource: "models", check: checkBodies.length, configured });
 				return { models: configured ? [model] : [] };

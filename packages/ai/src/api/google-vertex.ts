@@ -335,6 +335,15 @@ export const streamSimple: StreamFunction<"google-vertex", SimpleStreamOptions> 
 	const effort = (clampedReasoning === "off" ? "high" : clampedReasoning) as ClampedThinkingLevel;
 	const geminiModel = model as unknown as Model<"google-generative-ai">;
 
+	// A level the model's map spells out is sent as written (Gemini 4's `xhigh`, 3.1 Pro's `medium`). Levels the map
+	// leaves unset keep the per-family rules below, so older entries and budget-based models are sent what they were.
+	const mapped = clampedReasoning === "off" ? undefined : model.thinkingLevelMap?.[clampedReasoning];
+	if (typeof mapped === "string" && model.id.replace(/^models\//u, "").startsWith("gemini-")) {
+		return stream(model, context, {
+			...base,
+			thinking: { enabled: true, level: mapped.toUpperCase() as GoogleThinkingLevel },
+		});
+	}
 	if (isGemini3ProModel(geminiModel) || isGemini3FlashModel(geminiModel)) {
 		return stream(model, context, {
 			...base,
@@ -499,7 +508,9 @@ function buildParams(
 	if (options.thinking?.enabled && model.reasoning) {
 		const thinkingConfig: ThinkingConfig = { includeThoughts: true };
 		if (options.thinking.level !== undefined) {
-			thinkingConfig.thinkingLevel = THINKING_LEVEL_MAP[options.thinking.level];
+			// A level newer than the SDK's enum (Gemini 4's XHIGH) is sent by its name.
+			thinkingConfig.thinkingLevel =
+				THINKING_LEVEL_MAP[options.thinking.level] ?? (options.thinking.level as unknown as ThinkingLevel);
 		} else if (options.thinking.budgetTokens !== undefined) {
 			thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
 		}

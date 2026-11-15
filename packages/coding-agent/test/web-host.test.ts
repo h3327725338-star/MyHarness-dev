@@ -876,12 +876,7 @@ describe("Web host (real runtime with a faux provider)", () => {
 	});
 
 	async function start(
-		options: {
-			authFile?: boolean;
-			nebiusBaseUrl?: string;
-			runtimePerChat?: boolean;
-			extensionFactories?: InlineExtension[];
-		} = {},
+		options: { authFile?: boolean; runtimePerChat?: boolean; extensionFactories?: InlineExtension[] } = {},
 	): Promise<Fixture> {
 		const project = tempDir("myharness-web-project");
 		const dataRoot = tempDir("myharness-web-data");
@@ -980,7 +975,7 @@ describe("Web host (real runtime with a faux provider)", () => {
 		registerSettingsRoutes(server, host);
 		registerTranslateRoutes(server, host, () => agentDir);
 		// An undecided thinking-effort test is tried again; the tests do not wait between the attempts.
-		registerProviderRoutes(server, host, hub, { nebiusBaseUrl: options.nebiusBaseUrl });
+		registerProviderRoutes(server, host, hub);
 		await hub.addPrimary(runtimeHost, dialogs);
 		const address = await server.listen(0);
 		cleanups.push(() => server.close());
@@ -1180,6 +1175,98 @@ describe("Web host (real runtime with a faux provider)", () => {
 		const after = await toolState();
 		expect(after.follow.active).toBe(followOn);
 		expect(after.manual.active).toBe(true);
+	});
+
+	it("announces model_changed with the model, its efforts and the level in use, whichever way the model changes", async () => {
+		const fx = await start();
+		const model = fx.faux.getModel();
+		const entry = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
+			id,
+			name,
+			api: model.api,
+			reasoning: true,
+			input: model.input,
+			cost: model.cost,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			baseUrl: model.baseUrl,
+			...extra,
+		});
+		const runtime = fx.hub.host.session.modelRuntime;
+		runtime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				entry("deep", "Deep", { defaultThinkingLevel: "medium" }),
+				// "high" is not offered here: a switch from it has to move the level.
+				entry("short", "Short", { thinkingLevelMap: { high: null } }),
+				entry("plain", "Plain", { reasoning: false }),
+			],
+		});
+		const changes = () => fx.events.filter((event) => event.event === "model_changed");
+		/** The event number `count` has arrived, and says exactly what the chat's state says (the same shape). */
+		const announced = async (count: number) => {
+			await vi.waitFor(() => expect(changes()).toHaveLength(count), { timeout: 5_000 });
+			const snapshot = await fx.get("/api/state");
+			const { slot, ...data } = changes()[count - 1]!.data;
+			expect(slot).toBe(snapshot.slot);
+			expect(data).toEqual({ model: snapshot.model, thinking: snapshot.thinking });
+			return data;
+		};
+		expect(changes()).toHaveLength(0);
+
+		// The model menu (POST /api/model).
+		await fx.post("/api/model", { provider: model.provider, id: "deep" });
+		const deep = await announced(1);
+		expect(deep.model).toMatchObject({
+			provider: model.provider,
+			id: "deep",
+			name: "Deep",
+			reasoning: true,
+			thinkingLevels: ["off", "minimal", "low", "medium", "high"],
+			defaultThinkingLevel: "medium",
+		});
+		expect(deep.thinking).toMatchObject({ supported: true, levels: ["off", "minimal", "low", "medium", "high"] });
+
+		// A switch that moves the level: the level event comes first, and this one already carries the moved level.
+		await fx.post("/api/thinking", { level: "high" });
+		await fx.post("/api/model", { provider: model.provider, id: "short" });
+		const short = await announced(2);
+		expect(short.model).toMatchObject({ id: "short", thinkingLevels: ["off", "minimal", "low", "medium"] });
+		expect(short.thinking).toEqual({ level: "medium", levels: ["off", "minimal", "low", "medium"], supported: true });
+		const levelAt = fx.events.map((event) => event.event).lastIndexOf("thinking_level");
+		expect(levelAt).toBeGreaterThan(-1);
+		expect(fx.events[levelAt]!.data.level).toBe("medium");
+		expect(levelAt).toBeLessThan(fx.events.indexOf(changes()[1]!));
+
+		// Cycling (POST /api/model/cycle).
+		expect((await fx.post("/api/model/cycle", {})).changed).toBe(true);
+		const cycled = await announced(3);
+		expect(cycled.model?.id).not.toBe("short");
+
+		// A model that cannot reason has no effort to choose.
+		await fx.post("/api/model", { provider: model.provider, id: "plain" });
+		const plain = await announced(4);
+		expect(plain.model).toMatchObject({ id: "plain", reasoning: false });
+		expect(plain.thinking).toMatchObject({ supported: false, levels: ["off"] });
+
+		// The fallback model takes over for a run (and the main model comes back): same controller path, no route.
+		await fx.hub.host.session.useModelInThisSession(runtime.getModel(model.provider, "deep")!, "low");
+		const fallback = await announced(5);
+		expect(fallback.model?.id).toBe("deep");
+		expect(fallback.thinking.level).toBe("low");
+
+		// A refused switch changes nothing and says nothing.
+		await expect(fx.post("/api/model", { provider: model.provider, id: "nope" })).rejects.toThrow("404");
+		expect(changes()).toHaveLength(5);
+
+		// Another chat takes the slot's place: it may run on another model, so the page is told again.
+		const replaced = fx.events.length;
+		await fx.hub.host.runtimeHost.newSession();
+		await announced(6);
+		expect(fx.events.slice(replaced).map((event) => event.event)).toEqual(
+			expect.arrayContaining(["session_replaced", "model_changed"]),
+		);
 	});
 
 	it("archives and restores a saved chat, then physically deletes it and resets the active view", async () => {
@@ -3618,121 +3705,64 @@ describe("Web host (real runtime with a faux provider)", () => {
 		);
 	});
 
-	it("sets up Nebius Token Factory from one pasted key and gives each unset job its model", async () => {
-		// Token Factory's model list, as the account sees it: Nano (which no job uses any more) and one model nobody asked for.
-		const nebius = await startEndpoint((req, res) => {
-			if (req.headers.authorization !== "Bearer nb-good") {
-				res.statusCode = 401;
-				res.end('{"detail":"Invalid API key"}');
-				return;
-			}
-			res.setHeader("content-type", "application/json");
-			res.end(
-				JSON.stringify({
-					data: [
-						{ id: "deepseek-ai/DeepSeek-V4.1-Flash-1017" },
-						{ id: "nvidia/Nemotron-3-Ultra-550b-a55b" },
-						{ id: "nvidia/Nemotron-3_5-Lightning" },
-						{ id: "nvidia/Nemotron-3.5-Super-VL" },
-						{ id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B" },
-						{ id: "zai-org/GLM-5.3-Flash" },
-					],
-				}),
-			);
-		});
-		const fx = await start({ nebiusBaseUrl: nebius.baseUrl });
-		const mainBefore = fx.faux.getModel();
-
-		expect(await fx.get("/api/providers/nebius")).toMatchObject({
-			configured: false,
-			hasKey: false,
-			apiKeysUrl: "https://tokenfactory.nebius.com/project/api-keys",
-			consoleUrl: "https://tokenfactory.nebius.com/",
-			spend: null,
-		});
-		// Without a key there is nothing to check; a refused key writes nothing.
-		expect(await fx.post("/api/providers/nebius/setup", {})).toMatchObject({ ok: false, code: "missing_key" });
-		expect(await fx.post("/api/providers/nebius/setup", { apiKey: "nb-wrong" })).toMatchObject({
-			ok: false,
-			code: "rejected_key",
-		});
-		expect((await fx.get("/api/providers/custom")).providers).toEqual([]);
-
-		const result = await fx.post("/api/providers/nebius/setup", { apiKey: " nb-good " });
-		expect(result).toMatchObject({ ok: true, missing: [], listError: null });
-		expect(result.models.map((m: any) => [m.slot, m.id])).toEqual([
-			["flash", "deepseek-ai/DeepSeek-V4.1-Flash-1017"],
-			["ultra", "nvidia/Nemotron-3-Ultra-550b-a55b"],
-			["lightning", "nvidia/Nemotron-3_5-Lightning"],
-			["vision", "nvidia/Nemotron-3.5-Super-VL"],
-		]);
-		// The faux model already works, so the main model stays; every helper job had no model and gets one.
-		expect(result.kept).toEqual(["main"]);
-		expect(result.assigned).toEqual(
-			expect.arrayContaining(["compactionModel", "subAgent", "conversationNaming", "visionAssistant"]),
-		);
-		// Sub-agents and the fallback were never touched, so they are turned on (the vision assistant is on by default);
-		// naming was turned off by the user and stays off.
-		expect(result.turnedOn).toEqual(expect.arrayContaining(["subAgent", "fallbackModel"]));
-		expect(result.turnedOn).not.toContain("conversationNaming");
-
-		const custom = await fx.get("/api/providers/custom");
-		const entry = custom.providers.find((p: any) => p.id === "nebius");
-		expect(entry.config).toMatchObject({
+	it("reads a nebius entry left in models.json as an ordinary custom provider and keeps it as it is", async () => {
+		const fx = await start();
+		const modelsPath = join(process.env.MYHARNESS_CODING_AGENT_DIR as string, "models.json");
+		// What a one-key setup of an earlier version wrote. Nothing upgrades it on read any more (cached input at $0 and the
+		// level map stay as they are), and no preset route exists; the entry is simply one more custom provider.
+		const leftover = {
 			name: "Nebius Token Factory",
-			baseUrl: nebius.baseUrl,
+			baseUrl: "https://api.tokenfactory.nebius.com/v1/",
 			api: "openai-completions",
+			models: [
+				{
+					id: "nvidia/Nemotron-3-Ultra-550b-a55b",
+					name: "Nemotron 3 Ultra",
+					reasoning: true,
+					input: ["text"],
+					contextWindow: 1048576,
+					maxTokens: 65536,
+					cost: { input: 1, output: 3, cacheRead: 0, cacheWrite: 0, currency: "USD" },
+					compat: { supportsReasoningEffort: true },
+					thinkingLevelMap: { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high" },
+				},
+			],
+		};
+		writeFileSync(modelsPath, JSON.stringify({ providers: { nebius: leftover } }));
+		// Saving any provider makes the runtime read models.json again.
+		await fx.post("/api/providers/custom/save", {
+			id: "other",
+			config: {
+				name: "Other",
+				baseUrl: "http://127.0.0.1:9/v1",
+				api: "openai-completions",
+				models: [{ id: "m1" }],
+			},
 		});
-		expect(entry.config.models).toHaveLength(4);
-		expect(JSON.stringify(custom)).not.toContain("nb-good");
-		const listed = (await fx.get("/api/providers")).providers.find((p: any) => p.id === "nebius");
-		expect(listed).toMatchObject({ configured: true, enabled: true, modelCount: 4 });
 
-		const settings = (await fx.get("/api/settings")).items as Array<{ id: string; value: any }>;
-		const value = (id: string) => settings.find((s) => s.id === id)?.value;
-		expect(value("compactionModel")).toMatchObject({ provider: "nebius", model: "nvidia/Nemotron-3_5-Lightning" });
-		// Compaction keeps the provider's default thinking; sub-agents and commit descriptions think as hard as they can.
-		expect(value("compactionModel").thinkingLevel).toBeUndefined();
-		expect(value("subAgent")).toMatchObject({
-			provider: "nebius",
-			model: "nvidia/Nemotron-3-Ultra-550b-a55b",
-			thinkingLevel: "high",
+		const listed = await fx.get("/api/providers");
+		expect(listed.error ?? null).toBeNull();
+		expect(listed.providers.find((p: any) => p.id === "nebius")).toMatchObject({
+			name: "Nebius Token Factory",
+			custom: true,
 			enabled: true,
+			modelCount: 1,
 		});
-		expect(value("commitDescription")).toMatchObject({
-			provider: "nebius",
-			model: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-			thinkingLevel: "max",
-		});
-		expect(value("conversationNaming")).toMatchObject({
-			provider: "nebius",
-			model: "nvidia/Nemotron-3-Ultra-550b-a55b",
-			enabled: false,
-		});
-		expect(value("translation")).toMatchObject({
-			provider: "nebius",
-			model: "nvidia/Nemotron-3-Ultra-550b-a55b",
-		});
-		expect(value("visionAssistant")).toMatchObject({
-			provider: "nebius",
-			model: "nvidia/Nemotron-3.5-Super-VL",
-			enabled: true,
-		});
-		expect(fx.hub.host.session.model?.id).toBe(mainBefore.id);
-		// A new chat starts a new runtime, which checks the vision model's provider: the assistant stays on.
-		const fresh = await fx.post("/api/sessions/new", { mode: "general" });
-		expect(fresh.created).toBe(true);
-		const afterRestart = (await fx.get("/api/settings")).items as Array<{ id: string; value: any }>;
-		expect(afterRestart.find((s) => s.id === "visionAssistant")?.value).toMatchObject({ enabled: true });
+		// The layers apply to it like to any other custom provider (they never did to the preset entry).
+		const custom = (await fx.get("/api/providers/custom")).providers.find((p: any) => p.id === "nebius");
+		expect(custom.config).toMatchObject({ name: "Nebius Token Factory", layered: true });
+		// The file still holds every field of the entry as it was.
+		const stored = JSON.parse(readFileSync(modelsPath, "utf8")).providers.nebius;
+		expect(stored).toMatchObject({ name: leftover.name, baseUrl: leftover.baseUrl, api: leftover.api });
+		expect(stored.models).toEqual(leftover.models);
 
-		// Again, with the saved key: nothing is added twice and every job keeps what it has.
-		const again = await fx.post("/api/providers/nebius/setup", {});
-		expect(again).toMatchObject({ ok: true, assigned: [], turnedOn: [] });
-		expect(
-			(await fx.get("/api/providers/custom")).providers.find((p: any) => p.id === "nebius").config.models,
-		).toHaveLength(4);
-		expect(await fx.get("/api/providers/nebius")).toMatchObject({ configured: true, hasKey: true });
-		expect(nebius.requests.every((r) => r.url === "/v1/models")).toBe(true);
+		// The preset's routes are gone.
+		await expect(fx.get("/api/providers/nebius")).rejects.toThrow(/^404/);
+		await expect(fx.post("/api/providers/nebius/setup", { apiKey: "k" })).rejects.toThrow(/^404/);
+
+		// It is deleted like any other provider, and only that entry goes.
+		await fx.post("/api/providers/custom/delete", { id: "nebius" });
+		expect((await fx.get("/api/providers/custom")).providers.map((p: any) => p.id)).toEqual(["other"]);
 	});
 
 	it("keeps a key typed in the provider form, reports the provider as configured and takes the same key again", async () => {

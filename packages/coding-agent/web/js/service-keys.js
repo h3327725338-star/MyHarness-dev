@@ -1,14 +1,12 @@
-// Getting an API key for a service MyHarness offers ready-made (Tavily for web search, Nebius Token Factory for the
-// NVIDIA Nemotron models): the service's key page opens in a website tab of the built-in browser, and a strip above that
-// page takes the key, so it never has to be carried back to Settings. Without the built-in browser (the plain web page,
-// or links set to open in the system browser) the page opens in the system browser and the key goes into Settings.
+// Getting an API key for a service MyHarness offers ready-made (Tavily for web search): the service's key page opens
+// in a website tab of the built-in browser, and a strip above that page takes the key, so it never has to be carried
+// back to Settings. Without the built-in browser (the plain web page, or links set to open in the system browser) the
+// page opens in the system browser and the key goes into Settings.
 import { html, Icon, Spinner, useEffect, useState } from "./ui.js";
-import { api, loadModels, loadProviders, loadSettings, post, setView, state, toast } from "./store.js";
+import { loadSettings, post, setView, state, toast } from "./store.js";
 import { actions } from "./actions.js";
 import { builtinBrowserAvailable, linkTargetOf, openSystemLink } from "./link-target.js";
 import { serverText, t } from "./i18n.js";
-
-const NEBIUS_SLOT_NAMES = { flash: "DeepSeek V4.1 Flash", ultra: "Nemotron 3 Ultra", lightning: "Nemotron 3.5 Lightning", nano: "Nemotron 3 Nano", vision: "Nemotron 3.5 Super VL" };
 
 /** What each service needs: where its keys are made, how a pasted key is saved, and what to say once it is. */
 export const KEY_SERVICES = {
@@ -23,30 +21,7 @@ export const KEY_SERVICES = {
 			return t("Web search now uses your Tavily key.");
 		},
 	},
-	nebius: {
-		name: "Nebius Token Factory",
-		url: "https://tokenfactory.nebius.com/project/api-keys",
-		hint: "Sign in, create an API key, then paste it here. The NVIDIA Nemotron models are set up for you.",
-		section: "providers",
-		provider: "nebius",
-		async save(key) {
-			const result = await post("/api/providers/nebius/setup", { apiKey: key });
-			if (!result?.ok) throw new Error(serverText(result?.message, t("The key could not be saved.")));
-			await Promise.all([loadProviders(), loadSettings()]);
-			loadModels();
-			return nebiusSummary(result);
-		},
-	},
 };
-
-/** One line about a Nebius setup: the models found, and how many jobs got one. */
-export function nebiusSummary(result) {
-	const models = (result.models || []).map((model) => NEBIUS_SLOT_NAMES[model.slot] || model.name).join(", ");
-	const jobs = (result.assigned || []).length;
-	return jobs
-		? t("Ready: {models}. {count} jobs now use them.", { models, count: jobs })
-		: t("Ready: {models}. Every job keeps the model you set.", { models });
-}
 
 // Website tabs that were opened to get a key, and for which service. Only these show the strip.
 const keyTabs = new Map();
@@ -105,7 +80,7 @@ export function KeyPasteStrip({ tabId }) {
 			setBusy(false);
 		}
 	};
-	const back = () => setView({ settingsOpen: true, settingsSection: info.section, ...(info.provider ? { providerSel: info.provider } : {}) });
+	const back = () => setView({ settingsOpen: true, settingsSection: info.section });
 	return html`<div class=${`notice ws-key-strip ${done ? "ok" : ""}`} role="region" aria-label=${t("{name} API key", { name: info.name })}>
 		<${Icon} name=${done ? "check" : "key"} size=${14} />
 		${done
@@ -119,19 +94,4 @@ export function KeyPasteStrip({ tabId }) {
 		<button class="icon-btn sm" title=${t("Close")} aria-label=${t("Close")} onClick=${close}><${Icon} name="x" size=${13} /></button>
 		${error ? html`<div class="ws-key-error danger" role="alert">${error}</div>` : null}
 	</div>`;
-}
-
-/** The Nebius card's live facts: set up or not, the console links and this computer's spending estimate. */
-export function useNebiusInfo(nonce) {
-	const [info, setInfo] = useState(null);
-	useEffect(() => {
-		let live = true;
-		api("/api/providers/nebius")
-			.then((value) => live && setInfo(value))
-			.catch(() => live && setInfo(null));
-		return () => {
-			live = false;
-		};
-	}, [nonce]);
-	return info;
 }

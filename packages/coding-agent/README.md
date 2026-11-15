@@ -14,7 +14,7 @@ npm.cmd run build
 
 An installed copy (`MyHarness-Setup-<version>.exe` from [GitHub Releases](https://github.com/h3327725338-star/MyHarness/releases/latest)) starts from the Start Menu or the desktop shortcut. From a source checkout, daily use goes through the desktop app: double-click `dev-desktop.cmd` in the repository root. To run the sources directly in the caller's working directory, use `node --import ./scripts/dev-fast-loader.mjs ./packages/coding-agent/src/web.ts` (arguments are forwarded). The service never opens a browser; it prints its actual address as `MyHarness Web UI: <url>`. The built `myharness` command starts the same service through `dist/web.js`.
 
-Settings has a one-key Nebius Token Factory setup ([details](docs/nebius-token-factory.md)); other Providers, credentials and models are configured in browser Settings or `models.json`. There is no default Provider catalog. Local runtime data, credentials and existing Session formats are preserved.
+Providers, credentials and models are configured in browser Settings or `models.json`. There is no default Provider catalog and no Provider is built in. Local runtime data, credentials and existing Session formats are preserved.
 
 ## Product capabilities
 

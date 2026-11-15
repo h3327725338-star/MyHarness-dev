@@ -318,8 +318,12 @@
 .mode-side.coding { border-radius: var(--r-pill) 0 0 var(--r-pill); background: color-mix(in srgb, var(--mode-coding) 10%, transparent); color: var(--mode-coding); }
 .mode-side.general { border-radius: 0 var(--r-pill) var(--r-pill) 0; background: color-mix(in srgb, var(--mode-general) 10%, transparent); color: var(--mode-general); }
 .mode-switch.coding .mode-side.coding > svg, .mode-switch.general .mode-side.general > svg { opacity: 0; }
-.mode-knob { position: absolute; z-index: 1; top: 2px; left: 2px; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--mode-coding); color: var(--mode-on); box-shadow: var(--shadow-mode-knob); transition: background var(--t-morph) var(--ease), color var(--t-base) var(--ease); pointer-events: none; }
-.mode-switch.general .mode-knob { transform: translateX(28px); background: var(--mode-general); }
+/* The knob's colour moves through a registered colour (--mode-knob-bg) instead of a transition of the background itself:
+   Chromium runs a background-color transition on the compositor from its own copy of the value, the same arrangement
+   that made the page reveal flash (see the mode reveal below); a colour the page animates is drawn by the page. */
+@property --mode-knob-bg { syntax: "<color>"; inherits: false; initial-value: transparent; }
+.mode-knob { --mode-knob-bg: var(--mode-coding); position: absolute; z-index: 1; top: 2px; left: 2px; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--mode-knob-bg); color: var(--mode-on); box-shadow: var(--shadow-mode-knob); transition: --mode-knob-bg var(--t-morph) var(--ease), color var(--t-base) var(--ease); pointer-events: none; }
+.mode-switch.general .mode-knob { transform: translateX(28px); --mode-knob-bg: var(--mode-general); }
 .mode-morph-icon { display: block; }
 .mode-signal { position: absolute; z-index: 2; top: -5px; display: grid; place-items: center; pointer-events: none; }
 .mode-side.coding .mode-signal { left: -4px; }
@@ -351,11 +355,15 @@
 /* Every generated snapshot layer must let physical clicks reach the live switch underneath. */
 ::view-transition, ::view-transition-group(*), ::view-transition-image-pair(*), ::view-transition-old(*), ::view-transition-new(*) { pointer-events: none; }
 ::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
-::view-transition-new(root) { clip-path: circle(0px at 0 0); }
-/* Once a forward reveal is under way, the new page drawn without its animation is the whole page: where the reveal ends.
-   The animation and the transition's layers can go in different frames; the new page's layer is never left hidden over
-   the old page's picture in between (mode-transition.js, mode-reveal-shown). */
-html.mode-reveal-shown::view-transition-new(root) { clip-path: none; }
+/* The circle's radius and centre are lengths the page animates on the new page's layer (mode-transition.js); the
+   clip-path only reads them and is never animated itself, so the compositor keeps no copy of the animation that a frame
+   could find empty (that drew the layer fully clipped: the old page flashed over the new one). Registered so they
+   animate as lengths, and not inherited, so each frame restyles this one layer. Without the animation the radius is 0:
+   the new page stays hidden until its reveal starts. */
+@property --mode-reveal-r { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --mode-reveal-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --mode-reveal-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+::view-transition-new(root) { clip-path: circle(var(--mode-reveal-r) at var(--mode-reveal-x) var(--mode-reveal-y)); }
 /* Inside the mode reveal (mode-transition.js) the new mode is drawn as it stays: its columns and panel take their place at
    once instead of sliding and fading in under the circle, which also keeps the reveal's frames free of layout work. */
 html.mode-revealing .app, html.mode-revealing .main, html.mode-revealing .panel-slot { transition: none; }

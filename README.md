@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  MyHarness is a personal AI for your Windows PC that works inside the websites you're already signed into, remembers what matters to you, keeps chats and schedules in sync across your computers, and still handles coding when you need it. Out of the box it runs NVIDIA Nemotron and DeepSeek V4.1 Flash on Nebius Token Factory: paste one API key and every job gets its model.
+  MyHarness is a personal AI for your Windows PC that works inside the websites you're already signed into, remembers what matters to you, keeps chats and schedules in sync across your computers, and still handles coding when you need it. Bring your own model: add any OpenAI-, Anthropic-, Gemini- or Mistral-compatible Provider, and give each job its own model.
 </p>
 
 <p align="center">
@@ -126,7 +126,7 @@ MyHarness started as one computer-science student's fix for these problems, buil
 
 ### Big jobs, in parallel
 
-- **Sub-agents that split the work.** For research or other big jobs, the assistant hands parts to sub-agents that run in parallel (on Nemotron 3 Ultra by default), and you can stop any one of them. Staged workflows handle longer jobs step by step.
+- **Sub-agents that split the work.** For research or other big jobs, the assistant hands parts to sub-agents that run in parallel, and you can stop any one of them. Staged workflows handle longer jobs step by step.
 
 ### Polished for daily use
 
@@ -143,77 +143,22 @@ MyHarness started as one computer-science student's fix for these problems, buil
 
 ### Your models, your data
 
-- **A model for every job.** Sub-agents, memory, chat naming, translation, vision, schedules and the other helper jobs can each have their own model and thinking level, and one Nebius Token Factory key sets them all up.
-- **Your data stays on your PC.** The interface listens only on `127.0.0.1`; the Android app reaches the PC either on your local network after you turn the phone link on and scan its QR code, or from any network when the phone is signed in with the same Google account (connection details and, without a direct path, the messages themselves go as encrypted files through your own Drive; Google's public STUN servers see the two devices' addresses), and every message is encrypted with the phone's own key. Chats, memories, settings and keys live in `%USERPROFILE%\.myharness` (a source build run from a checkout keeps chats and memories in that checkout's `data` folder), and there is no MyHarness server. Model calls go to the Provider you choose (Nebius Token Factory by default), and sync goes through your own Google Drive. Sync is not end-to-end encrypted, except the browser's sign-ins, which are sealed with your passphrase before upload.
+- **A model for every job.** Sub-agents, memory, chat naming, translation, vision, schedules and the other helper jobs can each have their own model and thinking level.
+- **Your data stays on your PC.** The interface listens only on `127.0.0.1`; the Android app reaches the PC either on your local network after you turn the phone link on and scan its QR code, or from any network when the phone is signed in with the same Google account (connection details and, without a direct path, the messages themselves go as encrypted files through your own Drive; Google's public STUN servers see the two devices' addresses), and every message is encrypted with the phone's own key. Chats, memories, settings and keys live in `%USERPROFILE%\.myharness` (a source build run from a checkout keeps chats and memories in that checkout's `data` folder), and there is no MyHarness server. Model calls go to the Provider you choose, and sync goes through your own Google Drive. Sync is not end-to-end encrypted, except the browser's sign-ins, which are sealed with your passphrase before upload.
 
 ### Still writes code
 
 - **Coding mode** works inside a repository with Git, worktrees, per-turn change review and sub-agents.
 
-> Status: usable today on Windows x64, from the desktop app or a source checkout. Nebius Token Factory is offered ready-made (Settings → Providers → **Nebius Token Factory**: paste a key, DeepSeek V4.1 Flash and the Nemotron models are assigned to each job); any other OpenAI-, Anthropic-, Gemini- or Mistral-compatible Provider can be added by hand. The verified boundaries are listed in [PROJECT_STATUS.md](PROJECT_STATUS.md).
+> Status: usable today on Windows x64, from the desktop app or a source checkout. No model Provider is built in: any OpenAI-, Anthropic-, Gemini- or Mistral-compatible Provider can be added by hand (Settings → Providers → **Add provider**). The verified boundaries are listed in [PROJECT_STATUS.md](PROJECT_STATUS.md).
 
-## NVIDIA Nemotron on Nebius Token Factory
+## A model for every job
 
 ![Every job, its own model: Settings → Agent lists a model for each job, such as conversation naming, Auto Memory, sub-agents and the vision assistant](packages/coding-agent/docs/images/readme-models.png)
 
-*Settings → Agent. Any job can use a different model; the defaults are in the table below.*
+*Settings → Agent. Any job can use a different model, with its own thinking level.*
 
-The built-in model backend is **[Nebius Token Factory](https://api.tokenfactory.nebius.com/v1/)**, serving **NVIDIA Nemotron** and DeepSeek V4.1 Flash. Settings → Providers opens on **Nebius Token Factory**. **Get an API key** opens the Token Factory console in the built-in browser; the key pasted into the strip above that page (or into Settings) is checked against the account's model list, written as an ordinary `openai-completions` Provider in `models.json`, and every job that has no model of its own gets its model:
-
-| Model | Jobs |
-|-------|------|
-| DeepSeek V4.1 Flash 1017 | main model, commit descriptions (Ultra when the account has no DeepSeek) |
-| Nemotron 3 Ultra | sub-agents, conversation naming, translation |
-| Nemotron 3.5 Lightning | compaction, fallback, Auto Memory, hand-off notes, bookmark notes, scheduled tasks, worktree naming, branch summaries |
-| Nemotron 3.5 Super VL | vision assistant |
-
-**Why Token Factory.** Nebius Token Factory turned out to be a great home for a personal assistant. One OpenAI-compatible API serves a wide catalog of open models, so a single key let us pick, for every job, the model with the best value and the best fit, and each NVIDIA model has a job where it shines:
-
-- **Nemotron 3 Ultra, the deep thinker:** runs the sub-agents that research and work in parallel, and names and translates.
-- **Nemotron 3.5 Lightning, the quick hand:** takes the many small background jobs that run all day (memory, schedules, bookmark notes, summaries and compaction).
-- **Nemotron 3.5 Super VL, the eyes:** reads screenshots and images and reports what it sees to the main model.
-- **Room for long work:** every built-in model has a context window of about one million tokens, and its requests take the same OpenAI-compatible path as every other Provider.
-
-The main chat runs on DeepSeek V4.1 Flash because the Nemotron models had problems calling tools as the main agent in testing. They answer quickly, though, which suits the sub-agent, naming, translation, background and image work they do. The main model, sub-agents and commit descriptions are set to their model's highest thinking level (max for DeepSeek, high for Ultra). Each Nemotron model offers only the thinking levels NVIDIA documents for it: Ultra has off, medium and high; Lightning has off and high. DeepSeek offers off, low, high and max.
-
-Token Factory has no balance API, so the Nebius card links to the console for the balance and top-up, shows what this computer estimates it has spent from the model prices, and a request refused with HTTP 402 or an error that names the balance is explained as a balance problem.
-
-![Nebius Token Factory in Settings → Providers, with the balance links and this computer's spending estimate](packages/coding-agent/docs/images/nebius-provider-settings.png)
-
-<details>
-<summary>Model IDs, context windows and setup without the UI</summary>
-
-| Model ID | Context | Max output | Added by |
-|----------|---------|------------|----------|
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 1,048,576 | not published (65,536 is set) | the built-in setup and the example file |
-| `nvidia/Nemotron-3-Ultra-550b-a55b` | 1,048,576 | 65,536 | the built-in setup and the example file |
-| `nvidia/Nemotron-3_5-Lightning` | 1,048,576 | 65,536 | the built-in setup and the example file |
-| `nvidia/Nemotron-3.5-Super-VL` | 1,048,576 | not published (4,096 is set) | the built-in setup and the example file |
-| `nvidia/nemotron-3-super-120b-a12b` | 262,144 | 65,536 | the example file only |
-
-The built-in setup takes each ID as the account's model list spells it. Earlier versions also added Nemotron 3 Nano for naming and translation; Ultra does that now, and a Nano entry that is already there is left as it is. DeepSeek V4.1 Flash 1017 and Super-VL accept images; with the vision assistant on (the default), images go to Super-VL and the main model gets its report. The Nemotron text models are text-only. Verified on 2026-10-25: a generated test image carrying a random string plus a red circle and a blue rectangle was read correctly in about 1.3 s. Give it a few thousand output tokens — its reasoning runs before the answer.
-
-![Choosing a Nemotron model in the model selector, under a finished turn on Nemotron 3.5 Lightning](packages/coding-agent/docs/images/nebius-model-picker.png)
-
-Without the UI, the same Provider can come from one file:
-
-```powershell
-# 1. copy the ready-made Provider entry
-Copy-Item packages\coding-agent\docs\examples\nebius-models.json "$env:USERPROFILE\.myharness\agent\models.json"
-
-# 2. provide the Token Factory key through the environment
-$env:NEBIUS_TOKEN_FACTORY_API_KEY = "<your-token-factory-key>"
-
-# 3. start the app, then pick "Nemotron 3 Ultra" in /model
-.\dev-desktop.cmd
-```
-
-It can also be created by hand in Settings → **Providers** → **Add provider** with Base URL `https://api.tokenfactory.nebius.com/v1/` and API type OpenAI Chat Completions. The text models of the example declare `text` input and offer only their documented thinking levels, sent as `reasoning_effort` (Ultra: off / medium / high; Super: off / low / high; Lightning: off / high; `off` is sent as `none`); Super-VL declares `text` and `image` input, is sent no `reasoning_effort` and always reasons.
-
-</details>
-
-- Full setup, verification steps and limits: [NVIDIA Nemotron on Nebius Token Factory](packages/coding-agent/docs/nebius-token-factory.md).
-- Ready-to-copy configuration: [`examples/nebius-models.json`](packages/coding-agent/docs/examples/nebius-models.json).
+No model Provider is built in. Add one in Settings → **Providers** → **Add provider** (see [Providers](packages/coding-agent/docs/providers.md)), then pick the main model in the composer and, if you like, a model for each helper job in Settings → Agent.
 
 ## Memory, user profile and cross-device sync
 
@@ -236,7 +181,7 @@ It can also be created by hand in Settings → **Providers** → **Add provider*
 - Windows 10 or 11, x64;
 - Node.js `>=22.19.0`;
 - Git for Windows if you want to use the `bash` tool;
-- a model Provider key: Nebius Token Factory is built in, and other Providers can be added by hand.
+- a model Provider key: no Provider is built in; add one by hand.
 
 ```powershell
 git clone https://github.com/h3327725338-star/MyHarness.git
@@ -248,7 +193,7 @@ npm.cmd run build
 
 `dev-desktop.cmd` builds and starts the Electron desktop app, which is the normal way to use MyHarness. To run the sources from a command line instead, use `node --import ./scripts/dev-fast-loader.mjs ./packages/coding-agent/src/web.ts` from the repository root; it opens no browser and prints the actual address as `MyHarness Web UI: <url>`.
 
-After startup, the start screen links to the built-in Nebius Token Factory setup (Settings → Providers). Paste a Token Factory key there and DeepSeek V4.1 Flash and the Nemotron models are set up. Other Providers are described in [Providers](packages/coding-agent/docs/providers.md) and [Settings](packages/coding-agent/docs/settings.md).
+After startup, the start screen links to Settings → Providers, where you add a Provider. Providers are described in [Providers](packages/coding-agent/docs/providers.md) and [Settings](packages/coding-agent/docs/settings.md).
 
 To check that the Web source entry can start without a Provider credential:
 
@@ -270,7 +215,7 @@ This smoke check does not prove that an external Provider, OAuth flow, Web Searc
   <img src="packages/coding-agent/docs/images/readme-eval-workflows.png" alt="Core workflows, runs that gave the right result: reading images 15 of 15; signed-in website tasks 3 of 3, 3 of 3 and 2 of 3; handing a human check to a real person 3 of 3; scheduled tasks 3 of 3, 2 of 3, 2 of 3 and 6 of 6; sub-agent reports 4 of 5; memory in new chats 55 of 60, 56 of 60 and 24 of 24." width="640">
 </p>
 
-[Judge testing guide](docs/JUDGE_TESTING.md) covers installing (or building from source), attaching Nebius Token Factory credentials, a five-minute test script, what to inspect in the source, and the known limitations.
+[Judge testing guide](docs/JUDGE_TESTING.md) covers installing (or building from source), adding the judge Provider, a five-minute test script, what to inspect in the source, and the known limitations.
 
 ## For developers
 
@@ -302,7 +247,6 @@ The source and status documents deliberately separate implemented contracts, con
 - [Quickstart](packages/coding-agent/docs/quickstart.md)
 - [Usage and Web startup](packages/coding-agent/docs/usage.md)
 - [Providers and models](packages/coding-agent/docs/providers.md)
-- [NVIDIA Nemotron on Nebius Token Factory](packages/coding-agent/docs/nebius-token-factory.md)
 - [Google Drive sync](packages/coding-agent/docs/google-drive-sync.md)
 - [Windows setup](packages/coding-agent/docs/windows.md)
 - [Project status and validation boundaries](PROJECT_STATUS.md)

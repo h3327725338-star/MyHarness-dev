@@ -228,6 +228,11 @@ export type AgentSessionEvent =
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	/**
+	 * The session's live model was replaced, whoever did it (the user, cycling, the fallback model, a refreshed provider
+	 * definition). It carries nothing: the model and the thinking level that goes with it are read from the session.
+	 */
+	| { type: "model_changed" }
 	/** The set of active tools changed, whoever changed it (an extension, a settings switch, the user). */
 	| { type: "active_tools_changed"; names: readonly string[] }
 	| {
@@ -615,6 +620,7 @@ export class AgentSession {
 				notifyModelSelect: async (model, previousModel, source) => {
 					await this._extensionRunner.emit({ type: "model_select", model, previousModel, source });
 				},
+				notifyModelChanged: () => this._emit({ type: "model_changed" }),
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
 				ensureContextBudget: () => this._ensureContextBudget(),
 				notifyThinkingLevelChanged: (level, previousLevel) => {

@@ -34,8 +34,8 @@ export const levelAliases = (model) => model.raw?.thinkingLevelAliases || {};
 
 const LEVEL_ORDER = [...BASE_LEVELS, ...EXTRA_LEVELS, "ultra"];
 
-/** The levels the form offers: every level except the names the documentation says only run as another level. */
-export const offeredLevels = (model) => [...BASE_LEVELS, ...EXTRA_LEVELS].filter((level) => !levelAliases(model)[level]);
+/** Presets show only actual supported levels. Manual mode exposes the full set for editing. */
+export const offeredLevels = (model) => [...BASE_LEVELS, ...EXTRA_LEVELS].filter((level) => model.thinkingLevelMode === "manual" || (!levelAliases(model)[level] && (!(model.presetKnown || model.detected?.levels) || model.levels[level])));
 
 /** The aliases as [name, level] pairs in the order of the levels. */
 export const aliasPairs = (model) =>
@@ -77,6 +77,8 @@ export function modelDraft(model = {}, detected = {}) {
 		id: model.id ?? "",
 		name: model.name ?? "",
 		reasoning: model.reasoning === true,
+		defaultThinkingLevel: model.defaultThinkingLevel ?? "",
+		thinkingLevelMode: model.thinkingLevelMode ?? (model.thinkingLevelMap || model.reasoning === false ? "manual" : "catalog"),
 		// A model that declares reasoning without a map keeps the runtime's meaning (no level is excluded); one that does
 		// not declare reasoning has no known levels.
 		levels: model.thinkingLevelMap || model.reasoning === true ? levelsFromMap(model.thinkingLevelMap) : unknownLevels(),
@@ -94,6 +96,48 @@ export function modelDraft(model = {}, detected = {}) {
 	};
 }
 
+/** Apply the server's exact-ID preset and legacy-mode decision without overwriting an explicit manual choice. */
+export function applyEffortPreset(model, { preset, mode }) {
+	if (model.thinkingLevelMode === "manual" && (model.raw.thinkingLevelMode === "manual" || model.effortModeChosen === "manual" || model.touched?.levels || model.touched?.reasoning)) return model;
+	if (model.thinkingLevelMode !== "catalog" && mode !== "catalog") return { ...model, presetKnown: false };
+	if (preset) return {
+		...model, thinkingLevelMode: "catalog", presetKnown: true, presetId: model.id.trim(), presetMap: preset.thinkingLevelMap,
+		reasoning: preset.reasoning, levels: levelsFromMap(preset.thinkingLevelMap),
+		raw: { ...model.raw, thinkingLevelMap: preset.thinkingLevelMap, thinkingLevelAliases: preset.thinkingLevelAliases },
+		detected: { ...model.detected, levels: true, levelsSource: "official" },
+	};
+	if (model.presetKnown) return {
+		...model, presetKnown: false, presetId: undefined, presetMap: undefined, reasoning: false, levels: unknownLevels(),
+		raw: { ...model.raw, thinkingLevelMap: undefined, thinkingLevelAliases: undefined },
+		detected: { ...model.detected, levels: false, levelsSource: "unconfirmed" },
+	};
+	return { ...model, presetKnown: false };
+}
+
+/** A manual override that is the user's own: saved that way, picked in the form, or a level or the reasoning switch flipped by hand. */
+const manualIsChosen = (model) => model.thinkingLevelMode === "manual" && (model.raw.thinkingLevelMode === "manual" || model.effortModeChosen === "manual" || !!model.touched?.levels || !!model.touched?.reasoning);
+
+/**
+ * What the answer of a preset lookup changes in a model of the form.
+ * - A model the model list brought in as "does not reason" (`seedFromDetected`) that nobody has touched since: the
+ *   built-in table wins when it lists the ID. It states the vendor's levels, while a relay's list often leaves reasoning out.
+ * - A manual override the user chose keeps its levels; the answer only tells whether the table lists the model
+ *   (`presetAvailable`), so the form can say that the preset is there to switch to.
+ * - Anything else: `applyEffortPreset`.
+ */
+export function applyEffortLookup(model, result) {
+	const untouched = !model.effortModeChosen && !model.touched?.levels && !model.touched?.reasoning;
+	if (model.seededManual && untouched) {
+		if (!result?.preset) return model.presetAvailable === false ? model : { ...model, presetAvailable: false };
+		return applyEffortPreset({ ...model, seededManual: false, presetAvailable: true, thinkingLevelMode: "catalog", raw: { ...model.raw, thinkingLevelMode: "catalog" } }, { preset: result.preset, mode: "catalog" });
+	}
+	if (manualIsChosen(model)) {
+		const available = !!result?.preset;
+		return model.presetAvailable === available ? model : { ...model, presetAvailable: available };
+	}
+	return applyEffortPreset(model, result);
+}
+
 /** The models.json entry a draft stands for. */
 export function buildModel(draft) {
 	const model = { ...draft.raw, id: draft.id.trim() };
@@ -105,6 +149,12 @@ export function buildModel(draft) {
 	if (name && name !== model.id) model.name = name;
 	else delete model.name;
 	model.reasoning = draft.reasoning;
+	// Do not turn a temporary legacy inference into an explicit user override before lookup has finished.
+	if (draft.raw.thinkingLevelMode || draft.effortModeChosen || draft.touched?.levels || draft.touched?.reasoning || draft.presetKnown) model.thinkingLevelMode = draft.thinkingLevelMode;
+	else delete model.thinkingLevelMode;
+	if (draft.defaultThinkingLevel) model.defaultThinkingLevel = draft.defaultThinkingLevel;
+	else delete model.defaultThinkingLevel;
+	if (draft.touched?.levels || draft.touched?.reasoning) delete model.thinkingLevelAliases;
 	model.input = draft.image ? ["text", "image"] : ["text"];
 	const context = fromK(draft.contextWindow);
 	const maxTokens = fromK(draft.maxTokens);
@@ -112,7 +162,19 @@ export function buildModel(draft) {
 	else delete model.contextWindow;
 	if (maxTokens) model.maxTokens = maxTokens;
 	else delete model.maxTokens;
-	if (draft.reasoning) {
+	if (draft.thinkingLevelMode === "catalog" && draft.presetKnown && draft.presetMap) {
+		// The preset decides at load time and wins over these two fields. They are written anyway, so a version that does
+		// not know `thinkingLevelMode` still reads the model as one that reasons, with the same levels.
+		model.reasoning = true;
+		model.thinkingLevelMap = { ...draft.presetMap };
+		delete model.thinkingLevelAliases;
+	} else if (draft.thinkingLevelMode === "catalog" && (draft.presetKnown || draft.raw.reasoning === undefined && !draft.raw.thinkingLevelMap && !draft.reasoning)) {
+		// Nothing was stated about reasoning, neither in the file nor by a detection since (which sets draft.reasoning):
+		// the fields stay out, and the built-in table decides if it ever lists this ID.
+		delete model.reasoning;
+		delete model.thinkingLevelMap;
+		delete model.thinkingLevelAliases;
+	} else if (draft.reasoning) {
 		const map = { ...draft.raw.thinkingLevelMap };
 		for (const level of BASE_LEVELS) {
 			if (!draft.levels[level]) map[level] = null;
@@ -134,9 +196,48 @@ export function buildModel(draft) {
 	return model;
 }
 
+/**
+ * The provider-level `compat` to save for the form's "send reasoning levels" switch (`compat.supportsReasoningEffort`).
+ * On writes `true`. Off writes nothing new: the key stays absent when it was absent (the built-in default applies, which
+ * leaves the level out for an unknown service), and an earlier `true` becomes an explicit `false`. Other compat keys are kept.
+ */
+export function compatWithEffort(compat, send) {
+	const had = compat?.supportsReasoningEffort;
+	if (send) return { ...compat, supportsReasoningEffort: true };
+	if (had === true) return { ...compat, supportsReasoningEffort: false };
+	return compat;
+}
+
+/** Thinking formats that send the level in their own way, whatever `supportsReasoningEffort` says. */
+const OWN_EFFORT_FORMATS = new Set(["openrouter", "string-thinking", "ant-ling", "chat-template"]);
+
+/**
+ * Addresses whose service gets the level without being told to: the request builder's own rule for services it
+ * recognizes (packages/ai, openai-completions.ts: detectCompat). test/effort-catalog.test.ts holds this list against
+ * real request bodies.
+ */
+const EFFORT_DEFAULT_HOSTS = ["api.openai.com", "openrouter.ai", "api.cloudflare.com", "deepseek.com"];
+
+/**
+ * Whether requests to an OpenAI Chat Completions model carry its reasoning level: the switch on the provider, which a
+ * model's own `compat` overrides. `null` = the question does not apply (another API format, or a thinking format that
+ * sends the level its own way), so nothing is said about it. The same when neither level says anything and `baseUrl` is
+ * an address MyHarness recognizes: such a service keeps its built-in default, which the form does not restate.
+ */
+export function effortSent({ api, providerCompat, modelCompat, baseUrl }) {
+	if (api !== "openai-completions") return null;
+	if (OWN_EFFORT_FORMATS.has(modelCompat?.thinkingFormat ?? providerCompat?.thinkingFormat)) return null;
+	const explicit = modelCompat?.supportsReasoningEffort ?? providerCompat?.supportsReasoningEffort;
+	if (explicit === undefined) {
+		const address = String(baseUrl ?? "").toLowerCase();
+		if (EFFORT_DEFAULT_HOSTS.some((host) => address.includes(host))) return null;
+	}
+	return explicit === true;
+}
+
 /** A catalog entry as a new model of the form. Only what the catalog states is set; the rest keeps the usual defaults. */
 export function seedFromDetected(found) {
-	const seed = { id: found.id };
+	const seed = { id: found.id, thinkingLevelMode: found.reasoning === false ? "manual" : "catalog" };
 	if (found.name && found.name !== found.id) seed.name = found.name;
 	if (found.reasoning !== undefined) seed.reasoning = found.reasoning;
 	if (found.input) seed.input = found.input;
@@ -150,7 +251,8 @@ export function seedFromDetected(found) {
 	// user ticks the levels.
 	if (found.thinkingLevelMap && (found.thinkingSource === "official" || found.thinkingSource === "catalog")) detected.levels = true;
 	if (found.thinkingSource) detected.levelsSource = found.thinkingSource;
-	return modelDraft(seed, detected);
+	// `seededManual`: manual only because the list said "does not reason", not because anyone chose it (applyEffortLookup).
+	return { ...modelDraft(seed, detected), seededManual: found.reasoning === false };
 }
 
 /** Model IDs typed by the user: separated by commas, spaces or new lines; duplicates removed, order kept. */
@@ -165,6 +267,9 @@ export function parseModelIds(text) {
  */
 export function updateFromDetection(model, found) {
 	const next = { ...model, raw: { ...model.raw }, detected: { ...model.detected } };
+	if (model.thinkingLevelMode === "manual") {
+		found = { ...found, thinkingLevelMap: undefined, thinkingSource: undefined, reasoning: undefined };
+	}
 	if (found.input !== undefined) {
 		next.image = found.input.includes("image");
 		next.detected.input = true;
@@ -303,11 +408,11 @@ export function connectionReady(draft, { hasStoredKey }) {
 // ---- The three layers of a provider: the provider itself, its keys and their models (see providers/models/layers.ts). -----
 
 /**
- * An entry the layers apply to. A login, an extension's provider (the server sends those without `layered`) and the
- * ready-made Nebius entry stay as they are.
+ * An entry the layers apply to. A login and an extension's provider (the server sends those without `layered`) stay as
+ * they are.
  */
 export const isLayeredMember = ({ provider, entry }) =>
-	entry?.config?.layered === true && provider.id !== "nebius" && !provider.supportsOAuth && !provider.credentials?.hasOAuth;
+	entry?.config?.layered === true && !provider.supportsOAuth && !provider.credentials?.hasOAuth;
 
 /**
  * One row per top-level provider, in the order of the list: a group with its keys as `members`, or an entry that stands

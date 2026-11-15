@@ -8,7 +8,6 @@ import { MAX_KEEP_ALIVE_SECONDS, MIN_KEEP_ALIVE_SECONDS } from "../../platform/p
 import { stripJsonComments } from "../../utils/json.ts";
 import { normalizePath } from "../../utils/paths.ts";
 import { resolveProviderLayers } from "./layers.ts";
-import { upgradeNebiusPresetModels } from "./nebius-preset.ts";
 
 const PercentileCutoffsSchema = Type.Object({
 	p50: Type.Optional(Type.Number()),
@@ -178,6 +177,8 @@ const ModelDefinitionSchema = Type.Object({
 	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
+	defaultThinkingLevel: Type.Optional(Type.String()),
+	thinkingLevelMode: Type.Optional(Type.Union([Type.Literal("manual"), Type.Literal("catalog")])),
 	thinkingLevelStatus: Type.Optional(ThinkingLevelStatusSchema),
 	thinkingLevelAliases: Type.Optional(ThinkingLevelAliasesSchema),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
@@ -192,6 +193,7 @@ const ModelOverrideSchema = Type.Object({
 	name: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
+	defaultThinkingLevel: Type.Optional(Type.String()),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
 	cost: Type.Optional(
 		Type.Object({
@@ -329,7 +331,7 @@ export class ModelConfig {
 		const providers = new Map<string, ModelsJsonProvider>();
 		const groups = config.providerGroups ?? {};
 		for (const [providerId, provider] of Object.entries(config.providers)) {
-			const entry = upgradeNebiusPresetModels(providerId, structuredClone(provider));
+			const entry = structuredClone(provider);
 			const group = entry.group && Object.hasOwn(groups, entry.group) ? groups[entry.group] : undefined;
 			providers.set(providerId, deepFreeze(resolveProviderLayers(providerId, entry, group)));
 		}

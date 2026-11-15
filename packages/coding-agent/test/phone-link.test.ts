@@ -402,9 +402,25 @@ describe("phone link gateway", () => {
 		emit("terminal_output", { text: "secret" });
 		emit("message_update", { slot: "a", liveId: "l1" });
 		emit("sync_status", {});
+		// The model in use changed on the PC: a phone cannot ask for it before it shows it, so the event goes through whole.
+		const changed = {
+			slot: "a",
+			model: {
+				provider: "p",
+				id: "m",
+				name: "M",
+				reasoning: true,
+				input: ["text"],
+				thinkingLevels: ["low", "high"],
+				defaultThinkingLevel: "high",
+			},
+			thinking: { level: "low", levels: ["low", "high"], supported: true },
+		};
+		emit("model_changed", changed);
 		emit("run_finished", { runId: 1 });
 		expect(await next()).toEqual({ i: 2, e: "message_update", d: { slot: "a", liveId: "l1" } });
-		expect(await next()).toEqual({ i: 3, e: "run_finished", d: { runId: 1 } });
+		expect(await next()).toEqual({ i: 3, e: "model_changed", d: changed });
+		expect(await next()).toEqual({ i: 4, e: "run_finished", d: { runId: 1 } });
 		await reader.cancel();
 	});
 

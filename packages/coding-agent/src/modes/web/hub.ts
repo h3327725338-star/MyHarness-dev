@@ -566,21 +566,23 @@ export class WebHostHub implements WebHostHubLink {
 				: (from.workspace?.name ?? basename(cwd));
 			throw new HttpError(400, `工作区 [${name}] 本地路径不是目录`);
 		}
-		// An untouched empty chat of the same kind in the same folder is already what the user asks for.
-		const reusable = options.forceNew
-			? undefined
-			: [from, ...this.all()].find(
-					(host) =>
-						host.session.sessionManager.getMode() === mode &&
-						pathIdentityKey(host.cwd) === pathIdentityKey(cwd) &&
-						host.session.isIdle &&
-						!host.gitTask &&
-						!host.completionActive &&
-						(!defaultStorage || host.unbound === wantUnbound) &&
-						// Asks "no messages?" without projecting every message of every open chat just to read a length.
-						host.session.sessionManager.hasContextMessages() === false &&
-						!host.hasOperationContent,
-				);
+		await from.session.settingsManager.reload();
+		// An untouched empty chat can be reused when no explicit new-chat defaults need resolving.
+		const reusable =
+			options.forceNew || from.session.settingsManager.getNewChatModel()
+				? undefined
+				: [from, ...this.all()].find(
+						(host) =>
+							host.session.sessionManager.getMode() === mode &&
+							pathIdentityKey(host.cwd) === pathIdentityKey(cwd) &&
+							host.session.isIdle &&
+							!host.gitTask &&
+							!host.completionActive &&
+							(!defaultStorage || host.unbound === wantUnbound) &&
+							// Asks "no messages?" without projecting every message of every open chat just to read a length.
+							host.session.sessionManager.hasContextMessages() === false &&
+							!host.hasOperationContent,
+					);
 		if (reusable) return { slot: reusable.slotId, created: false };
 		const sessionDir = manager.usesDefaultSessionDir() ? undefined : manager.getSessionDir();
 		const sessionManager = !manager.isPersisted()

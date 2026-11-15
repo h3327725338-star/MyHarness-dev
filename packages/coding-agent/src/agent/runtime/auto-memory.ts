@@ -29,7 +29,7 @@ import {
 import type { SessionEntry } from "../../session/types.ts";
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
-import { helperReasoning, type MainModelRef, resolveAssistantModel } from "./assistant-model.ts";
+import { helperReasoning, type MainModelRef, resolveAssistantModel, withSupportedEffort } from "./assistant-model.ts";
 import type { CustomMessage } from "./messages.ts";
 
 export type MemoryScope = "global" | "workspace" | "session" | "project";
@@ -1708,7 +1708,12 @@ export class AutoMemoryManager {
 		const settings = this.options.settingsManager.getAutoMemorySettings();
 		if (!settings.enabled) return undefined;
 		const resolved = resolveAssistantModel(settings, this.options.getMainModel?.());
-		return resolved ? { enabled: true, ...resolved } : undefined;
+		return resolved
+			? {
+					enabled: true,
+					...withSupportedEffort(resolved, this.options.modelRuntime?.getModel(resolved.provider, resolved.model)),
+				}
+			: undefined;
 	}
 
 	/** 整理连续失败计数：瞬时失败静默退避，连续 3 轮才亮黄灯，灯上带最近失败原因。 */

@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@myharness/agent-core";
-import { clampThinkingLevel, type Model } from "@myharness/ai";
+import { clampThinkingLevel, getDefaultThinkingLevel, type Model } from "@myharness/ai";
 import { OWN_MODEL_DEFAULT_THINKING } from "./defaults.ts";
 
 /** A model reference stored for a helper model (Auto Memory, Sub-agent, Vision assistant, compaction). */
@@ -17,6 +17,8 @@ export interface MainModelRef {
 }
 
 export interface ResolvedAssistantModel {
+	/** Retains Default separately from an explicit max selection until the model is known. */
+	useModelDefault?: boolean;
 	provider: string;
 	model: string;
 	thinkingLevel: ThinkingLevel;
@@ -37,6 +39,7 @@ export function resolveAssistantModel(
 			provider: configured.provider,
 			model: configured.model,
 			thinkingLevel: configured.thinkingLevel ?? OWN_MODEL_DEFAULT_THINKING,
+			...(configured.thinkingLevel === undefined ? { useModelDefault: true } : {}),
 		};
 	}
 	if (configured.provider || configured.model || !main) return undefined;
@@ -46,7 +49,12 @@ export function resolveAssistantModel(
 /** `resolved` with its effort brought within the levels its model supports (as it is when the model is not known). */
 export function withSupportedEffort<T extends ResolvedAssistantModel>(resolved: T, model: Model<any> | undefined): T {
 	return model
-		? { ...resolved, thinkingLevel: clampThinkingLevel(model, resolved.thinkingLevel) as ThinkingLevel }
+		? {
+				...resolved,
+				thinkingLevel: (resolved.useModelDefault
+					? getDefaultThinkingLevel(model)
+					: clampThinkingLevel(model, resolved.thinkingLevel)) as ThinkingLevel,
+			}
 		: resolved;
 }
 

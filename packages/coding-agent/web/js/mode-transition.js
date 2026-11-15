@@ -1,7 +1,15 @@
 // A single reversible, sharp circular reveal. Reversal changes playback direction, not the captured pages.
-// A reversal starts a fresh animation from the current point instead of changing the running one's playbackRate:
-// Chromium runs this clip-path animation on the compositor, and a rate change mid-flight can leave the screen showing
-// the end point at once (the reveal vanishes instantly) while the animation itself still plays back.
+//
+// The circle is drawn by the page itself, frame by frame. The animation runs three registered lengths on the new page's
+// layer (--mode-reveal-r, -x, -y; layout.css) and the layer's clip-path reads them; the clip-path itself is not animated.
+// It must stay that way. Chromium hands an animated clip-path to the compositor, which then draws every frame from its
+// own copy of the animation's current value. A frame that finds no value there (now and then at the end of the reveal,
+// more often while the page is busy) draws the layer as the page first painted it: a circle of zero size. The whole old
+// page then covers the new one for one frame, and the reveal goes on. A length the page animates has no second copy:
+// every frame on screen is one the page produced, and the circle can only grow (or only shrink, played back).
+//
+// A reversal starts a fresh animation from the current point instead of changing the running one's playbackRate, so the
+// two directions never share an animation whose end has already been handled.
 import { motionEnabled } from "./ui.js";
 
 let active = null;
@@ -98,23 +106,6 @@ export function reverseModeReveal(mode) {
 	return true;
 }
 
-// The new page's layer drawn without the reveal's animation (layout.css) is where the playback ends: the whole page for a
-// reveal going forward, nothing for one going back. At the end the animation and the transition's layers can leave the
-// screen in different frames; with the stylesheet already at the end point, that frame shows the last picture again.
-// Before this, a forward reveal fell back to the hidden start for one frame now and then, and the whole old page flashed
-// over the new one right after the circle had filled the window. Forward, the end point is set only once the animation
-// has drawn a frame of its own, so the first frames of the circle cannot show the whole new page instead.
-function holdEndPoint(run, animation, rate) {
-	const root = document.documentElement;
-	if (rate < 0) {
-		root.classList.remove("mode-reveal-shown");
-		return;
-	}
-	animation.ready.then(() => requestAnimationFrame(() => {
-		if (active === run && run.animation === animation && animation.playbackRate > 0) root.classList.add("mode-reveal-shown");
-	}), () => {});
-}
-
 // Start (or restart) the run's reveal at `time` playing in direction `rate`; the previous animation, if any, goes.
 function playReveal(run, time, rate) {
 	const previous = run.animation;
@@ -122,7 +113,6 @@ function playReveal(run, time, rate) {
 	animation.currentTime = time;
 	animation.playbackRate = rate;
 	run.animation = animation;
-	holdEndPoint(run, animation, rate);
 	animation.onfinish = () => {
 		if (active !== run || run.animation !== animation) return;
 		if (run.target === run.from) {
@@ -133,7 +123,7 @@ function playReveal(run, time, rate) {
 		active = null;
 		run.transition.skipTransition();
 		// The animation holds its last frame until the transition's own layers are gone: cancelled at once, the new
-		// page's layer would fall back to its hidden start (the stylesheet's zero-size clip) for as long as it is drawn.
+		// page's layer would fall back to its hidden start (the radius' initial 0px) for as long as it is still drawn.
 		run.transition.finished.catch(() => {}).finally(() => animation.cancel());
 		release();
 	};
@@ -145,8 +135,6 @@ export async function revealMode(update, { from, to, restore } = {}) {
 		active.transition.skipTransition();
 		active = null;
 	}
-	// The last reveal's end point (holdEndPoint) stays until here: this reveal's new page starts hidden again.
-	document.documentElement.classList.remove("mode-reveal-shown");
 	const settled = async (guard = false) => {
 		const settleColours = guard ? colourFadeGuard() : null;
 		update();
@@ -169,12 +157,16 @@ export async function revealMode(update, { from, to, restore } = {}) {
 	catch { putBack(); release(); await settled(); return; }
 	// After the update the old page is mostly gone; what is left of it (a switch that was superseded) is put back.
 	transition.updateCallbackDone.catch(() => {}).finally(putBack);
-	const keyframes = { clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] };
+	// The centre is part of the animation (constant), so nothing is set on <html>, which would restyle the whole page.
+	const keyframes = { "--mode-reveal-r": ["0px", `${radius}px`], "--mode-reveal-x": [`${x}px`, `${x}px`], "--mode-reveal-y": [`${y}px`, `${y}px`] };
 	const run = { transition, from, to, restore, keyframes, target: to, animation: null };
 	active = run;
 	// Whatever ends the transition (the reveal finishing, another View Transition taking over), the waiting work goes on.
+	// The reveal's animation goes with the transition's layers, also when it was taken over before its end: left behind,
+	// it would hold its last radius and draw the next reveal's new page through it until that reveal's own animation starts.
 	transition.finished.catch(() => {}).finally(() => {
 		if (active === run) active = null;
+		run.animation?.cancel();
 		release();
 	});
 	try {

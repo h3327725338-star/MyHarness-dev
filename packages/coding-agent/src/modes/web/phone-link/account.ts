@@ -12,7 +12,7 @@
  */
 
 import { hostname } from "node:os";
-import type { Model as AnyModel, Api } from "@myharness/ai/compat";
+import { type Model as AnyModel, type Api, getDefaultThinkingLevel } from "@myharness/ai/compat";
 
 type Model = AnyModel<Api>;
 
@@ -35,7 +35,7 @@ const stringRecord = (value: unknown): Record<string, string> | undefined => {
 	return Object.keys(out).length ? out : undefined;
 };
 
-function phoneModel(model: Model): PhoneModel {
+export function phoneModel(model: Model): PhoneModel {
 	return {
 		id: model.id,
 		name: model.name || model.id,
@@ -44,6 +44,8 @@ function phoneModel(model: Model): PhoneModel {
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 		...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap as Record<string, unknown> } : {}),
+		// What "Default" stands for on this model, as the desktop shows it (a model that cannot reason has no effort choice).
+		...(model.reasoning ? { defaultThinkingLevel: getDefaultThinkingLevel(model) } : {}),
 		...(model.compat ? { compat: model.compat as Record<string, unknown> } : {}),
 	};
 }

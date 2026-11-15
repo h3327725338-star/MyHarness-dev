@@ -629,7 +629,14 @@ function buildToolResultText(text: string, hasImages: boolean, supportsImages: b
 }
 
 function usesReasoningEffort(model: Model<"mistral-conversations">): boolean {
-	return model.id === "mistral-small-2603" || model.id === "mistral-small-latest" || model.id === "mistral-medium-3.5";
+	return [
+		"mistral-small-2603",
+		"mistral-small-latest",
+		"mistral-medium-3.5",
+		"mistral-medium-3-5",
+		"mistral-large-4",
+		"mistral-large-4-0",
+	].includes(model.id);
 }
 
 function usesPromptModeReasoning(model: Model<"mistral-conversations">): boolean {
@@ -640,7 +647,9 @@ function mapReasoningEffort(
 	model: Model<"mistral-conversations">,
 	level: Exclude<SimpleStreamOptions["reasoning"], undefined>,
 ): MistralReasoningEffort {
-	return (model.thinkingLevelMap?.[level] ?? "high") as MistralReasoningEffort;
+	const fallback =
+		model.id.startsWith("mistral-large-4") && ["low", "medium", "high"].includes(level) ? level : "high";
+	return (model.thinkingLevelMap?.[level] ?? fallback) as MistralReasoningEffort;
 }
 
 function mapToolChoice(

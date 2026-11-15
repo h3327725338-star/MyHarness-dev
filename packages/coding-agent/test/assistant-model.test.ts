@@ -33,6 +33,7 @@ describe("helper model resolution (Auto Memory, Sub-agent, Vision, compaction)",
 			provider: "p",
 			model: "m",
 			thinkingLevel: "max",
+			useModelDefault: true,
 		});
 	});
 
@@ -43,7 +44,7 @@ describe("helper model resolution (Auto Memory, Sub-agent, Vision, compaction)",
 });
 
 describe("the default effort of a model of its own: the highest level that model supports", () => {
-	// The Nebius preset maps (nebius-preset.ts): DeepSeek off/low/high/max, Ultra off/medium/high, Lightning off/high,
+	// Level maps as providers declare them: DeepSeek off/low/high/max, Ultra off/medium/high, Lightning off/high,
 	// Super VL only its always-on reasoning.
 	const deepseek = model(true, {
 		off: "none",
@@ -70,6 +71,17 @@ describe("the default effort of a model of its own: the highest level that model
 		// No map: the portable levels up to high.
 		expect(defaultOf(plain)).toBe("high");
 		expect(defaultOf(noReasoning)).toBe("off");
+	});
+
+	it("resolves the model default separately from explicit max", () => {
+		const configured = { ...deepseek, defaultThinkingLevel: "low" as const };
+		expect(defaultOf(configured)).toBe("low");
+		expect(
+			withSupportedEffort(
+				resolveAssistantModel({ provider: "p", model: "m", thinkingLevel: "max" }, undefined)!,
+				configured,
+			).thinkingLevel,
+		).toBe("max");
 	});
 
 	it("keeps a level the user chose, brought within the model's levels", () => {

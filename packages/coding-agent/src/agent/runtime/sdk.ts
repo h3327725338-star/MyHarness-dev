@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@myharness/agent-core";
-import { clampThinkingLevel, type Message, type Model } from "@myharness/ai/compat";
+import { clampThinkingLevel, getDefaultThinkingLevel, type Message, type Model } from "@myharness/ai/compat";
 import type { ResourceLoader } from "../../application/resource-loader.ts";
 import { DefaultResourceLoader } from "../../application/resource-loader.ts";
 import { withAbsoluteAttachmentPaths } from "../../config/paths/attachments.ts";
@@ -204,7 +204,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
+	const newChat = settingsManager.getNewChatModel();
 	let model = options.model;
+	if (!model && !existingSession.model && newChat) {
+		const selected = modelRuntime.getModel(newChat.provider, newChat.model);
+		if (
+			selected &&
+			modelRuntime.hasConfiguredAuth(selected.provider) &&
+			modelRuntime.isProviderEnabled(selected.provider)
+		)
+			model = selected;
+	}
 	if (!model && !existingSession.model) {
 		const selection = new ModeStateStore(agentDir).get(sessionManager.getMode()).model;
 		if (selection) {
@@ -251,7 +261,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let thinkingLevel = options.thinkingLevel;
 
 	// If session has data, restore thinking level from it
-	if (thinkingLevel === undefined && hasExistingSession) {
+	if (thinkingLevel === undefined && (hasExistingSession || hasThinkingEntry)) {
 		thinkingLevel = hasThinkingEntry
 			? (existingSession.thinkingLevel as ThinkingLevel)
 			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
@@ -259,7 +269,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Fall back to settings default
 	if (thinkingLevel === undefined) {
-		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+		const usesNewChat =
+			!existingSession.model && model && newChat?.provider === model.provider && newChat.model === model.id;
+		thinkingLevel =
+			usesNewChat && model
+				? ((newChat.thinkingLevel ?? getDefaultThinkingLevel(model)) as ThinkingLevel)
+				: model?.defaultThinkingLevel
+					? (getDefaultThinkingLevel(model) as ThinkingLevel)
+					: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
 	}
 
 	// Clamp to model capabilities

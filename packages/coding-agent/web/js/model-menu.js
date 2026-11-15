@@ -203,9 +203,11 @@ export function EffortSlider({ levels, value, onChange, disabled, autoFocus, onD
  * server asks for "max" and brings it within the model's levels, OWN_MODEL_DEFAULT_THINKING), except scheduled tasks,
  * which keep the effort a new chat has ("chat").
  */
-export function jobDefaultEffort(jobId, levels) {
+export function jobDefaultEffort(jobId, levels, model) {
+	if (jobId === "scheduledTasks") return "chat";
 	if (jobId === "memoryPicker" && levels.includes("low")) return "low";
-	return jobId === "scheduledTasks" ? "chat" : levels.at(-1);
+	if (model?.defaultThinkingLevel && levels.includes(model.defaultThinkingLevel)) return model.defaultThinkingLevel;
+	return levels.at(-1);
 }
 
 /** "Default", named with what it stands for: "Default (max)", or "Default (same as the chat)". */
@@ -264,7 +266,7 @@ export function ModelRefPicker({ models, value, onChange, disabled, label, jobId
 					onPick=${(ref) => (setOpen(false), onChange({ ...ref, thinkingLevel: undefined }))} />
 			<//>
 		</span>
-		<${EffortPicker} levels=${levels} value=${v.thinkingLevel} disabled=${disabled} withDefault defaultLevel=${jobDefaultEffort(jobId, levels)} placement="bottom" class="select model-ref-effort"
+		<${EffortPicker} levels=${levels} value=${v.thinkingLevel} disabled=${disabled} withDefault defaultLevel=${jobDefaultEffort(jobId, levels, findModel(models, v.provider, v.model))} placement="bottom" class="select model-ref-effort"
 			onChange=${(level) => onChange({ provider: v.provider, model: v.model, thinkingLevel: level })} />
 	</span>`;
 }

@@ -695,7 +695,7 @@ function modelRefScreen(ctx, id) {
 					loading: !state.models,
 					rows: [
 						// The main model comes with its effort: nothing of its own is kept.
-						{ key: "main", label: t("Use the main model"), desc: t("Same model and thinking effort as the main chat"), check: !now.model, onEnter: async (cc) => (await commit({ provider: undefined, model: undefined, thinkingLevel: undefined }), cc.pop()) },
+						{ key: "main", label: tr(item.noModelLabel || "Use the main model"), desc: item.noModelLabel ? "" : t("Same model and thinking effort as the main chat"), check: !now.model, onEnter: async (cc) => (await commit({ provider: undefined, model: undefined, thinkingLevel: undefined }), cc.pop()) },
 						...modelRows(state.models, {
 							isCurrent: (provider, m) => now.provider === provider.id && now.model === m.id,
 							onPick: async (provider, m, cc) => (await commit({ provider: provider.id, model: m.id, thinkingLevel: undefined }), cc.pop()),
@@ -709,13 +709,13 @@ function modelRefScreen(ctx, id) {
 		rows.push({
 			key: "effort",
 			label: t("Thinking effort"),
-			value: v.thinkingLevel ? effortName(v.thinkingLevel) : defaultEffortName(jobDefaultEffort(id, levels)),
+			value: v.thinkingLevel ? effortName(v.thinkingLevel) : defaultEffortName(jobDefaultEffort(id, levels, findModel(state.models, v.provider, v.model))),
 			chevron: true,
 			onEnter: (c) =>
 				c.push(() => {
 					const now = live()?.value || {};
 					const nowLevels = modelEfforts(findModel(state.models, now.provider, now.model));
-					return effortSliderScreen({ title: t("Thinking effort"), levels: nowLevels, value: now.thinkingLevel, withDefault: true, defaultLevel: jobDefaultEffort(id, nowLevels), onChange: (level) => commit({ thinkingLevel: level }) });
+					return effortSliderScreen({ title: t("Thinking effort"), levels: nowLevels, value: now.thinkingLevel, withDefault: true, defaultLevel: jobDefaultEffort(id, nowLevels, findModel(state.models, now.provider, now.model)), onChange: (level) => commit({ thinkingLevel: level }) });
 				}),
 		});
 	}

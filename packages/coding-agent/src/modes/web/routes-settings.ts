@@ -395,6 +395,15 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		return [
 			// Agent
 			{
+				id: "newChatModel",
+				section: "Agent",
+				label: "New chat model",
+				description: "Model and effort used for new chats. Default effort uses this model's configured default.",
+				type: "modelRef",
+				value: s.getNewChatModel() ?? {},
+				noModelLabel: "Use the last selected model",
+			},
+			{
 				id: "steeringMode",
 				section: "Agent",
 				label: "Steering messages",
@@ -1166,6 +1175,25 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 			return;
 		}
 		switch (id) {
+			case "newChatModel": {
+				const ref = modelRefValue(value);
+				if (ref.provider && ref.model) {
+					const model = host.session.modelRuntime.getModel(ref.provider, ref.model);
+					if (!model || !host.session.modelRuntime.isProviderEnabled(ref.provider))
+						throw new HttpError(400, "Model unavailable.");
+					if (
+						ref.thinkingLevel &&
+						!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(ref.thinkingLevel)
+					)
+						throw new HttpError(400, "Invalid thinking level.");
+					s.setNewChatModel({
+						provider: ref.provider,
+						model: ref.model,
+						...(ref.thinkingLevel ? { thinkingLevel: ref.thinkingLevel as ThinkingLevel } : {}),
+					});
+				} else s.setNewChatModel(undefined);
+				break;
+			}
 			case "steeringMode":
 			case "followUpMode": {
 				if (value !== "all" && value !== "one-at-a-time") throw new HttpError(400, "Invalid mode");

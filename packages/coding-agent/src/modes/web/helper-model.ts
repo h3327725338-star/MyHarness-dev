@@ -3,7 +3,7 @@
 import type { ThinkingLevel } from "@myharness/agent-core";
 import { clampThinkingLevel } from "@myharness/ai";
 import type { Model } from "@myharness/ai/compat";
-import { resolveAssistantModel } from "../../agent/runtime/assistant-model.ts";
+import { resolveAssistantModel, withSupportedEffort } from "../../agent/runtime/assistant-model.ts";
 import type { WebHost } from "./host.ts";
 import { HttpError } from "./http-server.ts";
 
@@ -42,7 +42,7 @@ export function resolveHelperModel(
 			? host.session.modelRuntime.getModel(ref.provider, ref.model)
 			: undefined;
 	if (!selected) throw new HttpError(400, `Helper model unavailable: ${configured.provider}/${configured.model}`);
-	return { model: selected, thinkingLevel: clampThinkingLevel(selected, ref!.thinkingLevel) as ThinkingLevel };
+	return { model: selected, thinkingLevel: withSupportedEffort(ref!, selected).thinkingLevel };
 }
 
 /** Reasoning option for one-shot completions: 'off' sends nothing. */

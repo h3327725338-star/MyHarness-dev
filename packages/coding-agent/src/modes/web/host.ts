@@ -260,6 +260,8 @@ export interface SlotStatus {
 	 * keeps that folder and is not. Only worked out for unbound sessions (always false for a Workspace's chat).
 	 */
 	atDefaultDir: boolean;
+	/** A configured new-chat model requires the server to resolve the latest defaults. */
+	newChatModelConfigured: boolean;
 	/** The session runs inside a worktree copy (the sidebar shows one space at a time: main or copies). */
 	copy: boolean;
 	/** A scheduled task started this chat while it was open here; once it is saved, its list row says so (SessionInfo). */
@@ -575,6 +577,7 @@ export class WebHost {
 			lastOutcome: this.latestRunFinished()?.outcome ?? null,
 			unread: this.unread,
 			unbound,
+			newChatModelConfigured: !!this.session.settingsManager.getNewChatModel(),
 			// Compared the way hub.newSession compares a reusable chat's folder with the one the new chat gets.
 			atDefaultDir:
 				unbound &&
@@ -637,6 +640,8 @@ export class WebHost {
 		this.runtimeHost.setRebindSession(async () => {
 			await this.bindSession();
 			this.broadcast("session_replaced", { at: Date.now() });
+			// The chat that took this slot's place may run on another model, with other effort levels.
+			this.broadcast("model_changed", this.modelState());
 		});
 		// The chat's background shell jobs go to the page when one starts and when one ends (the Background panel).
 		this.stopWatchingJobs ??= backgroundJobManager.subscribe((job) => {
@@ -1150,6 +1155,11 @@ export class WebHost {
 				return;
 			case "thinking_level_changed":
 				this.broadcast("thinking_level", { level: event.level });
+				return;
+			case "model_changed":
+				// One event for every way the model changes (the model menu, cycling, the fallback model, a refreshed provider,
+				// another process driving a mirrored chat); a client that cannot ask for the state (a phone) takes it from here.
+				this.broadcast("model_changed", this.modelState());
 				return;
 			case "compaction_start":
 				this.autoCompactionActive = event.reason !== "manual";
@@ -1953,6 +1963,25 @@ export class WebHost {
 	// Snapshots
 	// ------------------------------------------------------------------
 
+	/**
+	 * The model in use and the thinking effort that goes with it, in the shape `snapshot()` and the `model_changed` event
+	 * both carry: the model (with its own levels and default), and the levels the session offers on it, the level in use
+	 * and whether the model reasons at all.
+	 */
+	modelState() {
+		const session = this.session;
+		const model = session.model;
+		return {
+			// The agent core's placeholder (provider "unknown") stands for "no model set up yet": the composer shows that.
+			model: model && model.provider !== "unknown" ? toWireModel(model) : null,
+			thinking: {
+				level: session.thinkingLevel,
+				levels: session.getAvailableThinkingLevels(),
+				supported: session.supportsThinking(),
+			},
+		};
+	}
+
 	/** How full the context window is right now. */
 	private contextState(): { usage: unknown; budget: unknown } {
 		const session = this.session;
@@ -2074,7 +2103,6 @@ export class WebHost {
 			cwdMissing = false;
 		}
 		const workspace = this.workspace;
-		const model = session.model;
 		const checkpoint = this.openCheckpoint() ?? session.getGitCheckpoint();
 		const settings = session.settingsManager;
 		// Through publishedRunState like the run_state event: a page that reloads while a message is ending the run reads the
@@ -2098,13 +2126,7 @@ export class WebHost {
 				persisted: manager.isPersisted(),
 				header: manager.getHeader() ? { timestamp: manager.getHeader()?.timestamp } : null,
 			},
-			// The agent core's placeholder (provider "unknown") stands for "no model set up yet": the composer shows that.
-			model: model && model.provider !== "unknown" ? toWireModel(model) : null,
-			thinking: {
-				level: session.thinkingLevel,
-				levels: session.getAvailableThinkingLevels(),
-				supported: session.supportsThinking(),
-			},
+			...this.modelState(),
 			run,
 			active: isRunStateActive(run.state),
 			flags: {

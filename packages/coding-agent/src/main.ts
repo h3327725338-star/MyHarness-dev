@@ -329,8 +329,8 @@ function buildSessionOptions(
 
 	if (!options.model && scopedModels.length > 0 && !hasExistingSession) {
 		// Check if saved default is in scoped models - use it if so, otherwise first scoped model
-		const savedProvider = settingsManager.getDefaultProvider();
-		const savedModelId = settingsManager.getDefaultModel();
+		const savedProvider = settingsManager.getNewChatModel()?.provider ?? settingsManager.getDefaultProvider();
+		const savedModelId = settingsManager.getNewChatModel()?.model ?? settingsManager.getDefaultModel();
 		const savedModel = savedProvider && savedModelId ? modelRuntime.getModel(savedProvider, savedModelId) : undefined;
 		const savedInScope = savedModel ? scopedModels.find((sm) => modelsAreEqual(sm.model, savedModel)) : undefined;
 

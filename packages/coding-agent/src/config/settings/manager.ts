@@ -678,6 +678,17 @@ export class SettingsManager {
 		return sessionDir ? normalizePath(sessionDir) : sessionDir;
 	}
 
+	getNewChatModel(): Settings["newChatModel"] {
+		return this.globalSettings.newChatModel;
+	}
+
+	setNewChatModel(value: Settings["newChatModel"]): void {
+		if (value) this.globalSettings.newChatModel = { ...value };
+		else delete this.globalSettings.newChatModel;
+		this.markModified("newChatModel");
+		this.save();
+	}
+
 	getDefaultProvider(): string | undefined {
 		return this.settings.defaultProvider;
 	}
@@ -709,6 +720,12 @@ export class SettingsManager {
 	/** Remove persisted references to a deleted Provider or custom Model. */
 	clearModelReferences(providerId: string, modelId?: string, removeProvider = false): void {
 		let changed = false;
+		const newChat = this.globalSettings.newChatModel;
+		if (newChat?.provider === providerId && (modelId === undefined || newChat.model === modelId)) {
+			delete this.globalSettings.newChatModel;
+			this.markModified("newChatModel");
+			changed = true;
+		}
 		const defaultMatches =
 			this.globalSettings.defaultProvider === providerId &&
 			(modelId === undefined || this.globalSettings.defaultModel === modelId);

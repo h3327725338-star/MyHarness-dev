@@ -8,13 +8,13 @@ MyHarness is a personal AI for a Windows PC (Personal AI track). It works inside
 
 An Electron shell starts a local-only Web UI (`127.0.0.1`) and a shared backend. Sessions, settings and credentials stay on the PC.
 
-The models are DeepSeek V4.1 Flash and NVIDIA Nemotron, served by Nebius Token Factory. Token Factory is built in: one API key sets up every role. Web search calls the Tavily API, which works without a key by default.
+The judged runs use DeepSeek V4.1 Flash and NVIDIA Nemotron models served by Nebius Token Factory. No model Provider is built in, so you add it by hand (see [Attach a model](#attach-a-model)). Web search calls the Tavily API, which works without a key by default.
 
 ## Environment
 
 - Windows 10 or Windows 11, x64.
 - The installer from the Releases page. Alternatively, a source build needs Node.js `>=22.19.0` and Git for Windows.
-- A Nebius Token Factory API key, only for model replies. **Judges:** judge-only Nebius Token Factory and Tavily API keys are in `MyHarness-Judge-Access-Keys.pdf`, the file attached to this project's Devpost submission under Additional info, which is for judges and organizers and does not appear on the public project page. Anyone else creates their own key: the app links to the Token Factory console. No key is stored in this repository.
+- A Nebius Token Factory API key, only for model replies. **Judges:** judge-only Nebius Token Factory and Tavily API keys are in `MyHarness-Judge-Access-Keys.pdf`, the file attached to this project's Devpost submission under Additional info, which is for judges and organizers and does not appear on the public project page. Anyone else creates their own key in the Token Factory console, or uses another Provider. No key is stored in this repository.
 
 ## Install
 
@@ -43,36 +43,21 @@ npm.cmd run build
 
 ## Attach a model
 
-Nebius Token Factory is built in, so attaching a model takes one API key.
+No model Provider is built in. Until a model is set, the start screen says so and links to Settings → **Providers**. Nebius Token Factory is an OpenAI-compatible service, so it is added like any other Provider:
 
-**In the app:** until a model is set, the start screen shows **Connect NVIDIA Nemotron on Nebius**. It opens Settings → **Providers** → **Nebius Token Factory**.
+1. Open Settings → **Providers** → **Add provider**.
+2. Enter a name, the Base URL `https://api.tokenfactory.nebius.com/v1/`, and the API format OpenAI Chat Completions.
+3. Paste the API key. Judges paste the judge-only key from the Devpost file; anyone else creates a key in the Token Factory console.
+4. Under **Model IDs to detect**, type the IDs you want, for example `deepseek-ai/DeepSeek-V4.1-Flash-1017`, `nvidia/Nemotron-3-Ultra-550b-a55b`, `nvidia/Nemotron-3_5-Lightning` and `nvidia/Nemotron-3.5-Super-VL`, and detect them against the endpoint's model list. The form reads each ID from that list and never tests the models themselves, so check each model's context window, image input and thinking levels, and fill them in if they are missing.
+5. Save, then pick the main model in the composer. Settings → **Agent** lets each helper job (sub-agents, conversation naming, Auto Memory, the vision assistant and the others) use its own model; the models used for each job in the evaluation are listed in the [evaluation](evaluation/README.md).
 
-1. Click **Get an API key**.
-2. Sign in to Token Factory in the built-in browser and create a key.
-3. Paste it into the strip above that page, or into the card in Settings.
-
-Judges can skip steps 1 and 2 and paste the judge-only key from the Devpost file into that card.
-
-MyHarness checks the key against the account's model list, adds DeepSeek V4.1 Flash and the NVIDIA Nemotron models, and gives each job its model:
-
-- DeepSeek V4.1 Flash 1017: the main chat and commit descriptions. Ultra takes these when the account does not list DeepSeek.
-- Nemotron 3 Ultra: sub-agents, conversation naming and translation.
-- Nemotron 3.5 Lightning: compaction and the other helper jobs.
-- Nemotron 3.5 Super VL: images.
-
-Jobs you already set are left alone.
-
-**From a file:** copy [`packages/coding-agent/docs/examples/nebius-models.json`](../packages/coding-agent/docs/examples/nebius-models.json) to `%USERPROFILE%\.myharness\agent\models.json`. Set `NEBIUS_TOKEN_FACTORY_API_KEY` in the environment, then start the app.
-
-The exact model IDs, context windows and reasoning levels are in [NVIDIA Nemotron on Nebius Token Factory](../packages/coding-agent/docs/nebius-token-factory.md).
-
-Without a Token Factory key the UI still starts and every non-model feature still works; only model replies need the key.
+Without a Provider the UI still starts and every non-model feature still works; only model replies need one.
 
 ## Five-minute test script
 
 Start each step in a new chat (**New chat** in the sidebar) unless it says otherwise. The models are not deterministic, so the wording will differ from run to run. Measured results for these workflows, failures included, are in the [evaluation](evaluation/README.md).
 
-1. **Start.** A fresh install starts with a chat under **Default**, which belongs to no project. The composer shows **DeepSeek V4.1 Flash 1017**, which the setup made the main model, with a 1.0M context window.
+1. **Start.** A fresh install starts with a chat under **Default**, which belongs to no project. After you attach a model, pick it as the main model in the composer; the evaluation's main model is **DeepSeek V4.1 Flash 1017**, with a 1.0M context window.
 2. **Web search with Tavily.** Ask: `What did NVIDIA announce about Nemotron 3.5 Lightning? Look it up on the web and give your sources.`
    - Web search is on by default. Tavily answers without a key through its free keyless access, and the search step lists the results it read.
    - **Get a free key** in Settings → **Web search** adds 1,000 searches a month. Judges can use **Add API key** there to add the judge-only Tavily key from the Devpost file instead.
@@ -86,10 +71,10 @@ Start each step in a new chat (**New chat** in the sidebar) unless it says other
 5. **A scheduled task.** Ask: `Remind me in 3 minutes to stand up and stretch.`
    - Expected: it confirms the time, and a card pops up when the time comes. Settings → **Scheduled tasks** lists what is set.
    - An agent task works the same way, for example `In 3 minutes, look up the weather in Kuala Lumpur and summarize it.` It starts a new chat at that time.
-6. **An image.** Paste or drop a screenshot and ask what it says. Nemotron 3.5 Super VL reads it through the vision assistant, and the main model answers from its report.
+6. **An image.** Paste or drop a screenshot and ask what it says. If the main model cannot read images, set the vision assistant in Settings → **Agent** to a model that can, such as Nemotron 3.5 Super VL; it reads the image and the main model answers from its report.
 7. **Which model does what.**
-   - Settings → **Agent** shows which model each job uses.
-   - Settings → **Providers** → **Nebius Token Factory**, first in the list, shows its Base URL and the models, the console links for balance and top-up, and this computer's spending estimate.
+   - Settings → **Agent** shows which model each job uses and lets you change it.
+   - Settings → **Providers** lists the Provider you added, with its Base URL, keys and models.
 8. **Coding (optional).** Add a project folder (any Git repository, or this one) with **Add workspace**, the **+** in the sidebar, and ask: `Read package.json and list the packages/ directories, then summarize the repository structure. Do not modify any files.`
    - Expected: the agent calls file and shell tools itself, and the turn header reports elapsed time and operation count. The answer names version `0.0.6` and the five directories under `packages/`.
    - The **Changes** panel lists the turn's tool operations, and the same session is on disk under `%USERPROFILE%\.myharness\data\workspaces\<workspace-id>\sessions\` (a source build run from a checkout keeps it in that checkout's `data\workspaces\` instead).
@@ -106,8 +91,7 @@ Start each step in a new chat (**New chat** in the sidebar) unless it says other
 
 - Windows desktop x64 only. There is no hosted demo, because the product works on local files.
 - The installer is not code-signed, so SmartScreen warns before the first run.
-- Model replies need a Nebius Token Factory key, or another Provider. Without one the UI starts but no model answers.
-- Token Factory has no balance API. The balance itself is only in its console; MyHarness shows a local estimate.
+- Model replies need a Provider that you add by hand (the judge-only keys are for Nebius Token Factory). Without one the UI starts but no model answers.
 - Tavily rate-limits its keyless access. When the limit is used up, the search says so and links to a free key.
 - Google Drive sync runs only while the app is open (the tray counts). The maintainer has run it for real across at least four PCs. Apart from the browser's sealed sign-in vault, the copy on Drive is not end-to-end encrypted.
 - Symbols (semantic code navigation) needs optional per-language modules and is disabled by default.

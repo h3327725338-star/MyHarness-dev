@@ -314,6 +314,15 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
 	const effort = (clampedReasoning === "off" ? "high" : clampedReasoning) as ClampedThinkingLevel;
 	const googleModel = model as Model<"google-generative-ai">;
 
+	// A level the model's map spells out is sent as written (Gemini 4's `xhigh`, 3.1 Pro's `medium`). Levels the map
+	// leaves unset keep the per-family rules below, so older entries and budget-based models are sent what they were.
+	const mapped = clampedReasoning === "off" ? undefined : googleModel.thinkingLevelMap?.[clampedReasoning];
+	if (typeof mapped === "string" && googleModel.id.replace(/^models\//u, "").startsWith("gemini-")) {
+		return stream(model, context, {
+			...base,
+			thinking: { enabled: true, level: mapped.toUpperCase() as GoogleThinkingLevel },
+		});
+	}
 	if (isGemini3ProModel(googleModel) || isGemini3FlashModel(googleModel) || isGemma4Model(googleModel)) {
 		return stream(model, context, {
 			...base,

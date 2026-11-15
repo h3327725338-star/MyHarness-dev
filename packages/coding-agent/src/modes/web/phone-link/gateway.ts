@@ -55,6 +55,7 @@ const EVENTS = new Set([
 	"usage",
 	"notice",
 	"thinking_level",
+	"model_changed",
 	"compaction_start",
 	"compaction_end",
 	"auto_retry_start",

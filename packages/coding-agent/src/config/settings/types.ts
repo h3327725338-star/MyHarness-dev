@@ -365,6 +365,8 @@ export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
+	/** Explicit new-chat selection; independent of the most recently used model. */
+	newChatModel?: { provider: string; model: string; thinkingLevel?: ThinkingLevel };
 	defaultThinkingLevel?: ThinkingLevel;
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";

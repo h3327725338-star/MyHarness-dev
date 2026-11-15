@@ -4,8 +4,8 @@ import { writeFileAtomically } from "../../utils/atomic-write.ts";
 
 /**
  * What this computer has spent on each provider, estimated from the prices in models.json and the token counts the
- * provider reported. A provider without a balance API (Nebius Token Factory) can show this next to a link to its
- * console. It is an estimate: the provider's own bill is what counts.
+ * provider reported. A provider without a balance API can show this next to a link to its console. It is an
+ * estimate: the provider's own bill is what counts.
  *
  * Every model request of the process ends here (ModelRuntime.stream / streamSimple), so chats, sub-agents and
  * background jobs all count. The file is `provider-spend.json` next to models.json; writes are batched.

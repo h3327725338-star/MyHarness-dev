@@ -1191,7 +1191,7 @@ function Welcome({ snap, models, opening = false }) {
 			<span><span class="kbd">@</span> ${t("mention a file")}</span>
 			${paletteKey ? html`<span><span class="kbd">${paletteKey}</span> ${t("command palette")}</span>` : null}
 		</div>
-		${!model && !opening ? html`<div class="welcome-warn"><${Icon} name="alertTriangle" size=${15} /> ${tNodes("No model is available yet. {add} to start.", { add: html`<button class="link-btn" onClick=${() => setView({ settingsOpen: true, settingsSection: "providers", providerSel: "nebius" })}>${t("Connect NVIDIA Nemotron on Nebius")}</button>` })}</div>` : null}
+		${!model && !opening ? html`<div class="welcome-warn"><${Icon} name="alertTriangle" size=${15} /> ${tNodes("No model is available yet. {add} to start.", { add: html`<button class="link-btn" onClick=${() => setView({ settingsOpen: true, settingsSection: "providers" })}>${t("Add a provider")}</button>` })}</div>` : null}
 	</div>`;
 }
 

@@ -5,6 +5,7 @@ import { getModel } from "@myharness/ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentSession } from "../src/agent/runtime/sdk.ts";
 import { getDataDir, getSessionDir, getWorkspaceSessionsDir } from "../src/config/paths/index.ts";
+import { SettingsManager } from "../src/config/settings/manager.ts";
 import { SessionManager } from "../src/session/manager/index.ts";
 import { getDefaultSessionDirPath } from "../src/session/storage/jsonl/index.ts";
 
@@ -29,6 +30,27 @@ describe("createAgentSession session manager defaults", () => {
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("uses configured new-chat effort, restores empty-session effort and preserves legacy defaults", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = SettingsManager.inMemory();
+		settings.setDefaultThinkingLevel("low");
+		const create = (sessionManager = SessionManager.inMemory(cwd)) =>
+			createAgentSession({ cwd, agentDir, model, settingsManager: settings, sessionManager });
+		const legacy = await create();
+		expect(legacy.session.thinkingLevel).toBe("low");
+		legacy.session.dispose();
+		settings.setNewChatModel({ provider: model.provider, model: model.id, thinkingLevel: "high" });
+		const fresh = await create();
+		expect(fresh.session.thinkingLevel).toBe("high");
+		fresh.session.dispose();
+		const saved = SessionManager.inMemory(cwd);
+		saved.appendModelChange(model.provider, model.id);
+		saved.appendThinkingLevelChange("low");
+		const reopened = await create(saved);
+		expect(reopened.session.thinkingLevel).toBe("low");
+		reopened.session.dispose();
 	});
 
 	it("uses the project data root for the default persisted session path", async () => {

@@ -58,6 +58,12 @@ export interface SessionModelHost {
 	ensureContextBudget(): Promise<unknown>;
 	/** Tell hosts and extensions that the thinking level changed. */
 	notifyThinkingLevelChanged(level: ThinkingLevel, previousLevel: ThinkingLevel): void;
+	/**
+	 * The live model was replaced (chosen, cycled, taken over by the fallback model, swapped for a re-read definition, or
+	 * dropped). Called once the thinking level has been brought within what the new model offers, so a host reads the
+	 * model and its level together. Every path that assigns the session's model calls this; none assigns it silently.
+	 */
+	notifyModelChanged(): void;
 }
 
 export class SessionModelController {
@@ -118,6 +124,7 @@ export class SessionModelController {
 
 		// Re-clamp thinking level for new model's capabilities
 		this._host.setThinkingLevel(thinkingLevel);
+		this._host.notifyModelChanged();
 
 		await this._notifyModelSelect(model, previousModel, "set");
 		await this._host.ensureContextBudget();
@@ -154,6 +161,7 @@ export class SessionModelController {
 			sessionManager.appendThinkingLevelChange(level);
 			this._host.notifyThinkingLevelChanged(level, previousLevel);
 		}
+		this._host.notifyModelChanged();
 
 		await this._notifyModelSelect(model, previousModel, "set");
 	}
@@ -172,6 +180,7 @@ export class SessionModelController {
 				agent.state.model = refreshed;
 				// The refreshed model may offer different thinking efforts; keep the selected one valid for it.
 				this._host.setThinkingLevel(agent.state.thinkingLevel);
+				this._host.notifyModelChanged();
 				return;
 			}
 		}
@@ -180,6 +189,7 @@ export class SessionModelController {
 		if (replacement) {
 			agent.state.model = replacement;
 			settingsManager.setDefaultModelAndProvider(replacement.provider, replacement.id);
+			this._host.notifyModelChanged();
 			return;
 		}
 
@@ -188,6 +198,7 @@ export class SessionModelController {
 			// The Agent core type currently models this field as required, while the
 			// session lifecycle already supports a no-model state after startup.
 			(agent.state as unknown as { model?: Model<any> }).model = undefined;
+			this._host.notifyModelChanged();
 		}
 	}
 
@@ -204,6 +215,7 @@ export class SessionModelController {
 		}
 
 		this._host.agent.state.model = refreshedModel;
+		this._host.notifyModelChanged();
 	}
 
 	/**
@@ -272,6 +284,7 @@ export class SessionModelController {
 		// - Undefined scoped model thinking level inherits the current session preference
 		// setThinkingLevel clamps to model capabilities.
 		this._host.setThinkingLevel(thinkingLevel);
+		this._host.notifyModelChanged();
 
 		await this._notifyModelSelect(next.model, currentModel, "cycle");
 		await this._host.ensureContextBudget();
@@ -300,6 +313,7 @@ export class SessionModelController {
 
 		// Re-clamp thinking level for new model's capabilities
 		this._host.setThinkingLevel(thinkingLevel);
+		this._host.notifyModelChanged();
 
 		await this._notifyModelSelect(nextModel, currentModel, "cycle");
 		await this._host.ensureContextBudget();

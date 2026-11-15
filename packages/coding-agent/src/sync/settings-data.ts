@@ -114,6 +114,7 @@ export const PORTABLE_SETTINGS_KEYS: readonly string[] = [
 	"defaultModel",
 	"defaultProvider",
 	"defaultThinkingLevel",
+	"newChatModel",
 	"disabledProviders",
 	"enabledModels",
 	"fallbackModel",

@@ -237,15 +237,6 @@
 .prov-item:active { background: var(--surface-active); }
 .prov-item.on { background: var(--surface-select); color: var(--text); }
 .prov-item-sub { font-size: var(--fs-xs); }
-/* Nebius Token Factory is offered ready-made (providers-page.js): first in the list, with its job plan and console links. */
-.prov-title .badge { vertical-align: middle; margin-left: 6px; font-weight: 500; }
-.nebius-get { gap: 10px; flex-wrap: wrap; }
-.nebius-plan { display: flex; flex-direction: column; padding: 4px 16px 10px; }
-.nebius-plan-row { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 12px; padding: 7px 0; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
-.nebius-plan-row:first-child { border-top: 0; }
-.nebius-plan-model { font-weight: 600; color: var(--text); }
-.nebius-spend { color: var(--text-2); font-size: var(--fs-sm); }
-.nebius-links { gap: 6px; flex-wrap: wrap; }
 .prov-add { min-height: 36px; margin-top: 4px; color: var(--accent); }
 .prov-empty { padding: 8px 10px; }
 .prov-head { display: flex; align-items: center; gap: 12px; padding: 2px 2px 0; }
@@ -496,6 +487,7 @@
 .pf-batch-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; padding: 2px 0 4px; }
 .pf-switches { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .pf-levels { display: flex; flex-wrap: wrap; gap: 6px; }
+.pf-levels > span.chip-toggle { display: inline-flex; align-items: center; }
 .pf-detect { display: flex; flex-direction: column; gap: 6px; padding: 0 2px 0 8px; }
 .pf-detect .notice { margin: 0; flex-direction: column; gap: 2px; }
 .pf-auto { margin-left: 4px; }

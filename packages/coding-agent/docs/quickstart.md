@@ -70,7 +70,7 @@ repository root instead; the process operates on the directory from which you in
 
 ## Configure Provider and authentication
 
-The quickest start is the built-in Nebius Token Factory setup: open Settings → Providers → Nebius Token Factory and paste a Token Factory key (see [NVIDIA Nemotron on Nebius Token Factory](nebius-token-factory.md)). Otherwise, configure a Provider and model in Settings, `models.json`, or an extension. An environment variable alone does not create a selectable model.
+No Provider is built in: configure a Provider and model in Settings → Providers, `models.json`, or an extension. An environment variable alone does not create a selectable model.
 
 Then provide the credential for that configured Provider before launching MyHarness:
 

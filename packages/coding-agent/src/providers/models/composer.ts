@@ -32,6 +32,8 @@ import {
 } from "../credentials/value-resolution.ts";
 import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./config.ts";
 
+import { resolveEffortConfiguration } from "./effort-catalog.ts";
+
 export interface ExtensionOAuthConfig {
 	name: string;
 	/** @deprecated Retained for extension source compatibility; ignored by canonical auth flows. */
@@ -72,6 +74,7 @@ export interface ProviderConfigInput {
 		baseUrl?: string;
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+		defaultThinkingLevel?: Model<Api>["defaultThinkingLevel"];
 		input: ("text" | "image")[];
 		cost: Model<Api>["cost"];
 		contextWindow: number;
@@ -116,6 +119,8 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 	return {
 		...model,
 		name: override.name ?? model.name,
+		defaultThinkingLevel: (override.defaultThinkingLevel ??
+			model.defaultThinkingLevel) as Model<Api>["defaultThinkingLevel"],
 		reasoning: override.reasoning ?? model.reasoning,
 		thinkingLevelMap: override.thinkingLevelMap
 			? { ...model.thinkingLevelMap, ...override.thinkingLevelMap }
@@ -160,15 +165,17 @@ function modelFromJson(
 	if (definition.maxTokens !== undefined && definition.maxTokens <= 0) {
 		throw new Error(`Provider ${providerId}, model ${definition.id}: invalid maxTokens`);
 	}
+	const effort = resolveEffortConfiguration(definition);
+	const preset = effort.mode === "catalog" ? effort.preset : undefined;
 	return {
 		id: definition.id,
 		name: definition.name ?? definition.id,
 		api: api as Api,
 		provider: providerId,
 		baseUrl,
-		reasoning: definition.reasoning ?? false,
-		// Efforts come only from the stored map (written from the catalog or a probe); nothing is inferred from the id.
-		thinkingLevelMap: definition.thinkingLevelMap,
+		reasoning: preset?.reasoning ?? definition.reasoning ?? false,
+		thinkingLevelMap: preset?.thinkingLevelMap ?? definition.thinkingLevelMap,
+		defaultThinkingLevel: definition.defaultThinkingLevel as Model<Api>["defaultThinkingLevel"],
 		input: (definition.input ?? ["text"]) as ("text" | "image")[],
 		// A user-entered image declaration is a claim, not verified provider metadata.
 		// Keep it testable until the built-in image probe succeeds.

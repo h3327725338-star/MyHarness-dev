@@ -826,6 +826,8 @@ export interface Model<TApi extends Api> {
 	 * Missing keys use provider defaults. null marks a level as unsupported.
 	 */
 	thinkingLevelMap?: ThinkingLevelMap;
+	/** User-selected default effort. Missing means highest supported effort. */
+	defaultThinkingLevel?: ModelThinkingLevel;
 	input: ("text" | "image")[];
 	/**
 	 * False when image input is user-declared but unverified, or when `input`

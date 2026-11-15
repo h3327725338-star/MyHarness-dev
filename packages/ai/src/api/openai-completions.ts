@@ -789,11 +789,19 @@ function buildParams(
 		}
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
+		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
+			(params as any).reasoning_effort =
+				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+		}
 	} else if (compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
 		(params as any).chat_template_kwargs = {
 			enable_thinking: !!options?.reasoningEffort,
 			preserve_thinking: true,
 		};
+		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
+			(params as any).reasoning_effort =
+				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+		}
 	} else if (compat.thinkingFormat === "chat-template" && model.reasoning) {
 		const chatTemplateKwargs = buildChatTemplateKwargs(model, options, compat);
 		if (chatTemplateKwargs) {

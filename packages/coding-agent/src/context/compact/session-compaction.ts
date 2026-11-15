@@ -10,8 +10,7 @@
 import type { Agent, AgentMessage, AgentTool, ThinkingLevel } from "@myharness/agent-core";
 import { contentText } from "@myharness/ai";
 import type { Model, Usage } from "@myharness/ai/compat";
-import { clampThinkingLevel } from "@myharness/ai/compat";
-import { OWN_MODEL_DEFAULT_THINKING } from "../../agent/runtime/defaults.ts";
+import { clampThinkingLevel, getDefaultThinkingLevel } from "@myharness/ai/compat";
 import type { SettingsManager } from "../../config/settings/index.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import { getLatestCompactionEntry } from "../../session/projection/index.ts";
@@ -104,7 +103,7 @@ export class SessionCompactionRunner {
 		// along.
 		const level =
 			configured.provider && configured.model
-				? (configured.thinkingLevel ?? OWN_MODEL_DEFAULT_THINKING)
+				? (configured.thinkingLevel ?? getDefaultThinkingLevel(model))
 				: (configured.thinkingLevel ?? this._host.agent.state.thinkingLevel);
 		return clampThinkingLevel(model, level) as ThinkingLevel;
 	}

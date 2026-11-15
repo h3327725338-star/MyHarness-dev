@@ -8,7 +8,7 @@
 
 import type { AgentMessage } from "@myharness/agent-core";
 import { stripModelGuidance } from "@myharness/ai";
-import { getSupportedThinkingLevels, type Model } from "@myharness/ai/compat";
+import { getDefaultThinkingLevel, getSupportedThinkingLevels, type Model } from "@myharness/ai/compat";
 import { parseSkillBlock } from "../../agent/runtime/agent-session.ts";
 import { ATTACHED_FILES_HEADER } from "../../config/paths/attachments.ts";
 import { explainProviderError } from "../../providers/recovery/error-explanation.ts";
@@ -324,6 +324,7 @@ export interface WireModel {
 	maxTokens: number;
 	input: string[];
 	thinkingLevels?: string[];
+	defaultThinkingLevel?: string;
 }
 
 export function toWireModel(model: Model<any>): WireModel {
@@ -338,6 +339,7 @@ export function toWireModel(model: Model<any>): WireModel {
 		input: [...model.input],
 		// This model's own effort options (what the Composer offers after switching to it).
 		thinkingLevels: getSupportedThinkingLevels(model),
+		defaultThinkingLevel: getDefaultThinkingLevel(model),
 	};
 }
 

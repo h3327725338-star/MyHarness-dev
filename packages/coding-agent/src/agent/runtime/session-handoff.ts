@@ -22,6 +22,7 @@ import {
 	type MainModelRef,
 	type ResolvedAssistantModel,
 	resolveAssistantModel,
+	withSupportedEffort,
 } from "./assistant-model.ts";
 
 export const HANDOFF_DEBOUNCE_MS = 45_000;
@@ -329,7 +330,7 @@ export class SessionHandoff {
 						messages: [{ role: "user", content: [{ type: "text", text: task }], timestamp: Date.now() }],
 					},
 					{
-						reasoning: helperReasoning(model, ref.thinkingLevel),
+						reasoning: helperReasoning(model, withSupportedEffort(ref, model).thinkingLevel),
 						signal: controller.signal,
 						timeoutMs: sdkFirstByteTimeoutMs(model, this.session.settingsManager),
 						maxRetries: retry.maxRetries,

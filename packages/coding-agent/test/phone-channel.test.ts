@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getSessionConversationDir, UNBOUND_WORKSPACE_ID } from "../src/config/paths/index.ts";
+import { phoneModel } from "../src/modes/web/phone-link/account.ts";
 import { PhoneChannel, type PhoneRegistration } from "../src/sync/phone/channel.ts";
 import { MemoryPhonePort } from "../src/sync/phone/port.ts";
 import type { SyncRecord } from "../src/sync/types.ts";
@@ -405,5 +406,47 @@ describe("phone channel on the PC", () => {
 		expect(parsed.entries.map((entry) => entry.id)).toEqual(["e-o1"]);
 		// Its first line hung on a line this chat does not have: it starts the chat instead.
 		expect(text).toContain('"id":"e-o1","parentId":null');
+	});
+});
+
+describe("what a phone is told about a model", () => {
+	const model = (extra: Record<string, unknown> = {}) =>
+		({
+			id: "m",
+			name: "M",
+			api: "openai-completions",
+			provider: "p",
+			baseUrl: "http://example.test",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+			...extra,
+		}) as Parameters<typeof phoneModel>[0];
+
+	it("names the effort Default stands for on a model that reasons, as the desktop resolves it", () => {
+		// The configured default, when the model offers it.
+		expect(phoneModel(model({ defaultThinkingLevel: "medium" })).defaultThinkingLevel).toBe("medium");
+		// None configured: the strongest level the model offers (no xhigh or max without a mapping).
+		expect(phoneModel(model()).defaultThinkingLevel).toBe("high");
+		// A configured default the model does not offer moves to the nearest level it does.
+		expect(phoneModel(model({ defaultThinkingLevel: "xhigh" })).defaultThinkingLevel).toBe("high");
+		expect(
+			phoneModel(model({ defaultThinkingLevel: "xhigh", thinkingLevelMap: { xhigh: "x" } })).defaultThinkingLevel,
+		).toBe("xhigh");
+	});
+
+	it("leaves it out for a model that cannot reason, and keeps what a phone already read", () => {
+		const plain = phoneModel(model({ reasoning: false, defaultThinkingLevel: "high" }));
+		expect("defaultThinkingLevel" in plain).toBe(false);
+		expect(phoneModel(model())).toMatchObject({
+			id: "m",
+			name: "M",
+			reasoning: true,
+			vision: true,
+			contextWindow: 1000,
+			maxTokens: 100,
+		});
 	});
 });

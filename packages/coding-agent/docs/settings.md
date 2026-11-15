@@ -15,6 +15,12 @@ Web UI 的每个对话都有自己的 `SettingsManager`，共用同一份 settin
 
 可以直接编辑文件，也可以使用 `/settings` 修改常用选项。
 
+## 新对话默认模型与模型默认推理档位
+
+设置 → 智能体 → **新对话默认模型**，可以指定每次新建对话的模型及推理档位。档位选 Default 时使用该模型设置的默认档位；未指定新对话模型时继续使用上次选过的模型；若该模型配置了默认档位则使用它，否则沿用上次档位。配置新对话模型后，点击新对话会创建使用最新默认设置的对话，不复用已有空白对话。该设置独立保存在全局 `newChatModel: { provider, model, thinkingLevel? }`，当前聊天临时切换模型或档位不会覆盖它；旧对话仍恢复自己的模型和档位。显式启动参数优先。删除所引用的模型或 Provider 时清除该设置。
+
+设置 → Providers → 模型中可配置 **默认推理档位**，写入模型的 `defaultThinkingLevel`；未设置时使用最高可用档。独立助手模型选择 Default 时也使用此值，显式选择的档位优先；记忆挑选器和定时任务保留各自的任务默认规则。内置模型档位表及手动覆盖见 [Models](models.md#built-in-presets-manual-overrides-and-default-effort)。
+
 ## Web 外观与配色主题
 
 设置 → 外观的“显示模式”保留跟随系统／深色／浅色；“阅读宽度”下方新增“配色主题”：经典炭黑（`classic`，原 Coding 配色）、静谧森林（`forest`，克制灰绿）和暖夜琥珀（`amber`，暖棕深灰）。选择立即生效，并通过现有浏览器偏好 `myharness.web.prefs` 的 `colorThemes.coding` / `colorThemes.general` 分别保存，刷新前的启动脚本也读取它，避免先显示另一套配色。旧版共享 `colorTheme` 首次读取时作为两边初始值保留，之后各自独立修改；未设置或无效值时 Coding 用经典炭黑、General 用静谧森林。每次保存都会写下两边的配色，所以没有 `colorThemesVersion: 2` 的旧保存里 General 的经典炭黑是当时的默认值而不是选择，按未设置处理（显示静谧森林）；之后保存都带这个版本号，用户再选经典炭黑会被保留。设置只修改当前 Coding／General 模式的配色，切换时恢复目标模式的选择；三套都有深色和浅色两个版本，随显示模式切换：经典炭黑的浅色是原来的基础浅色配色，静谧森林的浅色是浅灰绿，暖夜琥珀的浅色是暖米色。无需重启，不写入项目或全局 Agent settings。
@@ -158,7 +164,7 @@ Vision Assistant 接受声明支持 image input 的 models，以及通过 MyHarn
 - 如果中转站不同格式要用不同地址（带 `/v1` 和不带），不要在上层填 Base URL，分别填在下面。
 - 旧配置原样可用：每个旧条目显示成只有一把密钥的 Provider，Provider 设置为空，页面上不显示密钥这一层，加了第二把密钥才分成两层。打开页面不写文件，保存或合并时才写，每个模型实际用的地址、格式和密钥不变，旧对话也继续能用。
 - 页面按 Base URL 的域名（不看名字）在顶部给出合并建议：主机名相同的默认勾上；主机名不同但主域名相同或 Key 相同的标“可能是同一家”，由你决定。不点不影响使用；确认合并前会先把 `models.json` 备份成 `models.json.before-merge.bak`。
-- 登录型 Provider、覆盖已注册 Provider 的条目和 Nebius 不进入三层，只有一张表单。
+- 登录型 Provider 和覆盖已注册 Provider 的条目不进入三层，只有一张表单。
 
 文件格式和 Key 的保存位置见 [models.md](models.md#provider-layers)。
 
@@ -247,7 +253,7 @@ Package 资源和 project-local settings 走同一套 Project Trust flow：启�
 Conversation Naming、Auto Memory、Sub Agent、Vision Assistant、Compact Model、Commit Description、Worktree Naming 和 Branch Summary 选模型的规则相同（`src/agent/runtime/assistant-model.ts`）：
 
 - 没有设置 `provider` / `model`（Web UI 里的“使用主模型”）：运行时使用当前 main model，并且连同它当前的 Thinking Effort 一起继承；main model 变了就跟着变。如果另外写了 `thinkingLevel`，只覆盖 Effort。
-- 设置了自己的 `provider` + `model`：使用这个 model 和它自己的 `thinkingLevel`；没写 `thinkingLevel`（Web UI 里的“默认”）时用这个 model 支持的最高档：运行时按 `max` 请求，再收窄到 model 实际有的档位（`OWN_MODEL_DEFAULT_THINKING` 与 `clampThinkingLevel`），例如 DeepSeek V4.1 Flash 是 `max`，Nemotron Ultra 和 Lightning 是 `high`，没有推理的 model 不发送。Web UI 把这一档直接写在“默认”开关上，例如“默认（max）”。定时任务例外：没写 `thinkingLevel` 时沿用目标对话当前的档位，显示为“默认（与对话相同）”。
+- 设置了自己的 `provider` + `model`：使用这个 model 和它自己的 `thinkingLevel`；没写 `thinkingLevel`（Web UI 里的“默认”）时用这个 model 支持的最高档：运行时按 `max` 请求，再收窄到 model 实际有的档位（`OWN_MODEL_DEFAULT_THINKING` 与 `clampThinkingLevel`），例如只有 off / low / high / max 四档的 model 是 `max`，只有 off / high 两档的 model 是 `high`，没有推理的 model 不发送。Web UI 把这一档直接写在“默认”开关上，例如“默认（max）”。定时任务例外：没写 `thinkingLevel` 时沿用目标对话当前的档位，显示为“默认（与对话相同）”。
 - 只写了 `provider` 或 `model` 其中一个，视为没有配置。
 
 #### conversationNaming（对话自动命名）
@@ -354,7 +360,7 @@ Memory Markdown files 是 source of truth：
 Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆挑选”行选择。和其他助手不同，它不跟随主模型：关闭或没选模型时只用本地排序，打开后才在每条消息发出前向选中的模型发一次请求。
 
 - 模型看到的是当前可见记忆的序号、名称和描述（不含正文），再加上这条用户消息，然后回答该用哪几条，最多 5 条，可以一条都不选。选中的卡片取代本地排序的结果；常驻画像和目录照常发送。启用后这些内容都会发给选中的模型，私密记忆的名称和描述也在内，并产生额外 usage。消息里的常见敏感值先被过滤；含私钥的消息不发给模型，直接用本地排序。
-- 思考级别默认 `low`，也可以另选。自定义 `openai-completions` 服务默认不发 `reasoning_effort`（见 [models.md](models.md)），这时选什么档位都不生效，模型按自己的默认档运行，通常更慢；要让档位生效，需要在 `models.json` 里给这个模型或 Provider 打开 `compat.supportsReasoningEffort`。
+- 思考级别默认 `low`，也可以另选。自定义 `openai-completions` 服务默认不发 `reasoning_effort`（见 [models.md](models.md)），这时选什么档位都不生效，模型按自己的默认档运行，通常更慢；要让档位生效，可以在 设置 → Providers 里打开该 Provider 的“向这个服务发送推理档位”开关（默认关闭，写入 Provider 的 `compat.supportsReasoningEffort`），或直接在 `models.json` 里给这个模型或 Provider 打开 `compat.supportsReasoningEffort`。
 - 每次最多等 5 秒，不重试，不让消息的显示变慢：气泡立刻出现，等待期间可以停止，也可以继续发消息。运行中排队或引导的消息各有自己的一次挑选，等待发生在消息进入对话之后、下一次请求模型之前；所以引导消息会让下一步模型请求晚一次挑选的时间，第一条还在挑选时发出的第二条，要等两次挑选依次结束。超时只写日志，这条消息用本地排序；其他失败弹一次提示，同样用本地排序。连续失败 2 次后暂停 60 秒，这期间不再请求模型。
 - 目录按创建时间从旧到新排列，新记忆加在末尾，让请求开头保持不变、便于命中供应商的提示缓存。目录上限约 40000 token，超出时优先保留最近更新的；消息上限约 2000 token。
 
@@ -447,7 +453,7 @@ Global 设置，默认关闭，在 设置 → 智能体 → 助手 的“记忆�
 
 #### visionAssistant
 
-`Vision Assistant` 是 global 设置，默认开启（`enabled` 没写时为 `true`）。开启但还没有选自己的视觉模型、用户也没有自己打开过时，它不接管图片，支持 multimodal 的 main model 照常直接收到 images（`SettingsManager.isVisionAssistantActive()`）；选了视觉模型（例如 Nebius 一键配置给它配 Super VL）后才生效。用户关掉的保持关闭。main-model picker 和 vision-model picker 使用不同的 title 和 capability labels：
+`Vision Assistant` 是 global 设置，默认开启（`enabled` 没写时为 `true`）。开启但还没有选自己的视觉模型、用户也没有自己打开过时，它不接管图片，支持 multimodal 的 main model 照常直接收到 images（`SettingsManager.isVisionAssistantActive()`）；选了视觉模型后才生效。用户关掉的保持关闭。main-model picker 和 vision-model picker 使用不同的 title 和 capability labels：
 
 - main-model picker 会列出所有可用 models，并标记为 text-only 或 text-and-image。Vision Assistant 关闭时，支持 multimodal 的 main model 会直接收到 images。
 - vision-model picker 会列出 enabled Providers 中 credentials 可用的 eligible models。已经确认支持视觉的 models 可以直接选择；unknown 或之前测试失败的 custom models 在选择时会打开 capability test。明确声明为 text-only 的 models 不会列出。

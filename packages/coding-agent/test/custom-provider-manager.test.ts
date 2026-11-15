@@ -770,8 +770,8 @@ describe("CustomProviderManager", () => {
 				input: ["text", "image"],
 				contextWindow: 32768,
 			},
-			{ id: "auto-b", name: "Auto B", api: "openai-completions" },
-			{ id: "auto-a", api: "openai-completions" },
+			{ id: "auto-b", name: "Auto B", api: "openai-completions", thinkingLevelMode: "catalog" },
+			{ id: "auto-a", api: "openai-completions", thinkingLevelMode: "catalog" },
 		]);
 
 		const repeat = await runtime.refreshProviderModels("custom");

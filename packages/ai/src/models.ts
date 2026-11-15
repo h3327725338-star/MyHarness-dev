@@ -734,6 +734,12 @@ export function getSupportedThinkingLevels<TApi extends Api>(model: Model<TApi>)
 	});
 }
 
+/** Resolves a model's configured default without changing explicit effort selections. */
+export function getDefaultThinkingLevel<TApi extends Api>(model: Model<TApi>): ModelThinkingLevel {
+	const configured = model.defaultThinkingLevel;
+	return clampThinkingLevel(model, configured && EXTENDED_THINKING_LEVELS.includes(configured) ? configured : "max");
+}
+
 export function clampThinkingLevel<TApi extends Api>(
 	model: Model<TApi>,
 	level: ModelThinkingLevel,

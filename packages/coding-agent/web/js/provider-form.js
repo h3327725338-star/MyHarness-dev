@@ -9,7 +9,7 @@ import { Select } from "./select.js";
 import { post } from "./store.js";
 import { effortName, fmtTokens } from "./util.js";
 import { N_, t } from "./i18n.js";
-import { BASE_URL_EXAMPLE, aliasPairs, applyDetection, applyToTickedModels, authModeOf, baseUrlProblem, buildModel, connectionReady, coverOf, detectOutcome, detectRecord, fmtK, fromK, modelDraft, modelGaps, offeredLevels, parseModelIds, parseProviderJson, uniqueProviderId } from "./provider-models.js";
+import { BASE_URL_EXAMPLE, aliasPairs, applyDetection, applyEffortLookup, applyToTickedModels, authModeOf, baseUrlProblem, buildModel, compatWithEffort, connectionReady, coverOf, detectOutcome, detectRecord, effortSent, fmtK, fromK, modelDraft, modelGaps, offeredLevels, parseModelIds, parseProviderJson, uniqueProviderId } from "./provider-models.js";
 
 const API_LABELS = {
 	"openai-completions": N_("OpenAI Chat Completions (most compatible services)"),
@@ -239,6 +239,8 @@ function draftFromConfig(id, config, previous) {
 		keepAlive: config.keepAliveSeconds === undefined ? "" : String(config.keepAliveSeconds),
 		ipFamily: config.ipFamily ?? "",
 		sessionHeader: config.sessionHeader ?? "",
+		// compat.supportsReasoningEffort: off unless the entry says true.
+		sendEffort: config.compat?.supportsReasoningEffort === true,
 		auth: authMode,
 		apiKey: previous?.apiKey ?? "",
 		models: (config.models ?? []).map((model) => modelDraft(model)),
@@ -264,6 +266,9 @@ function buildConfig(draft, defaults) {
 	const sessionHeader = String(draft.sessionHeader ?? "").trim();
 	if (sessionHeader) config.sessionHeader = sessionHeader;
 	else delete config.sessionHeader;
+	const compat = compatWithEffort(draft.raw.compat, draft.sendEffort);
+	if (compat) config.compat = compat;
+	else delete config.compat;
 	// The chosen way to authenticate is saved with the provider. Whatever models.json already holds for the other way
 	// stays where it is, so switching back loses nothing.
 	config.authMode = draft.auth === "config" ? "config" : "apiKey";
@@ -312,8 +317,9 @@ const levelSourceTitle = (source) => (source === "official" ? t("Taken from the 
 
 /** What a level chip says when it is hovered or focused. */
 function levelTitle(model, level, detected) {
-	if (model.levels[level] && detected.levelsSource === "official") return t("Stated in the provider's documentation.");
-	return undefined;
+	if (!model.levels[level]) return t("Not enabled. This level is not offered in chats.");
+	if (detected.levelsSource === "official" && model.thinkingLevelMode === "catalog") return t("Stated in the provider's documentation.");
+	return t("Enabled. This level is offered in chats.");
 }
 
 /** A token capacity edited in K: the number is typed, the unit is fixed. */
@@ -398,11 +404,32 @@ function ModelUses({ model, layers, storedKey, sharedKey, keySuffix }) {
  * what the model really uses (and from which layer); its own format, address and key fold away under "Set separately
  * for this model" and are open from the start when it sets one of them or when no layer sets something it needs.
  */
-function ModelCard({ model, open, onToggle, onChange, onRemove, types, layers, storedKey, sharedKey, keySuffix, ticked, onTick }) {
-	const set = (patch) => onChange({ ...model, ...patch });
+function ModelCard({ model, open, onToggle, onChange, onRemove, types, layers, storedKey, sharedKey, keySuffix, ticked, onTick, effortOn }) {
+	const current = useRef({ model, onChange });
+	current.current = { model, onChange };
+	const set = (patch, automatic = false) => current.current.onChange({ ...current.current.model, ...patch }, automatic);
 	// A switch the user flips by hand is theirs.
 	const touch = (key, patch) => set({ ...patch, touched: { ...model.touched, [key]: true } });
 	const d = model.detected || {};
+	const presetVersion = useRef(0);
+	useEffect(() => {
+		const version = ++presetVersion.current;
+		// A manual override is looked up too: its levels stay, the answer only says whether the table lists the model.
+		if (!model.id.trim()) return;
+		const timer = setTimeout(() => {
+			post("/api/providers/custom/effort-preset", {
+				modelId: model.id,
+				model: { ...model.raw, ...(model.effortModeChosen || model.raw.thinkingLevelMode ? { thinkingLevelMode: model.thinkingLevelMode } : {}) },
+			}).then((result) => {
+				if (version !== presetVersion.current) return;
+				const latest = current.current.model;
+				if (latest.id !== model.id) return;
+				const next = applyEffortLookup(latest, result);
+				if (next !== latest) set(next, true);
+			}).catch(() => {});
+		}, 200);
+		return () => { clearTimeout(timer); ++presetVersion.current; };
+	}, [model.id, model.thinkingLevelMode]);
 	const title = model.name.trim() || model.id.trim() || t("New model");
 	const hasKey = !!sharedKey || !!layers?.upper?.key || !!model.apiKey.trim() || (!!storedKey && !model.removeKey);
 	const gaps = layers ? modelGaps(model, { group: layers.upper, entry: layers.draft, hasKey }) : [];
@@ -447,17 +474,25 @@ function ModelCard({ model, open, onToggle, onChange, onRemove, types, layers, s
 					<${KField} label=${t("Context window")} detected=${d.contextWindow} value=${model.contextWindow} onInput=${(v) => set({ contextWindow: v })} />
 					<${KField} label=${t("Max output")} detected=${d.maxTokens} value=${model.maxTokens} onInput=${(v) => set({ maxTokens: v })} />
 				</div>
+				<${Field} label=${t("Reasoning level configuration")}><${Select} value=${model.thinkingLevelMode} options=${[{ value: "catalog", label: t("Built-in preset") }, { value: "manual", label: t("Manual override") }]} onChange=${(mode) => {
+					if (mode === "catalog") set({ manualBackup: { reasoning: model.reasoning, levels: model.levels, raw: model.raw, detected: d }, thinkingLevelMode: mode, effortModeChosen: mode, touched: { ...model.touched, reasoning: false, levels: false } });
+					else set({ ...model.manualBackup, thinkingLevelMode: mode, effortModeChosen: mode, detected: { ...d, levels: false } });
+				}} />${model.thinkingLevelMode === "manual" && model.presetAvailable ? html`<span class="dim pf-hint">${t("The built-in table lists this model. Choose Built-in preset to use the documented levels.")}</span>` : null}<//>
 				<div class="pf-switches">
-					<label class="check-label"><${Toggle} checked=${model.reasoning} label=${t("Supports reasoning")} onChange=${(v) => touch("reasoning", { reasoning: v })} /><span>${t("Supports reasoning")}</span>${d.reasoning ? html`<${Detected} />` : null}</label>
+					<label class="check-label"><${Toggle} checked=${model.reasoning} label=${t("Supports reasoning")} onChange=${(v) => touch("reasoning", { reasoning: v, thinkingLevelMode: "manual" })} /><span>${t("Supports reasoning")}</span>${d.reasoning ? html`<${Detected} />` : null}</label>
 					<label class="check-label"><${Toggle} checked=${model.image} label=${t("Accepts images")} onChange=${(v) => set({ image: v })} /><span>${t("Accepts images")}</span>${d.input ? html`<${Detected} />` : null}</label>
 					<label class="check-label"><${Toggle} checked=${!!model.pricing} label=${t("Custom pricing")} onChange=${(enabled) => set({ pricing: enabled ? { ...emptyRates(), currency: "USD", tiers: [] } : null })} /><span>${t("Custom pricing")}</span></label>
 				</div>
 				<${FoldIn} content=${model.reasoning
 					? html`<div class="col field-label pf-levels-block"><span class="field-name">${t("Thinking effort this model accepts")}${d.levels ? html` <${Detected} title=${levelSourceTitle(d.levelsSource)} />` : null}</span>
-						<div class="pf-levels">${offeredLevels(model).map((level) => html`<button type="button" key=${level} class=${`chip-toggle ${model.levels[level] ? "on" : ""}`} aria-pressed=${model.levels[level]} title=${levelTitle(model, level, d)} onClick=${() => touch("levels", { levels: { ...model.levels, [level]: !model.levels[level] }, detected: { ...d, levels: false } })}>${effortName(level)}</button>`)}</div>
-						<span class="dim pf-hint">${d.levels ? (d.levelsSource === "official" ? t("These are the levels the provider's documentation lists for this model.") : t("These are the levels the endpoint lists for this model.")) : t("Nothing states which levels this model accepts, so the standard ones stay available. Tick the levels it really accepts and untick the others; MyHarness does not test them.")}</span>
-						${aliasPairs(model).length ? html`<span class="dim pf-hint">${t("Accepted by the API, but not separate levels (provider documentation): {pairs}", { pairs: aliasPairs(model).map(([name, level]) => `${effortName(name)} → ${effortName(level)}`).join(" · ") })}</span>` : null}</div>`
+						<div class="pf-levels">${offeredLevels(model).map((level) => model.thinkingLevelMode === "catalog" && model.presetKnown
+							? html`<span key=${level} class="chip-toggle on" title=${levelTitle(model, level, d)}>${effortName(level)}</span>`
+							: html`<button type="button" key=${level} class=${`chip-toggle ${model.levels[level] ? "on" : ""}`} aria-pressed=${model.levels[level]} aria-label=${`${effortName(level)}: ${model.levels[level] ? t("Enabled") : t("Not enabled")}`} title=${levelTitle(model, level, d)} onClick=${() => touch("levels", { thinkingLevelMode: "manual", levels: { ...model.levels, [level]: !model.levels[level] }, detected: { ...d, levels: false } })}>${effortName(level)}</button>`)}</div>
+						<span class="dim pf-hint">${model.thinkingLevelMode === "manual" ? t("Manual override: only highlighted levels are offered in chats. Unselected levels are not enabled.") : d.levels ? (d.levelsSource === "official" ? t("These are the levels the provider's documentation lists for this model. Switch to Manual override to change them for your provider.") : t("These are the levels the endpoint lists for this model.")) : model.presetKnown === false ? t("This Model ID is not in the built-in table. Saved capabilities are kept; use Manual override to configure its levels.") : t("Looking up the built-in reasoning preset…")}</span>
+						${aliasPairs(model).length ? html`<span class="dim pf-hint">${t("Accepted by the API, but not separate levels (provider documentation): {pairs}", { pairs: aliasPairs(model).map(([name, level]) => `${effortName(name)} → ${effortName(level)}`).join(" · ") })}</span>` : null}
+						${effortOn === false ? html`<span class="dim pf-hint">${t("Reasoning levels are not sent with requests. Turn on “Send reasoning levels to this service” in the provider settings.")}</span>` : null}</div>`
 					: null} />
+				${model.reasoning ? html`<${Field} label=${t("Default reasoning level")}><${Select} value=${model.defaultThinkingLevel} options=${[{ value: "", label: t("Highest supported level") }, ...offeredLevels(model).filter((level) => model.levels[level]).map((level) => ({ value: level, label: effortName(level) }))]} onChange=${(level) => set({ defaultThinkingLevel: level })} /><//>` : null}
 				<${Collapse} open=${!!model.pricing}>${pricing.current ? html`<${PricingFields} value=${pricing.current} onChange=${(next) => set({ pricing: next })} />` : null}<//>
 				${layers
 					? html`<div class="pf-uses">
@@ -658,7 +693,10 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 		setIdsText("");
 	};
 
-	const updateModel = (uid, next) => patch({ models: draft.models.map((m) => (m.uid === uid ? next : m)) });
+	const updateModel = (uid, next, automatic = false) => {
+		setDraft((current) => ({ ...current, models: current.models.map((m) => (m.uid === uid ? next : m)) }));
+		if (!automatic) setDirty(true);
+	};
 	const toggleOpen = (uid) =>
 		setOpenModels((current) => {
 			const next = new Set(current);
@@ -827,6 +865,10 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 				${draft.auth === "key" && !(hasStoredKey && keyArea) && !upperKey ? html`<span class="dim pf-hint">${t("Stored on this computer only, never in models.json.")}</span>` : null}
 				${upperKey ? html`<span class="dim pf-hint">${t("Covered by the API key in the provider settings {suffix}. What is here is kept and applies again once that is removed.", { suffix: upperKey.suffix ? `••••${upperKey.suffix}` : "" })}</span>` : null}
 			</div>
+			${effective.api === "openai-completions" ? html`<div class="col field-label pf-row">
+				<label class="check-label"><${Toggle} checked=${draft.sendEffort} label=${t("Send reasoning levels to this service")} onChange=${(v) => patch({ sendEffort: v })} /><span>${t("Send reasoning levels to this service")}</span></label>
+				<span class="dim pf-hint">${t("Off by default: many compatible services reject the reasoning_effort field. Turn it on only if this service accepts it; the level chosen in chats is then sent with every request. Official addresses MyHarness recognizes (such as OpenAI or DeepSeek) get the level without this switch; an explicit Off stops it.")}</span>
+			</div>` : null}
 		</div>
 		<button type="button" class="pf-more-toggle" aria-expanded=${moreOpen} onClick=${toggleMore}>
 			<${Fold} /><span class="pf-more-label">${t("More connection settings")}</span>
@@ -876,7 +918,7 @@ export function ProviderForm({ initial, apiTypes, defaults, keyArea, hasStoredKe
 			</div>`
 			: null}
 		${draft.models.length
-			? html`<div class="prov-branch pf-model-list">${draft.models.map((model) => html`<${ModelCard} key=${model.uid} model=${model} open=${openModels.has(model.uid)} onToggle=${() => toggleOpen(model.uid)} onChange=${(next) => updateModel(model.uid, next)} onRemove=${() => patch({ models: draft.models.filter((m) => m.uid !== model.uid) })} types=${types} layers=${layers} storedKey=${modelKeys?.[model.raw?.id]} sharedKey=${sharedKey} keySuffix=${keySuffix} ticked=${ticked.has(model.uid)} onTick=${tickable ? (on) => tick(model.uid, on) : null} />`)}</div>`
+			? html`<div class="prov-branch pf-model-list">${draft.models.map((model) => html`<${ModelCard} key=${model.uid} model=${model} open=${openModels.has(model.uid)} onToggle=${() => toggleOpen(model.uid)} onChange=${(next, automatic) => updateModel(model.uid, next, automatic)} onRemove=${() => patch({ models: draft.models.filter((m) => m.uid !== model.uid) })} types=${types} layers=${layers} storedKey=${modelKeys?.[model.raw?.id]} sharedKey=${sharedKey} keySuffix=${keySuffix} ticked=${ticked.has(model.uid)} onTick=${tickable ? (on) => tick(model.uid, on) : null} effortOn=${effortSent({ api: upper?.api || draft.api || model.api, providerCompat: compatWithEffort(draft.raw.compat, draft.sendEffort), modelCompat: model.raw?.compat, baseUrl: String(model.baseUrl ?? "").trim() || upper?.baseUrl || draft.baseUrl })} />`)}</div>`
 			: null}
 	</div>`;
 	const jsonCard = html`<div class="pf-json">

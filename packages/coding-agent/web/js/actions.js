@@ -1156,7 +1156,7 @@ function keepsNewChat({ rootPath, unbound, mode, group }) {
 	if (pending) return !!(pending.fresh && !pending.error && pending.mode === mode && group && pending.freshRow && samePath(pending.freshRow.group, group));
 	if (!canSendToActive()) return false;
 	const info = state.slots.find((slot) => slot.slot === activeSlotId());
-	if (!info || chatModeOf(info.mode) !== mode || info.copy) return false;
+	if (!info || chatModeOf(info.mode) !== mode || info.copy || info.newChatModelConfigured || state.settings?.items?.some((item) => item.id === "newChatModel" && item.value?.model)) return false;
 	if (info.firstMessage || info.name || info.active || info.completion || info.waiting || state.snap?.active || state.items.length || state.userBashOrder?.length) return false;
 	if (unbound || (!rootPath && info.unbound)) return !!info.unbound && info.atDefaultDir === true;
 	if (state.snap?.cwdMissing !== false) return false;

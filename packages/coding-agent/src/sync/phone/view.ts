@@ -39,6 +39,11 @@ export interface PhoneModel {
 	contextWindow: number;
 	maxTokens: number;
 	thinkingLevelMap?: Record<string, unknown>;
+	/**
+	 * The effort "Default" stands for on this model (the desktop's own pick, already within the levels the model offers).
+	 * Only for a model that reasons; optional, so an older phone ignores it and an older computer's view does not have it.
+	 */
+	defaultThinkingLevel?: string;
 	compat?: Record<string, unknown>;
 }
 
