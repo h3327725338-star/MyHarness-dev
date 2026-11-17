@@ -22,7 +22,7 @@
 | `roles/delegated.md` | 只读委派会话的执行边界 |
 | `roles/delegated-write.md` | 读写模式（Sub Agent 设置为「读写」）里可改文件的委派会话的执行边界，仅限自身副本（副本池里的 Git worktree，非 Git 目录是文件镜像）、永不 commit/push |
 | `roles/explore.md` | Explore 子进程通过 `--append-system-prompt` 追加的专用职责（只读任务，包括读写模式里 `access: read` 的任务）；用 `submit_report` 交报告并逐题给状态 |
-| `roles/explore-write.md` | 读写模式里可改文件的 Explore 子进程追加的专用职责，含副本边界、`[可读清单]` 规则、`submit_report` 交报告与末尾 `## Worktree result` 返回格式 |
+| `roles/explore-write.md` | 读写模式里可改文件的 Explore 子进程追加的专用职责，含副本边界、`[Readable paths]` 规则、`submit_report` 交报告与末尾 `## Worktree result` 返回格式 |
 | `session/commit-authorization.md` | 当前不存在；显式 `/commit` 的授权和 Git 事务边界由 Coding Agent 源码处理，不会从本目录加载 |
 | `session/handoff.md` | 后台交接摘要请求的职责与输出格式（话题、当前焦点、必要背景、结论与纠正、未完成事项、来源；区分已确认与未验证，中断回复不写成完成；“今天”等日期按任务给出的当前本机时间和每条消息的发送时间推算，推不出就不写；提示词文件本身不含非英文字符） |
 | `session/auto-memory.md` | 仅 Auto Memory 完整启用时追加的记忆优先级约束 |

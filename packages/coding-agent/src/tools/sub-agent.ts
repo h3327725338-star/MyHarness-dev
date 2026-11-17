@@ -2168,7 +2168,7 @@ export function resolveTaskReadRoots(
 
 function describeReadRoots(readRoots: readonly string[]): string {
 	if (readRoots.length === 0) return "";
-	return `\n\n[可读清单] Outside your copy you may also read these locations, with the read, grep, find, ls and symbols tools and absolute paths only (not from the shell); they are read-only for you:\n${readRoots.map((item) => `- ${item}`).join("\n")}`;
+	return `\n\n[Readable paths] Outside your copy you may also read these locations, with the read, grep, find, ls and symbols tools and absolute paths only (not from the shell); they are read-only for you:\n${readRoots.map((item) => `- ${item}`).join("\n")}`;
 }
 
 function describeWorktreeCopy(handle: PooledWorktreeHandle): string {
