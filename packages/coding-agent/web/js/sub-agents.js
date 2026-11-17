@@ -325,8 +325,8 @@ function failedCount(items) {
 }
 
 /**
- * Above the input, only while the chat has sub-agents: how many run and since when, open by default to one row per
- * sub-agent. Everything opens in place, one layer at a time (the list, one sub-agent's steps, one step's data); nothing
+ * Above the input, only while the chat has sub-agents: how many run and since when, folded by default to that one
+ * head row; clicking it opens one row per sub-agent. Everything opens in place, one layer at a time (the list, one sub-agent's steps, one step's data); nothing
  * here scrolls the conversation. The fullscreen view shows the same list, open to the same depth. When the last one
  * ends the bar says briefly whether all went well, then goes away (not while its list or the fullscreen view is open).
  */
@@ -336,7 +336,7 @@ export function SubAgentBar() {
 	const cwd = useStore((s) => s.snap?.cwd || "");
 	const session = useStore((s) => s.snap?.session?.id);
 	const openSignal = useStore((s) => s.view.subAgentPanel);
-	const [open, setOpen] = useState(true);
+	const [open, setOpen] = useState(false);
 	const [full, setFull] = useState(false);
 	const [summary, setSummary] = useState(null);
 	const rows = useOpenSet();
@@ -346,10 +346,10 @@ export function SubAgentBar() {
 	const live = state.items.length > 0 && (running > 0 || state.unknown);
 	const now = useNow(running > 0 && !state.unknown);
 
-	// Sub-agents that start (again) show their list open.
+	// Sub-agents that start (again) show the bar folded to its one head row; the list opens on click.
 	const wasLive = useRef(live);
 	useLayoutEffect(() => {
-		if (live && !wasLive.current) setOpen(true);
+		if (live && !wasLive.current) setOpen(false);
 		wasLive.current = live;
 	}, [live]);
 

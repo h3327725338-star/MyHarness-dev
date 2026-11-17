@@ -114,6 +114,7 @@ describe("Web UI: snapshot-first staged switch (store.js refreshSlotStaged)", ()
 		activeSlotId: () => string | null;
 		inSlot: <T>(slot: string, run: () => T) => T;
 		appendStreamedItem: (item: Record<string, unknown>, slot?: string) => void;
+		loadTranscript: (slot?: string, options?: { limit?: number }) => Promise<unknown>;
 		state: Record<string, any>;
 	};
 	let fetchCalls: string[];
@@ -286,6 +287,80 @@ describe("Web UI: snapshot-first staged switch (store.js refreshSlotStaged)", ()
 		const bag = staged.inSlot("staged-s7", () => ({ items: staged.state.items as Array<Record<string, unknown>> }));
 		expect(bag.items.map((item) => item.id)).toEqual(["old-2"]);
 	});
+
+	// A long finished turn streamed in without saved ids (replies and tool results are never announced), then the next
+	// message and its answer. A page read later starts at that next message (a first page, or a page sized to the list
+	// this chat holds, is aligned to a user message). The earlier turn's live entries were carried behind the newest
+	// answer: that answer then read as a text written along the way and folded into the earlier turn's steps.
+	for (const read of ["page", "staged"] as const) {
+		it(`⑧ a ${read} read that starts after a finished turn keeps that turn's live entries out of the newest one`, async () => {
+			const slot = `staged-s8-${read}`;
+			(globalThis as Record<string, unknown>).fetch = async (url: string) => {
+				const key = String(url);
+				fetchCalls.push(key);
+				const pathname = new URL(key, "http://127.0.0.1").pathname;
+				if (pathname === "/api/transcript")
+					return new Response(
+						JSON.stringify({
+							items: [
+								{ kind: "user", id: "u-2", ts: 40, text: "next" },
+								{
+									kind: "assistant",
+									id: "a-2",
+									ts: 41,
+									blocks: [{ type: "text", text: "answer 2" }],
+									stopReason: "stop",
+								},
+							],
+							hasMore: true,
+							nextCursor: "u-2",
+						}),
+						{ status: 200 },
+					);
+				return new Response(JSON.stringify(snapOf(slot)), { status: 200 });
+			};
+			const reply = (liveId: string, ts: number, blocks: unknown[], final = true) => ({
+				kind: "assistant",
+				liveId,
+				ts,
+				blocks,
+				stopReason: final
+					? blocks.some((b) => (b as { type: string }).type === "toolCall")
+						? "toolUse"
+						: "stop"
+					: undefined,
+				...(final ? { final: true, endedAt: ts } : {}),
+			});
+			staged.inSlot(slot, () => {
+				staged.appendStreamedItem({ kind: "user", id: "u-1", ts: 1, text: "long task" });
+				for (let step = 0; step < 3; step += 1) {
+					staged.appendStreamedItem(
+						reply(`live-${step}`, 2 + step * 2, [
+							{ type: "toolCall", id: `call-${step}`, name: "read", args: {} },
+						]),
+					);
+					staged.appendStreamedItem({
+						kind: "toolResult",
+						ts: 3 + step * 2,
+						toolCallId: `call-${step}`,
+						text: "out",
+						live: true,
+					});
+				}
+				staged.appendStreamedItem(reply("live-final", 20, [{ type: "text", text: "answer 1" }]));
+				staged.appendStreamedItem({ kind: "user", id: "u-2", ts: 40, text: "next" });
+				staged.appendStreamedItem(reply("live-next", 41, [{ type: "text", text: "answer 2" }]));
+				// A third reply still streaming: it is not saved yet, so it stays.
+				staged.appendStreamedItem(reply("live-streaming", 50, [{ type: "text", text: "still writing" }], false));
+			});
+			if (read === "page") await staged.inSlot(slot, () => staged.loadTranscript(slot, { limit: 120 }));
+			else await staged.refreshSlotStaged(slot, staged.nextSwitch());
+			const items = staged.inSlot(slot, () => staged.state.items as Array<Record<string, unknown>>);
+			expect(
+				items.map((item) => (item.id as string) ?? (item.liveId as string) ?? (item.toolCallId as string)),
+			).toEqual(["u-2", "a-2", "live-streaming"]);
+		});
+	}
 });
 
 describe("Web UI: turnsCache growth and linkage (store.js)", () => {

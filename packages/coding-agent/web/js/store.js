@@ -1033,12 +1033,25 @@ export async function loadTranscript(slot = targetSlot ?? activeSlot, { limit } 
 			if (item.kind === "toolResult" && item.toolCallId) persistedToolCalls.add(item.toolCallId);
 			if (item.kind === "assistant") persistedAssistants.push(item);
 		}
+		// Where this list and the read meet: the last entry the read also holds that the server saved in order (one with
+		// its saved id, or a finished reply, which is saved before its end is reported). Every live entry listed before it
+		// was saved before it, so the read either shows it or does not reach back that far (a first page, or a page sized
+		// to what this list held, starts after it; older pages bring it). Carried, such an entry landed after the newest
+		// answer: the answer then read as a text written along the way and folded into the steps. A tool result is
+		// reported before it is saved, so it does not set the boundary; a reply still streaming is not saved yet wherever
+		// it stands, so the boundary never drops it.
+		let covered = -1;
+		state.items.forEach((item, index) => {
+			if (item.pending) return;
+			if (item.id ? persistedIds.has(item.id) : item.kind === "assistant" && item.final && persistedAssistants.some((entry) => sameAssistantMessage(entry, item))) covered = index;
+		});
 		const runningTools = {};
-		for (const item of state.items) {
+		for (const [index, item] of state.items.entries()) {
 			if (!item.liveId && !(item.live && !item.id)) continue;
 			if (item.id && (persistedIds.has(item.id) || !bag.stagedLoading)) continue;
 			if (item.kind === "toolResult" && item.toolCallId && persistedToolCalls.has(item.toolCallId)) continue;
 			if (item.kind === "assistant" && item.final && persistedAssistants.some((entry) => sameAssistantMessage(entry, item))) continue;
+			if (index < covered && !(item.kind === "assistant" && !item.final)) continue;
 			carry.push(item);
 			// A tool the carried reply started is still running: keep its state, or its row falls back to "pending".
 			if (item.kind === "assistant")
