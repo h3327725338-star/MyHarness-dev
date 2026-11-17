@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir as osTmpdir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,7 +55,7 @@ async function snapshot(root: string): Promise<Map<string, { size: number; mtime
 async function poolRootOf(agent: string): Promise<string> {
 	const sandboxes = await readdir(join(agent, "sandboxes"));
 	expect(sandboxes).toHaveLength(1);
-	return join(agent, "sandboxes", sandboxes[0]!);
+	return realpath(join(agent, "sandboxes", sandboxes[0]!));
 }
 
 describe("mirror pool", () => {
@@ -71,7 +71,7 @@ describe("mirror pool", () => {
 		expect([...after]).toEqual([...before]);
 		expect(handle.slotName).toBe("slot-1");
 		expect(handle.sandboxPath).toBe(join(await poolRootOf(agent), "slot-1", "workspace"));
-		expect(handle.originCwd).toBe(origin);
+		expect(handle.originCwd).toBe(await realpath(origin));
 		expect(handle.importedFiles).toBe(2);
 		expect(handle.copiedFiles).toBe(2);
 		expect(handle.complete).toBe(true);
