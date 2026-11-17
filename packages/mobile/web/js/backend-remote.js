@@ -14,7 +14,9 @@ import { addPending, applyEvent, carryLive, markDelivered, mergeReloaded, remove
 import { accountLink, onAccountPcs, onAccountView } from "./account.js";
 import { mirrorPcTab } from "./browser-model.js";
 import { kvGet, kvSet } from "./db.js";
+import { pcModels, snapFromEvent, switchSnap } from "./effort.js";
 import { importKey, linkAad, open, parsePairing, seal } from "./link-crypto.js";
+import { latencyMoved } from "./link-status.js";
 import { allowedRoutes, openDirect, openRelay, PC_ROUTES } from "./link-remote.js";
 import { haptic, httpFetch, nativeInfo, notifyDone, onNative, runActive, secretDelete, secretGet, secretSet } from "./native.js";
 import { chatModeOf, DEFAULT_KEY, emptyLists, isOpen, pathKey } from "./pc-groups.js";
@@ -99,6 +101,9 @@ export function routeName(route) {
 	if (route === "lan") return t("Local network");
 	return "";
 }
+
+/** What the link forgets when another PC is chosen or none: the last try's plan, losses and measurements (link-status.js). */
+const FRESH_LINK = { retryAt: 0, attempt: 0, fatal: false, lost: 0, rtt: 0, since: 0, trying: [], fails: null, onlineAt: 0, direct: null };
 
 function setLink(patch) {
 	state.pc.link = { ...state.pc.link, ...patch };
@@ -205,9 +210,12 @@ async function findLan() {
 
 /** The `open` request on one route (`{ address }` or `{ pipe, timeoutMs }`): resolves with the PC's opened answer. */
 async function openOn(route) {
+	const began = Date.now();
 	const opened = await exchange("open", { name: nativeInfo.device || "Phone", app: nativeInfo.version }, route);
 	if (opened.status !== 200) throw failure(opened.status, opened.body);
-	return open(key, linkAad("open", "res", config.deviceId, opened.nonce), opened.body);
+	const answer = await open(key, linkAad("open", "res", config.deviceId, opened.nonce), opened.body);
+	// How long one request and its answer took on this route: shown as the connection's delay (link-status.js).
+	return Object.assign(answer, { rttMs: Date.now() - began });
 }
 
 async function openPipe(route, pipe) {
@@ -237,10 +245,11 @@ function watchPipe(pipe) {
 function raceRoutes(mine) {
 	const link = accountLink();
 	if (!link) return Promise.reject(new LinkFailure(t("Sign in with Google first."), 0));
-	const since = Date.now();
 	const trying = new Set();
+	// Why each way failed, for Settings → PC connection (`link.fails`).
+	const fails = {};
 	const show = () => {
-		if (mine === generation && state.pc.link.status === "connecting") setLink({ trying: [...trying], since });
+		if (mine === generation && state.pc.link.status === "connecting") setLink({ trying: [...trying], fails: { ...fails } });
 	};
 	const stopDirect = new AbortController();
 	const target = { drive: link.drive, pcId: config.pcId, phoneId: config.deviceId };
@@ -327,6 +336,7 @@ function raceRoutes(mine) {
 					done(route);
 				},
 				(error) => {
+					if (error?.message !== "Cancelled." && error?.message !== "superseded") fails[route] = route === "direct" && error?.direct ? directReason(error) : t(error?.message || "The PC cannot be reached.");
 					// The relay's reason counts most (it works whenever Drive does); a refusal by the PC counts above all.
 					if (!reason || route === "relay" || error?.status === 403 || error?.status === 429) {
 						if (!(reason?.status === 403 || reason?.status === 429)) reason = error;
@@ -358,7 +368,7 @@ function adopt(result, mine) {
 		config = { ...config, name: answer.pc.name };
 		localStorage.setItem(LINK_KEY, JSON.stringify(config));
 	}
-	setLink({ route: result.route, trying: [], paired: config, host, pcVersion: answer.pc?.version || "" });
+	setLink({ route: result.route, trying: [], paired: config, host, pcVersion: answer.pc?.version || "", rtt: answer.rttMs || 0, fails: null });
 	if (result.route === "relay") scheduleFaster();
 	else clearTimeout(directTimer);
 }
@@ -375,7 +385,7 @@ function upgrade(result) {
 	host = result.host || "";
 	session = result.answer.s;
 	counter = 0;
-	setLink({ route: result.route, host });
+	setLink({ route: result.route, host, rtt: result.answer.rttMs || state.pc.link.rtt || 0 });
 	if (result.route !== "relay") clearTimeout(directTimer);
 	runStream(mine, { moved: true });
 	// Requests still on their way over the old route finish there; it is closed once they had the time to.
@@ -859,23 +869,60 @@ function applySnapshot(bag, snap) {
 
 function publishModels(bag, list) {
 	if (list) bag.modelList = list;
-	const snap = bag.snap || {};
-	const providers = (bag.modelList?.providers || []).map((provider) => ({
-		id: provider.id,
-		name: provider.name,
-		models: provider.models.map((model) => ({ id: model.id, name: model.name || model.id, reasoning: model.reasoning, vision: (model.input || []).includes("image") })),
-	}));
-	const model = snap.model;
-	const levels = snap.thinking?.supported ? snap.thinking.levels || [] : [];
 	if (state.pc.chat !== bag) return;
-	state.pc.models = {
-		loaded: true,
-		providers,
-		current: model ? { provider: model.provider, providerName: providers.find((provider) => provider.id === model.provider)?.name || model.provider, id: model.id, name: model.name || model.id, reasoning: model.reasoning, vision: (model.input || []).includes("image") } : null,
-		efforts: levels.length > 1 ? levels : [],
-		effort: snap.thinking?.level || "off",
-	};
+	// The model list (each model's own levels and default) and the chat's snapshot (the model in use, its levels, the level
+	// in use) are put together in one place, effort.js, so what the page shows always comes from both.
+	state.pc.models = pcModels({ list: bag.modelList, snap: bag.snap });
 	emit();
+}
+
+/** The level in use changed (the PC's event, or the user's own choice): keep the rest of the snapshot as it is. */
+function withLevel(bag, level) {
+	if (bag.snap) bag.snap = { ...bag.snap, thinking: { ...bag.snap.thinking, level } };
+}
+
+// A model or effort the user chose is on its way: the PC's events about it are not applied meanwhile (they may describe an
+// earlier choice), the answer decides.
+const choosing = new Map(); // slot → how many choices are under way
+const passedOver = new Set(); // slots whose model event was not applied because a choice was under way
+const snapshotTimers = new Map();
+
+/** A choice (model or effort) got its answer or failed. */
+function choiceDone(slot) {
+	const left = Math.max(0, (choosing.get(slot) || 1) - 1);
+	choosing.set(slot, left);
+	// A model event of the PC that was passed over meanwhile may be newer than the answer: the model and its levels are read again.
+	if (!left && passedOver.delete(slot)) refreshSnapshotSoon(slot);
+}
+
+/** Read only the model in use and its levels again (a light GET /api/state, not the whole chat). */
+function refreshSnapshotSoon(slot, delay = 150) {
+	clearTimeout(snapshotTimers.get(slot));
+	snapshotTimers.set(
+		slot,
+		setTimeout(async () => {
+			const bag = bags.get(slot);
+			const mine = generation;
+			if (!bag) return;
+			// A choice is on its way: this read waits for its answer (choiceDone asks for it again).
+			if (choosing.get(slot)) {
+				passedOver.add(slot);
+				return;
+			}
+			try {
+				const snap = await call("GET", "/api/state", undefined, slot);
+				if (mine !== generation) return;
+				if (choosing.get(slot)) {
+					passedOver.add(slot);
+					return;
+				}
+				bag.snap = { model: snap.model, thinking: snap.thinking };
+				publishModels(bag);
+			} catch {
+				// The next full read of the chat has it.
+			}
+		}, delay),
+	);
 }
 
 /** Pictures the PC lists by address (large ones) are fetched through the link and put into the items as data. */
@@ -988,7 +1035,8 @@ function onEvent(name, data) {
 		return;
 	}
 	if (name === "shutdown") {
-		setLink({ status: "offline", error: t("MyHarness on the PC was closed.") });
+		// The stream ends with it: runStream plans the next try and says so (retryAt).
+		setLink({ status: "offline", error: t("MyHarness on the PC was closed."), lost: state.pc.link.lost || Date.now() });
 		return;
 	}
 	if (name === "workspaces_changed") {
@@ -998,9 +1046,34 @@ function onEvent(name, data) {
 	const slot = data?.slot;
 	if (!slot) return;
 	const bag = bagFor(slot);
-	if (name === "thinking_level") {
-		if (bag.snap) bag.snap = { ...bag.snap, thinking: { ...bag.snap.thinking, level: data.level } };
+	if (name === "model_changed") {
+		// The PC's model changed, however (its model menu, cycling, a fallback model, another chat taking the slot): the event
+		// carries the model, its levels and the level in use, so they replace the page's at once (effort.js has the rules).
+		// A choice made here is on its way: its answer decides, as with thinking_level. A chat not on the page is read when opened.
+		if (!bag.loaded) return;
+		if (choosing.get(slot)) {
+			passedOver.add(slot);
+			return;
+		}
+		const snap = snapFromEvent(data);
+		if (!snap) {
+			refreshSnapshotSoon(slot);
+			return;
+		}
+		// The level event that came with this switch asked for a re-read; this event already says everything it would.
+		clearTimeout(snapshotTimers.get(slot));
+		bag.snap = snap;
 		publishModels(bag);
+		return;
+	}
+	if (name === "thinking_level") {
+		if (choosing.get(slot)) return;
+		withLevel(bag, data.level);
+		publishModels(bag);
+		// The level changes on its own when another model is chosen (on the PC, by a fallback…): a PC that does not send
+		// model_changed (an older one) names no model, so the model and its levels are read again, or the page would show
+		// the new level beside the old model's levels. A newer PC's model_changed that follows cancels this read.
+		refreshSnapshotSoon(slot);
 		return;
 	}
 	if (name === "models_changed" || name === "compaction_end") {
@@ -1042,7 +1115,7 @@ async function runStream(mine, { moved = false } = {}) {
 		if (announced || mine !== generation) return;
 		announced = true;
 		retries = 0;
-		setLink({ status: "online", error: "", trying: [] });
+		setLink({ status: "online", error: "", trying: [], retryAt: 0, attempt: 0, fatal: false, lost: 0, fails: null, onlineAt: Date.now() });
 		if (moved) catchUp();
 		else onConnected(mine).catch((error) => console.warn("link refresh failed", error));
 	};
@@ -1117,9 +1190,18 @@ async function runStream(mine, { moved = false } = {}) {
 		// A remote route that failed is opened again on the next try (perhaps another one).
 		if (transport && error?.status !== 401) dropTransport();
 		const fatal = error?.status === 403;
-		setLink({ status: "offline", error: error?.status === 401 || error?.message === "superseded" ? "" : error?.message || String(error) });
+		const delay = fatal ? 0 : RETRY_DELAYS[Math.min(retries++, RETRY_DELAYS.length - 1)];
+		// The page says whether a try is planned (and when), and whether a connection that had been up was lost, instead of
+		// a bare "not reachable" (link-status.js).
+		setLink({
+			status: "offline",
+			error: error?.status === 401 || error?.message === "superseded" ? "" : error?.message || String(error),
+			fatal,
+			retryAt: fatal ? 0 : Date.now() + delay,
+			attempt: retries,
+			lost: state.pc.link.lost || (announced ? Date.now() : 0),
+		});
 		if (fatal) return;
-		const delay = RETRY_DELAYS[Math.min(retries++, RETRY_DELAYS.length - 1)];
 		clearTimeout(retryTimer);
 		retryAt = Date.now() + delay;
 		retryTimer = setTimeout(() => mine === generation && (document.visibilityState === "visible" || watched.size > 0) && connect(), delay);
@@ -1202,7 +1284,7 @@ function rest() {
 	stream = null;
 	dropTransport();
 	session = "";
-	setLink({ status: "offline", error: "", trying: [] });
+	setLink({ status: "offline", error: "", trying: [], retryAt: 0, lost: 0, fails: null });
 }
 
 async function onConnected(mine) {
@@ -1246,6 +1328,7 @@ function checkAlive() {
 	const mine = generation;
 	const waitMs = ALIVE_WAIT_MS[state.pc.link.route] || ALIVE_WAIT_MS.relay;
 	let settled = false;
+	const began = Date.now();
 	const timer = setTimeout(() => {
 		if (settled || mine !== generation) return;
 		settled = true;
@@ -1257,6 +1340,8 @@ function checkAlive() {
 			settled = true;
 			clearTimeout(timer);
 			if (mine !== generation) return;
+			// The delay shown in Settings → PC connection follows what this round trip took.
+			if (latencyMoved(state.pc.link.rtt, Date.now() - began)) setLink({ rtt: Date.now() - began });
 			slots = answer.slots || slots;
 			catchUp();
 		},
@@ -1278,7 +1363,7 @@ function connect() {
 	stream = null;
 	const mine = ++generation;
 	session = "";
-	setLink({ status: "connecting", error: "" });
+	setLink({ status: "connecting", error: "", retryAt: 0, since: Date.now(), trying: [], fails: null });
 	runStream(mine);
 }
 
@@ -1384,7 +1469,7 @@ export const pc = {
 		state.pc.chat = emptyChat();
 		state.pc.chats = [];
 		state.pc.chatsLoaded = false;
-		setLink({ paired: config, status: "connecting", error: "", host: "", route: "" });
+		setLink({ paired: config, status: "connecting", error: "", host: "", route: "", ...FRESH_LINK });
 		connect();
 		return config;
 	},
@@ -1401,7 +1486,7 @@ export const pc = {
 		config = { name: parsed.name, hosts: parsed.hosts, port: parsed.port, deviceId: parsed.deviceId };
 		key = nextKey;
 		session = "";
-		setLink({ status: "connecting", error: "", host: "" });
+		setLink({ status: "connecting", error: "", host: "", ...FRESH_LINK });
 		try {
 			await openSession();
 		} catch (error) {
@@ -1454,7 +1539,7 @@ export const pc = {
 		state.pc.chats = [];
 		state.pc.chatsLoaded = false;
 		state.pc.models = emptyModels();
-		setLink({ paired: null, status: "none", error: "", host: "" });
+		setLink({ paired: null, status: "none", error: "", host: "", ...FRESH_LINK });
 	},
 
 	hasModel: () => !!state.pc.models.current,
@@ -1580,16 +1665,60 @@ export const pc = {
 	retry: null,
 
 	async setModel(provider, id) {
-		await call("POST", "/api/model", { provider, id });
 		const bag = state.pc.chat;
-		await loadChat(bag, { quiet: true });
+		const slot = bag.slot;
+		const before = bag.snap;
+		// The model, its levels and the level that goes with it show at once (the PC keeps the level in use when the new model
+		// offers it, else the nearest one); the PC's answer replaces this. Through Drive that answer takes seconds.
+		const patch = switchSnap(state.pc.models, provider, id);
+		if (patch) {
+			bag.snap = patch;
+			publishModels(bag);
+		}
+		choosing.set(slot, (choosing.get(slot) || 0) + 1);
+		let switched = false;
+		try {
+			await call("POST", "/api/model", { provider, id });
+			switched = true;
+			const snap = await call("GET", "/api/state", undefined, slot);
+			bag.snap = { model: snap.model, thinking: snap.thinking };
+			// This read is later than the PC's own event about this switch: nothing is left to read again.
+			passedOver.delete(slot);
+			publishModels(bag);
+		} catch (error) {
+			if (!switched) {
+				bag.snap = before;
+				publishModels(bag);
+				throw error;
+			}
+			// The PC has switched and only reading the result failed: the page keeps the choice it shows and reads it again.
+			passedOver.add(slot);
+		} finally {
+			choiceDone(slot);
+		}
+		// The model's own entry in the chat and the model list (defaults) are read in the background, not waited for.
 		loadModels(bag);
+		refreshSoon(slot, 300);
 	},
 
 	async setEffort(level) {
-		const answer = await call("POST", "/api/thinking", { level });
 		const bag = state.pc.chat;
-		if (bag.snap) bag.snap = { ...bag.snap, thinking: { ...bag.snap.thinking, level: answer.level || level } };
+		const slot = bag.slot;
+		const before = bag.snap?.thinking?.level;
+		withLevel(bag, level);
+		publishModels(bag);
+		choosing.set(slot, (choosing.get(slot) || 0) + 1);
+		try {
+			const answer = await call("POST", "/api/thinking", { level });
+			// The PC brings the level within the model's levels: what it answers is the level in use.
+			withLevel(bag, answer.level || level);
+		} catch (error) {
+			if (before !== undefined) withLevel(bag, before);
+			publishModels(bag);
+			throw error;
+		} finally {
+			choiceDone(slot);
+		}
 		publishModels(bag);
 	},
 

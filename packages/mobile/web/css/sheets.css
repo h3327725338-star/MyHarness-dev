@@ -44,6 +44,7 @@
 .sheet .rows { background: var(--bg-inset); }
 .rows-title { padding: 0 8px 7px; color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.03em; }
 .rows-note { padding: 7px 8px 0; color: var(--text-3); font-size: var(--fs-xs); line-height: 17px; }
+.rows-note > div + div { margin-top: 6px; }
 .rowi {
 	position: relative; width: 100%; display: flex; align-items: center; gap: 12px; min-height: 54px; padding: 9px 14px; text-align: left; color: var(--text);
 	transition: background var(--t-base) var(--ease);
@@ -53,14 +54,18 @@ button.rowi:active, .rowi.tap:active { background: var(--surface-hover); }
 .rowi .ricon { flex: none; width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center; justify-content: center; background: var(--bg-inset); color: var(--text-2); }
 .sheet .rowi .ricon { background: var(--bg-raised); }
 .rowi .rmain { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.rowi .rtitle { font-size: var(--fs-md); line-height: 21px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rowi .rsub { font-size: var(--fs-xs); line-height: 16px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.rowi .rvalue { flex: none; max-width: 46%; color: var(--text-3); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rowi .rtitle { font-size: var(--fs-md); line-height: 21px; overflow-wrap: anywhere; }
+.rowi .rsub { font-size: var(--fs-xs); line-height: 16px; color: var(--text-3); overflow-wrap: anywhere; }
+/* A value that needs two lines is split evenly, not left with one character on the second. */
+.rowi .rvalue { flex: none; max-width: 46%; color: var(--text-3); font-size: var(--fs-sm); text-align: right; overflow-wrap: anywhere; text-wrap: balance; }
 .rowi .rchev { flex: none; color: var(--text-4); }
 .rowi.danger .rtitle, .rowi.danger .ricon { color: var(--danger); }
-.rowi.on .rtitle { color: var(--accent); font-weight: 600; }
+.rowi.on .rtitle { color: color-mix(in srgb, var(--accent) 60%, var(--text)); font-weight: 600; }
 .rowi .check { flex: none; color: var(--accent); }
-.rowi:disabled { opacity: var(--disabled-opacity); }
+/* A row that cannot be used now is lettered grey, not faded (faded, its title fell to 3.2:1). */
+.rowi:disabled { opacity: 1; }
+.rowi:disabled .rtitle, .rowi:disabled .rvalue, .rowi:disabled .rsub { color: var(--text-3); }
+.rowi:disabled .ricon { color: var(--text-3); opacity: 0.7; }
 .toggle { width: 46px; height: 28px; border-radius: 14px; background: var(--border-strong); position: relative; flex: none; transition: background var(--t-slow) var(--ease); }
 .toggle::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: var(--shadow-toggle); transition: transform 300ms var(--spring); }
 .toggle.on { background: var(--accent); }
@@ -79,6 +84,14 @@ button.rowi:active, .rowi.tap:active { background: var(--surface-hover); }
 .pill { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border-radius: var(--r-pill); border: 1px solid var(--border-strong); background: var(--bg-inset); color: var(--text-2); font-size: var(--fs-sm); transition: background var(--t-base) var(--ease), border-color var(--t-base) var(--ease), color var(--t-base) var(--ease), transform var(--t-fast) var(--ease); }
 .pill:active { transform: scale(0.95); }
 .pill.on { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); font-weight: 600; }
+/* The reasoning effort of the model in use, all levels on the model sheet: one tap each, wide enough to hit with a thumb. */
+.effort-block { margin: 0 0 14px; }
+.effort-block .etitle-model { color: var(--text-3); font-weight: 400; margin-left: 4px; }
+.effort-pills { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 4px; }
+.pill.effort-pill { height: 44px; min-width: 64px; justify-content: center; padding: 0 16px; flex-direction: column; gap: 0; line-height: 15px; }
+.pill.effort-pill .edefault { font-size: 11px; line-height: 12px; font-weight: 500; color: var(--text-2); letter-spacing: 0.02em; }
+.pill.effort-pill.on { color: var(--text); }
+.pill.effort-pill.on .edefault { color: var(--text-2); }
 .model-row { display: flex; align-items: center; gap: 8px; padding: 8px 8px 8px 14px; border-radius: 14px; background: var(--bg-inset); border: 1px solid var(--border-soft); }
 .model-row .mname { flex: 1 1 auto; min-width: 0; font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
 .model-row .mtags { flex: none; display: flex; gap: 4px; }
@@ -97,14 +110,39 @@ button.rowi:active, .rowi.tap:active { background: var(--surface-hover); }
 .empty-state h3 { margin: 4px 0 0; color: var(--text); font-size: var(--fs-md); font-weight: 600; }
 .steps-list { display: flex; flex-direction: column; gap: 12px; padding: 4px; }
 .steps-list .sitem { display: flex; gap: 12px; align-items: flex-start; color: var(--text-2); font-size: var(--fs-sm); line-height: 20px; }
-.steps-list .snum { flex: none; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); font-size: var(--fs-xs); font-weight: 700; }
+.steps-list .snum { flex: none; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--text); font-size: var(--fs-xs); font-weight: 700; }
 .status-card { display: flex; align-items: center; gap: 12px; padding: 14px; border-radius: 18px; background: var(--bg-raised); border: 1px solid var(--border-soft); }
 .status-card .sicon { width: 44px; height: 44px; border-radius: 14px; flex: none; display: flex; align-items: center; justify-content: center; background: var(--bg-inset); color: var(--text-2); }
 .status-card.ok .sicon { background: var(--ok-soft); color: var(--ok); }
 .status-card.bad .sicon { background: var(--danger-soft); color: var(--danger); }
+.status-card.warn .sicon { background: var(--warn-soft); color: var(--warn); }
 .status-card .smain { flex: 1 1 auto; min-width: 0; }
-.status-card .stitle { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status-card .ssub { color: var(--text-3); font-size: var(--fs-xs); line-height: 17px; overflow-wrap: anywhere; }
+/* A long PC name takes a second line before it is cut. */
+.status-card .stitle { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-weight: 600; overflow: hidden; overflow-wrap: anywhere; }
+.status-card .ssub { display: block; color: var(--text-3); font-size: var(--fs-xs); line-height: 17px; overflow-wrap: anywhere; }
+.status-card > svg { flex: none; color: var(--text-3); }
+/* On the settings page the card is a button that opens the connection page. */
+.status-card.tap { width: 100%; text-align: left; transition: background var(--t-base) var(--ease), transform var(--t-fast) var(--ease); }
+.status-card.tap:active { background: var(--surface-hover); transform: scale(0.99); }
+
+/* Settings: a bar of the groups (one tap goes to a group and opens it) and groups that open and close. */
+.jump-nav { position: sticky; top: -6px; z-index: 4; display: flex; gap: 8px; margin: 0 -16px; padding: 6px 16px; overflow-x: auto; background: var(--bg-panel); scrollbar-width: none; }
+.jump-chip { position: relative; flex: none; height: 32px; padding: 0 14px; border-radius: var(--r-pill); border: 1px solid var(--border-strong); background: var(--bg-inset); color: var(--text-2); font-size: var(--fs-sm); white-space: nowrap; transition: background var(--t-base) var(--ease), transform var(--t-fast) var(--ease); }
+.jump-chip::before { content: ""; position: absolute; inset: -6px -3px; }
+.jump-chip:active { background: var(--surface-active); transform: scale(0.96); }
+.fold { scroll-margin-top: 56px; }
+.fold + .fold, .jump-nav + .fold { margin-top: -10px; }
+.fold-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 0 8px; border-radius: var(--r-md); text-align: left; color: var(--text-2); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.03em; transition: background var(--t-base) var(--ease); }
+.fold-head:active { background: var(--surface-hover); }
+.fold-head .ftitle { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.fold-head .fsum { flex: 0 1 55%; min-width: 0; color: var(--text-3); font-size: var(--fs-sm); font-weight: 400; letter-spacing: 0; text-align: right; overflow-wrap: anywhere; animation: fold-sum-in var(--t-slow) var(--ease-out) both; }
+.fold-head svg { flex: none; color: var(--text-3); transition: transform var(--t-slow) var(--ease); }
+.fold.open .fold-head svg { transform: rotate(90deg); }
+/* The height runs from 0 to the content's own (0fr to 1fr); what is shut cannot be tabbed to or seen by a screen reader. */
+.fold-body { display: grid; grid-template-rows: 0fr; visibility: hidden; transition: grid-template-rows var(--t-slow) var(--ease), visibility 0s linear var(--t-slow); }
+.fold.open .fold-body { grid-template-rows: 1fr; visibility: visible; transition-delay: 0s; }
+.fold-inner { min-height: 0; overflow: hidden; }
+@keyframes fold-sum-in { from { opacity: 0; } to { opacity: 1; } }
 .tab-card { display: flex; align-items: center; gap: 12px; min-height: 60px; padding: 8px 6px 8px 14px; border-radius: 16px; background: var(--bg-inset); border: 1.5px solid var(--border-soft); margin-bottom: 8px; transition: border-color var(--t-base) var(--ease), transform var(--t-fast) var(--ease); }
 .tab-card:active { transform: scale(0.985); }
 .tab-card.on { border-color: var(--accent); }

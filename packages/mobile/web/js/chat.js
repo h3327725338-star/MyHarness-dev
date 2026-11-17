@@ -3,14 +3,14 @@ import { serverText, t } from "/shared/i18n.js";
 import { Spinner, html, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/shared/ui.js";
 import { backend, nav } from "./backends.js";
 import { Composer, shortModelName } from "./composer.js";
-import { awaitingFirstReply } from "./live.js";
+import { AWAY_PX, createFollow, scrolled as scrolledTo, settled, wrote } from "./follow.js";
+import { headLine, LinkDot, useLinkInfo } from "./link-ui.js";
 import { Icon, Mark } from "./micons.js";
 import { haptic, onInsets } from "./native.js";
 import { promptSheet } from "./sheets.js";
 import { attempt, emit, side, state, toast, useStore } from "./store.js";
 import { Transcript } from "./transcript.js";
 
-const STICK_PX = 90;
 const openUrl = (url, options) => nav.openUrl(url, options);
 
 function greeting() {
@@ -81,24 +81,30 @@ export function Chat() {
 	const models = useStore((s) => side(s).models);
 	const link = useStore((s) => s.pc.link);
 	const scroll = useRef(null);
-	const stick = useRef(true);
+	// Whether the pane follows the end of the reply, and where it was last seen (follow.js).
+	const reader = useRef(null);
+	if (!reader.current) reader.current = createFollow();
 	const [away, setAway] = useState(false);
 	const [scrolled, setScrolled] = useState(false);
 	const lastChat = useRef(null);
+	// Where the reader was when older messages began to load, and whether such a load is on.
 	const prepend = useRef(null);
+	const olderLoading = useRef(false);
 
 	const toBottom = (smooth) => {
 		const node = scroll.current;
 		if (!node) return;
 		if (smooth && document.documentElement.dataset.motion !== "off") node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-		else node.scrollTop = node.scrollHeight;
+		else {
+			node.scrollTop = node.scrollHeight;
+			wrote(reader.current, node.scrollTop);
+		}
 	};
 
 	const onScroll = () => {
 		const node = scroll.current;
-		const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
-		stick.current = distance < STICK_PX;
-		setAway(distance > 420);
+		const distance = scrolledTo(reader.current, { top: node.scrollTop, height: node.scrollHeight, client: node.clientHeight });
+		setAway(distance > AWAY_PX);
 		setScrolled(node.scrollTop > 4);
 		if (node.scrollTop < 240 && chat.hasMore && !chat.loadingOlder) {
 			prepend.current = { height: node.scrollHeight, top: node.scrollTop };
@@ -106,23 +112,40 @@ export function Chat() {
 		}
 	};
 
-	// Follow the reply while the reader is at the end; keep the reader's place when older messages are added above.
-	useLayoutEffect(() => {
+	// Moves the pane to where it belongs after the page changed (follow.js: settled): to the end while following it, or
+	// back to the reader's place when older messages were added above.
+	const settle = (place) => {
 		const node = scroll.current;
 		if (!node) return;
+		// The reader moved the pane and the page changed before that scroll event was delivered: the move counts now,
+		// or the pane would be taken back to the end under their finger.
+		if (node.scrollTop < reader.current.top - 1) scrolledTo(reader.current, { top: node.scrollTop, height: node.scrollHeight, client: node.clientHeight });
+		const top = settled(reader.current, { place, height: node.scrollHeight });
+		if (top === null) return;
+		node.scrollTop = top;
+		wrote(reader.current, node.scrollTop);
+	};
+
+	// Follow the reply while the reader is at the end; keep the reader's place when older messages are added above.
+	useLayoutEffect(() => {
+		if (!scroll.current) return;
+		let place = null;
 		if (lastChat.current !== chat.id) {
 			lastChat.current = chat.id;
-			stick.current = true;
+			reader.current.stick = true;
 			prepend.current = null;
-			node.scrollTop = node.scrollHeight;
-			return;
-		}
-		if (prepend.current && !chat.loadingOlder) {
-			node.scrollTop = prepend.current.top + (node.scrollHeight - prepend.current.height);
+			olderLoading.current = false;
+		} else if (chat.loadingOlder) olderLoading.current = true;
+		else if (olderLoading.current) {
+			// The older messages are in: the reader keeps their place.
+			olderLoading.current = false;
+			place = prepend.current;
 			prepend.current = null;
-			return;
-		}
-		if (stick.current) node.scrollTop = node.scrollHeight;
+		} else prepend.current = null; // a place noted for a load that never started (nothing to load, or it failed at once)
+		// Class components (the Markdown blocks) draw their text after every layout effect of the same update, so the page
+		// is not as tall as it will be yet: the pane is placed when the whole update is on the page (still before anything
+		// is painted: microtasks run first).
+		queueMicrotask(() => settle(place));
 	}, [chat.id, chat.items, chat.toolRuns, chat.running, chat.loadingOlder, chat.dialogs]);
 
 	// The conversation also grows while its items stay the same (a reply being written out, a block of work folding
@@ -132,21 +155,19 @@ export function Chat() {
 		const node = scroll.current;
 		const inner = node?.querySelector(".chat-inner");
 		if (!inner || typeof ResizeObserver !== "function") return;
-		const observer = new ResizeObserver(() => {
-			if (stick.current) node.scrollTop = node.scrollHeight;
-		});
+		const observer = new ResizeObserver(() => settle(null));
 		observer.observe(inner);
 		return () => observer.disconnect();
 	}, [chat.id, hasTurns]);
 
 	// The keyboard takes space from the conversation: the end stays in view.
-	useEffect(() => onInsets(() => stick.current && requestAnimationFrame(() => toBottom(false))), []);
+	useEffect(() => onInsets(() => reader.current.stick && requestAnimationFrame(() => toBottom(false))), []);
 
 	// A message the user just sent is always brought into view.
 	const pendingCount = chat.items.reduce((sum, item) => sum + (item.pending ? 1 : 0), 0);
 	useEffect(() => {
 		if (pendingCount > 0) {
-			stick.current = true;
+			reader.current.stick = true;
 			toBottom(true);
 		}
 	}, [pendingCount]);
@@ -166,9 +187,11 @@ export function Chat() {
 	// An unnamed chat is called by its first message, as in the chat list.
 	const firstLine = (chat.items.find((item) => item.kind === "user")?.text || "").trim().split("\n")[0].slice(0, 60);
 	const title = chat.title || firstLine || (empty ? t("New chat") : t("Chat"));
+	const linkNow = useLinkInfo();
 	const where = mode === "pc" ? link.paired?.name || t("PC") : t("This phone");
-	const sub = [where, mode === "pc" ? chat.place : "", models.current ? shortModelName(models.current.name, models.current.providerName) : ""].filter(Boolean).join(" · ");
-	const awaiting = awaitingFirstReply({ running: chat.running, items: chat.items });
+	// While the PC is not connected the line says what is going on in place of the workspace and the model.
+	const linkLine = mode === "pc" ? headLine(linkNow) : "";
+	const sub = linkLine ? `${where} · ${linkLine}` : [where, mode === "pc" ? chat.place : "", models.current ? shortModelName(models.current.name, models.current.providerName) : ""].filter(Boolean).join(" · ");
 
 	const newChat = async () => {
 		haptic("tick");
@@ -180,7 +203,7 @@ export function Chat() {
 			<button class="icon-btn" onClick=${() => nav.go("drawer")} aria-label=${t("Chats")}><${Icon} name="menu" size=${22} /></button>
 			<div class="head-title" onClick=${() => scroll.current?.scrollTo({ top: 0, behavior: "smooth" })}>
 				<span class="name title-swap" key=${title}>${title}</span>
-				<span class="sub"><span class="where"><${Icon} name=${mode === "pc" ? "desktop" : "phone"} size=${12} /></span>${sub}</span>
+				<span class="sub"><span class="where">${mode === "pc" && link.paired ? html`<${LinkDot} info=${linkNow} />` : html`<${Icon} name=${mode === "pc" ? "desktop" : "phone"} size=${12} />`}</span>${sub}</span>
 			</div>
 			<button class="icon-btn" onClick=${newChat} aria-label=${t("New chat")} disabled=${mode === "pc" && link.status !== "online" && link.status !== "connecting"}><${Icon} name="compose" size=${21} /></button>
 		</div>
@@ -192,11 +215,11 @@ export function Chat() {
 					: html`<div class="chat-inner">
 							${chat.hasMore && html`<div class="older">${chat.loadingOlder ? html`<${Spinner} size=${16} />` : html`<button class="btn sm ghost" onClick=${() => backend().loadOlder?.()}>${t("Earlier messages")}</button>`}</div>`}
 							<${Transcript}
+								chatId=${chat.id}
 								items=${chat.items}
 								toolRuns=${chat.toolRuns}
 								runs=${chat.runs}
 								running=${chat.running}
-								awaiting=${awaiting}
 								cwd=${chat.cwd}
 								actions=${actions}
 								onOpenUrl=${openUrl}
@@ -208,7 +231,7 @@ export function Chat() {
 		<button
 			class="to-bottom ${away ? "show" : ""}"
 			onClick=${() => {
-				stick.current = true;
+				reader.current.stick = true;
 				toBottom(true);
 			}}
 			aria-label=${t("Jump to the latest")}

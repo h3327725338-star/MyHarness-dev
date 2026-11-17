@@ -9,8 +9,10 @@ import { pc, routeName } from "./backend-remote.js";
 import { setMode } from "./backends.js";
 import { SEARCH_ENGINES, clearBrowsingData } from "./browser-model.js";
 import { storageEstimate } from "./db.js";
-import { AccountPcs, routeLabel } from "./drawer.js";
+import { AccountPcs } from "./drawer.js";
 import { allowedRoutes, PC_ROUTES } from "./link-remote.js";
+import { formatLatency } from "./link-status.js";
+import { useLinkInfo, wordsOf } from "./link-ui.js";
 import { Icon } from "./micons.js";
 import { canScan, haptic, isNative, nativeInfo, onNative, openNotificationSettings, openWaitingSettings, quietBanners, scanQr, secretGet, secretSet, waitingHidden } from "./native.js";
 import { colorThemes, prefs, setPrefs, shownChatMode } from "./prefs.js";
@@ -32,6 +34,39 @@ function Section({ title, note, children }) {
 		<div class="rows">${children}</div>
 		${note && html`<div class="rows-note">${note}</div>`}
 	</div>`;
+}
+
+/**
+ * A group of settings that opens and closes (its height moves, it does not jump). The header is a 44 px button; while the
+ * group is shut it says in a few words what is inside (`summary`). `id` is where the page's group bar scrolls to.
+ */
+function Fold({ id, title, summary, open, onToggle, lab, children }) {
+	return html`<div class="fold ${open ? "open" : ""}" id=${id}>
+		<button class="fold-head" aria-expanded=${open ? "true" : "false"} data-lab=${lab} onClick=${onToggle}>
+			<span class="ftitle">${title}</span>
+			${!open && summary ? html`<span class="fsum">${summary}</span>` : null}
+			<${Icon} name="chevronRight" size=${16} />
+		</button>
+		<div class="fold-body" inert=${!open}><div class="fold-inner">${children}</div></div>
+	</div>`;
+}
+
+/** A `Fold` holding grouped rows, with an optional note under them. */
+function Group({ note, children, ...fold }) {
+	return html`<${Fold} ...${fold}><${Section} note=${note}>${children}<//><//>`;
+}
+
+/** The connection to the PC as one card: its name, its state, the way it is reached. A button when `onClick` is given. */
+function LinkCard({ link, info, words, onClick }) {
+	const busyNow = info.phase === "connecting" || info.phase === "reconnecting";
+	const tone = !link.paired ? "" : info.tone === "ok" ? "ok" : info.tone === "bad" || info.phase === "offline" ? "bad" : info.phase === "retrying" ? "warn" : "";
+	const inner = html`<span class="sicon">${busyNow ? html`<${Spinner} size=${20} />` : html`<${Icon} name="desktop" size=${22} />`}</span>
+		<span class="smain">
+			<span class="stitle">${link.paired ? link.paired.name : t("Not connected")}</span>
+			<span class="ssub">${link.paired ? html`<strong>${words.title}</strong>${words.detail ? ` · ${words.detail}` : ""}` : t("Connect a PC to control it from here.")}</span>
+		</span>
+		${onClick ? html`<${Icon} name="chevronRight" size=${16} />` : null}`;
+	return onClick ? html`<button class="status-card tap ${tone}" onClick=${onClick} data-lab="link-card">${inner}</button>` : html`<div class="status-card ${tone}">${inner}</div>`;
 }
 
 // ---- Providers and models ----------------------------------------------------------------------
@@ -270,6 +305,12 @@ const ROUTE_NOTES = {
 	direct: "Over the internet, without a detour. Rarely possible on mobile data.",
 	relay: "Works on any network; each message takes a second or two. The PC's browser is not shown this way.",
 };
+// What the way in use means for where the messages go: one sentence per way, shown under the connection page.
+const WAY_NOTES = {
+	lan: "On your local network the phone and the PC talk to each other directly; no server carries the messages.",
+	direct: "Over the internet the messages go straight between the phone and the PC. Only the set-up goes through your Google Drive, and a public Google server sees both public addresses.",
+	relay: "Through your Google Drive each message is an encrypted file that the phone and the PC leave for each other, so it takes a second or two each way.",
+};
 const ROUTE_ICONS = { lan: "wifi", direct: "globe", relay: "drive" };
 
 /** Which ways to a PC of the account this phone tries (prefs.pcRoutes); at least one stays on. */
@@ -281,13 +322,15 @@ function RoutesSection() {
 		if (!PC_ROUTES.some((id) => next[id])) return toast(t("At least one way must stay on."), "error", 3200);
 		update({ pcRoutes: next });
 	};
-	return html`<${Section}
-		title=${t("Ways to connect")}
-		note=${t("Only the ways turned on are tried. When none of them reaches the PC, the app says so and does not use another. The choice stays on this phone. A PC paired with its QR code is always reached on the local network.")}
-	>
-		${PC_ROUTES.map(
-			(route) => html`<${Row} key=${route} icon=${ROUTE_ICONS[route]} title=${routeName(route)} sub=${t(ROUTE_NOTES[route])}><${Switch} on=${on.includes(route)} onChange=${(value) => set(route, value)} label=${routeName(route)} /><//>`,
-		)}
+	// The switches are rarely touched: they sit in a group that is shut until it is opened.
+	const [open, setOpen] = useState(false);
+	return html`<${Fold} lab="routes" id="link-routes" title=${t("Ways to connect")} summary=${t("{on} of {total} on", { on: on.length, total: PC_ROUTES.length })} open=${open} onToggle=${() => setOpen(!open)}>
+		<div class="rows">
+			${PC_ROUTES.map(
+				(route) => html`<${Row} key=${route} icon=${ROUTE_ICONS[route]} title=${routeName(route)} sub=${t(ROUTE_NOTES[route])}><${Switch} on=${on.includes(route)} onChange=${(value) => set(route, value)} label=${routeName(route)} /><//>`,
+			)}
+		</div>
+		<div class="rows-note">${t("Only the ways turned on are tried. When none of them reaches the PC, the app says so and does not use another. The choice stays on this phone. A PC paired with its QR code is always reached on the local network.")}</div>
 	<//>`;
 }
 
@@ -323,10 +366,43 @@ function LinkPage({ close }) {
 	};
 
 	const signed = useStore((s) => s.account.status !== "signedOut");
-	const statusText = { online: t("Connected"), connecting: t("Connecting…"), offline: link.error || t("Not reachable"), none: t("Not connected") }[link.status];
-	const route = link.status === "online" ? routeLabel(link) : "";
+	const info = useLinkInfo();
+	const words = wordsOf(info);
+	const busyNow = info.phase === "connecting" || info.phase === "reconnecting";
+	const failed = Object.entries(info.fails || {}).filter(([, reason]) => reason);
+	const shownAddress = info.route === "lan" && info.host ? `${info.host}:${link.paired?.port}` : "";
+	const since = link.onlineAt ? new Date(link.onlineAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+	// Where the messages go depends on the way in use; a PC paired with its QR code is always on the local network.
+	const wayNote = info.phase === "online" ? WAY_NOTES[info.route] : link.paired && link.paired.kind !== "account" ? WAY_NOTES.lan : "";
 
 	return html`<${Page} title=${t("PC connection")} close=${close}>
+		${link.paired && html`<${LinkCard} link=${link} info=${info} words=${words} />`}
+		${link.paired &&
+		info.phase === "online" &&
+		html`<${Section} title=${t("This connection")}>
+			<${Row} icon=${ROUTE_ICONS[info.route] || "link"} title=${t("Way")} value=${routeName(info.route)} />
+			${info.rtt ? html`<${Row} icon="pulse" title=${t("Delay")} value=${formatLatency(info.rtt)} sub=${t("One request and its answer, measured when the connection opened or was last checked.")} />` : null}
+			${shownAddress ? html`<${Row} icon="wifi" title=${t("Address")} value=${shownAddress} />` : null}
+			${since ? html`<${Row} icon="clock" title=${t("Connected since")} value=${since} />` : null}
+			${info.version ? html`<${Row} icon="desktop" title=${t("MyHarness on the PC")} value=${info.version} />` : null}
+		<//>`}
+		${link.paired && info.phase === "online" && info.route === "relay" && link.direct && !link.direct.ok
+			? html`<div class="rows-note">${t("Why not direct: {reason}", { reason: link.direct.reason })} ${t("Tried at {time}; tried again every 2 minutes and when the phone changes networks.", { time: new Date(link.direct.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })}</div>`
+			: null}
+		${link.paired && info.phase !== "online" && failed.length > 0
+			? html`<${Section} title=${t("Why it does not connect")}>
+				${failed.map(([route, reason]) => html`<${Row} key=${route} icon=${ROUTE_ICONS[route] || "x"} title=${routeName(route)} sub=${reason} />`)}
+			<//>`
+			: null}
+		${link.paired && info.phase !== "online" && info.phase !== "none" && failed.length === 0 && (info.peer || info.reason)
+			? html`<div class="rows-note">${[info.peer === "off" ? t("The PC is off, or MyHarness is closed there.") : info.peer === "refuses" ? t("The PC does not accept phones right now.") : "", info.reason].filter(Boolean).join(" ")}</div>`
+			: null}
+		${link.paired &&
+		html`<${Section}>
+			<${Row} icon="refresh" title=${info.phase === "retrying" ? t("Connect now") : t("Connect again")} onClick=${() => pc.reconnect()} disabled=${busyNow} />
+			<${Row} icon="qr" title=${t("Pair with another PC")} onClick=${() => (canScan ? scanQr() : paste())} />
+			<${Row} icon="x" title=${t("Disconnect and forget this PC")} danger onClick=${unpair} />
+		<//>`}
 		${signed &&
 		html`<div>
 			<div class="rows-title">${t("PCs of your Google account")}</div>
@@ -335,18 +411,7 @@ function LinkPage({ close }) {
 		</div>`}
 		${signed && html`<${RoutesSection} />`}
 		${link.paired
-			? html`<div class="status-card ${link.status === "online" ? "ok" : link.status === "offline" ? "bad" : ""}">
-						<span class="sicon">${link.status === "connecting" ? html`<${Spinner} size=${20} />` : html`<${Icon} name="desktop" size=${22} />`}</span>
-						<span class="smain"><div class="stitle">${link.paired.name}</div><div class="ssub">${statusText}${route ? ` · ${route}` : ""}${link.status === "online" && link.host ? ` · ${link.host}:${link.paired.port}` : ""}</div></span>
-					</div>
-					${link.status === "online" && link.route === "relay" && link.direct && !link.direct.ok
-						? html`<div class="rows-note">${t("Why not direct: {reason}", { reason: link.direct.reason })} ${t("Tried at {time}; tried again every 2 minutes and when the phone changes networks.", { time: new Date(link.direct.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })}</div>`
-						: null}
-					<${Section}>
-						<${Row} icon="refresh" title=${t("Connect again")} onClick=${() => pc.reconnect()} disabled=${link.status === "connecting"} />
-						<${Row} icon="qr" title=${t("Pair with another PC")} onClick=${() => (canScan ? scanQr() : paste())} />
-						<${Row} icon="x" title=${t("Disconnect and forget this PC")} danger onClick=${unpair} />
-					<//>`
+			? null
 			: html`<div class="empty-state" style="padding-bottom:10px">
 						<span class="eicon"><${Icon} name="desktop" size=${26} /></span>
 						<h3>${t("Use your PC from your phone")}</h3>
@@ -361,7 +426,10 @@ function LinkPage({ close }) {
 						${canScan && html`<button class="btn primary block" disabled=${busy} onClick=${() => scanQr()}>${busy ? html`<${Spinner} size=${17} />` : html`<${Icon} name="qr" size=${18} />`}${t("Scan the QR code")}</button>`}
 						<button class="btn block ${canScan ? "" : "primary"}" disabled=${busy} onClick=${paste}><${Icon} name="link" size=${18} />${t("Paste the pairing code")}</button>
 					</div>`}
-		<div class="rows-note">${t("The phone and the PC talk directly over your local network; nothing goes through a server. Every message is encrypted with a key that only the QR code carried. A paired phone can make the agent on the PC act, so pair only your own phone.")}</div>
+		<div class="rows-note">
+			${wayNote ? html`<div data-lab="way-note">${t(wayNote)}</div>` : null}
+			<div>${t("Every message is encrypted with this phone's key. A paired phone can make the agent on the PC act, so pair only your own phone.")}</div>
+		</div>
 	<//>`;
 }
 
@@ -410,7 +478,7 @@ const COLOR_THEMES = [
 	{ value: "amber", label: "Amber", dark: "#d4ae82", light: "#96632b" },
 ];
 
-function AccountSection() {
+function AccountSection({ open, onToggle }) {
 	const info = useStore((s) => s.account);
 	const [busy, setBusy] = useState(false);
 	if (info.status === "signedOut") return null;
@@ -431,10 +499,13 @@ function AccountSection() {
 		await attempt(() => account.signOut());
 		setBusy(false);
 	};
-	return html`<${Section} title=${t("Google account")} note=${t("Your PCs' chats, providers, memories and bookmarks come to this phone through this account's Google Drive. MyHarness sees only the files it created there.")}>
-		<${Row} icon="drive" title=${info.email || info.name} sub=${status} />
-		<${Row} icon="refresh" title=${t("Sync now")} disabled=${busy || info.status === "loading"} onClick=${() => attempt(() => account.refresh())} />
-		<${Row} icon="x" title=${t("Sign out")} danger disabled=${busy} onClick=${signOut} />
+	return html`<${Fold} id="set-account" title=${t("Google account")} summary=${info.email || info.name} open=${open} onToggle=${onToggle}>
+		<div class="rows">
+			<${Row} icon="drive" title=${info.email || info.name} sub=${status} />
+			<${Row} icon="refresh" title=${t("Sync now")} disabled=${busy || info.status === "loading"} onClick=${() => attempt(() => account.refresh())} />
+			<${Row} icon="x" title=${t("Sign out")} danger disabled=${busy} onClick=${signOut} />
+		</div>
+		<div class="rows-note">${t("Your PCs' chats, providers, memories and bookmarks come to this phone through this account's Google Drive. MyHarness sees only the files it created there.")}</div>
 	<//>`;
 }
 
@@ -442,6 +513,8 @@ function SettingsPage({ close }) {
 	const update = usePrefs();
 	const models = useStore((s) => s.local.models);
 	const link = useStore((s) => s.pc.link);
+	const linkInfoNow = useLinkInfo();
+	const linkNow = wordsOf(linkInfoNow);
 	const chats = useStore((s) => s.local.chats.length);
 	const [storage, setStorage] = useState(null);
 	useEffect(() => {
@@ -458,11 +531,36 @@ function SettingsPage({ close }) {
 	};
 	const modelCount = models.providers.reduce((sum, provider) => sum + provider.models.length, 0);
 
+	// The page is long, so the groups open and close; the ones used least start shut and say what is inside.
+	const signed = useStore((s) => s.account.status !== "signedOut");
+	const [shut, setShut] = useState({ browser: true, data: true, about: true });
+	const isOpen = (id) => !shut[id];
+	const toggle = (id) => setShut((before) => ({ ...before, [id]: !before[id] }));
+	const titles = { account: t("Google account"), assistant: t("Assistant"), appearance: t("Appearance"), general: t("General"), browser: t("Browser"), data: t("Data on this phone"), about: t("About") };
+	const searchName = SEARCH_ENGINES.find((entry) => entry.value === prefs.browserSearch)?.label || "Google";
+	const dataSummary = `${chats}${storage?.usage ? ` · ${fmtBytes(storage.usage)}` : ""}`;
+	const summaries = { browser: searchName, data: dataSummary, about: nativeInfo.version };
+	const fold = (id) => ({ id: `set-${id}`, title: titles[id], summary: summaries[id] || "", open: isOpen(id), onToggle: () => toggle(id) });
+	// A tap on the group bar opens the group and brings it to the top. A group that was shut is still opening when the first
+	// scroll starts, and the page may not be tall enough yet to bring it to the top: it is scrolled to again once it is open.
+	const jump = (id) => {
+		const wasShut = !isOpen(id);
+		setShut((before) => ({ ...before, [id]: false }));
+		const calm = prefs.motion === false || matchMedia("(prefers-reduced-motion: reduce)").matches;
+		const bring = () => document.getElementById(`set-${id}`)?.scrollIntoView({ block: "start", behavior: calm ? "auto" : "smooth" });
+		setTimeout(bring, 30);
+		if (wasShut) setTimeout(bring, calm ? 60 : 320);
+	};
+	const jumpTo = Object.keys(titles).filter((id) => id !== "account" || signed);
+
 	return html`<${Page} title=${t("Settings")} close=${close}>
-		<${AccountSection} />
-		<${Section} title=${t("Assistant")}>
+		<${LinkCard} link=${link} info=${linkInfoNow} words=${linkNow} onClick=${openLinkPage} />
+		<nav class="jump-nav" aria-label=${t("Settings")}>
+			${jumpTo.map((id) => html`<button class="jump-chip" key=${id} onClick=${() => jump(id)}>${titles[id]}</button>`)}
+		</nav>
+		${signed && html`<${AccountSection} ...${fold("account")} />`}
+		<${Group} ...${fold("assistant")}>
 			<${Row} icon="cpu" title=${t("Models on this phone")} value=${modelCount ? t("{n} models", { n: modelCount }) : t("Set up")} chevron onClick=${() => openModelsPage()} />
-			<${Row} icon="desktop" title=${t("PC connection")} value=${link.paired ? link.paired.name : t("Not connected")} chevron onClick=${openLinkPage} />
 			<${Row}
 				icon="edit"
 				title=${t("Your instructions")}
@@ -474,8 +572,7 @@ function SettingsPage({ close }) {
 				}}
 			/>
 		<//>
-		<div>
-			<div class="rows-title">${t("Appearance")}</div>
+		<${Fold} ...${fold("appearance")}>
 			<div class="swatches">
 				${COLOR_THEMES.map((theme) => html`<button class="swatch ${schemes[chatMode] === theme.value ? "on" : ""}" key=${theme.value} onClick=${() => (haptic("tick"), update({ colorThemes: { ...schemes, [chatMode]: theme.value } }))}><i style=${`background:${dark ? theme.dark : theme.light}`}></i>${t(theme.label)}</button>`)}
 			</div>
@@ -486,8 +583,8 @@ function SettingsPage({ close }) {
 				<${Row} icon="sparkle" title=${t("Animations")}><${Switch} on=${prefs.motion !== false} onChange=${(on) => update({ motion: on })} label=${t("Animations")} /><//>
 				<${Row} icon="pulse" title=${t("Vibration feedback")}><${Switch} on=${prefs.haptics !== false} onChange=${(on) => update({ haptics: on })} label=${t("Vibration feedback")} /><//>
 			</div>
-		</div>
-		<${Section} title=${t("General")}>
+		<//>
+		<${Group} ...${fold("general")}>
 			<${Row}
 				icon="language"
 				title=${t("Language")}
@@ -514,8 +611,8 @@ function SettingsPage({ close }) {
 			/>`}
 			${isNative && html`<${WaitingRow} />`}
 		<//>
-		<${Section} title=${t("Browser")}>
-			<${Row} icon="search" title=${t("Search engine of the address field")} value=${SEARCH_ENGINES.find((entry) => entry.value === prefs.browserSearch)?.label || "Google"} chevron onClick=${() => pick(t("Search engine"), SEARCH_ENGINES, "browserSearch")} />
+		<${Group} ...${fold("browser")}>
+			<${Row} icon="search" title=${t("Search engine of the address field")} value=${searchName} chevron onClick=${() => pick(t("Search engine"), SEARCH_ENGINES, "browserSearch")} />
 			<${Row}
 				icon="trash"
 				title=${t("Clear cookies and site data")}
@@ -527,8 +624,8 @@ function SettingsPage({ close }) {
 				}}
 			/>
 		<//>
-		<${Section} title=${t("Data on this phone")} note=${t("Chats on this phone stay in the app's private storage and are removed with the app. Chats on the PC are stored on the PC.")}>
-			<${Row} icon="chat" title=${t("Chats")} value=${`${chats}${storage?.usage ? ` · ${fmtBytes(storage.usage)}` : ""}`} />
+		<${Group} ...${fold("data")} note=${t("Chats on this phone stay in the app's private storage and are removed with the app. Chats on the PC are stored on the PC.")}>
+			<${Row} icon="chat" title=${t("Chats")} value=${dataSummary} />
 			<${Row}
 				icon="trash"
 				title=${t("Delete all chats on this phone")}
@@ -542,7 +639,7 @@ function SettingsPage({ close }) {
 				}}
 			/>
 		<//>
-		<${Section} title=${t("About")}>
+		<${Group} ...${fold("about")}>
 			<${Row} icon="info" title="MyHarness" value=${`${nativeInfo.version}${nativeInfo.debug && nativeInfo.version !== "dev" ? " (debug)" : ""}`} />
 			${nativeInfo.android && html`<${Row} icon="phone" title=${nativeInfo.device} value=${`Android ${nativeInfo.android}`} />`}
 		<//>

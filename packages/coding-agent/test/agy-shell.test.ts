@@ -12,7 +12,9 @@ import agyShell, {
 	appendsSystemPrompt,
 	argumentsForApp,
 	callSummary,
+	clipBytes,
 	contextLimit,
+	cutFromInput,
 	failureText,
 	HOST_TURN_REMINDER,
 	inlineInstructions,
@@ -21,6 +23,7 @@ import agyShell, {
 	launchEnv,
 	levelOf,
 	listsUpdateCommand,
+	MAX_PROMPT_BYTES,
 	MCP_SERVER,
 	NO_AUTO_UPDATE_ENV,
 	namesAppTool,
@@ -33,6 +36,7 @@ import agyShell, {
 	poolsOf,
 	quotaGroups,
 	quotaText,
+	renderTranscript,
 	requestsIn,
 	STRIPPED_ENV,
 	thoughtValue,
@@ -589,6 +593,7 @@ describe("agy-shell with a stand-in agy", () => {
 		// What an earlier test's requests carried says nothing about this one's.
 		internals.shared.appendsPrompt = undefined;
 		internals.shared.turnPrompts.clear();
+		internals.shared.promptLimits.clear();
 	});
 	afterEach(async () => {
 		for (const session of sessions) {
@@ -1680,5 +1685,183 @@ describe("agy-shell with a stand-in agy", () => {
 				"INVALID:invalid tool call: invalid arguments: missing property 'toolSummary'",
 			);
 		}
+	});
+
+	/** Chinese text of about `bytes` UTF-8 bytes, so that characters and bytes differ (three bytes a character). */
+	const chineseOf = (bytes: number, seed: string) => {
+		const sentence = `${seed}模型读取配置并运行测试，把失败用例的堆栈整理成报告，最后写出下一步的计划。`;
+		return sentence.repeat(Math.max(1, Math.ceil(bytes / Buffer.byteLength(sentence, "utf8"))));
+	};
+	/** The text the plugin put in session/prompt, as the stand-in echoed it. */
+	const sentPrompt = (final: any): string => {
+		const text = textOf(final);
+		expect(text.startsWith("PROMPT:")).toBe(true);
+		return text.slice("PROMPT:".length);
+	};
+	const bytes = (text: string) => Buffer.byteLength(text, "utf8");
+
+	// agy keeps only the beginning of a long message (192,000 bytes with agy 1.5.9, seen 2026-11-17). A chat's history
+	// that went along whole lost its newest part and the user's new words, and the model answered an older question.
+	it("keeps a rebuilt conversation's history within what agy takes in one message, newest first", async () => {
+		const chat = openChat();
+		for (const seed of ["最早的消息", "较早的消息", "中间的消息", "又一段消息"]) {
+			chat.messages.push({ role: "user", content: `问题：${seed}`, timestamp: Date.now() });
+			chat.messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: chineseOf(64_000, seed) }],
+				timestamp: Date.now(),
+			});
+		}
+		chat.messages.push({ role: "user", content: "最新的问题：去掉第二行的final", timestamp: Date.now() });
+		chat.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: `${chineseOf(20_000, "最新的回答")}NEWEST-ANSWER-END` }],
+			timestamp: Date.now(),
+		});
+		setEnv("MOCK_ACP_CAPS", JSON.stringify({ sessionCapabilities: {} }));
+		const current = "现在请批改我的答案。";
+		const sent = sentPrompt(await chat.send(`${current}\necho`));
+		expect(bytes(sent)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+		expect(sent).toContain("最新的问题：去掉第二行的final");
+		expect(sent).toContain("NEWEST-ANSWER-END");
+		expect(sent).toContain(current);
+		expect(sent).not.toContain("问题：最早的消息");
+		expect(sent).toMatch(/earlier messages? (is|are) left out here/);
+		expect(sent.trim().endsWith(HOST_TURN_REMINDER)).toBe(true);
+	});
+
+	// A request of MyHarness's own (a summary, a title) goes as one text: its instruction at the end stays.
+	it("keeps a long side request within what agy takes in one message, with its instruction", async () => {
+		const instruction = "请只用一句话总结上面的会议记录。最近一条决议：下个版本先修复并发写入的问题。";
+		const message = `${chineseOf(300_000, "会议记录")}\n${instruction}\necho`;
+		const result = await internals
+			.streamSimple(model(), { messages: [{ role: "user", content: message, timestamp: 1 }] }, {})
+			.result();
+		expect(result.stopReason).toBe("stop");
+		const sent = sentPrompt({ text: result.content.map((part: any) => part.text ?? "").join("") });
+		expect(bytes(sent)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+		expect(sent).toContain(message.slice(-2_000));
+		expect(sent).toContain(message.slice(0, 200));
+		expect(sent).toMatch(/\[\.\.\. \d+ bytes left out \.\.\.\]/);
+	});
+
+	// agy cut a message all the same (a lower limit, or a message too long by itself): the user is told, and a
+	// conversation that lost the newest part of its history is not continued; a new one gets it within the lower limit.
+	it("tells the user when agy cut a message, and starts over a conversation whose history was cut", async () => {
+		const chat = openChat();
+		const notes: [string, string][] = [];
+		internals.shared.contexts.get(chat.session.sessionId).ui.notify = (text: string, kind: string) =>
+			notes.push([text, kind]);
+		await chat.send("cut 300 ;; tokens 10 0 5 ;; say short");
+		expect(notes).toHaveLength(1);
+		expect(notes[0][1]).toBe("warning");
+		expect(notes[0][0]).toContain("截掉");
+		expect(chat.session.startOver).toBe(false);
+		// A short message that was cut is no length to keep under.
+		expect(internals.shared.promptLimits.size).toBe(0);
+
+		for (const seed of ["第一段", "第二段", "第三段"]) {
+			chat.messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: chineseOf(60_000, seed) }],
+				timestamp: Date.now(),
+			});
+		}
+		chat.session.close();
+		setEnv("MOCK_ACP_CAPS", JSON.stringify({ sessionCapabilities: {} }));
+		const first = sentPrompt(await chat.send("cut 60000 ;; tokens 10 0 5 ;; echo"));
+		expect(first).toContain("<earlier-conversation>");
+		expect(notes).toHaveLength(2);
+		expect(notes[1][0]).toContain("之前的对话记录");
+		expect(chat.session.startOver).toBe(true);
+		const limit = internals.shared.promptLimits.get(model().id);
+		expect(limit).toBeLessThanOrEqual(bytes(first) - 60_000);
+
+		const conversations = () => requests().filter((entry) => entry.method === "session/new").length;
+		const before = conversations();
+		const again = sentPrompt(await chat.send("echo"));
+		expect(conversations()).toBe(before + 1);
+		expect(again).toContain("<earlier-conversation>");
+		expect(bytes(again)).toBeLessThanOrEqual(limit!);
+		expect(chat.session.startOver).toBe(false);
+	});
+});
+
+describe("agy-shell earlier conversation within what agy takes", () => {
+	const bytes = (text: string) => Buffer.byteLength(text, "utf8");
+
+	it("cuts a text to a number of UTF-8 bytes without halving a character, keeping its beginning and end", () => {
+		const text = `开头${"中文和English混合🙂".repeat(5_000)}结尾`;
+		for (const limit of [3_000, 3_001, 3_002, 50_000]) {
+			const cut = clipBytes(text, limit);
+			expect(bytes(cut)).toBeLessThanOrEqual(limit);
+			expect(cut).not.toContain("�");
+			expect(cut.startsWith("开头")).toBe(true);
+			expect(cut.endsWith("结尾")).toBe(true);
+			expect(cut).toMatch(/\[\.\.\. \d+ bytes left out \.\.\.\]/);
+		}
+		expect(clipBytes("短", 100)).toBe("短");
+	});
+
+	it("gives what was said first and fills the rest with the newest tool results", () => {
+		const messages: any[] = [];
+		for (let i = 0; i < 12; i++) {
+			messages.push({ role: "user", content: `question ${i}` });
+			messages.push({
+				role: "assistant",
+				content: [{ type: "toolCall", name: "read", arguments: { path: `file-${i}.txt` } }],
+			});
+			messages.push({
+				role: "toolResult",
+				toolName: "read",
+				content: [{ type: "text", text: `result ${i} ${"内容".repeat(4_000)}` }],
+			});
+			messages.push({ role: "assistant", content: [{ type: "text", text: `answer ${i}` }] });
+		}
+		const text = renderTranscript(messages, 60_000);
+		expect(bytes(text)).toBeLessThanOrEqual(60_000);
+		// Every question and answer is there, the oldest included.
+		for (let i = 0; i < 12; i++) {
+			expect(text).toContain(`user: question ${i}\n`);
+			expect(text).toContain(`assistant: answer ${i}`);
+		}
+		// The newest tool results are given, the oldest only named with their size.
+		expect(text).toContain("tool result (read): result 11 ");
+		expect(text).toContain("tool result (read): [left out, ");
+		expect(text).not.toContain("result 0 内容");
+		expect(text.indexOf("question 0")).toBeLessThan(text.indexOf("question 11"));
+		expect(text).not.toContain("left out here");
+	});
+
+	it("leaves out the oldest messages first and says so", () => {
+		const messages = Array.from({ length: 40 }, (_, i) => ({
+			role: i % 2 ? "assistant" : "user",
+			content: `message ${i} ${"字".repeat(1_000)}`,
+		}));
+		const text = renderTranscript(messages, 20_000);
+		expect(bytes(text)).toBeLessThanOrEqual(20_000);
+		expect(text).toContain("message 39 ");
+		expect(text).not.toContain("message 0 ");
+		expect(text.startsWith("(")).toBe(true);
+		expect(text.split("\n")[0]).toMatch(/^\(\d+ earlier messages are left out here/);
+		expect(renderTranscript(messages, 100)).toBe("");
+	});
+
+	it("reads a message agy cut from its record, and not the record's own shortening", () => {
+		const note =
+			"NOTE: The output was truncated because it was too long. Use a more targeted query or a smaller range to get the information you need.";
+		const step = (content: string, type = "USER_INPUT") => JSON.stringify({ step_index: 0, type, content });
+		const cut = step(`<USER_REQUEST>\nhead\n<truncated 188066 bytes>\nmiddle\n<truncated 129557 bytes>\n\n${note}`);
+		const shortened = step("<USER_REQUEST>\nhead\n<truncated 13001 bytes>\ntail of the message</USER_REQUEST>");
+		const quoted = step(
+			`<USER_REQUEST>\nthe log said <truncated 5 bytes>\n\n${note}\nwhat does it mean?</USER_REQUEST>`,
+		);
+		expect(cutFromInput([shortened, cut].join("\n"))).toBe(129_557);
+		expect(cutFromInput(shortened)).toBeUndefined();
+		expect(cutFromInput(quoted)).toBeUndefined();
+		expect(cutFromInput(step(`<truncated 9 bytes>\n\n${note}`, "GENERIC"))).toBeUndefined();
+		expect(
+			cutFromInput("not json USER_INPUT NOTE: The output was truncated because it was too long."),
+		).toBeUndefined();
 	});
 });

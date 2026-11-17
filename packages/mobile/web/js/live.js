@@ -19,10 +19,16 @@ const wordsOf = (item) =>
 		.join("\n");
 
 /**
+ * What a reply says, without the whitespace at its end: the saved copy is trimmed, the copy written on the page may end
+ * in the line break the model streamed last, and that alone must not make them two replies.
+ */
+const spokenWords = (item) => wordsOf(item).trimEnd();
+
+/**
  * The PC's saved copy of a reply and the copy that is (or was) being written on the page are the same message. They
  * cannot be told by their time: the written copy carries when the reply started, the saved one when it was saved. So:
- * a tool call in common, or (a reply without tool calls) the same model and the same words; `partial`: the written
- * copy may hold only the beginning of them.
+ * a tool call in common, or (a reply without tool calls) the same model and the same words (compared without the
+ * whitespace at the end); `partial`: the written copy may hold only the beginning of them.
  */
 function sameReply(saved, live, { partial = false } = {}) {
 	if (saved.kind !== "assistant" || live.kind !== "assistant") return false;
@@ -34,9 +40,9 @@ function sameReply(saved, live, { partial = false } = {}) {
 	}
 	if (toolCallIds(saved).length && !partial) return false;
 	if (saved.model !== live.model || saved.ts + 2000 < live.ts) return false;
-	const written = wordsOf(live);
-	if (!written.trim()) return false;
-	return partial ? wordsOf(saved).startsWith(written) : wordsOf(saved) === written;
+	const written = spokenWords(live);
+	if (!written) return false;
+	return partial ? spokenWords(saved).startsWith(written) : spokenWords(saved) === written;
 }
 
 /**

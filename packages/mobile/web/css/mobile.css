@@ -144,7 +144,7 @@ textarea.field { padding: 11px 14px; }
 	display: block; width: 100%; min-height: 24px; max-height: 38vh; padding: 14px 16px 4px; margin: 0; border: 0; outline: none; resize: none;
 	background: transparent; color: var(--text); font: var(--fs-read) / 1.5 var(--font-read); overflow-y: auto;
 }
-.composer-input::placeholder { color: var(--text-4); }
+.composer-input::placeholder { color: var(--text-3); }
 .composer-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px 8px; min-width: 0; }
 .composer-bar .spacer { flex: 1 1 auto; min-width: 0; }
 .chip {
@@ -159,7 +159,7 @@ textarea.field { padding: 11px 14px; }
 /* The model and its reasoning effort in one pill: the name gives way first, the effort is always whole. */
 .chip.model-chip { max-width: none; gap: 6px; padding: 0 13px; background: var(--surface-hover); color: var(--text); }
 .chip.model-chip:active { background: var(--surface-active); }
-.chip.model-chip .effort { flex: none; color: var(--text-3); }
+.chip.model-chip .effort { flex: none; color: var(--text-2); }
 .round-btn {
 	width: 38px; height: 38px; border-radius: 50%; flex: none; display: inline-flex; align-items: center; justify-content: center;
 	color: var(--text-2); transition: background var(--t-base) var(--ease), transform var(--t-fast) var(--spring), opacity var(--t-base), color var(--t-base);
@@ -231,12 +231,26 @@ textarea.field { padding: 11px 14px; }
 .dot.warn { background: var(--warn); }
 .dot.off { background: var(--text-4); }
 .dot.live { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+.dot.bad { background: var(--danger); }
+/* The state in the title bar: the dot sits where the PC icon was, with room to be seen. */
+.head-title .sub .dot { flex: none; width: 7px; height: 7px; margin: 0 1px; }
+/* The connection in one line under the Phone / PC switch (drawer): name, state, way and delay; opens Settings → PC connection. */
+.pc-line { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 52px; padding: 6px 12px; border-radius: 14px; text-align: left; color: var(--text-2); font-size: var(--fs-sm); overflow: hidden; animation: line-in var(--t-slow) var(--ease-out) backwards; transition: background var(--t-base) var(--ease); }
+.pc-line:active { background: var(--surface-hover); }
+.pc-line .dot { flex: none; width: 8px; height: 8px; }
+.pc-line .pmain { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+/* A long PC name takes a second line before it is cut. */
+.pc-line .pname { font-weight: 600; color: var(--text); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+/* The state may need a second line (the way, the delay, the reason); it is wrapped, not cut: the full text is on the connection page. */
+.pc-line .pstate { color: var(--text-3); font-size: var(--fs-xs); line-height: 16px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.pc-line.warn .pstate, .pc-line.bad .pstate { color: var(--text-2); }
+.pc-line svg { flex: none; color: var(--text-4); }
 @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.8); } }
 
 .search-field { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px; border-radius: 14px; background: var(--bg-inset); border: 1px solid var(--border-soft); color: var(--text-3); transition: border-color var(--t-base) var(--ease); }
 .search-field:focus-within { border-color: var(--border-hover); }
 .search-field input { flex: 1 1 auto; min-width: 0; height: 100%; border: 0; outline: none; background: transparent; color: var(--text); font-size: var(--fs-md); }
-.search-field input::placeholder { color: var(--text-4); }
+.search-field input::placeholder { color: var(--text-3); }
 .new-chat { display: flex; align-items: center; gap: 12px; height: 46px; padding: 0 12px; border-radius: 14px; color: var(--text); font-weight: 600; font-size: var(--fs-md); transition: background var(--t-base) var(--ease), transform var(--t-fast) var(--ease); }
 .new-chat .plus { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--accent); color: var(--on-accent); }
 .new-chat:active { background: var(--surface-hover); transform: scale(0.985); }
@@ -254,18 +268,17 @@ textarea.field { padding: 11px 14px; }
 .chat-row:active { background: var(--surface-hover); transform: scale(0.985); }
 .chat-row.on { background: var(--surface-select); color: var(--text); }
 .chat-row .ctitle { flex: 1 1 auto; min-width: 0; font-size: var(--fs-md); line-height: 21px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-row .cmeta { flex: none; font-size: var(--fs-xs); color: var(--text-4); }
+.chat-row .cmeta { flex: none; font-size: var(--fs-xs); color: var(--text-3); }
 .chat-row .cstate { flex: none; display: flex; align-items: center; justify-content: center; width: 16px; }
 .chat-row.enter { animation: row-in 280ms var(--ease-out) both; }
 @keyframes row-in { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: none; } }
 .list-note { padding: 28px 16px; text-align: center; color: var(--text-3); font-size: var(--fs-sm); line-height: 20px; }
 .list-note .btn { margin-top: 12px; }
-.list-note .connect-progress { margin-top: 6px; font-size: var(--fs-xs); opacity: 0.8; }
+.list-note .connect-progress { margin-top: 6px; font-size: var(--fs-xs); color: var(--text-3); }
 /* The same note as one line above the PC's lists of last time, while the PC is being connected again. */
-.pc-status { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 2px 10px; color: var(--text-3); font-size: var(--fs-xs); line-height: 16px; animation: rise-in 240ms var(--ease-out) both; }
+.pc-status { display: flex; align-items: center; gap: 4px 8px; min-height: 32px; padding: 2px 10px; color: var(--text-3); font-size: var(--fs-xs); line-height: 16px; animation: rise-in 240ms var(--ease-out) both; }
 .pc-status > div { min-width: 0; }
 .pc-status > div:first-of-type { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pc-status .connect-progress { flex: none; opacity: 0.8; }
 .pc-status .btn { flex: none; height: 28px; }
 .skeleton-row { height: 46px; margin: 2px 0; border-radius: 14px; background: linear-gradient(90deg, var(--bg-inset) 0%, var(--surface-hover) 50%, var(--bg-inset) 100%); background-size: 200% 100%; animation: skeleton 1.2s ease-in-out infinite; opacity: 0.6; }
 @keyframes skeleton { from { background-position: 200% 0; } to { background-position: -200% 0; } }
@@ -304,7 +317,7 @@ textarea.field { padding: 11px 14px; }
 .start-empty { margin: auto 0; max-width: 320px; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px 12px; text-align: center; color: var(--text-3); font-size: var(--fs-sm); line-height: 20px; }
 .start-empty .eicon { width: 52px; height: 52px; border-radius: 16px; display: flex; align-items: center; justify-content: center; background: var(--bg-inset); }
 .sd-grid { width: 100%; max-width: 480px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px 2px; }
-.sd-section { width: 100%; max-width: 480px; margin-top: 18px; padding: 0 10px 4px; color: var(--text-4); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; }
+.sd-section { width: 100%; max-width: 480px; margin-top: 18px; padding: 0 10px 4px; color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; }
 .sd-tile { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0; padding: 10px 2px 8px; border-radius: 16px; color: var(--text-2); font-size: var(--fs-xs); line-height: 16px; transition: background var(--t-base) var(--ease), transform var(--t-fast) var(--ease); animation: tile-in 320ms var(--ease-out) both; }
 .sd-tile:active { background: var(--surface-hover); transform: scale(0.94); }
 @keyframes tile-in { from { opacity: 0; transform: translateY(8px) scale(0.92); } to { opacity: 1; transform: none; } }
@@ -359,10 +372,12 @@ textarea.field { padding: 11px 14px; }
 .boot.gone { opacity: 0; pointer-events: none; }
 .boot img { width: 64px; height: 64px; border-radius: 18px; animation: pulse 1.6s ease-in-out infinite; }
 
+/* With motion off every animation runs once and is over at once. One that repeats (the caret, the typing dots, a spinner)
+   would otherwise go through its whole cycle every millisecond; run once, it rests in its own drawing. */
 @media (prefers-reduced-motion: reduce) {
-	*, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
+	*, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
 }
-:root[data-motion="off"] *, :root[data-motion="off"] *::before, :root[data-motion="off"] *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
+:root[data-motion="off"] *, :root[data-motion="off"] *::before, :root[data-motion="off"] *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
 
 /* Sign-in (signin.js): the first screen until the phone is signed in with Google. */
 .signin { position: fixed; inset: 0; z-index: 390; display: flex; align-items: center; justify-content: center; background: var(--bg-panel); padding: calc(var(--inset-top) + 24px) 24px calc(var(--inset-bottom) + 24px); overflow-y: auto; }
@@ -381,7 +396,7 @@ textarea.field { padding: 11px 14px; }
 .seg.seg-sm button { border-radius: 9px; font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.01em; }
 .seg.seg-sm .seg-thumb { border-radius: 9px; }
 .pc-chats { display: flex; flex-direction: column; }
-.pc-section { padding: 10px 8px 2px; color: var(--text-4); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; }
+.pc-section { padding: 10px 8px 2px; color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; }
 .pc-section-gap { height: 6px; }
 .pc-group .group-label.pc-ghead { margin-top: 2px; padding: 0 2px 0 0; height: 36px; }
 .pc-gtoggle { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; height: 100%; padding: 0 6px; border-radius: var(--r-md); color: inherit; font: inherit; text-align: left; }
@@ -390,10 +405,68 @@ textarea.field { padding: 11px 14px; }
 .pc-gtoggle .dot { width: 6px; height: 6px; flex: none; }
 .pc-gnew { flex: none; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
 .pc-gbody { display: flex; flex-direction: column; padding-left: 6px; }
-.pc-gnote { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: var(--text-4); font-size: var(--fs-sm); }
+.pc-gnote { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: var(--text-3); font-size: var(--fs-sm); }
 .pc-gnote .btn { height: 28px; }
 .pc-more { display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 12px; border-radius: 12px; color: var(--text-3); font-size: var(--fs-sm); }
-.pc-more .dim { color: var(--text-4); }
+.pc-more .dim { color: var(--text-3); }
 .pc-more:active:not(:disabled) { background: var(--surface-hover); }
-.pc-row .ctitle { display: inline-flex; align-items: center; gap: 6px; }
-.pc-row:disabled { opacity: 0.55; }
+.pc-row .ctitle { display: flex; align-items: center; gap: 6px; }
+/* A long PC name ends in an ellipsis (a flex container does not draw one for its own text). */
+.pc-row .pcname { min-width: 0; overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.pc-row .cmeta { color: var(--text-3); }
+/* A PC that is off, or does not take phones, cannot be picked; it is shown by its dot and its words, not dimmed to the point of
+   being unreadable (opacity took its name and state down to 2.3:1). The chosen PC's state is lettered stronger on its tinted row. */
+.pc-row:disabled .pcname { color: var(--text-2); }
+.pc-row.on .cmeta { color: var(--text-2); }
+/* .chat-row .ctitle (below) lets a title take two lines; a PC row keeps its icon beside the name. */
+.chat-row.pc-row .ctitle { display: flex; align-items: center; gap: 8px; }
+
+/* ---- Touch targets: a finger needs 44 px. What looks smaller is reached by an invisible edge around it (the drawn size stays). ---- */
+.round-btn { width: 44px; height: 44px; }
+.chip.model-chip, .btn.sm, .pc-gnew, .toggle { position: relative; }
+.chip.model-chip::before, .btn.sm::before { content: ""; position: absolute; inset: -6px -4px; }
+.pc-gnew::before { content: ""; position: absolute; inset: -6px; }
+.toggle::before { content: ""; position: absolute; inset: -10px -6px; }
+.seg button::before { content: ""; position: absolute; inset: -6px 0; }
+.seg.seg-sm button::before { inset: -9px 0; }
+.search-field { height: 44px; }
+.search-field input { height: 44px; margin: -1px 0; }
+.composer-input { min-height: 44px; }
+.pc-gtoggle { min-height: 44px; }
+.welcome-chip { min-height: 44px; }
+/* A chat title may take a second line before it is cut: a long title stays recognisable. */
+.chat-row .ctitle { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+/* The connection note above the PC's lists: the state and its button on one line, the details under them (not squeezed into a cut word). */
+.pc-status { flex-wrap: wrap; }
+.pc-status > div:first-of-type { white-space: normal; flex: 1 1 0; min-width: 40%; }
+.pc-status .btn { order: 2; }
+.pc-status .btn::before { inset: -8px -6px; }
+
+/* ---- Things that appear: they fade (and open) in the way the rest of the page does; Reduce motion and the Animations switch turn them to 1 ms (above). ---- */
+/* The PC bar of the drawer opens its height when the PC side is chosen. The negative margin takes back the gap above it. */
+@keyframes line-in {
+	from { opacity: 0; min-height: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: -10px; }
+	to { opacity: 1; min-height: 52px; max-height: 140px; padding-top: 6px; padding-bottom: 6px; margin-top: 0; }
+}
+/* The state's words fade in again when the state changes (the tone gives each state its own animation name, so it starts over),
+   and the dot's colour moves instead of switching. Five names for one movement: a name that stays does not start again. */
+@keyframes soft-in-a { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes soft-in-b { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes soft-in-c { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes soft-in-d { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes soft-in-e { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.pc-line.ok .pstate { animation: soft-in-a var(--t-slow) var(--ease-out) both; }
+.pc-line.busy .pstate { animation: soft-in-b var(--t-slow) var(--ease-out) both; }
+.pc-line.warn .pstate { animation: soft-in-c var(--t-slow) var(--ease-out) both; }
+.pc-line.bad .pstate { animation: soft-in-d var(--t-slow) var(--ease-out) both; }
+.pc-line.off .pstate { animation: soft-in-e var(--t-slow) var(--ease-out) both; }
+.dot { transition: background-color var(--t-slow) var(--ease); }
+/* The title bar's second line is drawn by chat.js without a key of its own, so it cannot start a movement when its words change;
+   its dot has the state's tone, and the line follows the dot (:has). Where :has is missing the words simply change. */
+@supports selector(:has(a)) {
+	.head-title .sub:has(.dot.ok) { animation: soft-in-a var(--t-slow) var(--ease-out) both; }
+	.head-title .sub:has(.dot.live) { animation: soft-in-b var(--t-slow) var(--ease-out) both; }
+	.head-title .sub:has(.dot.warn) { animation: soft-in-c var(--t-slow) var(--ease-out) both; }
+	.head-title .sub:has(.dot.bad) { animation: soft-in-d var(--t-slow) var(--ease-out) both; }
+	.head-title .sub:has(.dot.off) { animation: soft-in-e var(--t-slow) var(--ease-out) both; }
+}

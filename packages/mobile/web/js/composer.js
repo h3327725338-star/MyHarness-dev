@@ -1,10 +1,12 @@
 // The input area of the chat pane: text, attachments (camera, photos, files), the model and effort choice, and the
 // button that sends, or stops the reply being written.
-import { t } from "/shared/i18n.js";
+import { serverText, t } from "/shared/i18n.js";
 import { Spinner, html, useEffect, useLayoutEffect, useRef, useState } from "/shared/ui.js";
 import { effortName, fmtBytes } from "/shared/util.js";
 import { imageAttachment, prepareFile } from "./attachments.js";
 import { backend } from "./backends.js";
+import { levelAfterSwitch } from "./effort.js";
+import { useLinkInfo, wordsOf } from "./link-ui.js";
 import { Icon } from "./micons.js";
 import { haptic, onNative } from "./native.js";
 import { prefs } from "./prefs.js";
@@ -43,10 +45,40 @@ export function shortModelName(name, providerName) {
 	return rest && rest.length < full.length - lead.length ? rest : full;
 }
 
+/** The levels of the model in use, all on the sheet (one tap each); the level that is "Default" for this model is marked. */
+function EffortPicker({ models }) {
+	const [busy, setBusy] = useState(false);
+	if (!models.current || models.efforts.length < 2) return null;
+	const choose = async (level) => {
+		if (busy || level === models.effort) return;
+		haptic("tick");
+		setBusy(true);
+		try {
+			await backend().setEffort(level);
+		} catch (error) {
+			toast(serverText(error?.message, String(error?.message || error)), "error");
+		}
+		setBusy(false);
+	};
+	return html`<div class="effort-block">
+		<div class="rows-title">${t("Reasoning effort")} <span class="etitle-model">${shortModelName(models.current.name, models.current.providerName)}</span></div>
+		<div class="effort-pills" role="radiogroup" aria-label=${t("Reasoning effort")}>
+			${models.efforts.map(
+				(level) => html`<button class="pill effort-pill ${level === models.effort ? "on" : ""}" key=${level} role="radio" aria-checked=${level === models.effort ? "true" : "false"} onClick=${() => choose(level)}>
+					${effortName(level)}${level === models.defaultEffort ? html`<span class="edefault">${t("Default")}</span>` : null}
+				</button>`,
+			)}
+		</div>
+		<div class="rows-note">${t("“Default” is what this model was set up to use. Each model keeps within its own levels: one that lacks the level you chose takes the nearest.")}</div>
+	</div>`;
+}
+
 /** One sheet for both choices, as the chip shows both: the model, and how hard it thinks. */
 function ModelSheet({ close, onManage }) {
 	const models = useStore((s) => side(s).models);
 	const mode = useStore((s) => s.mode);
+	// The PC does not switch models while a reply is being written (it answers 409); the rows say so instead of failing.
+	const blocked = useStore((s) => s.mode === "pc" && side(s).chat.running);
 	const [query, setQuery] = useState("");
 	const needle = query.trim().toLowerCase();
 	const total = models.providers.reduce((sum, provider) => sum + provider.models.length, 0);
@@ -54,8 +86,8 @@ function ModelSheet({ close, onManage }) {
 		.map((provider) => ({ ...provider, models: provider.models.filter((model) => !needle || `${model.name} ${model.id} ${provider.name}`.toLowerCase().includes(needle)) }))
 		.filter((provider) => provider.models.length);
 	return html`<${Sheet} title=${t("Model")} sub=${mode === "pc" ? t("on the PC") : t("on this phone")} close=${close}>
-		${models.efforts.length > 1 &&
-		html`<div class="rows" style="margin-bottom:14px"><${Row} icon="brain" title=${t("Reasoning effort")} value=${effortName(models.effort)} chevron onClick=${pickEffort} /></div>`}
+		<${EffortPicker} models=${models} />
+		${blocked && html`<div class="banner" style="margin:0 4px 12px"><${Icon} name="clock" size=${18} /><span class="btext">${t("Models can be switched when the agent is idle")}</span></div>`}
 		${total > 8 && html`<input class="field sheet-search" style="width:calc(100% - 8px)" placeholder=${t("Search models")} value=${query} onInput=${(event) => setQuery(event.target.value)} />`}
 		${groups.map(
 			(provider) => html`<div key=${provider.id} style="margin-bottom:14px">
@@ -63,19 +95,23 @@ function ModelSheet({ close, onManage }) {
 				<div class="rows">
 					${provider.models.map((model) => {
 						const on = models.current?.provider === provider.id && models.current?.id === model.id;
+						// The effort this model would have if it were chosen now.
+						const would = on ? "" : levelAfterSwitch(models, model);
 						return html`<${Row}
 							key=${model.id}
 							title=${shortModelName(model.name, provider.name)}
 							sub=${model.name !== model.id ? model.id : ""}
+							value=${would ? effortName(would) : ""}
 							on=${on}
 							check=${on}
+							disabled=${blocked && !on}
 							onClick=${async () => {
 								haptic("tick");
-								try {
-									await backend().setModel(provider.id, model.id);
-								} catch (error) {
-									toast(error.message, "error");
-								}
+								if (on) return close();
+								// The sheet closes as soon as the choice is made; the chip changes at once and the PC's answer settles it.
+								backend()
+									.setModel(provider.id, model.id)
+									.catch((error) => toast(serverText(error?.message, String(error?.message || error)), "error"));
 								close();
 							}}
 						/>`;
@@ -86,22 +122,6 @@ function ModelSheet({ close, onManage }) {
 		${!groups.length && html`<div class="empty-state"><span class="eicon"><${Icon} name="cpu" size=${24} /></span>${total ? t("No model matches.") : mode === "pc" ? t("The PC has no model set up yet.") : t("No model yet. Add a provider and its models first.")}</div>`}
 		${mode === "local" && html`<button class="btn block" onClick=${() => (close(), onManage())}><${Icon} name="sliders" size=${17} />${t("Manage providers and models")}</button>`}
 	<//>`;
-}
-
-async function pickEffort() {
-	const models = side().models;
-	const choice = await actionSheet({
-		title: t("Reasoning effort"),
-		sub: models.current?.name,
-		actions: models.efforts.map((level) => ({ value: level, label: effortName(level), checked: level === models.effort })),
-	});
-	if (choice) {
-		try {
-			await backend().setEffort(choice);
-		} catch (error) {
-			toast(error.message, "error");
-		}
-	}
 }
 
 // ---- Attachments -------------------------------------------------------------------------------
@@ -129,6 +149,7 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 	const queue = useStore((s) => side(s).chat.queue);
 	const models = useStore((s) => side(s).models);
 	const link = useStore((s) => s.pc.link);
+	const info = useLinkInfo();
 	// No PC chat is open yet (a new one is still being made on the PC): nothing to send into.
 	const noPcChat = useStore((s) => s.mode === "pc" && !s.pc.chat.slot);
 	// A PC's chat is still being read from Google Drive on the phone side (or could not be): a message must not start a
@@ -251,6 +272,12 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 		}
 	};
 
+	// The connection said in a line (link-status.js): while it is being opened a message waits for it; when it failed, why.
+	const busyNow = info.phase === "connecting" || info.phase === "reconnecting";
+	const words = wordsOf(info);
+	const bannerText = busyNow
+		? `${words.title} ${t("A message you send now goes out as soon as it is connected.")}`
+		: [words.title, words.detail || (info.phase === "offline" ? t("The PC cannot be reached. Is it on, with MyHarness open, on the same network?") : "")].filter(Boolean).join(" — ");
 	const showStop = running && !text.trim() && !attachments.length;
 	const modelLabel = models.current ? shortModelName(models.current.name, models.current.providerName) : mode === "pc" ? t("Model") : t("Choose a model");
 
@@ -262,8 +289,8 @@ export function Composer({ onOpenSettings, onOpenLink }) {
 		${mode === "pc" && !link.paired && html`<div class="banner info"><${Icon} name="desktop" size=${18} /><span class="btext">${t("Connect to MyHarness on your PC to send messages to it.")}</span><button class="btn sm primary" onClick=${onOpenLink}>${t("Connect")}</button></div>`}
 		${mode === "pc" &&
 		link.paired &&
-		link.status === "offline" &&
-		html`<div class="banner"><${Icon} name="wifi" size=${18} /><span class="btext">${link.error || t("The PC cannot be reached. Is it on, with MyHarness open, on the same network?")}</span><button class="btn sm" onClick=${() => backend().reconnect?.()}>${t("Retry")}</button></div>`}
+		info.phase !== "online" &&
+		html`<div class="banner ${info.phase === "refused" ? "danger" : busyNow ? "info" : ""}">${busyNow ? html`<${Spinner} size=${18} />` : html`<${Icon} name="wifi" size=${18} />`}<span class="btext">${bannerText}</span>${busyNow ? null : html`<button class="btn sm" onClick=${() => backend().reconnect?.()}>${info.phase === "retrying" ? t("Retry now") : t("Retry")}</button>`}</div>`}
 		${queue.length > 0 &&
 		html`<div class="queue-row">
 			${queue.map((entry, index) => html`<div class="queue-item" key=${index}><span class="qlabel">${t("Queued")}</span><span class="qbody">${entry.text || t("(attachments)")}</span></div>`)}

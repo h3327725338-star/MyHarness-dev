@@ -82,6 +82,33 @@ export function renderMarkdown(text, { breaks = false } = {}) {
 	return out;
 }
 
+// Where the caret of a text being written goes: at the end of the last line of text. From the last block down, for as
+// long as a block holds other blocks (a list its items, a quote its paragraphs, a table its rows), to the one that holds
+// the text. Null where the reply ends in something without text (a rule): no caret is drawn there.
+const HOLDS_TEXT = new Set(["P", "H1", "H2", "H3", "H4", "H5", "H6", "TD", "TH", "CODE"]);
+const HOLDS_BLOCKS = new Set(["UL", "OL", "LI", "BLOCKQUOTE", "TABLE", "THEAD", "TBODY", "TR", "DIV"]);
+const BLOCKS = new Set([...HOLDS_TEXT, ...HOLDS_BLOCKS, "PRE"]);
+/** The last element in `node` that is part of the text: the caret, when it is already there, is not. */
+function lastOf(node) {
+	const last = node.lastElementChild;
+	return last?.classList.contains("caret") ? last.previousElementSibling : last;
+}
+function caretHost(base) {
+	let node = lastOf(base);
+	// Nothing is written yet: the caret is all there is.
+	if (!node) return base;
+	for (;;) {
+		if (HOLDS_TEXT.has(node.tagName)) return node;
+		if (!HOLDS_BLOCKS.has(node.tagName)) return null;
+		let inner = node.classList.contains("code-block") ? node.querySelector("pre > code") : lastOf(node);
+		// A table whose body has no row yet ends in its head.
+		if (!inner && node.tagName === "TBODY") inner = node.previousElementSibling;
+		// A list item that ends in words (plain, bold, a link, a piece of code) holds the text itself.
+		if (!inner || !BLOCKS.has(inner.tagName) || (inner.tagName === "CODE" && node.tagName !== "DIV")) return node.tagName === "LI" ? node : null;
+		node = inner;
+	}
+}
+
 let linkHandler = null;
 /** Where a tapped link goes (the built-in browser pane); set once by main.js. */
 export function setLinkHandler(fn) {
@@ -91,10 +118,15 @@ export function setLinkHandler(fn) {
 /**
  * A block of rendered Markdown. The HTML is set directly on the node and only when the text changed, so a long reply
  * being written does not go through Preact's diff for every token.
+ *
+ * `caret`: the text is still being written, and a caret is drawn at the end of its last line. It is put inside the block
+ * that holds that line (see caretHost) and takes no room of its own (transcript.css), so the page is exactly as tall with
+ * it as without. A caret after the whole text took a line of its own under it, and the page got that line shorter in the
+ * frame the writing ended: with the pane following the end, everything on screen moved down at once.
  */
 export class Markdown extends Component {
 	shouldComponentUpdate(next) {
-		return next.text !== this.props.text || next.class !== this.props.class || next.breaks !== this.props.breaks;
+		return next.text !== this.props.text || next.class !== this.props.class || next.breaks !== this.props.breaks || next.caret !== this.props.caret;
 	}
 
 	componentDidMount() {
@@ -107,8 +139,14 @@ export class Markdown extends Component {
 
 	paint() {
 		const html = renderMarkdown(this.props.text || "", { breaks: this.props.breaks });
-		if (this.painted === html) return;
+		if (this.painted !== html) this.paintText(html);
+		this.placeCaret();
+	}
+
+	paintText(html) {
 		const base = this.base;
+		// The caret is no part of the text: it is taken out before the blocks are compared and put back afterwards.
+		this.caret?.remove();
 		if (!this.painted || !base.firstChild) base.innerHTML = html;
 		else {
 			// The paragraphs, lists and code blocks that are already there stay as they are (their pictures do not load
@@ -124,6 +162,19 @@ export class Markdown extends Component {
 			for (let index = same; index < fresh.length; index++) base.appendChild(fresh[index]);
 		}
 		this.painted = html;
+	}
+
+	placeCaret() {
+		const host = this.props.caret ? caretHost(this.base) : null;
+		if (!host) {
+			this.caret?.remove();
+			return;
+		}
+		this.caret ||= Object.assign(document.createElement("span"), { className: "caret" });
+		if (host.lastChild === this.caret) return;
+		// A node put into the page again starts its blinking over; on one clock for all, it blinks on as it did.
+		this.caret.style.animationDelay = `${-(performance.now() % 1000)}ms`;
+		host.appendChild(this.caret);
 	}
 
 	onClick = (event) => {

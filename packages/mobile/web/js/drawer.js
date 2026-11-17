@@ -1,8 +1,9 @@
 // The left pane: which side messages go to (this phone or the PC), and that side's chats.
 import { t } from "/shared/i18n.js";
-import { Spinner, html, useEffect, useMemo, useRef, useState } from "/shared/ui.js";
+import { Spinner, html, useMemo, useRef, useState } from "/shared/ui.js";
 import { pc, routeName } from "./backend-remote.js";
 import { backend, nav, setMode } from "./backends.js";
+import { LinkDot, stateWord, useLinkInfo, wordsOf } from "./link-ui.js";
 import { Icon, Mark } from "./micons.js";
 import { haptic } from "./native.js";
 import { ModeTabs, PcChats } from "./pc-chats.js";
@@ -65,6 +66,7 @@ export function AccountPcs({ onPicked }) {
 	const pcs = useStore((s) => s.account.pcs);
 	const status = useStore((s) => s.account.status);
 	const current = useStore((s) => (s.pc.link.paired?.kind === "account" ? s.pc.link.paired.pcId : ""));
+	const info = useLinkInfo();
 	if (status === "noSpace") return html`<div class="list-note">${t("No PC has used this Google account with MyHarness yet. Sign in on a PC first (MyHarness → Settings → Google Drive), keep MyHarness open there, and look again in a minute.")}</div>`;
 	if (!pcs.length) return html`<div class="list-note">${status === "loading" ? html`<${Spinner} size=${18} />` : t("No PC of this Google account is on right now. Open MyHarness on a PC signed in with the same account.")}</div>`;
 	const pick = async (entry) => {
@@ -75,31 +77,29 @@ export function AccountPcs({ onPicked }) {
 	};
 	return html`<div class="pc-list">
 		${pcs.map(
-			(entry) => html`<button class="chat-row pc-row ${entry.id === current ? "on" : ""}" key=${entry.id} disabled=${!entry.online || !entry.accepts} onClick=${() => pick(entry)} style="width:100%;text-align:left">
-				<span class="ctitle"><${Icon} name="desktop" size=${16} /> ${entry.name}</span>
-				<span class="cmeta">${!entry.online ? t("Off") : !entry.accepts ? t("Does not accept phones") : entry.id === current ? t("Connected") : t("On")}</span>
-				<span class="cstate"><span class="dot ${entry.online && entry.accepts ? "ok" : "off"}"></span></span>
+			(entry) => html`<button class="chat-row pc-row ${entry.id === current ? "on" : ""}" key=${entry.id} disabled=${(!entry.online || !entry.accepts) && entry.id !== current} onClick=${() => pick(entry)} style="width:100%;text-align:left">
+				<span class="ctitle"><${Icon} name="desktop" size=${16} /><span class="pcname">${entry.name}</span></span>
+				<span class="cmeta">${entry.id === current ? stateWord(info) : !entry.online ? t("Off") : !entry.accepts ? t("Does not accept phones") : t("On")}</span>
+				<span class="cstate">${entry.id === current ? html`<${LinkDot} info=${info} />` : html`<span class="dot ${entry.online && entry.accepts ? "ok" : "off"}"></span>`}</span>
 			</button>`,
 		)}
 	</div>`;
 }
 
-/** While a PC is being connected: how long it has taken, and which ways to it are still being tried. */
-function ConnectProgress({ link }) {
-	const [, tick] = useState(0);
-	useEffect(() => {
-		const timer = setInterval(() => tick((count) => count + 1), 1000);
-		return () => clearInterval(timer);
-	}, []);
-	const routes = (link.trying || []).map((route) => routeLabel({ route })).filter(Boolean);
-	if (!routes.length || !link.since) return null;
-	const seconds = Math.max(0, Math.round((Date.now() - link.since) / 1000));
-	return html`<div class="connect-progress">${t("{seconds} s · trying: {routes}", { seconds, routes: routes.join(" / ") })}</div>`;
-}
-
-function LinkDot({ link }) {
-	const cls = link.status === "online" ? "ok" : link.status === "connecting" ? "live" : link.paired ? "warn" : "off";
-	return html`<span class="dot ${cls}"></span>`;
+/**
+ * The connection under the Phone / PC switch: the PC's name and its state; once connected also the way it is reached and the
+ * delay. While it is not connected the note under the lists says the rest (seconds, ways tried, the reason), so the bar keeps
+ * to the state in a word instead of saying it twice. It opens Settings → PC connection; it is the only place in the drawer that
+ * names the PC (the foot has the Settings button alone).
+ */
+function PcLine({ info, name }) {
+	const words = wordsOf(info);
+	const detail = info.phase === "online" ? words.detail : "";
+	const stateText = [words.title, detail].filter(Boolean).join(" · ");
+	// The label replaces what the button shows for a screen reader, so it says the same: which PC, and its state.
+	return html`<button class="pc-line ${info.tone}" onClick=${() => nav.openLink()} aria-label=${`${t("PC connection")}: ${name}, ${stateText}`}>
+		<${LinkDot} info=${info} /><span class="pmain"><span class="pname">${name}</span><span class="pstate">${stateText}</span></span><${Icon} name="chevronRight" size=${14} />
+	</button>`;
 }
 
 export function Drawer() {
@@ -108,6 +108,7 @@ export function Drawer() {
 	const loaded = useStore((s) => side(s).chatsLoaded);
 	const activeId = useStore((s) => (s.mode === "pc" ? (side(s).chat.slot ? `slot:${side(s).chat.slot}` : "") : side(s).chat.id));
 	const link = useStore((s) => s.pc.link);
+	const info = useLinkInfo();
 	const signed = useStore((s) => s.account.status !== "signedOut");
 	// The PC's lists as they were last time are shown while it is being connected (backend-remote.js keeps them).
 	const pcListed = useStore((s) => s.pc.lists.general.loaded || s.pc.lists.coding.loaded);
@@ -175,10 +176,20 @@ export function Drawer() {
 
 	const pcDown = mode === "pc" && link.status !== "online";
 	const pcBlocked = pcDown && !pcListed;
-	const pcNote = () => html`${link.status === "connecting" ? html`<${Spinner} size=${pcListed ? 13 : 18} />` : null}
-		<div>${link.status === "connecting" ? t("Connecting to {name}…", { name: link.paired?.name || "PC" }) : link.error || t("The PC cannot be reached.")}</div>
-		${link.status === "connecting" ? html`<${ConnectProgress} link=${link} />` : null}
-		${link.status !== "connecting" && html`<button class="btn ${pcListed ? "sm" : ""}" onClick=${() => backend().reconnect()}>${t("Retry")}</button>`}`;
+	// What is wrong and what is being done about it, in words: a try under way (with how long and which ways), a try planned
+	// (with the seconds left), the PC being off, or the reason it cannot be reached (link-status.js).
+	const busyNow = info.phase === "connecting" || info.phase === "reconnecting";
+	// Above the PC's lists (`compact`) the bar under the switch has said the state already, so the note keeps to what the bar leaves
+	// out (the seconds and ways tried, the reason) and the button, and no words at all when there is nothing to add; with no
+	// lists to show, it is the whole message and says it all.
+	const pcNote = (compact) => {
+		const words = wordsOf(info);
+		const name = link.paired?.name || "PC";
+		const title = busyNow ? (info.phase === "reconnecting" ? t("Reconnecting to {name}…", { name }) : t("Connecting to {name}…", { name })) : words.title;
+		return html`${busyNow ? html`<${Spinner} size=${compact ? 13 : 18} />` : null}
+			${compact ? (words.detail || !link.paired ? html`<div>${words.detail || title}</div>` : null) : html`<div>${title}</div>${words.detail ? html`<div class="connect-progress">${words.detail}</div>` : null}`}
+			${!busyNow && info.phase !== "none" ? html`<button class="btn ${compact ? "sm" : ""}" onClick=${() => backend().reconnect()}>${info.phase === "retrying" ? t("Retry now") : t("Retry")}</button>` : null}`;
+	};
 
 	return html`<div class="drawer">
 		<div class="drawer-top">
@@ -186,8 +197,9 @@ export function Drawer() {
 			<div class="seg" role="tablist">
 				<span class="seg-thumb" style=${`width:calc((100% - 6px) / 2);transform:translateX(${mode === "pc" ? 100 : 0}%)`}></span>
 				<button role="tab" aria-selected=${mode === "local" ? "true" : "false"} class=${mode === "local" ? "on" : ""} onClick=${(event) => (haptic("tick"), setMode("local", centre(event)))}><${Icon} name="phone" size=${15} />${t("This phone")}</button>
-				<button role="tab" aria-selected=${mode === "pc" ? "true" : "false"} class=${mode === "pc" ? "on" : ""} onClick=${(event) => (haptic("tick"), setMode("pc", centre(event)))}><${Icon} name="desktop" size=${15} />${t("PC")}<${LinkDot} link=${link} /></button>
+				<button role="tab" aria-selected=${mode === "pc" ? "true" : "false"} class=${mode === "pc" ? "on" : ""} onClick=${(event) => (haptic("tick"), setMode("pc", centre(event)))}><${Icon} name="desktop" size=${15} />${t("PC")}<${LinkDot} info=${info} /></button>
 			</div>
+			${mode === "pc" && link.paired ? html`<${PcLine} info=${info} name=${link.paired.name} />` : null}
 			${mode === "pc" && link.paired ? html`<${ModeTabs} />` : null}
 			<label class="search-field"><${Icon} name="search" size=${17} /><input type="search" placeholder=${t("Search chats")} value=${query} onInput=${(event) => setQuery(event.target.value)} enterkeyhint="search" /></label>
 			<button class="new-chat" onClick=${newChat} disabled=${pcDown && link.status !== "connecting"}><span class="plus"><${Icon} name="plus" size=${18} /></span>${t("New chat")}</button>
@@ -203,9 +215,9 @@ export function Drawer() {
 						<div><button class="btn primary" onClick=${() => nav.openLink()}><${Icon} name="qr" size=${17} />${t("Connect to a PC")}</button></div>
 					</div>`
 				: pcBlocked
-					? html`<div class="list-note">${pcNote()}</div>`
+					? html`<div class="list-note">${pcNote(false)}</div>`
 					: mode === "pc"
-						? html`${pcDown ? html`<div class="pc-status">${pcNote()}</div>` : null}<${PcChats} query=${query} Row=${ChatRow} onOpen=${openPcRow} onNew=${newPcChat} />`
+						? html`${pcDown ? html`<div class="pc-status">${pcNote(true)}</div>` : null}<${PcChats} query=${query} Row=${ChatRow} onOpen=${openPcRow} onNew=${newPcChat} />`
 						: !loaded
 						? [0, 1, 2, 3, 4].map((index) => html`<div class="skeleton-row" key=${index} style=${`animation-delay:${index * 80}ms`}></div>`)
 						: groups.length === 0
@@ -219,7 +231,6 @@ export function Drawer() {
 		</div>
 		<div class="drawer-foot">
 			<button class="foot-btn grow" onClick=${() => nav.openSettings()}><${Icon} name="gear" size=${20} /><span class="flabel">${t("Settings")}</span></button>
-			${mode === "pc" && link.paired && html`<button class="foot-btn" onClick=${() => nav.openLink()} aria-label=${t("PC connection")}><${Icon} name="desktop" size=${20} /><span class="flabel">${link.paired.name}</span></button>`}
 		</div>
 	</div>`;
 }

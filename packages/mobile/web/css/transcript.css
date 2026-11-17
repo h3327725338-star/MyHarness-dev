@@ -4,6 +4,12 @@
 .turn { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .turn.enter { animation: turn-in 340ms var(--ease-out) both; }
 @keyframes turn-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+/* The work and the texts written between it: one column like the turn itself, so that it can fold into one block as a piece
+   when the reply ends (useSwapGlide in the shared ui.js). The still copy it leaves behind while it folds is the colour of the
+   pane and does not play the entrances of what it copies. */
+.turn-work { position: relative; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.swap-glide-copy { position: absolute; inset: 0 0 auto 0; pointer-events: none; z-index: 1; background: var(--bg-panel); }
+.swap-glide-copy, .swap-glide-copy * { animation: none !important; }
 
 .user-row { position: relative; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; transition: opacity 260ms var(--ease); }
 .user-bubble {
@@ -31,7 +37,7 @@
 .process-head { width: 100%; display: flex; align-items: center; gap: 9px; min-height: 42px; padding: 6px 12px; color: var(--text-2); text-align: left; font-size: var(--fs-sm); line-height: 18px; }
 .process-head:active { background: var(--surface-hover); }
 .process-head .ptext { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.process-head .pmeta { flex: none; color: var(--text-4); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.process-head .pmeta { flex: none; color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 .process-head .pico { flex: none; width: 18px; display: flex; justify-content: center; color: var(--text-3); }
 .process-head .disclose { transition: transform var(--t-slow) var(--ease); color: var(--text-4); }
 .process-head[aria-expanded="true"] .disclose { transform: rotate(90deg); }
@@ -40,13 +46,14 @@
 .step-row { display: flex; align-items: flex-start; gap: 9px; min-height: 30px; padding: 5px 0; color: var(--text-2); font-size: var(--fs-sm); line-height: 19px; min-width: 0; text-align: left; width: 100%; }
 .step-row .sico { flex: none; width: 18px; height: 19px; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
 .step-row .stext { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-.step-row .stext .target { color: var(--text-3); }
+.step-row .stext .target, .step-row .stext .detail { color: var(--text-3); }
 .step-row.error .sico, .step-row.error .verb { color: var(--danger); }
 .step-row.running .verb { color: var(--text); }
-.step-row .counts { flex: none; }
+/* +N −M of a change to a file stays whole at the end of the row; the text beside it is what wraps. */
+.step-row .counts { flex: none; align-self: flex-start; align-items: center; height: 19px; white-space: nowrap; }
 .step-detail { margin: 0 0 6px 27px; padding: 9px 11px; border-radius: 12px; background: var(--bg-panel); border: 1px solid var(--border-soft); font-size: var(--fs-sm); line-height: 1.55; color: var(--text-2); max-height: 320px; overflow: auto; overscroll-behavior: contain; touch-action: pan-x pan-y; }
 .step-detail pre { margin: 0; font-size: var(--fs-code); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-.step-detail .dlabel { display: block; margin: 8px 0 3px; color: var(--text-4); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; }
+.step-detail .dlabel { display: block; margin: 8px 0 3px; color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; }
 .step-detail .dlabel:first-child { margin-top: 0; }
 .think-text { margin: 0 0 6px 27px; padding: 9px 11px; border-radius: 12px; background: var(--bg-panel); border: 1px solid var(--border-soft); color: var(--text-2); font-size: var(--fs-sm); line-height: 1.6; max-height: 340px; overflow: auto; overscroll-behavior: contain; }
 .think-text .md { font-size: inherit; line-height: inherit; }
@@ -54,7 +61,7 @@
 .web-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 12px; background: var(--bg-panel); border: 1px solid var(--border-soft); color: var(--text-2); font-size: var(--fs-sm); line-height: 18px; min-width: 0; text-align: left; }
 .web-item:active { background: var(--surface-hover); }
 .web-item .wtitle { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.web-item .whost { flex: none; max-width: 38%; color: var(--text-4); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.web-item .whost { flex: none; max-width: 38%; color: var(--text-3); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note-text { color: var(--text); }
 
 /* What appears while a reply is being written (the dots, a block of work, the answer) comes in softly. */
@@ -62,7 +69,9 @@
 @keyframes part-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .final { min-width: 0; }
 .final .md { font: var(--fs-read) / var(--lh-read) var(--font-read); }
-.caret { display: inline-block; width: 8px; height: 1.05em; margin-left: 2px; vertical-align: -0.16em; border-radius: 2px; background: var(--accent); animation: caret 1s steps(2, start) infinite; }
+/* The caret sits in the last line of the text being written (markdown.js). Its right margin gives back the width it takes,
+   so it never moves to a line of its own and the text is laid out exactly as it is without it. */
+.caret { display: inline-block; width: 8px; height: 1.05em; margin: 0 -10px 0 2px; vertical-align: -0.16em; border-radius: 2px; background: var(--accent); animation: caret 1s steps(2, start) infinite; }
 @keyframes caret { to { opacity: 0.15; } }
 .typing { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 2px; }
 .typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); animation: typing 1.2s ease-in-out infinite; }
@@ -71,15 +80,20 @@
 @keyframes typing { 0%, 60%, 100% { transform: translateY(0); opacity: 0.35; } 30% { transform: translateY(-5px); opacity: 1; } }
 .status-line { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: var(--fs-sm); min-height: 24px; }
 
-.msg-actions { display: flex; align-items: center; gap: 2px; margin: 6px 0 0 -8px; color: var(--text-3); }
-.msg-actions .icon-btn { width: 36px; height: 36px; color: var(--text-3); }
-.msg-actions .meta { margin-left: 6px; font-size: var(--fs-xs); color: var(--text-4); font-variant-numeric: tabular-nums; }
+/* The buttons are 44px square (a finger's size); the fold they sit in reaches 12px to the left so that the icons, which sit
+   in the middle of their button, still start where the text starts, and takes back the turn's 12px gap above it (the
+   space above the buttons is inside the fold, so it grows with it and a folded one leaves none). The "2s · opus" line is
+   --text-3 (4.5:1 or more in every colour theme). */
+.msg-actions-fold { margin: -12px 0 0 -12px; }
+.msg-actions { display: flex; align-items: center; gap: 2px; padding-top: 14px; color: var(--text-3); }
+.msg-actions .icon-btn { width: 44px; height: 44px; color: var(--text-3); }
+.msg-actions .meta { margin-left: 2px; font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
 .msg-error { display: flex; align-items: flex-start; gap: 10px; padding: 11px 13px; border-radius: 16px; background: var(--danger-soft); color: var(--text); font-size: var(--fs-sm); line-height: 19px; }
 .msg-error svg { color: var(--danger); margin-top: 1px; }
 .msg-error .etext { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .msg-error.muted { background: var(--bg-inset); color: var(--text-3); }
 .msg-error.muted svg { color: var(--text-3); }
-.marker { display: flex; align-items: center; gap: 10px; color: var(--text-4); font-size: var(--fs-xs); }
+.marker { display: flex; align-items: center; gap: 10px; color: var(--text-3); font-size: var(--fs-xs); }
 .marker::before, .marker::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--border-soft); }
 .older { display: flex; justify-content: center; padding: 4px 0 10px; }
 .card { border-radius: 16px; background: var(--bg-inset); border: 1px solid var(--border-soft); padding: 10px 12px; font-size: var(--fs-sm); line-height: 19px; color: var(--text-2); min-width: 0; }
@@ -127,7 +141,9 @@
 .md input[type="checkbox"] { margin-right: 6px; }
 .code-block { margin: 0 0 0.95em; border: 1px solid var(--border); border-radius: 14px; background: var(--code-bg); overflow: hidden; }
 .code-head { display: flex; align-items: center; justify-content: space-between; height: 36px; padding: 0 6px 0 12px; font-size: var(--fs-xs); color: var(--text-3); border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--code-bg) 60%, var(--bg-raised)); }
-.code-copy { color: var(--text-3); font-size: var(--fs-xs); height: 28px; padding: 0 10px; border-radius: var(--r-md); transition: background var(--t-base) var(--ease), color var(--t-base) var(--ease); }
+/* The button is drawn 28px high; a finger reaches it within 44px (the edge around it is not drawn). */
+.code-copy::before { content: ""; position: absolute; inset: -4px -6px -12px -10px; }
+.code-copy { position: relative; color: var(--text-3); font-size: var(--fs-xs); height: 28px; padding: 0 10px; border-radius: var(--r-md); transition: background var(--t-base) var(--ease), color var(--t-base) var(--ease); }
 .code-copy:active { background: var(--surface-active); color: var(--text); }
 .code-copy.done { color: var(--ok); }
 .code-block pre { margin: 0; padding: 11px 13px; overflow-x: auto; font-size: var(--fs-code); line-height: 1.55; touch-action: pan-x pan-y; overscroll-behavior-x: contain; }

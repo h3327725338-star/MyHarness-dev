@@ -40,7 +40,9 @@
  * The conversation and its context belong to `agy` (managesOwnContext): MyHarness shows how full the window is, as `agy`
  * reports it, and does not gate on it or compact automatically. Manual compaction creates a portable MyHarness
  * checkpoint in a separate request and rebuilds the agy conversation from it. Which conversation a chat continues is remembered, and it is
- * resumed after `agy` was restarted when `agy` supports that; otherwise the chat's earlier messages go along as text.
+ * resumed after `agy` was restarted when `agy` supports that; otherwise the chat's earlier messages go along as text,
+ * within what `agy` takes in one message (MAX_PROMPT_BYTES): the newest are kept and the oldest left out, and a message
+ * `agy` still cut short is reported to the user (cutFromInput).
  * `agy` compacts by itself near the end of its own window. A shorter length can be set per model on the provider's
  * card (Settings → Provider → agy): a conversation that has reached it is compacted by `agy`'s own /compact before the
  * next message, and the chat's meter is measured against that length.
@@ -115,8 +117,25 @@ const LATE_REPORT_MS = 2_000;
 const LEFT_CALL_TEXT = "agy 结束了这一轮，但没有报告这个工具的结果；它启动的东西可能还在运行。";
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const MAX_CARD_CHARS = 30_000;
-const MAX_TOOL_RESULT_CHARS = 20_000;
-const MAX_TRANSCRIPT_CHARS = 400_000;
+/**
+ * `agy` passes on only the beginning of a long message: with agy 1.5.9 and Gemini 4 Hydrogen the first 192,000 UTF-8
+ * bytes of the request, its own wrapping included, followed by a note to the model; the end is gone and the client is
+ * not told (seen 2026-11-17, with text and with an embedded resource alike; the limit is `agy`'s
+ * max_user_request_bytes, which its service may set differently per model). A message that carries the chat's earlier
+ * conversation lost its newest part and the user's new words that way, and the model answered an older question. What
+ * this plugin puts into one message stays under this, with room for that wrapping and for a lower limit.
+ */
+export const MAX_PROMPT_BYTES = 150_000;
+/**
+ * A model on which `agy` still cut a message shorter gets its messages kept this far under what it took (cutFromInput),
+ * and never less than the floor below.
+ */
+const CUT_MARGIN_BYTES = 8_000;
+const MIN_PROMPT_BYTES = 32_000;
+/** One tool result in an earlier part of the chat goes along with this much at most. */
+const MAX_TOOL_RESULT_BYTES = 20_000;
+/** A message only part of which fits is still given in part (its beginning and its end) when this much room is left. */
+const MIN_PART_BYTES = 2_000;
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 /** The shortest context length a user may set for a model: below it `agy` would compact after nearly every turn. */
 export const MIN_CONTEXT_LIMIT = 50_000;
@@ -508,6 +527,8 @@ type Shared = {
 	 * adds to its prompt between the two (turnPromptFor). The newest few, the oldest first.
 	 */
 	turnPrompts: Map<string, string>;
+	/** What a message may carry on a model of `agy` that cut one shorter than MAX_PROMPT_BYTES, by model id. */
+	promptLimits: Map<string, number>;
 };
 const SHARED_KEY = Symbol.for("myharness.agy-shell");
 const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
@@ -517,11 +538,13 @@ const shared: Shared = (globalThis as any)[SHARED_KEY] ?? {
 	versions: new Map(),
 	updateCommands: new Map(),
 	turnPrompts: new Map(),
+	promptLimits: new Map(),
 };
 // A copy of this file from before the hidden update check, or from before a prompt was added to `agy`'s system prompt,
 // may have made the registry (a reload of the extension).
 shared.updateCommands ??= new Map();
 shared.turnPrompts ??= new Map();
+shared.promptLimits ??= new Map();
 (globalThis as any)[SHARED_KEY] = shared;
 
 type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
@@ -1225,6 +1248,31 @@ const requestRecord = (conversationId: string) =>
 		"transcript.jsonl",
 	);
 
+/**
+ * How many bytes `agy` cut from the end of a message, among the lines of its record, when it did (MAX_PROMPT_BYTES).
+ * The record shortens every long message for itself, with one `<truncated N bytes>` in its middle; a message `agy` cut
+ * before the model saw it ends with such a mark and a note to the model (seen with agy 1.5.9 on 2026-11-17).
+ */
+const CUT_NOTE = "NOTE: The output was truncated because it was too long.";
+export function cutFromInput(lines: string): number | undefined {
+	let cut: number | undefined;
+	for (const line of lines.split("\n")) {
+		if (!line.includes("USER_INPUT") || !line.includes(CUT_NOTE)) continue;
+		let step: any;
+		try {
+			step = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (step?.type !== "USER_INPUT" || typeof step.content !== "string") continue;
+		const mark = /<truncated (\d+) bytes>\s*NOTE: The output was truncated because it was too long\.[^\n]*\s*$/.exec(
+			step.content,
+		);
+		if (mark) cut = (cut ?? 0) + Number(mark[1]);
+	}
+	return cut;
+}
+
 /** The model requests among the lines of a record: a step is one when it carries token counts. */
 export function requestsIn(lines: string): RequestUsage[] {
 	const count = (value: unknown) =>
@@ -1554,24 +1602,102 @@ function plainText(content: any): string {
 		.join("\n");
 }
 
-/** What an earlier part of a chat said, for an `agy` conversation that did not see it happen. */
-function renderTranscript(messages: any[], complete = false): string {
-	const lines: string[] = [];
-	let total = 0;
-	// Newest first, so a limit only ever costs the oldest messages.
-	for (let i = messages.length - 1; i >= 0 && (complete || total < MAX_TRANSCRIPT_CHARS); i--) {
-		const message = messages[i];
+const bytesOf = (text: string) => Buffer.byteLength(text, "utf8");
+
+/** The first `bytes` bytes of a text at most, never half a character. */
+function headBytes(text: string, bytes: number): string {
+	if (bytes <= 0) return "";
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= bytes) return text;
+	let end = bytes;
+	while (end > 0 && (buffer[end] & 0xc0) === 0x80) end--;
+	return buffer.subarray(0, end).toString("utf8");
+}
+
+/** The last `bytes` bytes of a text at most, never half a character. */
+function tailBytes(text: string, bytes: number): string {
+	if (bytes <= 0) return "";
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= bytes) return text;
+	let start = buffer.length - bytes;
+	while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+	return buffer.subarray(start).toString("utf8");
+}
+
+/** A text in at most `bytes` bytes: its beginning and its end, with how much was left out between them. */
+export function clipBytes(text: string, bytes: number): string {
+	const size = bytesOf(text);
+	if (size <= bytes) return text;
+	const gap = (left: number) => `\n[... ${left} bytes left out ...]\n`;
+	const room = bytes - bytesOf(gap(size));
+	if (room <= 0) return headBytes(text, bytes);
+	const head = headBytes(text, Math.floor(room / 2));
+	const tail = tailBytes(text, room - bytesOf(head));
+	return `${head}${gap(size - bytesOf(head) - bytesOf(tail))}${tail}`;
+}
+
+/** The room a note on left-out earlier messages takes at the top of a transcript. */
+const TRANSCRIPT_NOTE_BYTES = 200;
+
+/**
+ * What an earlier part of a chat said, in at most `budget` UTF-8 bytes, for an `agy` conversation that did not see it
+ * happen (or a request of MyHarness's own that answers apart from the chat). `agy` drops the end of a longer message,
+ * which is the newest part of the chat and the words that follow it (MAX_PROMPT_BYTES), so the budget is kept here.
+ *
+ * What was said (the user's messages, the model's words and the tools it called) comes first, newest first: a chat
+ * that is too long loses its oldest messages, never its newest, and a note says how many are left out. Tool results
+ * fill the room that is left, also newest first; one that does not fit is named with its size instead (in a chat
+ * measured on 2026-11-17 they were four fifths of the text, and pushed out every message after the second question).
+ */
+export function renderTranscript(messages: any[], budget: number): string {
+	const entries = messages.flatMap((message) => {
 		const text = plainText(message.content);
-		if (!text) continue;
-		const isTool = message.role === "toolResult";
-		const clipped =
-			!complete && isTool && text.length > MAX_TOOL_RESULT_CHARS
-				? `${text.slice(0, MAX_TOOL_RESULT_CHARS)} ...`
-				: text;
-		lines.unshift(`${isTool ? `tool result (${message.toolName})` : message.role}: ${clipped}`);
-		total += clipped.length;
+		if (!text) return [];
+		const tool = message.role === "toolResult";
+		return [{ label: tool ? `tool result (${message.toolName})` : String(message.role), text, tool }];
+	});
+	const room = budget - TRANSCRIPT_NOTE_BYTES;
+	if (!entries.length || room < MIN_PART_BYTES) return "";
+	const separator = 2;
+	const standIn = (entry: (typeof entries)[number]) => `${entry.label}: [left out, ${bytesOf(entry.text)} bytes]`;
+	const shown: string[] = [];
+	let used = 0;
+	let first = entries.length;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		const line = entry.tool ? standIn(entry) : `${entry.label}: ${entry.text}`;
+		const size = bytesOf(line) + separator;
+		if (used + size > room) {
+			// The newest message that does not fit whole goes along in part when there is room for a useful part of it.
+			const left = room - used - separator;
+			if (!entry.tool && left >= MIN_PART_BYTES) {
+				shown[i] = clipBytes(line, left);
+				used += bytesOf(shown[i]) + separator;
+				first = i;
+			}
+			break;
+		}
+		shown[i] = line;
+		used += size;
+		first = i;
 	}
-	return lines.join("\n\n");
+	for (let i = entries.length - 1; i >= first; i--) {
+		const entry = entries[i];
+		if (!entry.tool) continue;
+		const stand = bytesOf(shown[i]);
+		const left = room - used + stand;
+		const whole = `${entry.label}: ${clipBytes(entry.text, MAX_TOOL_RESULT_BYTES)}`;
+		const line = bytesOf(whole) <= left ? whole : left >= MIN_PART_BYTES ? clipBytes(whole, left) : undefined;
+		if (!line) continue;
+		shown[i] = line;
+		used += bytesOf(line) - stand;
+	}
+	const kept = shown.slice(first).filter((line) => line !== undefined);
+	const note =
+		first > 0
+			? `(${first} earlier message${first === 1 ? " is" : "s are"} left out here: agy takes only so much in one message.)\n\n`
+			: "";
+	return `${note}${kept.join("\n\n")}`;
 }
 
 /** The choices of a select option `agy` offers (ACP's SessionConfigOption), flat. */
@@ -1664,6 +1790,14 @@ class AcpSession {
 	compactingNow = false;
 	/** How much of `agy`'s record of this conversation has been read for its model requests, in bytes. */
 	private recordAt = 0;
+	/** The UTF-8 bytes of text the last message sent carried. */
+	sentBytes = 0;
+	/** The last message sent carried the chat's earlier conversation. */
+	historySent = false;
+	/** `agy` cut the end off a message that carried the chat's earlier conversation: the next message starts over. */
+	startOver = false;
+	/** Bytes `agy` cut from the end of the last message sent, as its record shows (cutFromInput). */
+	private inputCut?: number;
 	private modelOption?: SelectOption;
 	private thoughtOption?: SelectOption;
 	private queue: any[] = [];
@@ -1983,10 +2117,20 @@ class AcpSession {
 			const end = bytes.lastIndexOf(10);
 			if (end < 0) return [];
 			this.recordAt += end + 1;
-			return requestsIn(bytes.subarray(0, end).toString("utf8"));
+			const lines = bytes.subarray(0, end).toString("utf8");
+			const cut = cutFromInput(lines);
+			if (cut) this.inputCut = (this.inputCut ?? 0) + cut;
+			return requestsIn(lines);
 		} catch {
 			return [];
 		}
+	}
+
+	/** How many bytes `agy` cut from the end of this turn's message, once, when its record showed it did. */
+	takeCut(): number | undefined {
+		const cut = this.inputCut;
+		this.inputCut = undefined;
+		return cut;
 	}
 
 	private async setOption(option: SelectOption, value: string): Promise<void> {
@@ -2081,6 +2225,7 @@ class AcpSession {
 		this.forgetCalls("这一轮已经结束");
 		// Discard late usage from a cancelled turn before starting another one.
 		this.takeRequests();
+		this.inputCut = undefined;
 		const turn = ++this.turn;
 		this.turnActive = true;
 		this.turnOpen = true;
@@ -2089,6 +2234,7 @@ class AcpSession {
 			? [{ type: "text", text: this.pendingInstructions }, ...content]
 			: [...content];
 		if (!this.ephemeral) prompt.push({ type: "text", text: HOST_TURN_REMINDER });
+		this.sentBytes = prompt.reduce((sum, part) => sum + (part?.type === "text" ? bytesOf(part.text ?? "") : 0), 0);
 		if (this.pendingInstructions) {
 			// From this message on the conversation has them.
 			this.givenHash = this.pendingHash;
@@ -2524,6 +2670,50 @@ export function ownResult(call: Pick<OwnCall, "content" | "rawOutput">, cwd?: st
 	return parts.map((part) => (part.type === "text" ? { ...part, text: part.text.slice(0, MAX_CARD_CHARS) } : part));
 }
 
+/** What one message may carry on this model, in UTF-8 bytes (MAX_PROMPT_BYTES, or less where `agy` cut one shorter). */
+const promptLimit = (modelId: string | undefined) =>
+	Math.min(MAX_PROMPT_BYTES, (modelId && shared.promptLimits.get(modelId)) || MAX_PROMPT_BYTES);
+
+/**
+ * The room a message leaves for the chat's earlier conversation, in UTF-8 bytes: what the message carries anyway (the
+ * given texts, instructions waiting to go along, the turn's reminder) counts against what one message may carry.
+ * Images do not: `agy` takes them as uploads beside the text (a 359 KB image left a message of 832 bytes, whole, with
+ * agy 1.5.9 on 2026-11-17).
+ */
+function historyRoom(session: AcpSession, modelId: string | undefined, texts: string[]): number {
+	const carried = [...texts, session.pendingInstructions ?? "", session.ephemeral ? "" : HOST_TURN_REMINDER];
+	return promptLimit(modelId) - carried.reduce((sum, text) => sum + bytesOf(text ?? ""), 0);
+}
+
+/**
+ * `agy` cut the end off the message this turn sent (its record says so; cutFromInput), which the model then never saw.
+ * The user is told, since nothing else shows it. Later messages on the model stay under what `agy` took. A message
+ * that carried the chat's earlier conversation lost the newest part of it, and that conversation is not continued:
+ * the next message starts a new one with the history again, within the lower limit.
+ */
+function reportCut(session: AcpSession, model: any): void {
+	const cut = session.takeCut();
+	if (!cut) return;
+	// What `agy` took of the text (its own wrapping aside). Less than the floor is no limit to learn from: a short
+	// message it cut says nothing about the length it takes.
+	const took = session.sentBytes - cut;
+	if (took >= MIN_PROMPT_BYTES && model?.id) {
+		shared.promptLimits.set(
+			model.id,
+			Math.min(promptLimit(model.id), Math.max(MIN_PROMPT_BYTES, took - CUT_MARGIN_BYTES)),
+		);
+	}
+	const history = session.historySent && !session.ephemeral;
+	if (history) session.startOver = true;
+	const size = cut >= 1024 ? `${Math.round(cut / 1024)} KB` : `${cut} 字节`;
+	const text = session.ephemeral
+		? `agy 截掉了 MyHarness 一个后台请求（如压缩摘要、标题）末尾约 ${size}，它的结果可能不完整。`
+		: history
+			? `agy 截掉了这条消息末尾约 ${size}：这条消息带着之前的对话记录，模型没看到其中最新的部分。下一条消息会重新整理对话记录交给 agy。`
+			: `agy 截掉了这条消息末尾约 ${size}（agy 一条消息能收的长度有限），模型没看到被截掉的部分。请把内容拆短后再发。`;
+	shared.contexts.get(session.sessionId)?.ui?.notify?.(text, "warning");
+}
+
 async function runTurn(stream: any, session: AcpSession, model: any, context: any, options: any): Promise<void> {
 	const output: any = {
 		role: "assistant",
@@ -2541,6 +2731,7 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 			output.usage.cacheRead += request.cacheRead;
 			output.usage.output += request.output;
 		}
+		reportCut(session, model);
 		output.usage.totalTokens =
 			session.usage?.used ?? output.usage.input + output.usage.cacheRead + output.usage.output;
 		output.stopReason = reason;
@@ -2591,6 +2782,12 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 			// A start made ahead of this request (AcpSession.warm) is over first, however it went.
 			await session.warming;
 			session.hold();
+			// The conversation lost the newest part of the history it was given (reportCut): a new one gets it again.
+			if (session.startOver) {
+				session.startOver = false;
+				session.close();
+				if (!session.ephemeral) writeLink(session.sessionId, undefined);
+			}
 			if (session.running && (session.signature !== signature || !session.servesPrompt(context.systemPrompt))) {
 				session.close();
 			}
@@ -2630,9 +2827,16 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 		}
 		// The turn is over in `agy`: the program went away between two tool rounds (restart, idle close).
 		if (!goesOn) {
-			const earlier = session.needsHistory ? renderTranscript(messages) : "";
+			const go = "Continue where you left off.";
+			const earlier = session.needsHistory
+				? renderTranscript(
+						messages,
+						historyRoom(session, model.id, [go, "<earlier-conversation>\n\n</earlier-conversation>\n\n"]),
+					)
+				: "";
 			const history = earlier ? `<earlier-conversation>\n${earlier}\n</earlier-conversation>\n\n` : "";
-			session.sendPrompt([{ type: "text", text: `${history}Continue where you left off.` }]);
+			session.historySent = !!earlier;
+			session.sendPrompt([{ type: "text", text: `${history}${go}` }]);
 		}
 	} else if (!goesOn) {
 		let start = messages.length;
@@ -2644,14 +2848,23 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 			stopWaiting?.();
 			throw error;
 		}
-		const earlier = session.needsHistory ? renderTranscript(messages.slice(0, start)) : "";
-		if (earlier) {
-			content.unshift({
-				type: "text",
-				text: `<earlier-conversation>\nThis chat started before this agy conversation. Earlier messages, for context:\n\n${earlier}\n</earlier-conversation>`,
-			});
-		}
+		// The new message goes whole; the earlier conversation gets the room it leaves (MAX_PROMPT_BYTES).
+		const opening =
+			"<earlier-conversation>\nThis chat started before this agy conversation. Earlier messages, for context:\n\n";
+		const closing = "\n</earlier-conversation>";
+		const earlier = session.needsHistory
+			? renderTranscript(
+					messages.slice(0, start),
+					historyRoom(session, model.id, [
+						opening,
+						closing,
+						...content.map((part) => (part.type === "text" ? part.text : "")),
+					]),
+				)
+			: "";
+		if (earlier) content.unshift({ type: "text", text: `${opening}${earlier}${closing}` });
 		session.lastUserTimestamp = last?.timestamp;
+		session.historySent = !!earlier;
 		session.sendPrompt(content);
 	}
 
@@ -2715,6 +2928,7 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 			}
 		}
 		applyUsage(requests);
+		reportCut(session, model);
 		output.stopReason = reason;
 		stream.push({ type: "done", reason, message: output });
 		stream.end();
@@ -2823,7 +3037,8 @@ function streamSimple(model: any, context: any, options: any): any {
 				messages: [
 					{
 						role: "user",
-						content: renderTranscript(context.messages ?? [], true) || "(empty)",
+						// Its instruction is usually last, and stays: what does not fit is the oldest part.
+						content: renderTranscript(context.messages ?? [], promptLimit(model?.id)) || "(empty)",
 						timestamp: Date.now(),
 					},
 				],

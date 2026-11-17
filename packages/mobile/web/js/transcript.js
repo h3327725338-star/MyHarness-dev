@@ -2,8 +2,8 @@
 // A turn is the user's message, then the work (reasoning and tool calls, folded into one block once it is done),
 // then the answer. The same component draws the phone's own chats and the PC's.
 import { count, serverText, t } from "/shared/i18n.js";
-import { Collapse, Spinner, html, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/shared/ui.js";
-import { actionTitle, buildTurns, groupLabel, groupSteps, nextRound, runForTurn, turnDuration, turnOutcome, turnSegments } from "/shared/turns.js";
+import { Collapse, Counts, FoldIn, Spinner, html, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSwapGlide } from "/shared/ui.js";
+import { actionTitle, buildTurns, changeTotals, groupLabel, groupSteps, nextRound, runForTurn, turnDuration, turnOutcome, turnSegments } from "/shared/turns.js";
 import { clip, fmtBytes, fmtDuration } from "/shared/util.js";
 import { hostOf } from "./browser-model.js";
 import { lastingKey } from "./live.js";
@@ -139,9 +139,15 @@ function browserTitle(step) {
 	return { verb: step.isError ? t("Browser step failed") : running ? words[0] : words[1], target: args.url ? hostOf(args.url) || args.url : "" };
 }
 
+/** What a step row says: the verb and target, then describeAction's `detail` (a line range, "in src") and, for a change to a file, its `extra` (lines added and removed). */
 function stepWords(step) {
 	if (step.call?.name === "browser") return browserTitle(step);
-	return { verb: step.verb, target: step.target };
+	return { verb: step.verb, target: step.target, detail: step.detail, extra: step.kind === "edit" || step.kind === "write" ? step.extra : undefined };
+}
+
+/** The text of a step row and the +N −M beside it: the counts keep their own place at the end of the row, the text wraps before them. */
+function StepLine({ words }) {
+	return html`<span class="stext"><span class="verb">${words.verb}</span>${words.target ? html` <span class="target">${clip(words.target, 140)}</span>` : null}${words.detail ? html` <span class="detail">${clip(words.detail, 60)}</span>` : null}</span>${words.extra ? html`<${Counts} additions=${words.extra.additions} deletions=${words.extra.deletions} />` : null}`;
 }
 
 function ActionDetail({ step }) {
@@ -178,52 +184,64 @@ function WebResults({ actions, onOpenUrl }) {
 	</div>`;
 }
 
+/**
+ * What a fold shows, kept drawn while the fold closes. Collapse takes its content off the page when the closing motion is
+ * over; given nothing at the moment `open` ends, a block of work (a few hundred pixels) vanished in one frame instead of
+ * folding, and everything below it jumped up.
+ */
+function useFoldContent(open, draw) {
+	const last = useRef(null);
+	if (open) last.current = draw();
+	return last.current;
+}
+
 function StepGroup({ group, onOpenUrl }) {
 	const [open, setOpen] = useState(false);
 	const [detail, setDetail] = useState(null);
 	const single = group.actions.length === 1 ? group.actions[0] : null;
 	const running = group.actions.some((action) => action.status === "running" || action.status === "pending");
 	const failed = group.actions.every((action) => action.isError);
-	const head = single ? stepWords(single) : { verb: groupLabel(group.kind, group.actions), target: "" };
+	const head = single ? stepWords(single) : { verb: groupLabel(group.kind, group.actions), target: "", extra: group.kind === "edit" || group.kind === "write" ? changeTotals(group.actions) : undefined };
 	const lead = single || group.actions.find((action) => action.status === "running") || group.actions[group.actions.length - 1];
 	const isWeb = group.kind === "web";
+	const content = useFoldContent(open, () =>
+		single
+			? isWeb
+				? html`<${WebResults} actions=${[single]} onOpenUrl=${onOpenUrl} /><${ActionDetail} step=${single} />`
+				: html`<${ActionDetail} step=${single} />`
+			: html`<div style="margin-left:27px">
+					${group.actions.map((action) => {
+						const words = stepWords(action);
+						return html`<div key=${action.key}>
+							<button class="step-row ${action.isError ? "error" : ""}" onClick=${() => setDetail(detail === action.key ? null : action.key)}>
+								<span class="sico">${stepIcon(action)}</span>
+								<${StepLine} words=${words} />
+							</button>
+							${detail === action.key && html`<div style="margin-left:-27px"><${ActionDetail} step=${action} /></div>`}
+						</div>`;
+					})}
+					${isWeb && html`<div style="margin-left:-27px"><${WebResults} actions=${group.actions} onOpenUrl=${onOpenUrl} /></div>`}
+				</div>`,
+	);
 	return html`<div>
 		<button class="step-row ${failed ? "error" : ""} ${running ? "running" : ""}" onClick=${() => setOpen(!open)} aria-expanded=${open ? "true" : "false"}>
 			<span class="sico">${stepIcon(single || { ...lead, isError: failed })}</span>
-			<span class="stext"><span class="verb">${head.verb}</span>${head.target ? html` <span class="target">${clip(head.target, 140)}</span>` : null}</span>
+			<${StepLine} words=${head} />
 		</button>
-		<${Collapse} open=${open}>
-			${open &&
-			(single
-				? isWeb
-					? html`<${WebResults} actions=${[single]} onOpenUrl=${onOpenUrl} /><${ActionDetail} step=${single} />`
-					: html`<${ActionDetail} step=${single} />`
-				: html`<div style="margin-left:27px">
-						${group.actions.map((action) => {
-							const words = stepWords(action);
-							return html`<div key=${action.key}>
-								<button class="step-row ${action.isError ? "error" : ""}" onClick=${() => setDetail(detail === action.key ? null : action.key)}>
-									<span class="sico">${stepIcon(action)}</span>
-									<span class="stext"><span class="verb">${words.verb}</span>${words.target ? html` <span class="target">${clip(words.target, 140)}</span>` : null}</span>
-								</button>
-								${detail === action.key && html`<div style="margin-left:-27px"><${ActionDetail} step=${action} /></div>`}
-							</div>`;
-						})}
-						${isWeb && html`<div style="margin-left:-27px"><${WebResults} actions=${group.actions} onOpenUrl=${onOpenUrl} /></div>`}
-					</div>`)}
-		<//>
+		<${Collapse} open=${open}>${content}<//>
 	</div>`;
 }
 
 function Thinking({ step }) {
 	const [open, setOpen] = useState(false);
 	const empty = !step.text;
+	const content = useFoldContent(open, () => html`<div class="think-text selectable"><${Markdown} text=${step.text} /></div>`);
 	return html`<div>
 		<button class="step-row ${step.live ? "running" : ""}" onClick=${() => !empty && setOpen(!open)} aria-expanded=${open ? "true" : "false"}>
 			<span class="sico">${step.live ? html`<${Spinner} size=${13} />` : html`<${Icon} name="brain" size=${15} />`}</span>
 			<span class="stext"><span class="verb">${step.live ? t("Thinking") : t("Thought")}</span>${!open && step.text ? html` <span class="target">${clip(step.text.replace(/\s+/g, " "), 60)}</span>` : null}</span>
 		</button>
-		<${Collapse} open=${open}>${open && html`<div class="think-text selectable"><${Markdown} text=${step.text} /></div>`}<//>
+		<${Collapse} open=${open}>${content}<//>
 	</div>`;
 }
 
@@ -257,6 +275,18 @@ function Process({ segment, live, defaultOpen, entering, onOpenUrl }) {
 	}, [defaultOpen]);
 	const groups = useMemo(() => groupSteps(segment.steps), [segment.steps]);
 	const failed = segment.stats?.failedActions > 0;
+	const content = useFoldContent(
+		open,
+		() => html`<div class="process-body">
+			${groups.map((entry) => {
+				if (entry.type === "group") return html`<${StepGroup} key=${entry.key} group=${entry} onOpenUrl=${onOpenUrl} />`;
+				if (entry.type === "thinking") return html`<${Thinking} key=${entry.key} step=${entry} />`;
+				if (entry.type === "note") return html`<div class="note-text" key=${entry.key} style="padding:4px 0 6px"><${Markdown} text=${entry.text} /></div>`;
+				if (entry.type === "custom") return html`<div class="step-row" key=${entry.key}><span class="sico"><${Icon} name="info" size=${15} /></span><span class="stext">${clip(entry.item.text, 400)}</span></div>`;
+				return null;
+			})}
+		</div>`,
+	);
 	return html`<div class="process ${live ? "live" : ""} ${entering ? "part-in" : ""}">
 		<button
 			class="process-head"
@@ -271,18 +301,7 @@ function Process({ segment, live, defaultOpen, entering, onOpenUrl }) {
 			<span class="ptext ${live ? "shimmer-text" : ""}">${processSummary(segment, live)}</span>
 			<span class="disclose"><${Icon} name="chevronRight" size=${15} /></span>
 		</button>
-		<${Collapse} open=${open}>
-			${open &&
-			html`<div class="process-body">
-				${groups.map((entry) => {
-					if (entry.type === "group") return html`<${StepGroup} key=${entry.key} group=${entry} onOpenUrl=${onOpenUrl} />`;
-					if (entry.type === "thinking") return html`<${Thinking} key=${entry.key} step=${entry} />`;
-					if (entry.type === "note") return html`<div class="note-text" key=${entry.key} style="padding:4px 0 6px"><${Markdown} text=${entry.text} /></div>`;
-					if (entry.type === "custom") return html`<div class="step-row" key=${entry.key}><span class="sico"><${Icon} name="info" size=${15} /></span><span class="stext">${clip(entry.item.text, 400)}</span></div>`;
-					return null;
-				})}
-			</div>`}
-		<//>
+		<${Collapse} open=${open}>${content}<//>
 	</div>`;
 }
 
@@ -386,7 +405,38 @@ function StreamText({ text, fresh, open, caret, name, onWritten }) {
 	}, [text, open]);
 	useEffect(() => () => cancelAnimationFrame(s.frame), []);
 	const writing = shown < text.length;
-	return html`<${Markdown} text=${writing ? drawnPrefix(text, shown) : text} />${caret || writing ? html`<span class="caret"></span>` : null}`;
+	return html`<${Markdown} text=${writing ? drawnPrefix(text, shown) : text} caret=${!!(caret || writing)} />`;
+}
+
+/**
+ * One text of a reply on the page: a note between the steps, or the answer. Whether it comes in softly is settled when it
+ * is first drawn and kept: a text that moves (the answer is a note from the moment a tool call follows it, and the notes
+ * live in the block of work above the answer) is drawn anew in its new place, and must not fade in a second time.
+ */
+function ReplyText({ live, selectable, ...stream }) {
+	const soft = useRef(null);
+	if (soft.current === null) soft.current = live && !written.has(stream.name);
+	return html`<div class="final ${selectable ? "selectable" : ""} ${soft.current ? "part-in" : ""}"><${StreamText} ...${stream} /></div>`;
+}
+
+/** How long nothing may be moving on the page before the three dots say the reply goes on (see `waiting`). */
+const DOTS_AFTER_MS = 800;
+
+/**
+ * The three dots of a reply that has nothing else to show. Before anything of the reply is on the page they are there at
+ * once (`immediate`); later they wait for a real pause, so the short gaps between one step and the next never flash them.
+ */
+function useWaitingDots(idle, immediate) {
+	const [late, setLate] = useState(false);
+	useEffect(() => {
+		if (!idle) {
+			setLate(false);
+			return undefined;
+		}
+		const timer = setTimeout(() => setLate(true), DOTS_AFTER_MS);
+		return () => clearTimeout(timer);
+	}, [idle]);
+	return idle && (immediate || late);
 }
 
 // ---- A turn ------------------------------------------------------------------------------------
@@ -403,7 +453,7 @@ function ChangesCard({ item }) {
 
 const OUTCOME_NOTE = { cancelled: "Stopped", redirected: "Switched to your new message", unanswered: "No response" };
 
-const Turn = memo(function Turn({ turn, live, awaiting, run, last, actions, resolveImage, onView, onOpenUrl, modelLabel }) {
+const Turn = memo(function Turn({ turn, live, enter, run, last, actions, resolveImage, onView, onOpenUrl, modelLabel }) {
 	const done = !live;
 	const segments = useMemo(() => turnSegments(turn, { fold: done }), [turn, done]);
 	const outcome = turnOutcome(turn, { run, live, waiting: false });
@@ -439,27 +489,36 @@ const Turn = memo(function Turn({ turn, live, awaiting, run, last, actions, reso
 	// The block of work that is going on right now, or text that is being written: the page shows that the PC is busy.
 	const working = live && !turn.final && lastProcess >= 0 && lastProcess === segments.length - 1;
 	const writing = !!turn.final?.streaming || (lastSegment?.type === "text" && !!lastSegment.step.streaming);
-	// Otherwise the three dots say so, for as long as the reply is not over: also between the moment the model starts
-	// and its first word, which through Google Drive can be seconds.
-	const waiting = live && !held && (awaiting || !(working || writing));
+	// The three dots say the reply goes on when nothing else on the page does: no block of work in progress, no text
+	// being written, no answer yet. A block of work shows its own spinner through the gaps between its steps (a tool
+	// ends, the model starts its next message), so the dots no longer come and go there. Before anything of the reply is
+	// on the page they are there at once and stay until it starts, which through Google Drive can be seconds.
+	const waiting = useWaitingDots(live && !held && !working && !writing && !turn.final, !lastSegment && !turn.final);
+	// The work folds into one block when the reply ends: the block glides to its new height, and the actions fold in.
+	const workRef = useSwapGlide(done);
+	// The page is shorter for a moment while the block is rebuilt, and the browser then moves the pane up to the new end of
+	// the page; the glide has given the page its old height back by the time that is seen, so the pane is put back where it was.
+	const turnRef = useRef(null);
+	const pane = useRef({ done, top: null });
+	if (pane.current.done !== done) pane.current = { done, top: turnRef.current?.closest(".chat-scroll")?.scrollTop ?? null };
+	useLayoutEffect(() => {
+		const top = pane.current.top;
+		if (top === null) return;
+		pane.current.top = null;
+		const scroller = turnRef.current?.closest(".chat-scroll");
+		if (scroller && scroller.scrollTop !== top) scroller.scrollTop = top;
+	});
 	// Parts that appear while the reply is written come in softly; a chat that is opened shows them at once.
-	const part = live ? "part-in" : "";
-	return html`<div class="turn enter" data-turn=${turn.key}>
+	const work = segments.slice(0, shownSegments).map((segment, index) =>
+		segment.type === "process"
+			? html`<${Process} key=${segment.key} segment=${segment} live=${live && index === lastProcess && !turn.final && index === segments.length - 1} defaultOpen=${live && !turn.final && index === segments.length - 1} entering=${live} onOpenUrl=${onOpenUrl} />`
+			: html`<${ReplyText} key=${segment.key} live=${live} text=${segment.step.text} fresh=${live && freshOf(segment.step)} open=${!!segment.step.streaming} name=${segment.step.key} onWritten=${onWritten} />`,
+	);
+	return html`<div class="turn ${enter ? "enter" : ""}" data-turn=${turn.key} ref=${turnRef}>
 		${turn.jobReport && html`<div class="marker">${t("Background work finished")}</div>`}
 		${turn.user && html`<${UserMessage} item=${turn.user} actions=${actions} resolveImage=${resolveImage} onView=${onView} />`}
-		${[
-			...segments
-				.slice(0, shownSegments)
-				.map((segment, index) =>
-					segment.type === "process"
-						? html`<${Process} key=${segment.key} segment=${segment} live=${live && index === lastProcess && !turn.final && index === segments.length - 1} defaultOpen=${live && !turn.final && index === segments.length - 1} entering=${live} onOpenUrl=${onOpenUrl} />`
-						: html`<div class="final ${part}" key=${segment.key}><${StreamText} text=${segment.step.text} fresh=${live && freshOf(segment.step)} open=${!!segment.step.streaming} name=${segment.step.key} onWritten=${onWritten} /></div>`,
-				),
-			// The answer has the key of the note it was or becomes (see `written`), so the same element goes on being written.
-			turn.final && !held
-				? html`<div class="final selectable ${part}" key=${`x-${textName(turn.final.message)}`}><${StreamText} text=${finalText} fresh=${arrivedJustNow(turn.final.message)} open=${!!turn.final.streaming} caret=${!!turn.final.streaming} name=${textName(turn.final.message)} /></div>`
-				: null,
-		]}
+		${work.length > 0 && html`<div class="turn-work" ref=${workRef}>${work}</div>`}
+		${turn.final && !held ? html`<${ReplyText} key=${`x-${textName(turn.final.message)}`} live=${live} selectable=${true} text=${finalText} fresh=${arrivedJustNow(turn.final.message)} open=${!!turn.final.streaming} caret=${!!turn.final.streaming} name=${textName(turn.final.message)} />` : null}
 		${waiting && html`<div class="status-line part-in"><span class="typing"><i></i><i></i><i></i></span></div>`}
 		${turn.changes && html`<${ChangesCard} item=${turn.changes} />`}
 		${done &&
@@ -472,13 +531,16 @@ const Turn = memo(function Turn({ turn, live, awaiting, run, last, actions, reso
 			${last && actions.retry && html`<button class="btn sm" onClick=${actions.retry}>${t("Retry")}</button>`}
 		</div>`}
 		${done && OUTCOME_NOTE[outcome] && html`<div class="msg-error muted"><${Icon} name="stopCircle" size=${18} /><span class="etext">${t(OUTCOME_NOTE[outcome])}</span>${last && outcome === "cancelled" && actions.retry ? html`<button class="btn sm" onClick=${actions.retry}>${t("Retry")}</button>` : null}</div>`}
-		${done &&
-		finalText &&
-		html`<div class="msg-actions">
-			<button class="icon-btn" onClick=${copyAnswer} aria-label=${t("Copy")}><${Icon} name="copy" size=${17} /></button>
-			<button class="icon-btn" onClick=${() => shareText(finalText)} aria-label=${t("Share")}><${Icon} name="share" size=${17} /></button>
-			<span class="meta">${[duration > 1500 ? fmtDuration(duration) : "", turn.lastAssistant?.model || modelLabel || ""].filter(Boolean).join(" · ")}</span>
-		</div>`}
+		<${FoldIn}
+			class="msg-actions-fold"
+			content=${done &&
+			finalText &&
+			html`<div class="msg-actions">
+				<button class="icon-btn" onClick=${copyAnswer} aria-label=${t("Copy")}><${Icon} name="copy" size=${17} /></button>
+				<button class="icon-btn" onClick=${() => shareText(finalText)} aria-label=${t("Share")}><${Icon} name="share" size=${17} /></button>
+				<span class="meta">${[duration > 1500 ? fmtDuration(duration) : "", turn.lastAssistant?.model || modelLabel || ""].filter(Boolean).join(" · ")}</span>
+			</div>`}
+		/>
 	</div>`;
 });
 
@@ -498,17 +560,56 @@ function Standalone({ item }) {
 }
 
 /**
- * The turns of a chat. `chat` is the live chat object of either side (store.js: emptyChat); `actions` are what the
- * reader can do: { edit(text), retry(), regenerate() }, each optional.
+ * Which turns come in with the entrance motion: only a turn added at the end of a chat that is already on the page (a
+ * message just sent, the next round). What is there when a chat is opened, read again from the PC, or has older
+ * messages added above it appears at once. `keys` are the turns' names on the page (null: not a round of the chat).
+ * `entering` keeps the name of a turn that came in, so its class stays for as long as it is drawn.
  */
-export function Transcript({ items, toolRuns, runs, running, awaiting, cwd, actions, resolveImage, onOpenUrl, modelLabel }) {
+function enteringTurns(memory, chatId, turns, keys) {
+	let m = memory.current;
+	const named = keys.filter(Boolean);
+	// A chat that had no id until its first message keeps what it shows; any other change of chat, or turns that are
+	// all different from the ones shown, is another chat being opened.
+	const another = !m || (m.chat != null && m.chat !== chatId) || (m.known.size > 0 && named.length > 0 && !named.some((key) => m.known.has(key)));
+	if (another) {
+		m = memory.current = { chat: chatId, known: new Set(), entering: new Set() };
+		// Opened: all of it is there already, except a message this phone is sending right now.
+		turns.forEach((turn, index) => {
+			if (!keys[index]) return;
+			m.known.add(keys[index]);
+			if (turn.user?.pending) m.entering.add(keys[index]);
+		});
+		return m.entering;
+	}
+	m.chat = chatId;
+	let lastKnown = -1;
+	keys.forEach((key, index) => {
+		if (key && m.known.has(key)) lastKnown = index;
+	});
+	keys.forEach((key, index) => {
+		if (!key || m.known.has(key)) return;
+		m.known.add(key);
+		if (index > lastKnown) m.entering.add(key);
+	});
+	if (m.known.size > 600) m.known = new Set(named);
+	return m.entering;
+}
+
+/**
+ * The turns of a chat. `chat` is the live chat object of either side (store.js: emptyChat); `actions` are what the
+ * reader can do: { edit(text), retry(), regenerate() }, each optional. `chatId` tells one chat from another.
+ */
+export function Transcript({ chatId, items, toolRuns, runs, running, cwd, actions, resolveImage, onOpenUrl, modelLabel }) {
 	const previous = useRef(null);
 	const names = useRef(new Map());
+	const shown = useRef(null);
 	const turns = useMemo(() => {
 		const built = buildTurns(items, { toolRuns, cwd }, previous.current);
 		previous.current = built;
 		return built;
 	}, [items, toolRuns, cwd]);
+	const keys = turns.map((turn) => (turn.standalone ? null : lastingKey(names.current, turn)));
+	const entering = enteringTurns(shown, chatId, turns, keys);
 	const [viewing, setViewing] = useState(null);
 	let lastRound = -1;
 	for (let i = turns.length - 1; i >= 0; i--) {
@@ -531,10 +632,10 @@ export function Transcript({ items, toolRuns, runs, running, awaiting, cwd, acti
 			const last = index === lastRound;
 			const live = running && index === liveRound;
 			return html`<${Turn}
-				key=${lastingKey(names.current, turn)}
+				key=${keys[index]}
 				turn=${turn}
 				live=${live}
-				awaiting=${live && awaiting}
+				enter=${entering.has(keys[index])}
 				run=${live ? undefined : runForTurn(turn, runs, nextRound(turns, index))}
 				last=${last}
 				actions=${actions}

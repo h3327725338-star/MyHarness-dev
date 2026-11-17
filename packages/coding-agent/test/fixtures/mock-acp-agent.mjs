@@ -228,6 +228,15 @@ async function runStep(session, step, promptText) {
 			join(recordOf(session.id), "transcript.jsonl"),
 			`${JSON.stringify({ step_index: ++session.steps, source: "MODEL", type: "GENERIC", status: "DONE", content: argument })}\n`,
 		);
+	} else if (verb === "cut") {
+		// agy passed on only the beginning of the message: its record ends the message with a mark and a note to the model.
+		mkdirSync(recordOf(session.id), { recursive: true });
+		const note = "NOTE: The output was truncated because it was too long. Use a more targeted query or a smaller range.";
+		const content = `<USER_REQUEST>\n${promptText.slice(0, 200)}\n<truncated ${argument} bytes>\n\n${note}`;
+		appendFileSync(
+			join(recordOf(session.id), "transcript.jsonl"),
+			`${JSON.stringify({ step_index: ++session.steps, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content })}\n`,
+		);
 	} else if (verb === "sleep") await sleep(Number(argument));
 	else if (verb === "wait") {
 		while (!session.cancelled) await sleep(20);
@@ -352,7 +361,7 @@ async function searchRelay(session, promptText) {
 }
 
 const VERBS = new Set(
-	"say think echo system env model usage tokens latetokens note sleep wait write read run other leave tools app appquiet stop".split(
+	"say think echo system env model usage tokens latetokens note cut sleep wait write read run other leave tools app appquiet stop".split(
 		" ",
 	),
 );

@@ -96,6 +96,45 @@ test("an earlier reply with the same first words is not taken for the one being 
 	assert.equal(c.items[1].liveId, undefined);
 });
 
+test("a saved copy and the written copy that differ only by whitespace at the end are one reply", () => {
+	const written = (words) => {
+		const c = chat();
+		applyEvent(c, "agent_start", { runId: 1 });
+		applyEvent(c, "message_start", { item: user("q") });
+		applyEvent(c, "message_start", { liveId: "live-1", item: assistant([]) });
+		applyEvent(c, "message_update", { liveId: "live-1", item: assistant([text(words)]) });
+		applyEvent(c, "message_end", { liveId: "live-1", item: assistant([text(words)], 100, { stopReason: "stop" }), endedAt: 120 });
+		return c;
+	};
+	const replies = (c) => c.items.filter((item) => item.kind === "assistant");
+	// The streamed copy ends in a line break, the PC's saved copy is trimmed.
+	let c = written("The answer.\n\n");
+	reload(c, [user("q", 1, { id: "u1" }), assistant([text("The answer.")], 9000, { id: "a1", stopReason: "stop" })]);
+	assert.equal(replies(c).length, 1, "not shown twice");
+	assert.equal(replies(c)[0].id, "a1");
+	assert.equal(replies(c)[0].liveId, "live-1", "the saved copy takes the name it was written under");
+	// The end of the reply told again afterwards finds the saved copy too.
+	applyEvent(c, "message_end", { liveId: "live-1", item: assistant([text("The answer.\n\n")], 100), endedAt: 120 });
+	assert.equal(replies(c).length, 1);
+	// The other way round: the saved copy ends in whitespace, the written one does not.
+	c = written("The answer.");
+	reload(c, [user("q", 1, { id: "u1" }), assistant([text("The answer. \n")], 9000, { id: "a1", stopReason: "stop" })]);
+	assert.equal(replies(c).length, 1);
+	assert.equal(replies(c)[0].liveId, "live-1");
+	// A reply still being written (only its beginning, ending in a space) is found in the saved one the same way.
+	c = chat();
+	applyEvent(c, "agent_start", { runId: 1 });
+	applyEvent(c, "message_start", { item: user("q") });
+	applyEvent(c, "message_start", { liveId: "live-1", item: assistant([]) });
+	applyEvent(c, "message_update", { liveId: "live-1", item: assistant([text("The answer \n")]) });
+	reload(c, [user("q", 1, { id: "u1" }), assistant([text("The answer is 42.")], 9000, { id: "a1", stopReason: "stop" })]);
+	assert.equal(replies(c).length, 1);
+	// Different words are still two replies.
+	c = written("The answer.\n");
+	reload(c, [user("q", 1, { id: "u1" }), assistant([text("The answer!")], 9000, { id: "a1", stopReason: "stop" })]);
+	assert.equal(replies(c).length, 2);
+});
+
 test("when the PC says no reply is being written, only what it has saved is shown", () => {
 	const c = chat();
 	c.items = [user("q", 1, { id: "u1" }), assistant([text("Half")], 100, { liveId: "live-1" })];
@@ -130,8 +169,13 @@ test("text being written out never ends in a half-made heading, list, fence or t
 	assert.equal(drawnPrefix(code, 15), "Run:\n```python\n");
 	const table = "Sizes:\n| name | size |\n| --- | --- |\n| a | 1 |\n";
 	assert.equal(drawnPrefix(table, 20), "Sizes:\n", "a table waits for its first two lines");
+	assert.equal(drawnPrefix(table, 23), "Sizes:\n", "the head line that has just ended is not drawn as a paragraph in between");
 	assert.equal(drawnPrefix(table, 30), "Sizes:\n");
+	assert.equal(drawnPrefix(table, 37), table.slice(0, 37), "the table is drawn once its second line has ended");
 	assert.equal(drawnPrefix(table, 40), table.slice(0, 40));
+	assert.equal(drawnPrefix("| note\n\nnext", 8), "| note\n\n", "a line of bars that an empty line ended is a paragraph");
+	assert.equal(drawnPrefix("| note\nnext", 9), "| note\nne");
+	assert.equal(drawnPrefix("plain words\nmore", 12), "plain words\n");
 	assert.equal(drawnPrefix("plain words", 5), "plain");
 	assert.equal(drawnPrefix(list, list.length), list);
 });

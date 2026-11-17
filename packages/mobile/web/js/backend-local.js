@@ -12,6 +12,7 @@ import { Agent, clampThinkingLevel, completeSimple, getSupportedThinkingLevels, 
 import { account as accountApi, onAccountView, queueOps, signedIn } from "./account.js";
 import { chatFromJsonl, linesForPc, phoneContext, titleLine } from "./account-view.js";
 import * as db from "./db.js";
+import { defaultLevel } from "./effort.js";
 import { addPending, applyEvent, removePending } from "./live.js";
 import { httpFetch, nativeInfo, notifyDone, runActive, secretDelete, secretGet, secretSet } from "./native.js";
 import { prefs, resolvedLang, setPrefs } from "./prefs.js";
@@ -88,11 +89,23 @@ function publishModels() {
 			id: provider.id,
 			name: provider.name,
 			hasKey: !!providerKey(provider.id),
-			models: (provider.models || []).map((entry) => ({ id: entry.id, name: entry.name || entry.id, reasoning: !!entry.reasoning, vision: !!entry.vision })),
+			// Each model's own levels, so the picker can show the effort a model would get before it is chosen (effort.js).
+			models: (provider.models || []).map((entry) => ({
+				id: entry.id,
+				name: entry.name || entry.id,
+				reasoning: !!entry.reasoning,
+				vision: !!entry.vision,
+				thinkingLevels: entry.reasoning ? getSupportedThinkingLevels(coreModel(provider, entry)) : undefined,
+				defaultThinkingLevel: entry.defaultThinkingLevel,
+			})),
 		})),
 		current: found ? { provider: found.provider.id, providerName: found.provider.name, id: found.model.id, name: found.model.name || found.model.id, reasoning: !!found.model.reasoning, vision: !!found.model.vision } : null,
 		efforts: efforts.length > 1 ? efforts : [],
 		effort,
+		// What "Default" stands for on this model, and the level a model switch starts from (the choice made here, which a
+		// model that does not offer it brings to its nearest level).
+		defaultEffort: efforts.length > 1 ? defaultLevel({ defaultThinkingLevel: found.model.defaultThinkingLevel }, efforts) : "",
+		base: prefs.effort || "off",
 	};
 	emit();
 }
@@ -170,7 +183,7 @@ function applySyncedProviders(settings) {
 			name: remote.name || remote.id,
 			api: remote.api,
 			baseUrl: String(remote.baseUrl || "").replace(/\/+$/, ""),
-			models: (remote.models || []).map((model) => ({ id: model.id, name: model.name || model.id, reasoning: !!model.reasoning, vision: !!model.vision, contextWindow: model.contextWindow, maxTokens: model.maxTokens, ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}), ...(model.compat ? { compat: model.compat } : {}) })),
+			models: (remote.models || []).map((model) => ({ id: model.id, name: model.name || model.id, reasoning: !!model.reasoning, vision: !!model.vision, contextWindow: model.contextWindow, maxTokens: model.maxTokens, ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}), ...(typeof model.defaultThinkingLevel === "string" ? { defaultThinkingLevel: model.defaultThinkingLevel } : {}), ...(model.compat ? { compat: model.compat } : {}) })),
 			...(remote.headers ? { headers: remote.headers } : {}),
 			...(remote.compat ? { compat: remote.compat } : {}),
 			synced: true,

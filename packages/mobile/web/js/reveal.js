@@ -63,7 +63,9 @@ const SIGN_ONLY = /^\s{0,3}(?:[-=]+|[-*+]|\d{1,9}[.)]?|#{1,6}|>+|`{1,2}|`{3,}[\w
  * first characters differently once the rest is there: "Files:" followed by the "-" of a list is a heading for a
  * moment, a code block opens under the wrong language while its name is half written, and a table is rows of bars
  * until its second line is complete. So a last line that is only such a sign, and a table without its first two lines,
- * are left out until more is written; the count itself is not changed.
+ * are left out until more is written; the count itself is not changed. A head line that has just ended (nothing of the
+ * next line is there yet) waits too: drawn as a paragraph it would be taken away again with the next character, and the
+ * page would get shorter and taller again under the reader's eyes.
  */
 export function drawnPrefix(text, count) {
 	if (count >= text.length) return text;
@@ -71,7 +73,8 @@ export function drawnPrefix(text, count) {
 	const lineStart = cut.lastIndexOf("\n") + 1;
 	const last = cut.slice(lineStart);
 	if (SIGN_ONLY.test(last) && last.trim()) return cut.slice(0, lineStart);
-	if (!last.trimStart().startsWith("|")) return cut;
+	const bars = last.trimStart().startsWith("|");
+	if (!bars && last) return cut;
 	// The lines of bars this one belongs to: a table once the head and the line under it are whole.
 	let start = lineStart;
 	let whole = 0;
@@ -81,5 +84,5 @@ export function drawnPrefix(text, count) {
 		start = before;
 		whole += 1;
 	}
-	return whole >= 2 ? cut : cut.slice(0, start);
+	return whole >= 2 || (!bars && whole === 0) ? cut : cut.slice(0, start);
 }
