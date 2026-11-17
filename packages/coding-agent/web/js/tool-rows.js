@@ -31,7 +31,27 @@ export function useKeptChoice(key) {
 	return [choices.get(key), choose];
 }
 
-export const KIND_ICON = { read: "file", list: "folder", find: "search", search: "search", run: "terminal", edit: "edit", write: "fileDiff", web: "globe", fetch: "globe", github: "gitBranch", mail: "mail", agent: "layers", history: "clock", tool: "wrench" };
+/**
+ * Several folds under one prefix (the steps of a sub-agent), kept the same way as one fold: `chosen(key)` is the user's
+ * choice or undefined, `has(key, fallback)` whether it is open (the fallback when untouched), `toggle(key, fallback)`
+ * flips what is shown now.
+ */
+export function useKeptFolds(prefix) {
+	const [, render] = useState(0);
+	const chosen = (key) => choices.get(`${prefix}${key}`);
+	const has = (key, fallback = false) => chosen(key) ?? fallback;
+	const toggle = (key, fallback = false) => {
+		const full = `${prefix}${key}`;
+		const next = !(choices.get(full) ?? fallback);
+		choices.delete(full);
+		choices.set(full, next);
+		if (choices.size > KEPT_CHOICES) choices.delete(choices.keys().next().value);
+		render((n) => n + 1);
+	};
+	return { chosen, has, toggle };
+}
+
+export const KIND_ICON = { read: "file", list: "folder", find: "search", search: "search", run: "terminal", edit: "edit", write: "fileDiff", web: "globe", fetch: "globe", github: "gitBranch", mail: "mail", agent: "layers", report: "file", history: "clock", tool: "wrench" };
 
 /** The glyph at the start of a tool row: working, failed, stopped, or the icon of its kind. */
 export function StatusGlyph({ step }) {

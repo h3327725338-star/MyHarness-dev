@@ -1272,7 +1272,6 @@ export const zhCN = {
 	Hide: "隐藏",
 	Show: "显示",
 	"No report yet.": "还没有报告。",
-	Findings: "调查结果",
 	Unresolved: "未解决",
 	Workflow: "工作流",
 	"{completed}/{total} tasks done": "已完成 {completed}/{total} 个任务",
@@ -1473,6 +1472,15 @@ export const zhCN = {
 	// A report's own verdict states (task.dataGaps / task.reportSubmission), shown as badges and lists
 	"Completed with data gaps": "完成（有资料缺口）",
 	"Report not handed in properly": "没按格式提交",
+	// The parts of an opened sub-agent (sub-agents.js SubAgentProcess) and how a dispatch and a hand-in are named
+	"{tasks}: {names}": "{tasks}：{names}",
+	Report: "报告",
+	Process: "过程",
+	"Sub-agent's reply": "子智能体回答",
+	"The last lines the sub-agent wrote as replies (the session keeps only these)": "子智能体回复里最后写下的几行（只保留了这些）",
+	"Handing in the report": "正在提交报告",
+	"Handed in the report": "已提交报告",
+	"hand in the report": "提交报告",
 	"Data gaps": "资料缺口",
 	"Question statuses": "问题状态",
 	"Answered": "已回答",

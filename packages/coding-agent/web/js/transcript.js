@@ -9,7 +9,7 @@ import { Markdown } from "./markdown.js";
 import { DiffView, languageFor, parsePatch } from "./diff.js";
 import { buildTurns, buildTurnsAsync, buildTurnsWork, cachedTurns, tailPreviewSlice, changeTotals, groupSteps, groupLabel, nextRound, runForTurn, interruptedByNext, turnDuration, turnOutcome, turnSegments, historySourcesOf } from "./turns.js";
 import { actions, openCommand } from "./actions.js";
-import { KIND_ICON, StatusGlyph, WebSteps, forgetKeptChoices, keptChoice, useKeptChoice } from "./tool-rows.js";
+import { KIND_ICON, StatusGlyph, WebSteps, forgetKeptChoices, keptChoice, useKeptChoice, useKeptFolds } from "./tool-rows.js";
 import { StepCounts } from "./step-counts.js";
 import { basename, clip, splitFirstSentence, dirname, fmtBytes, fmtDuration, fmtShortDuration, fmtTokens, plural, formatData, ansiSegments } from "./util.js";
 import { count, t, N_, serverText, tNodes, getLang } from "./i18n.js";
@@ -246,10 +246,14 @@ function taskNote(task) {
 	return { line: clip(full.replace(/\s+/g, " "), 200), full: clip(full, 800) };
 }
 
-function TaskResult({ task }) {
-	const [open, setOpen] = useState(false);
+function TaskResult({ task, foldKey }) {
+	// Kept by the call id and the task place, like the tool rows: a finished turn builds this row again and must not
+	// close what the user opened (the folds inside the opened task are kept the same way).
+	const [chosen, choose] = useKeptChoice(foldKey);
+	const folds = useKeptFolds(`${foldKey}|`);
+	const open = chosen ?? false;
 	const cwd = useStore((st) => st.snap?.cwd || "");
-	const toggle = () => setOpen(!open);
+	const toggle = () => choose(!open);
 	const note = taskNote(task);
 	const meta = [task.toolUseCount ? plural(task.toolUseCount, "tool call") : "", task.durationMs ? fmtDuration(task.durationMs) : ""].filter(Boolean).join(" · ");
 	// The report's own verdict: complete with data gaps (never a warning mark), or handed in as plain text instead of
@@ -266,7 +270,7 @@ function TaskResult({ task }) {
 			<span class="action-tail dim">${meta}<${Fold} /></span>
 		</div>
 		<${Collapse} open=${open}>
-			<div class="sub-detail"><${SubAgentProcess} result=${task} running=${task.status === "running"} cwd=${cwd} /></div>
+			<div class="sub-detail"><${SubAgentProcess} result=${task} running=${task.status === "running"} cwd=${cwd} opened=${folds} /></div>
 		<//>
 	</div>`;
 }
@@ -282,7 +286,7 @@ function settleDetails(details) {
 }
 
 /** Sub-agent batch or workflow progress, from tool details (live or final). */
-function AgentDetails({ details }) {
+function AgentDetails({ details, foldKey }) {
 	if (!details) return null;
 	if (details.phases) {
 		return html`<div class="sub-agent">
@@ -290,13 +294,13 @@ function AgentDetails({ details }) {
 			${details.phases.map(
 				(phase, i) => html`<div class="sub-phase" key=${i}>
 				<div class="sub-phase-head dim"><span class="action-ico" title=${t(phase.status)}><${TaskStatusIcon} status=${phase.status} /></span><span class="truncate grow">${t("Phase {n}: {name}", { n: i + 1, name: typeof phase.name === "string" ? phase.name : "" })}</span><span class="sub-phase-count">${phase.completed}/${phase.total}</span></div>
-				${phase.results.map((task, j) => html`<${TaskResult} key=${j} task=${task} />`)}
+				${phase.results.map((task, j) => html`<${TaskResult} key=${j} task=${task} foldKey=${`${foldKey}|${i}:${j}`} />`)}
 			</div>`,
 			)}
 		</div>`;
 	}
 	if (details.results) {
-		return html`<div class="sub-agent"><div class="dim sub-head">${`${t("{completed}/{total} tasks done", { completed: details.completed, total: details.total })}${details.background ? ` · ${t("running in the background")}` : ""}${details.model ? ` · ${details.model}` : ""}`}</div>${details.results.map((task, j) => html`<${TaskResult} key=${j} task=${task} />`)}</div>`;
+		return html`<div class="sub-agent"><div class="dim sub-head">${`${t("{completed}/{total} tasks done", { completed: details.completed, total: details.total })}${details.background ? ` · ${t("running in the background")}` : ""}${details.model ? ` · ${details.model}` : ""}`}</div>${details.results.map((task, j) => html`<${TaskResult} key=${j} task=${task} foldKey=${`${foldKey}|${j}`} />`)}</div>`;
 	}
 	return null;
 }
@@ -339,7 +343,7 @@ const ActionRow = memo(function ActionRow({ step, defaultOpen }) {
 			</span>
 		</div>
 		<${Collapse} open=${open}><${RawDetails} step=${step} /><//>
-		${step.kind === "agent" ? html`<${AgentDetails} details=${liveDetails} />` : null}
+		${step.kind === "agent" ? html`<${AgentDetails} details=${liveDetails} foldKey=${`${session}|${step.key}|tasks`} />` : null}
 	</div>`;
 });
 

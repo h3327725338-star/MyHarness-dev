@@ -17,6 +17,7 @@ const TENSES = {
 	github: [N_("Querying GitHub"), N_("Queried GitHub"), N_("query GitHub")],
 	mail: [N_("Using mail"), N_("Used mail"), N_("use mail")],
 	agent: [N_("Delegating"), N_("Delegated"), N_("delegate")],
+	report: [N_("Handing in the report"), N_("Handed in the report"), N_("hand in the report")],
 	history: [N_("Looking through earlier chats"), N_("Looked through earlier chats"), N_("look through earlier chats")],
 	tool: [N_("Using"), N_("Used"), N_("use")],
 };
@@ -181,9 +182,20 @@ export function describeAction(call, result, run, cwd) {
 			target = Array.isArray(args.urls) ? args.urls.join(" · ") : str(args.url);
 			web = webCounts(name, result?.details);
 			break;
-		case "agent":
+		case "agent": {
 			kind = "agent";
-			target = clip(firstLine(str(args.task || args.prompt || args.description || (Array.isArray(args.tasks) ? args.tasks.map((t) => t.task || t.prompt || "").join(" · ") : ""))), 120);
+			// A batch is named by how many tasks it has and their short names, never by the prompts run together; a task
+			// without a short name falls back to the first line of its prompt.
+			const tasks = Array.isArray(args.tasks) ? args.tasks.filter((task) => task && typeof task === "object") : [];
+			if (tasks.length > 0) {
+				const names = tasks.map((task) => clip(firstLine(str(task.description || task.task || task.prompt)), 60)).filter(Boolean);
+				target = clip(names.length > 0 ? t("{tasks}: {names}", { tasks: count(tasks.length, "task"), names: names.join(" · ") }) : count(tasks.length, "task"), 160);
+			} else target = clip(firstLine(str(args.description || args.task || args.prompt)), 120);
+			break;
+		}
+		case "submit_report":
+			// How a sub-agent hands in its report (its last step), said in words; the report itself is shown as the report.
+			kind = "report";
 			break;
 		case "workflow":
 		case "ultracode": {

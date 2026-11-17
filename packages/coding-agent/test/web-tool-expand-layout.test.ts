@@ -37,7 +37,7 @@ describe("Expanded tool card layout", () => {
 		const openRaw = transcriptSrc.search(
 			/<\$\{Collapse\} open=\$\{open\}><\$\{RawDetails\} step=\$\{step\} \/><\/\/>/,
 		);
-		const taskList = transcriptSrc.search(/<\$\{AgentDetails\} details=\$\{liveDetails\} \/>/);
+		const taskList = transcriptSrc.search(/<\$\{AgentDetails\} details=\$\{liveDetails\}[^\n]*?\/>/);
 		expect(openRaw).toBeGreaterThan(-1);
 		expect(taskList).toBeGreaterThan(-1);
 		expect(openRaw).toBeLessThan(taskList);

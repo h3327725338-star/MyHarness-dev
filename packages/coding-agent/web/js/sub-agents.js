@@ -8,7 +8,7 @@ import { Markdown } from "./markdown.js";
 import { describeAction } from "./turns.js";
 import { StatusGlyph } from "./tool-rows.js";
 import { count, serverText, t } from "./i18n.js";
-import { clip, fmtDuration, fmtShortDuration, formatData, plural } from "./util.js";
+import { clip, firstLine, fmtDuration, fmtShortDuration, formatData, plural } from "./util.js";
 
 export const EMPTY_SUB_AGENTS = Object.freeze({ items: [], running: 0 });
 /** How a finished sub-agent looks: a glyph that differs in shape, coloured only when it needs the user. */
@@ -131,16 +131,21 @@ export function StopButton({ label, title, onStop, disabled }) {
 	</button>`;
 }
 
-/** Which rows are open, shared by the bar and its fullscreen view so both show the same depth. */
+/**
+ * Which rows are open, shared by the bar and its fullscreen view so both show the same depth. The same interface as
+ * the transcript's kept folds (tool-rows.js useKeptFolds): `chosen(key)` is the user's choice or undefined, `has(key,
+ * fallback)` whether it is open, `toggle(key, fallback)` flips what is shown now.
+ */
 function useOpenSet() {
-	const [keys, setKeys] = useState(() => new Set());
+	const [keys, setKeys] = useState(() => new Map());
+	const chosen = (key) => keys.get(key);
 	return {
-		has: (key) => keys.has(key),
-		toggle: (key) =>
+		chosen,
+		has: (key, fallback = false) => chosen(key) ?? fallback,
+		toggle: (key, fallback = false) =>
 			setKeys((old) => {
-				const next = new Set(old);
-				if (next.has(key)) next.delete(key);
-				else next.add(key);
+				const next = new Map(old);
+				next.set(key, !(old.get(key) ?? fallback));
 				return next;
 			}),
 	};
@@ -172,7 +177,7 @@ function TraceRaw({ trace, failed }) {
  * One tool call of a sub-agent the way the main agent's tool rows show it: the same glyph, wording, time and fold arrow
  * (describeAction, StatusGlyph). A call still marked running in a task that has ended did not finish.
  */
-function TraceRow({ trace, taskRunning, cwd, open, onToggle }) {
+function TraceRow({ trace, taskRunning, cwd, open, onToggle, note }) {
 	const unfinished = trace.status === "running" && !taskRunning;
 	const failed = trace.status === "failed";
 	const ended = failed || trace.status === "completed";
@@ -188,6 +193,7 @@ function TraceRow({ trace, taskRunning, cwd, open, onToggle }) {
 				${step.target ? html` <span class=${step.kind === "run" ? "mono target" : "target"}>${step.target}</span>` : null}
 				${step.detail ? html` <span class="dim">${step.detail}</span>` : null}
 				${unfinished ? html` <span class="dim">${t("not finished")}</span>` : null}
+				${note ? html` <span class="dim">· ${note}</span>` : null}
 			</span>
 			<span class="action-tail">
 				${took ? html`<span class="dim">${took}</span>` : null}
@@ -198,42 +204,118 @@ function TraceRow({ trace, taskRunning, cwd, open, onToggle }) {
 	</div>`;
 }
 
-/** The report a task has so far: its error, its answer, what it found and what it left open. */
-function TaskReport({ result }) {
-	if (!result) return html`<div class="dim">${t("No report yet.")}</div>`;
-	// A report only has to name what is missing: gaps the material could not answer, and questions not fully answered
-	// (each with the status the worker handed in and, when there is one, its note).
-	const openQuestions = reportQuestionStatuses(null, result).filter((entry) => entry.status !== "answered");
-	// The verdict fields are server text in one fixed language: route them through serverText so English mode shows
-	// the known Chinese strings in English (an unknown one keeps its text as the fallback).
-	return html`<div class="sa-report">
-		${result.error ? html`<div class="c-danger">${serverText(result.error, result.error)}</div>` : null}
-		${result.output ? html`<${Markdown} text=${result.output} />` : html`<div class="dim">${t("No report yet.")}</div>`}
-		${result.dataGaps?.length ? html`<div class="raw-label">${t("Data gaps")}</div><ul class="sub-list">${result.dataGaps.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
-		${openQuestions.length ? html`<div class="raw-label">${t("Question statuses")}</div><ul class="sub-list">${openQuestions.map((entry, i) => html`<li key=${i}><span class="dim">${t(QUESTION_STATUS_LABEL[entry.status] || entry.status)}</span> ${entry.question}${entry.note ? ` — ${serverText(entry.note, entry.note)}` : ""}</li>`)}</ul>` : null}
-		${result.findings?.length ? html`<div class="raw-label">${t("Findings")}</div><ul class="sub-list">${result.findings.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
-		${result.unresolved?.length ? html`<div class="raw-label">${t("Unresolved")}</div><ul class="sub-list">${result.unresolved.map((f, i) => html`<li key=${i}>${serverText(f, f)}</li>`)}</ul>` : null}
+/** How a finished task ended, in the words of its row's badge (or its plain status). */
+function verdictLabel(result) {
+	if (reportHandedIn(null, result)) return t("Report not handed in properly");
+	if (result.status === "completed" && reportGaps(null, result).length) return t("Completed with data gaps");
+	return t(STATUS_LABEL[result.status] || result.status || "completed");
+}
+
+/** What a running sub-agent does now, named from its newest unfinished tool call the way the tool rows name it. */
+function processNow(traces, cwd) {
+	for (let i = traces.length - 1; i >= 0; i--) {
+		const trace = traces[i];
+		if (trace.status !== "running") continue;
+		const described = describeAction({ name: trace.toolName, args: trace.args || {} }, undefined, { status: "running" }, cwd);
+		return `${described.verb}${described.target ? ` ${clip(described.target, 90)}` : ""}`;
+	}
+	return t("Working…");
+}
+
+/**
+ * The lines the sub-agent wrote as replies (the server keeps their last lines as `findings`), as one Markdown text: the
+ * lines were split from Markdown, so joined again lists and code read as they were written. Nothing when they only
+ * repeat the report.
+ */
+function replyText(result) {
+	const lines = Array.isArray(result?.findings) ? result.findings.filter((line) => typeof line === "string" && line.trim()) : [];
+	const text = lines.join("\n").trim();
+	return text && text !== String(result?.output || "").trim() ? text : "";
+}
+
+/**
+ * One part of an opened sub-agent: a small labelled row (what the part is, one line of what it holds, the fold arrow)
+ * over its content. A part without content to open is a still row.
+ */
+function Section({ name, label, summary, live, open, onToggle, title, children }) {
+	const foldable = !!onToggle;
+	const keyToggle = (event) => (event.key === "Enter" || event.key === " ") && (event.preventDefault(), onToggle());
+	return html`<div class=${`sa-sec sa-sec-${name}`}>
+		<div class=${`action-row sa-sec-row${foldable ? "" : " static"}`} onClick=${foldable ? onToggle : undefined} role=${foldable ? "button" : undefined} tabindex=${foldable ? "0" : undefined} aria-expanded=${foldable ? open : undefined} onKeyDown=${foldable ? keyToggle : undefined} title=${title}>
+			<span class="sa-sec-label">${label}</span>
+			<span class=${`sa-sec-text truncate ${live ? "shimmer-text" : ""}`}>${summary}</span>
+			${foldable ? html`<span class="action-tail"><${Fold} /></span>` : null}
+		</div>
+		${foldable ? html`<${Collapse} open=${open}>${children}<//>` : null}
 	</div>`;
 }
 
 /**
- * What one sub-agent did: its tool calls in order (the steps the session records for it; it keeps no reasoning text),
- * then its report. Without recorded steps it says so; nothing is made up. `opened` shares the open tool rows with
- * another view of the same task (the bar and its fullscreen view); without it the rows keep their own state.
+ * The report a task handed in, under one labelled head that says how the task ended: its error, the report itself
+ * (the Markdown it handed in, or the reply text read instead), and what it left open.
+ */
+function TaskReport({ result, running }) {
+	// A report only has to name what is missing: gaps the material could not answer, and questions not fully answered
+	// (each with the status the worker handed in and, when there is one, its note).
+	const openQuestions = reportQuestionStatuses(null, result).filter((entry) => entry.status !== "answered");
+	const dataGaps = reportGaps(null, result);
+	// The verdict fields are server text in one fixed language: route them through serverText so English mode shows
+	// the known Chinese strings in English (an unknown one keeps its text as the fallback).
+	return html`<div class="sa-sec sa-sec-report">
+		<div class="action-row sa-sec-row static">
+			<span class="sa-sec-label">${t("Report")}</span>
+			${running
+				? null
+				: html`<span class="sa-sec-text sa-verdict truncate"><${TaskStatusIcon} status=${result.status} dataGaps=${dataGaps} reportSubmission=${result.reportSubmission} /><span>${verdictLabel(result)}</span></span>`}
+		</div>
+		<div class="sa-sec-body sa-report">
+			${result.error ? html`<div class="c-danger">${serverText(result.error, result.error)}</div>` : null}
+			${result.output ? html`<${Markdown} text=${result.output} />` : result.error ? null : html`<div class="dim">${t("No report yet.")}</div>`}
+			${dataGaps.length ? html`<div class="raw-label">${t("Data gaps")}</div><ul class="sub-list">${dataGaps.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
+			${openQuestions.length ? html`<div class="raw-label">${t("Question statuses")}</div><ul class="sub-list">${openQuestions.map((entry, i) => html`<li key=${i}><span class="dim">${t(QUESTION_STATUS_LABEL[entry.status] || entry.status)}</span> ${entry.question}${entry.note ? ` — ${serverText(entry.note, entry.note)}` : ""}</li>`)}</ul>` : null}
+			${result.unresolved?.length ? html`<div class="raw-label">${t("Unresolved")}</div><ul class="sub-list">${result.unresolved.map((f, i) => html`<li key=${i}>${serverText(f, f)}</li>`)}</ul>` : null}
+		</div>
+	</div>`;
+}
+
+/**
+ * What one sub-agent did, in parts that never run together: the task it was given (one line, opens to the whole
+ * prompt), its process (all its tool calls folded into one line that says how many and, while it runs, what it does
+ * now), the report it handed in, and the lines it wrote as replies (folded; open when there is no report). The session
+ * keeps no reasoning text for it and nothing is made up. `opened` keeps the folds: the bar shares it with its
+ * fullscreen view, the transcript keeps it by the call's id; without it the folds keep their own state.
  */
 export function SubAgentProcess({ result, running, cwd, facts, opened, idPrefix = "" }) {
 	const own = useOpenSet();
 	const open = opened || own;
 	const traces = Array.isArray(result?.transcript) ? result.transcript : [];
+	const fold = (name, fallback = false) => ({ open: open.has(`${idPrefix}${name}`, fallback), onToggle: () => open.toggle(`${idPrefix}${name}`, fallback) });
+	const prompt = typeof result?.prompt === "string" ? result.prompt.trim() : "";
+	const calls = traces.length || result?.toolUseCount || 0;
+	const handedIn = traces.some((trace) => trace.toolName === "submit_report" && trace.status === "completed");
+	const now = running ? processNow(traces, cwd) : handedIn ? t("Handed in the report") : "";
+	const processLine = [calls ? plural(calls, "tool call") : "", now].filter(Boolean).join(" · ") || t("No process yet");
+	const reply = replyText(result);
+	// The report part appears once there is something to show: what was handed in, an error, or a task that ended.
+	const hasReport = !!result && (!!result.output || !!result.error || !running);
 	return html`<div class="sa-process">
 		${facts ? html`<div class="dim sa-facts">${facts}</div>` : null}
+		${prompt ? html`<${Section} name="task" label=${t("Task")} summary=${clip(firstLine(prompt), 200)} ...${fold("task")}><div class="sa-sec-body sa-prompt">${prompt}</div><//>` : null}
 		${traces.length
-			? html`<div class="steps sa-steps">${traces.map((trace, index) => {
-					const key = `${idPrefix}${trace.toolCallId || index}`;
-					return html`<div class=${`step ${index < traces.length - 1 ? "linked" : ""}`} key=${key}><${TraceRow} trace=${trace} taskRunning=${running} cwd=${cwd} open=${open.has(key)} onToggle=${() => open.toggle(key)} /></div>`;
-				})}</div>`
-			: html`<div class="dim sa-empty">${t("No process yet")}</div>`}
-		<${TaskReport} result=${result} />
+			? html`<${Section} name="process" label=${t("Process")} summary=${processLine} live=${running} ...${fold("process")}>
+					<div class="steps sa-steps">${traces.map((trace, index) => {
+						const key = `${idPrefix}${trace.toolCallId || index}`;
+						const note = trace.toolName === "submit_report" && trace.status === "completed" && !running && result ? verdictLabel(result) : "";
+						return html`<div class=${`step ${index < traces.length - 1 ? "linked" : ""}`} key=${key}><${TraceRow} trace=${trace} taskRunning=${running} cwd=${cwd} open=${open.has(key)} onToggle=${() => open.toggle(key)} note=${note} /></div>`;
+					})}</div>
+				<//>`
+			: html`<${Section} name="process" label=${t("Process")} summary=${processLine} live=${running && calls > 0} />`}
+		${hasReport ? html`<${TaskReport} result=${result} running=${running} />` : null}
+		${reply
+			? html`<${Section} name="reply" label=${t("Sub-agent's reply")} summary="" title=${t("The last lines the sub-agent wrote as replies (the session keeps only these)")} ...${fold("reply", !result?.output)}>
+					<div class="sa-sec-body sa-reply"><${Markdown} text=${reply} /></div>
+				<//>`
+			: null}
 	</div>`;
 }
 

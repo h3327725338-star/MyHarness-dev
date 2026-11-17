@@ -445,14 +445,26 @@ button.status-pill { cursor: pointer; }
 .sub-state { flex: none; padding: 0 5px; border-radius: var(--r-pill); background: var(--surface-hover); color: var(--text-3); font-size: var(--fs-mini); line-height: 15px; white-space: nowrap; }
 .sub-state.gaps { background: var(--accent-soft); color: var(--accent); }
 .c-accent { color: var(--accent); }
-.sub-detail { margin: 2px 0 6px 24px; padding: 8px 10px; background: var(--bg-inset); border-radius: var(--r-md); font-size: var(--fs-body); max-height: 360px; overflow: auto; overscroll-behavior: contain; }
+/* An opened sub-task grows with what it holds: the conversation is the one scroller (no nested scroll). */
+.sub-detail { margin: 2px 0 6px 24px; padding: 6px 8px; background: var(--bg-inset); border-radius: var(--r-md); font-size: var(--fs-body); }
 .sub-list { margin: 0; padding-left: 18px; }
 
 /* One sub-agent's steps (web/js/sub-agents.js SubAgentProcess), under its row in the activity bar and under its task
-   row in the dispatch's run step: the main agent's tool rows, then the report. */
-.sa-process { display: flex; flex-direction: column; gap: 6px; }
-.sa-facts, .sa-empty { font-size: var(--fs-xs); }
+   row in the dispatch's run step, in parts that never run together: a small labelled row each (task, process, report,
+   reply), the process folding all its tool calls (the main agent's tool rows) into that one row, and what a part holds
+   set in a card of its own below its row. */
+.sa-process { display: flex; flex-direction: column; gap: 2px; }
+.sa-facts, .sa-empty { font-size: var(--fs-xs); padding: 0 4px 2px; }
+.sa-sec-row { min-height: 24px; font-size: var(--fs-sm); }
+.sa-sec-label { flex: none; min-width: 3.5em; color: var(--text); }
+.sa-sec-text { flex: 1 1 auto; min-width: 0; color: var(--text-3); }
+.sa-verdict { display: inline-flex; align-items: center; gap: 6px; }
+.sa-sec-body { margin: 2px 0 6px; padding: 6px 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r-md); font-size: var(--fs-body); overflow-wrap: anywhere; }
+.sa-sec-report { margin-top: 2px; }
+.sa-prompt { white-space: pre-wrap; color: var(--text-2); font-size: var(--fs-sm); }
+.sa-steps { padding: 2px 0 4px; }
 .sa-report { display: flex; flex-direction: column; gap: 4px; }
+.sa-reply { color: var(--text-2); }
 /* Inside these areas the tool data does not scroll on its own: the area around it is the one scroller (no nested scroll). */
 .sa-process .raw-body { max-height: none; overflow-y: visible; scrollbar-gutter: auto; }
 .sa-still { display: inline-block; margin-top: 6px; font-size: var(--fs-sm); }
