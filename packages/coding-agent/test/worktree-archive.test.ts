@@ -3,6 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { autoArchiveReason, isInsideDirectory, WorktreeArchiveRecords } from "../src/git/worktrees/archive-records.ts";
+import {
+	isSubagentPoolSlotPath,
+	subagentPoolSlotIndex,
+	subagentPoolSlotName,
+} from "../src/git/worktrees/pool-layout.ts";
 
 let agentDir = "";
 let tempDir = "";
@@ -102,6 +107,50 @@ describe("isInsideDirectory", () => {
 	});
 });
 
+describe("autoArchiveReason – sub-agent copy pool", () => {
+	const base = () => ({ isMain: false, tempDir });
+
+	it("never archives a copy whose record says it is pool infrastructure", () => {
+		const path = existingCopy("myharness-subagent-pool-1");
+		expect(
+			autoArchiveReason({
+				...base(),
+				path,
+				branch: "myharness-subagent-pool-1",
+				record: { path, origin: "pool" },
+			}),
+		).toBeUndefined();
+	});
+
+	it("never archives a pool slot path even without a record or branch", () => {
+		// A detached pool copy would otherwise be a "temporary" script leftover; a pool copy on a generated
+		// sub-agent branch would otherwise be archived as "subagent".
+		const detached = existingCopy("myharness-subagent-pool-2");
+		expect(autoArchiveReason({ ...base(), path: detached, branch: undefined })).toBeUndefined();
+		const attached = existingCopy("myharness-subagent-pool-3");
+		expect(autoArchiveReason({ ...base(), path: attached, branch: "myharness-subagent-pool-3" })).toBeUndefined();
+	});
+
+	it("still archives an ordinary sub-agent copy next to the pool slots", () => {
+		const path = existingCopy("myharness-subagent-0123456789");
+		expect(autoArchiveReason({ ...base(), path, branch: "myharness-subagent-0123456789" })).toBe("subagent");
+	});
+});
+
+describe("pool slot paths (pool-layout.ts)", () => {
+	it("recognises pool slot folder names by number and rejects look-alikes", () => {
+		const repo = join(agentDir, "worktrees", "repo");
+		const slot = join(repo, "myharness-subagent-pool-7");
+		expect(isSubagentPoolSlotPath(slot)).toBe(true);
+		expect(subagentPoolSlotIndex(slot)).toBe(7);
+		expect(subagentPoolSlotName(7)).toBe("myharness-subagent-pool-7");
+		// An ordinary sub-agent copy or an unfinished slot name is not a pool slot.
+		expect(isSubagentPoolSlotPath(join(repo, "myharness-subagent-0123456789"))).toBe(false);
+		expect(isSubagentPoolSlotPath(join(repo, "myharness-subagent-pool-x"))).toBe(false);
+		expect(isSubagentPoolSlotPath(join(repo, "myharness-subagent-pool-"))).toBe(false);
+	});
+});
+
 describe("WorktreeArchiveRecords", () => {
 	it("merges patches, clears fields and keeps the copy path inside the record", () => {
 		const path = existingCopy("copy");
@@ -125,6 +174,13 @@ describe("WorktreeArchiveRecords", () => {
 		// Restoring clears the archive fields but remembers who made the copy.
 		records.update(path, { archivedAt: undefined, reason: undefined });
 		expect(records.get(path)).toEqual({ path, origin: "subagent", branch: "myharness-subagent-abc" });
+	});
+
+	it("keeps a pool copy's origin in its record like any other origin", () => {
+		const path = existingCopy("myharness-subagent-pool-4");
+		const records = new WorktreeArchiveRecords(agentDir);
+		records.update(path, { origin: "pool" });
+		expect(records.get(path)).toEqual({ path, origin: "pool" });
 	});
 
 	it("drops records whose copy no longer exists", () => {

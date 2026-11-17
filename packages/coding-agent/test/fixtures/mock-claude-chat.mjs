@@ -3,7 +3,8 @@
 // model and no network beyond that loopback endpoint.
 //
 // One turn: it lists the endpoint's tools, calls `read` on the file named in MOCK_CLAUDE_READ (default notes.txt),
-// writes "REPORT: <what the tool returned>" and ends the turn.
+// writes "REPORT: <what the tool returned>" and ends the turn. A later turn that asks for submit_report hands the report
+// in with that tool instead.
 //
 // Environment:
 //   MOCK_CLAUDE_LOG   file that gets one JSON line for the start (arguments, cwd) and one with the tools the endpoint
@@ -46,9 +47,30 @@ async function rpc(method, params) {
 
 const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
 
-async function turn() {
+/** Hand the report already written in. MyHarness asks for it after a reply that never called submit_report. */
+async function submitReport() {
+	const toolUseId = "toolu_mock_submit";
+	const input = { report: "", questions: [] };
+	send({
+		type: "assistant",
+		message: { id: "msg_mock_3", usage, content: [{ type: "tool_use", id: toolUseId, name: "mcp__myharness__submit_report", input }] },
+	});
+	const result = await rpc("tools/call", { name: "submit_report", arguments: input, _meta: { "claudecode/toolUseId": toolUseId } });
+	send({
+		type: "user",
+		message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: result.content }] },
+	});
+	send({ type: "result", subtype: "success", is_error: false });
+}
+
+async function turn(message) {
 	if (!mcp) {
 		send({ type: "result", subtype: "error_during_execution", is_error: true, result: "no MCP endpoint was given" });
+		return;
+	}
+	if (JSON.stringify(message?.message?.content ?? "").includes("submit_report")) {
+		await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "mock-claude" } });
+		await submitReport();
 		return;
 	}
 	await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "mock-claude" } });
@@ -83,7 +105,7 @@ async function turn() {
 			id: "msg_mock_2",
 			usage,
 			stop_reason: "end_turn",
-			content: [{ type: "text", text: `REPORT: ${result.isError ? "tool failed: " : ""}${text}` }],
+			content: [{ type: "text", text: `REPORT: ${result.isError ? "tool failed: " : ""}${text}\nFindings: the file above was read in full and no other file was needed to answer the task.` }],
 		},
 	});
 	send({ type: "result", subtype: "success", is_error: false });
@@ -103,7 +125,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 		return;
 	}
 	if (message.type === "user") {
-		turn().catch((error) => {
+		turn(message).catch((error) => {
 			send({ type: "result", subtype: "error_during_execution", is_error: true, result: String(error?.message ?? error) });
 		});
 	}

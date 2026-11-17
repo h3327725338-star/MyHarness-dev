@@ -92,6 +92,43 @@ describe("Web UI: interface language", () => {
 		}
 	});
 
+	it("turns the sub-agent report verdict strings into English", () => {
+		lang.setLang("en");
+		expect(i18n.serverText("子 Agent 提交的报告里有问题没有完成：问题一；问题二")).toBe(
+			"The submitted report has unfinished questions: 问题一；问题二",
+		);
+		expect(i18n.serverText("资料拿不到：某个内部网页")).toBe("Material unreachable: 某个内部网页");
+		expect(i18n.serverText("问题未完成：问题三")).toBe("Question not completed: 问题三");
+		expect(i18n.serverText("问题未逐项回答：问题四")).toBe("Question not answered item by item: 问题四");
+		expect(i18n.serverText("提交的报告没有给出这个问题的状态")).toBe(
+			"The submitted report did not give a status for this question",
+		);
+		expect(i18n.serverText("没按格式提交（未调用 submit_report）。正文里没有逐项状态")).toBe(
+			"Report not handed in properly (submit_report was never called). 正文里没有逐项状态",
+		);
+		expect(i18n.serverText("子 Agent 进程在交回报告后异常退出（退出码 3；输出：boom），报告判定不受影响")).toBe(
+			"The sub-agent process exited abnormally after handing in its report (exit code 3; output: boom); the report's verdict stands",
+		);
+		expect(i18n.serverText("子 Agent 进程在交回报告后异常退出（退出码 1），报告判定不受影响")).toBe(
+			"The sub-agent process exited abnormally after handing in its report (exit code 1); the report's verdict stands",
+		);
+		lang.setLang("en");
+	});
+
+	it("turns the pool-copy refusals of the Git routes into Chinese", () => {
+		lang.setLang("zh-CN");
+		expect(i18n.serverText("This pool copy is running a sub-agent task; stop the task before deleting it.")).toBe(
+			"这个副本池副本正在运行子智能体任务，请先停止任务再删除。",
+		);
+		expect(i18n.serverText("Pool copies are reused by sub-agent tasks and cannot be combined into main.")).toBe(
+			"副本池的副本供子智能体任务复用，不能合并到 main。",
+		);
+		expect(i18n.serverText("Pool copies are reused by sub-agent tasks and cannot be archived.")).toBe(
+			"副本池的副本供子智能体任务复用，不能归档。",
+		);
+		lang.setLang("en");
+	});
+
 	it("turns English server text into Chinese, including messages with variable parts", () => {
 		lang.setLang("zh-CN");
 		expect(i18n.serverText("Steering messages")).toBe("引导消息");

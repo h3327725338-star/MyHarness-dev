@@ -26,6 +26,7 @@ import { createSessionMemoryManageOperations } from "./memory/manage.ts";
 import { createSessionMemoryOperations } from "./memory/search.ts";
 import { createAllToolDefinitions, createToolDefinition, type ToolName } from "./registry.ts";
 import type { SubAgentToolOptions } from "./sub-agent.ts";
+import { createSubmitReportToolDefinition, SUBMIT_REPORT_TOOL_NAME } from "./submit-report.ts";
 import type { SymbolsCodeIntelligenceServices } from "./symbols-runtime.ts";
 import { createToolDefinitionFromAgentTool } from "./tool-definition-wrapper.ts";
 import { wrapToolWithResultPersistence } from "./tool-result-persistence.ts";
@@ -49,6 +50,11 @@ export interface SessionToolRegistryOptions {
 	customTools: ToolDefinition[];
 	/** Whether tools registered by extensions are exposed (not for delegated sessions). */
 	includeExtensionTools: boolean;
+	/**
+	 * Delegated worker sessions only: add the `submit_report` tool the worker hands its final report in with. The main
+	 * agent's registry never holds it, so it never shows up in a main tool list or system prompt.
+	 */
+	delegatedReportTool?: boolean;
 	codeIntelligence?: SymbolsCodeIntelligenceServices;
 	/** Replaces the built-in tools (custom runtimes). */
 	baseToolsOverride?: Record<string, AgentTool>;
@@ -321,6 +327,12 @@ export class SessionToolRegistry {
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+		if (this._options.delegatedReportTool && !baseToolsOverride) {
+			this._baseToolDefinitions.set(
+				SUBMIT_REPORT_TOOL_NAME,
+				createSubmitReportToolDefinition() as unknown as ToolDefinition,
+			);
+		}
 	}
 
 	/**

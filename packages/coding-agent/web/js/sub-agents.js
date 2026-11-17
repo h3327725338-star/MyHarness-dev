@@ -14,7 +14,14 @@ export const EMPTY_SUB_AGENTS = Object.freeze({ items: [], running: 0 });
 /** How a finished sub-agent looks: a glyph that differs in shape, coloured only when it needs the user. */
 const DONE_MARK = { completed: ["checkCircle", "c-dim"], partial: ["alertTriangle", "c-warn"], failed: ["alertCircle", "c-danger"], timeout: ["alertCircle", "c-danger"] };
 const STATUS_LABEL = { running: "running", completed: "completed", partial: "partial", failed: "failed", timeout: "timeout", cancelled: "Stopped", pending: "Not started" };
+/** Label of a question status handed in with a report; `answered` questions are not listed again. */
+const QUESTION_STATUS_LABEL = { answered: "Answered", partial: "Partly answered", unavailable: "Material unreachable", not_done: "Not done" };
 const SUMMARY_MS = 6000;
+
+/** The report's own verdict fields, whether the record carries them (transcript) or only the result does (bar). */
+const reportGaps = (task, result) => result?.dataGaps ?? task?.dataGaps ?? [];
+const reportQuestionStatuses = (task, result) => result?.questionStatuses ?? task?.questionStatuses ?? [];
+const reportHandedIn = (task, result) => (result?.reportSubmission ?? task?.reportSubmission) === "text";
 
 /** The sub-agent state of the chat on screen; while the connection is down it is unknown, never "running". */
 export function useSubAgents() {
@@ -77,10 +84,16 @@ export function taskActivity(task, cwd) {
 	return t("Working…");
 }
 
-export function TaskStatusIcon({ status, unknown }) {
+export function TaskStatusIcon({ status, unknown, dataGaps, reportSubmission }) {
 	if (unknown) return html`<${Icon} name="clock" size=${13} class="c-dim" />`;
 	if (status === "running") return html`<${Spinner} size=${13} />`;
 	if (status === "cancelled") return html`<${Icon} name="stopCircle" size=${13} class="c-dim" />`;
+	// The report was read from the reply text because submit_report was never called: its own state, shown with its
+	// own glyph instead of the failure marks it used to blend into.
+	if (reportSubmission === "text" && (status === "completed" || status === "partial"))
+		return html`<${Icon} name="file" size=${13} class="c-dim" />`;
+	// Complete with data gaps: the task is done; it only names what it could not reach (never a warning triangle).
+	if (status === "completed" && dataGaps?.length) return html`<${Icon} name="checkCircle" size=${13} class="c-accent" />`;
 	const mark = DONE_MARK[status];
 	return mark ? html`<${Icon} name=${mark[0]} size=${13} class=${mark[1]} />` : html`<span class="dot" />`;
 }
@@ -188,11 +201,18 @@ function TraceRow({ trace, taskRunning, cwd, open, onToggle }) {
 /** The report a task has so far: its error, its answer, what it found and what it left open. */
 function TaskReport({ result }) {
 	if (!result) return html`<div class="dim">${t("No report yet.")}</div>`;
+	// A report only has to name what is missing: gaps the material could not answer, and questions not fully answered
+	// (each with the status the worker handed in and, when there is one, its note).
+	const openQuestions = reportQuestionStatuses(null, result).filter((entry) => entry.status !== "answered");
+	// The verdict fields are server text in one fixed language: route them through serverText so English mode shows
+	// the known Chinese strings in English (an unknown one keeps its text as the fallback).
 	return html`<div class="sa-report">
-		${result.error ? html`<div class="c-danger">${result.error}</div>` : null}
+		${result.error ? html`<div class="c-danger">${serverText(result.error, result.error)}</div>` : null}
 		${result.output ? html`<${Markdown} text=${result.output} />` : html`<div class="dim">${t("No report yet.")}</div>`}
+		${result.dataGaps?.length ? html`<div class="raw-label">${t("Data gaps")}</div><ul class="sub-list">${result.dataGaps.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
+		${openQuestions.length ? html`<div class="raw-label">${t("Question statuses")}</div><ul class="sub-list">${openQuestions.map((entry, i) => html`<li key=${i}><span class="dim">${t(QUESTION_STATUS_LABEL[entry.status] || entry.status)}</span> ${entry.question}${entry.note ? ` — ${serverText(entry.note, entry.note)}` : ""}</li>`)}</ul>` : null}
 		${result.findings?.length ? html`<div class="raw-label">${t("Findings")}</div><ul class="sub-list">${result.findings.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
-		${result.unresolved?.length ? html`<div class="raw-label">${t("Unresolved")}</div><ul class="sub-list">${result.unresolved.map((f, i) => html`<li key=${i}>${f}</li>`)}</ul>` : null}
+		${result.unresolved?.length ? html`<div class="raw-label">${t("Unresolved")}</div><ul class="sub-list">${result.unresolved.map((f, i) => html`<li key=${i}>${serverText(f, f)}</li>`)}</ul>` : null}
 	</div>`;
 }
 
@@ -243,11 +263,16 @@ function TaskRow({ item, task, now, cwd, unknown, result, rows, traces }) {
 	const elapsed = taskElapsed(task, now);
 	const meta = [task.toolUseCount ? plural(task.toolUseCount, "tool call") : "", elapsed >= 1000 ? fmtDuration(elapsed) : ""].filter(Boolean).join(" · ");
 	const facts = [result?.model || item.model, item.id].filter(Boolean).join(" · ");
+	// The report's own verdict: complete with data gaps, or handed in as plain text instead of submit_report.
+	const dataGaps = reportGaps(task, result);
+	const textReport = reportHandedIn(task, result);
+	const stateBadge = textReport ? t("Report not handed in properly") : task.status === "completed" && dataGaps.length ? t("Completed with data gaps") : null;
 	return html`<div class=${`sa-task s-${unknown ? "unknown" : task.status}`}>
 		<div class="sa-row" onClick=${rowClick(toggle)}>
 			<button type="button" class="sa-toggle" aria-expanded=${open} title=${task.description || t("Sub-agent")}>
-				<span class="sa-ico"><${TaskStatusIcon} status=${task.status} unknown=${unknown} /></span>
+				<span class="sa-ico"><${TaskStatusIcon} status=${task.status} unknown=${unknown} dataGaps=${dataGaps} reportSubmission=${result?.reportSubmission ?? task.reportSubmission} /></span>
 				<span class="sa-name truncate">${task.description || t("Sub-agent")}</span>
+				${stateBadge && !running ? html`<span class=${`sa-state ${textReport ? "report-text" : "gaps"}`}>${stateBadge}</span>` : null}
 				<span class=${`sa-activity truncate ${running ? "shimmer-text" : "dim"}`}>${unknown ? t("Status unknown") : taskActivity(task, cwd)}</span>
 				<span class="sa-time">${meta}</span>
 			</button>

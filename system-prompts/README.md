@@ -20,9 +20,9 @@
 | `global/output-language.md` | 编程会话的用户回复语言策略 |
 | `roles/main.md` | Main 授权边界，以及“回复结束即停止工作”：除非自己启动的东西真的会把它带回来（后台 shell 命令或后台子智能体派发结束时回报、定时 Agent 任务），不承诺稍后回来查看或汇报；保留现有 `reviewer` 同样使用此文本的行为 |
 | `roles/delegated.md` | 只读委派会话的执行边界 |
-| `roles/delegated-write.md` | 读写模式（Sub Agent 设置为「读写」）委派会话的执行边界，仅限自身 worktree、永不 commit/push |
-| `roles/explore.md` | Explore 子进程通过 `--append-system-prompt` 追加的专用职责 |
-| `roles/explore-write.md` | 读写模式 Explore 子进程追加的专用职责，含 worktree 边界与末尾 `## Worktree result` 返回格式 |
+| `roles/delegated-write.md` | 读写模式（Sub Agent 设置为「读写」）里可改文件的委派会话的执行边界，仅限自身副本（副本池里的 Git worktree，非 Git 目录是文件镜像）、永不 commit/push |
+| `roles/explore.md` | Explore 子进程通过 `--append-system-prompt` 追加的专用职责（只读任务，包括读写模式里 `access: read` 的任务）；用 `submit_report` 交报告并逐题给状态 |
+| `roles/explore-write.md` | 读写模式里可改文件的 Explore 子进程追加的专用职责，含副本边界、`[可读清单]` 规则、`submit_report` 交报告与末尾 `## Worktree result` 返回格式 |
 | `session/commit-authorization.md` | 当前不存在；显式 `/commit` 的授权和 Git 事务边界由 Coding Agent 源码处理，不会从本目录加载 |
 | `session/handoff.md` | 后台交接摘要请求的职责与输出格式（话题、当前焦点、必要背景、结论与纠正、未完成事项、来源；区分已确认与未验证，中断回复不写成完成；“今天”等日期按任务给出的当前本机时间和每条消息的发送时间推算，推不出就不写；提示词文件本身不含非英文字符） |
 | `session/auto-memory.md` | 仅 Auto Memory 完整启用时追加的记忆优先级约束 |
@@ -36,7 +36,7 @@
 | `skills/coding-agent.md` | 编程会话的技能读取规则；仅启用 read 且存在可见技能时有正文 |
 | `skills/harness.md` | 通用 AgentHarness 的技能说明；原文不同，独立维护 |
 | `harness/default.md` | 通用 AgentHarness 未提供自定义 systemPrompt 时的默认身份 |
-| `tools/{read,bash,pwsh,job-list,job-output,job-kill,edit,write,apply-patch,apply-rename,find,grep,ls,github,mail,symbols,agent,agent-tasks,workflow,ultracode,web-search,web-fetch,memory-search,memory-get,memory-delete,memory-claim,memory-write,session-search,session-get,ask-user-question,todo-write,schedule,workspace}/snippet.md` | 对应工具的简短系统说明；仅启用该工具时组合。symbols 与 apply-rename 说明仅在 symbols 启用时出现，workspace 说明仅在桌面宿主连接时出现 |
+| `tools/{read,bash,pwsh,job-list,job-output,job-kill,edit,write,apply-patch,apply-rename,find,grep,ls,github,mail,symbols,agent,agent-tasks,workflow,ultracode,web-search,web-fetch,memory-search,memory-get,memory-delete,memory-claim,memory-write,session-search,session-get,ask-user-question,todo-write,schedule,workspace,submit-report}/snippet.md` | 对应工具的简短系统说明；仅启用该工具时组合。submit-report 说明只出现在委派子进程里（交报告用的 `submit_report` 工具）。symbols 与 apply-rename 说明仅在 symbols 启用时出现，workspace 说明仅在桌面宿主连接时出现 |
 | `tools/{read,edit,write,symbols,agent,workflow,ultracode,web-search,web-fetch}/guidelines.md` | 对应工具的操作规则；每个非空行是一条，按文件行序组合。symbols 规则仅在 symbols 启用时出现 |
 | `tools/no-snippets.md` | 历史占位说明；当前组合对缺 snippet 使用行内占位 `(no description available)`，不加载此文件 |
 | `tools/routing/introduction.md` | 工具选择通用引言 |

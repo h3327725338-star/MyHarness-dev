@@ -252,11 +252,17 @@ function TaskResult({ task }) {
 	const toggle = () => setOpen(!open);
 	const note = taskNote(task);
 	const meta = [task.toolUseCount ? plural(task.toolUseCount, "tool call") : "", task.durationMs ? fmtDuration(task.durationMs) : ""].filter(Boolean).join(" · ");
+	// The report's own verdict: complete with data gaps (never a warning mark), or handed in as plain text instead of
+	// submit_report (its own state, not blended into the failures).
+	const dataGaps = task.dataGaps ?? [];
+	const textReport = task.reportSubmission === "text";
+	const stateBadge = textReport ? t("Report not handed in properly") : task.status === "completed" && dataGaps.length ? t("Completed with data gaps") : null;
 	return html`<div class=${`sub-task${note ? " noted" : ""}`}>
 		<div class="action-row" onClick=${toggle} role="button" tabindex="0" aria-expanded=${open} onKeyDown=${(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle())}>
-			<span class="action-ico"><${TaskStatusIcon} status=${task.status} /></span>
+			<span class="action-ico"><${TaskStatusIcon} status=${task.status} dataGaps=${dataGaps} reportSubmission=${task.reportSubmission} /></span>
 			<span class="action-text truncate" title=${task.description || clip(task.prompt || "", 300)}>${task.description || clip(task.prompt || "", 80)}</span>
 			${note ? html`<span class=${`sub-note truncate ${task.status === "failed" || task.status === "timeout" ? "bad" : "dim"}`} title=${note.full}>${note.line}</span>` : null}
+			${stateBadge && task.status !== "running" ? html`<span class=${`sub-state ${textReport ? "report-text" : "gaps"}`}>${stateBadge}</span>` : null}
 			<span class="action-tail dim">${meta}<${Fold} /></span>
 		</div>
 		<${Collapse} open=${open}>

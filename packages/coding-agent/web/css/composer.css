@@ -343,6 +343,10 @@ button.env-chip:hover { color: var(--text); background: var(--surface-hover); }
 .copy-state { flex: none; padding: 0 5px; border-radius: var(--r-pill); background: var(--surface-hover); color: var(--text-3); font-size: var(--fs-mini); font-weight: 400; line-height: 15px; white-space: nowrap; }
 .copy-state.warn { background: var(--warn-soft); color: var(--warn); }
 .copy-state.ok { background: var(--ok-soft); color: var(--ok); }
+.copy-state.accent { background: var(--accent-soft); color: var(--accent); }
+/* A sub-agent task's own report verdict: complete with data gaps, or a report handed in as plain text. */
+.sa-state { flex: none; padding: 0 5px; border-radius: var(--r-pill); background: var(--surface-hover); color: var(--text-3); font-size: var(--fs-mini); line-height: 15px; white-space: nowrap; }
+.sa-state.gaps { background: var(--accent-soft); color: var(--accent); }
 .branch-wt-action { color: var(--text); }
 .branch-wt-action > svg { flex: none; color: var(--accent); }
 .branch-wt-action:disabled { color: var(--text-3); }

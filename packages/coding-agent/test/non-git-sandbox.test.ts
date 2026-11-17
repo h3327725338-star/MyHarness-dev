@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionBackgroundWork } from "../src/agent/delegation/background-work.ts";
-import * as sandboxModule from "../src/agent/delegation/non-git-sandbox.ts";
+import * as mirrorPoolModule from "../src/agent/delegation/mirror-pool.ts";
 import {
 	cleanupStaleDelegatedSandboxes,
 	type DelegatedSandboxHandle,
@@ -187,7 +187,7 @@ describe("non-Git workspace mirrors", () => {
 	it("does not start a writable worker on the host when mirror preparation fails", async () => {
 		const path = await origin();
 		const failure = vi
-			.spyOn(sandboxModule, "prepareDelegatedSandbox")
+			.spyOn(mirrorPoolModule, "acquireMirrorCopy")
 			.mockResolvedValue({ ok: false, error: "mirror denied" });
 		try {
 			const result = await runExploreBatch({

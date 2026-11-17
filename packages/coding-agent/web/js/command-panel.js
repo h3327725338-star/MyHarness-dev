@@ -1072,8 +1072,11 @@ function worktreesScreen(ctx) {
 							{ key: "enter", label: t("Enter"), disabled: w.current || busy, onEnter: async (cc) => { if (await attempt(() => post("/api/git/worktrees/enter", { path: w.path }, undefined, { timeoutMs: REQUEST_TIMEOUT.session }))) { cc.close(); await loadGitStatus(); window.dispatchEvent(new CustomEvent("myharness:git-changed", { detail: { slot } })); reload(); } } },
 							...(!w.isMain
 								? [
-										{ key: "combine", label: t("Combine into main"), disabled: busy, onEnter: async (cc) => { const r = await attempt(() => post("/api/git/worktrees/combine", { branch: w.branch })); if (r) { toast(r.message || (r.status === "merged" ? t("Merged into main and removed.") : r.error || r.status), r.ok ? "info" : "error", 8000); reload(); cc.pop(); } } },
-										{ key: "delete", label: t("Delete copy"), danger: true, chevron: true, disabled: w.current || !!state.snap?.active, onEnter: (cc) => cc.push((ccc) => deleteCopyScreen(ccc, w, slot, reload)) },
+										// A pool copy is reused by sub-agent tasks and combining would delete its folder: no Combine row.
+										...(w.pool
+											? []
+											: [{ key: "combine", label: t("Combine into main"), disabled: busy, onEnter: async (cc) => { const r = await attempt(() => post("/api/git/worktrees/combine", { branch: w.branch })); if (r) { toast(r.message || (r.status === "merged" ? t("Merged into main and removed.") : r.error || r.status), r.ok ? "info" : "error", 8000); reload(); cc.pop(); } } }]),
+										{ key: "delete", label: t("Delete copy"), danger: true, chevron: true, disabled: w.current || !!state.snap?.active || (!!w.pool && !!w.poolBusy), onEnter: (cc) => cc.push((ccc) => deleteCopyScreen(ccc, w, slot, reload)) },
 									]
 								: []),
 						],

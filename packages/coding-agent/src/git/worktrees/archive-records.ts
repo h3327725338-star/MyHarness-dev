@@ -11,9 +11,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { isAbsolute, join, relative } from "node:path";
 import { resolvePath } from "../../utils/paths.ts";
 import { worktreeId } from "./display-name.ts";
+import { isSubagentPoolSlotPath } from "./pool-layout.ts";
 
 /** Why a copy exists. Written when the copy is created, so archiving never has to guess afterwards. */
-export type WorktreeOrigin = "manual" | "subagent" | "external";
+export type WorktreeOrigin = "manual" | "subagent" | "external" | "pool";
 
 /** Generated branch prefix of a delegated sub-agent copy; older copies have no record, only this name. */
 export const SUBAGENT_BRANCH_PREFIX = "myharness-subagent-";
@@ -62,7 +63,10 @@ export interface AutoArchiveCandidate {
 export function autoArchiveReason(candidate: AutoArchiveCandidate): "subagent" | "temporary" | undefined {
 	if (candidate.isMain || candidate.record?.archivedAt) return undefined;
 	const origin = candidate.record?.origin;
-	if (origin === "manual") return undefined;
+	if (origin === "manual" || origin === "pool") return undefined;
+	// A pool slot folder is the copy pool's long-lived infrastructure even without a record: it is reused task after
+	// task, so no name- or location-based fallback may archive it.
+	if (isSubagentPoolSlotPath(candidate.path)) return undefined;
 	if (origin === "subagent") return "subagent";
 	if (origin === "external") return "temporary";
 	// Sub-agent copies created before origins were recorded still carry their generated branch name.
@@ -75,7 +79,9 @@ function parseRecord(text: string): WorktreeArchiveRecord | undefined {
 	const data = JSON.parse(text) as Partial<WorktreeArchiveRecord>;
 	if (typeof data.path !== "string" || !data.path) return undefined;
 	const origin =
-		data.origin === "manual" || data.origin === "subagent" || data.origin === "external" ? data.origin : undefined;
+		data.origin === "manual" || data.origin === "subagent" || data.origin === "external" || data.origin === "pool"
+			? data.origin
+			: undefined;
 	return {
 		path: data.path,
 		origin,

@@ -50,6 +50,7 @@ vi.mock("../src/agent/runtime/services.ts", () => ({
 	createAgentSessionServices: fx.create,
 	createAgentSessionFromServices: async () => ({
 		session: {
+			messages: [],
 			prompt: fx.prompt,
 			steer: fx.steer,
 			dispose: fx.sessionDispose,

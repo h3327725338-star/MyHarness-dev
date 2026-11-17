@@ -8,6 +8,7 @@ import { statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { contentText } from "@myharness/ai";
+import { isSlotLockHeld } from "../../agent/delegation/slot-lock.ts";
 import { buildConversationTitleContext, normalizeConversationTitle } from "../../agent/runtime/conversation-title.ts";
 import { GitCommitUseCase } from "../../application/use-cases/git-commit.ts";
 import { GitPushUseCase, type GitPushWorkflowResult } from "../../application/use-cases/git-push.ts";
@@ -58,6 +59,12 @@ import {
 import { WorktreeDisplayNames } from "../../git/worktrees/display-name.ts";
 import { type GitWorktree, GitWorktreeManager } from "../../git/worktrees/manager.ts";
 import { WorktreeMergedRecords } from "../../git/worktrees/merged-records.ts";
+import {
+	isSubagentPoolSlotPath,
+	subagentPoolLockPath,
+	subagentPoolSlotIndex,
+	subagentPoolSlotName,
+} from "../../git/worktrees/pool-layout.ts";
 import { completeWithNetworkPolicy, failureOf } from "../../providers/recovery/network-retry.ts";
 import { mergeProviderAttributionHeaders } from "../../providers/runtime/attribution.ts";
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
@@ -109,6 +116,35 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 	const mergedCopies = () => new WorktreeMergedRecords(host.runtimeHost.services.agentDir);
 	const copyArchive = () => new WorktreeArchiveRecords(host.runtimeHost.services.agentDir);
 	const launchers = new Map<string, WorktreeLauncher>();
+
+	/** Occupancy lock file of a pool copy, or `undefined` when the copy is not one of the pool's reusable slots. */
+	const poolSlotLock = (mainWorktreePath: string, worktreePath: string): string | undefined => {
+		if (!isSubagentPoolSlotPath(worktreePath)) return undefined;
+		const slotName = subagentPoolSlotName(subagentPoolSlotIndex(worktreePath) ?? 0);
+		return subagentPoolLockPath(host.runtimeHost.services.agentDir, mainWorktreePath, slotName);
+	};
+	/** Whether a pool copy is held by a live sub-agent task right now (its occupancy lock is alive). */
+	const poolSlotBusy = (mainWorktreePath: string, worktreePath: string): boolean => {
+		const lock = poolSlotLock(mainWorktreePath, worktreePath);
+		return !!lock && isSlotLockHeld(lock);
+	};
+
+	/**
+	 * The real main worktree of the repository, the way the pool identifies it: the first entry of
+	 * `git worktree list --porcelain` (the manager's parse keeps that order), not the entry whose branch happens to
+	 * be named "main" (`listing.main`). The pool hashes its lock and state files under the first entry, so the busy
+	 * check must use the same path; with `main` checked out on another branch the two differ and the check would
+	 * silently read an empty state directory.
+	 */
+	const poolMainWorktreePath = (listing: { worktrees?: readonly GitWorktree[] }, fallback: string): string =>
+		listing.worktrees?.[0]?.path ?? fallback;
+
+	/** Refuse an action that would put a chat or a new instance into a pool copy a sub-agent task is holding. */
+	const refuseBusyPoolCopy = (root: string, worktreePath: string, message: string): void => {
+		if (!isSubagentPoolSlotPath(worktreePath)) return;
+		if (poolSlotBusy(poolMainWorktreePath(worktreeCase.list(root), root), worktreePath))
+			throw new HttpError(409, message);
+	};
 
 	const publishTask = (state: GitTaskState | undefined, result?: unknown) => {
 		if (state) tasks.set(host.slotId, state);
@@ -932,6 +968,7 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		const listing = await worktreeCase.listAsync(root);
 		if (!listing.ok) throw new HttpError(500, listing.error ?? "Cannot list worktrees.");
 		const current = path.resolve(cwd());
+		const poolMain = poolMainWorktreePath(listing, root);
 		const worktrees = listing.worktrees ?? [];
 		// Archive finished copies on the way out. Only a small record file is written here, never a Git command: the
 		// branch of an archived copy is released later, by the idle-guarded archive sync below.
@@ -946,6 +983,8 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		for (const worktree of worktrees) {
 			// The copy this chat runs in stays an active copy no matter what its folder looks like.
 			if (path.resolve(worktree.path) === current) continue;
+			// Pool copies are long-lived infrastructure: never archived behind the user's back, even without a record.
+			if (isSubagentPoolSlotPath(worktree.path)) continue;
 			const reason = autoArchiveReason({
 				path: worktree.path,
 				branch: worktree.branch,
@@ -999,6 +1038,9 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 					archived: !!record?.archivedAt,
 					archivedAt: record?.archivedAt ?? null,
 					archiveReason: record?.reason ?? null,
+					// The copy pool's reusable copies: shown with their own badges, never archived, deletable only idle.
+					pool: isSubagentPoolSlotPath(worktree.path),
+					poolBusy: poolSlotBusy(poolMain, worktree.path),
 					displayName: copyNames().label(worktree),
 					current: path.resolve(worktree.path) === current,
 				};
@@ -1096,7 +1138,13 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 
 	server.route("POST", "/api/git/worktrees/start", async ({ body }) => {
 		requireTrusted();
-		const worktree = findWorktree(repositoryRootOrThrow(), String(asObject(body).path ?? ""));
+		const root = repositoryRootOrThrow();
+		const worktree = findWorktree(root, String(asObject(body).path ?? ""));
+		refuseBusyPoolCopy(
+			root,
+			worktree.path,
+			"This pool copy is running a sub-agent task; stop the task before starting it.",
+		);
 		const agentDir = host.runtimeHost.services.agentDir;
 		let launcher = launchers.get(agentDir);
 		if (!launcher) {
@@ -1109,6 +1157,11 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 	server.route("POST", "/api/git/worktrees/enter", async ({ body }) => {
 		const root = repositoryRootOrThrow();
 		const worktree = findWorktree(root, String(asObject(body).path ?? ""));
+		refuseBusyPoolCopy(
+			root,
+			worktree.path,
+			"This pool copy is running a sub-agent task; stop the task before entering it.",
+		);
 		const result = await worktreeCase.enter(worktree, { carryHistory: asObject(body).carryHistory === true });
 		if (!result.ok) throw new HttpError(400, result.error ?? "Failed to enter the worktree.");
 		return { ok: true, message: result.message ?? null };
@@ -1119,6 +1172,12 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		requireTrusted();
 		const root = repositoryRootOrThrow();
 		const worktree = findWorktree(root, String(asObject(body).path ?? ""));
+		// A pool copy in use runs a sub-agent task: deleting it would pull the folder out from under the running worker.
+		if (isSubagentPoolSlotPath(worktree.path)) {
+			const listing = worktreeCase.list(root);
+			if (poolSlotBusy(poolMainWorktreePath(listing, root), worktree.path))
+				throw new HttpError(409, "This pool copy is running a sub-agent task; stop the task before deleting it.");
+		}
 		const result = worktreeCase.delete(root, worktree, asObject(body).force === true);
 		if (!result.ok) throw new HttpError(400, result.error ?? "Failed to delete the worktree.");
 		copyArchive().remove(worktree.path);
@@ -1145,6 +1204,8 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 			const manager = new GitWorktreeManager(host.runtimeHost.services.agentDir);
 			const candidates = (listing.worktrees ?? []).filter((worktree) => {
 				if (worktree.isMain || !worktree.branch) return false;
+				// Pool copies are long-lived infrastructure: the archive sync never detaches them.
+				if (isSubagentPoolSlotPath(worktree.path)) return false;
 				if (path.resolve(worktree.path) === current) return false;
 				const record = archive.get(worktree.path);
 				if (!record?.archivedAt) return false;
@@ -1201,6 +1262,10 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		const manager = new GitWorktreeManager(host.runtimeHost.services.agentDir);
 		const isCurrent = path.resolve(worktree.path) === path.resolve(cwd());
 		if (payload.archived === true) {
+			// Pool copies are long-lived infrastructure: archiving would move one out of the active list and detach a
+			// clean one (releasing its branch), the same protection the archive sync and clear already apply.
+			if (isSubagentPoolSlotPath(worktree.path))
+				throw new HttpError(409, "Pool copies are reused by sub-agent tasks and cannot be archived.");
 			const record = archive.get(worktree.path);
 			archive.update(worktree.path, {
 				archivedAt: new Date().toISOString(),
@@ -1250,6 +1315,9 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		const failed: Array<{ path: string; error: string }> = [];
 		const targets = (listing.worktrees ?? []).filter((worktree) => {
 			if (worktree.isMain || path.resolve(worktree.path) === current) return false;
+			// Pool copies are never archived here, and a pool copy that got a record some other way stays pool
+			// infrastructure: "Clear archived copies" must not delete it.
+			if (isSubagentPoolSlotPath(worktree.path)) return false;
 			if (only && !only.has(path.resolve(worktree.path))) return false;
 			return !!archive.get(worktree.path)?.archivedAt;
 		});
@@ -1290,6 +1358,14 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		const root = repositoryRootOrThrow();
 		const branch = String(asObject(body).branch ?? "");
 		if (!branch) throw new HttpError(400, "Branch is required.");
+		// Combining merges the branch into main and deletes the copy's folder. A pool copy is long-lived infrastructure
+		// a sub-agent task may be holding, so it is never combined (the delete route refuses a busy one the same way).
+		const listing = worktreeCase.list(root);
+		if (
+			listing.ok &&
+			listing.worktrees?.some((entry) => entry.branch === branch && isSubagentPoolSlotPath(entry.path))
+		)
+			throw new HttpError(409, "Pool copies are reused by sub-agent tasks and cannot be combined into main.");
 		const result = worktreeCase.combine(root, branch);
 		if (result.ok) invalidateGitReadCache(root);
 		return JSON.parse(JSON.stringify(result));
@@ -1369,6 +1445,17 @@ export function registerGitRoutes(server: WebHttpServer, host: WebHost): void {
 		// A separate explicit flag keeps existing branch-only callers safe.
 		if (payload.deleteWorktrees === true && payload.force !== true)
 			throw new HttpError(400, "Deleting a branch and its copies requires explicit force confirmation.");
+		// Deleting a branch with its copies force-removes every copy on that branch: a pool copy a sub-agent task holds
+		// is refused exactly like the copy delete route does.
+		if (payload.deleteWorktrees === true) {
+			const listing = worktreeCase.list(root);
+			const main = poolMainWorktreePath(listing, root);
+			const busyPoolCopy = (listing.worktrees ?? []).some(
+				(entry) => entry.branch === name && isSubagentPoolSlotPath(entry.path) && poolSlotBusy(main, entry.path),
+			);
+			if (busyPoolCopy)
+				throw new HttpError(409, "This pool copy is running a sub-agent task; stop the task before deleting it.");
+		}
 		const result =
 			payload.deleteWorktrees === true
 				? await worktreeCase.deleteBranchAndCopies(root, name)

@@ -389,11 +389,12 @@ function BranchMenu({ gitStatus, branchSource, slot, close }) {
 		for (const b of data?.branches || []) {
 			const copy = byBranch.get(b.name);
 			if (copy) shown.add(copy.path);
-			if (!b.current && (isSubagentBranch(b.name) || copy?.archived || copy?.subagent)) continue;
+			if (!b.current && (isSubagentBranch(b.name) || copy?.archived || copy?.subagent || copy?.pool)) continue;
 			out.push({ key: `b:${b.name}`, branch: b, copy });
 		}
 		// A copy no listed branch points at (a detached HEAD, or a branch the list does not have) still gets its row.
-		for (const w of copiesList) if (!shown.has(w.path) && !w.archived && !w.subagent) out.push({ key: `w:${w.path}`, copy: w });
+		// A detached pool copy waits in the Sub-agent copies group with the other sub-agent copies instead.
+		for (const w of copiesList) if (!shown.has(w.path) && !w.archived && !w.subagent && !w.pool) out.push({ key: `w:${w.path}`, copy: w });
 		const rank = ({ branch: b, copy: w }) => (b ? b.current : w?.current) ? 0 : w?.isMain ? 1 : !w ? 5 : w.merged ? 4 : holdsWork(w) ? 2 : 3;
 		const ordered = out.map((entry, index) => ({ entry, index }))
 			.sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
@@ -682,7 +683,7 @@ function BranchMenu({ gitStatus, branchSource, slot, close }) {
 	const rowActions = (target, { archived = false } = {}) => {
 		const w = target.copy;
 		const copy = !!w && !w.isMain;
-		const deletable = !w?.isMain && !(target.branch?.worktreePath && !w) && !(target.branch?.current || w?.current);
+		const deletable = !w?.isMain && !w?.poolBusy && !(target.branch?.worktreePath && !w) && !(target.branch?.current || w?.current);
 		return html`<div class="branch-row-actions" onClick=${(e) => e.stopPropagation()}>
 			${copy && !w.current ? html`<button class="icon-btn sm" disabled=${disabled} title=${t("Enter to edit")} aria-label=${t("Enter to edit")} onClick=${() => enterCopy(w.path)}><${Icon} name="arrowRight" size=${13} /></button>` : null}
 			${archived
@@ -725,6 +726,7 @@ function BranchMenu({ gitStatus, branchSource, slot, close }) {
 		<//>`;
 	};
 	// Rows of the folded groups below the list: sub-agent copies (deleted like any copy) and archived copies.
+	// A pool copy shows its own badges (Pool, and In use while a task holds it) and keeps its delete action only idle.
 	const groupRow = (w, archived = false) => {
 		const target = { key: `w:${w.path}`, kind: archived ? "archived" : "copy", branch: w.branch ? { name: w.branch } : null, copy: w };
 		const rowBusy = busy === target.key || busy === `w:${w.path}` || busy === `start:${w.path}` || busy === `archive:${w.path}`;
@@ -736,6 +738,8 @@ function BranchMenu({ gitStatus, branchSource, slot, close }) {
 					<span class="dim truncate branch-sub">${shortPath(w.path)}</span>
 				</span>
 				<${CopyState} w=${w} archived=${archived} />
+				${w.pool ? html`<span class="copy-state accent" title=${t("Kept in the sub-agent copy pool for reuse; never archived, never cleared")}>${t("Pool")}</span>` : null}
+				${w.poolBusy ? html`<span class="copy-state ok" title=${t("A sub-agent task is using this copy right now")}>${t("In use")}</span>` : null}
 				${confirmPill(target)}
 				${rowBusy ? html`<${Spinner} size=${13} />` : null}
 				${rowActions(target, { archived })}
@@ -747,7 +751,7 @@ function BranchMenu({ gitStatus, branchSource, slot, close }) {
 	// A group with a long list grows far taller than the region can show, which would make the shared fold fill the
 	// visible area in the first frame; capping the list lets the fold ease over the height you can actually see.
 	const copiesClass = (rows) => `branch-copies${rows.length > 12 ? " branch-copies-long" : ""}`;
-	const agentCopies = copiesList.filter((w) => !w.isMain && w.subagent && !w.archived);
+	const agentCopies = copiesList.filter((w) => !w.isMain && !w.archived && (w.subagent || w.pool));
 	// Newest archived copy first: the copy finished most recently is the one worth checking first.
 	const archivedCopies = copiesList
 		.filter((w) => !w.isMain && w.archived)

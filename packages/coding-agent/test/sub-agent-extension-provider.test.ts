@@ -18,7 +18,10 @@ const devLoader = resolve(here, "../../../scripts/dev-fast-loader.mjs");
 const claudeCodeShell = resolve(here, "../examples/extensions/claude-code-shell.ts");
 const mockClaude = resolve(here, "fixtures/mock-claude-chat.mjs");
 
-/** A provider whose one model reads notes.txt and then reports what the tool returned. */
+/**
+ * A provider whose one model reads notes.txt, reports what the tool returned, and, when asked to hand the report in,
+ * calls submit_report (it does not do so on its own, like a model that skips the instruction the first time).
+ */
 const SCRIPTED_PROVIDER = `
 import { createAssistantMessageEventStream, createProvider } from "@myharness/ai";
 
@@ -30,8 +33,23 @@ export default function (pi) {
 		const last = context.messages[context.messages.length - 1];
 		setTimeout(() => {
 			events.push({ type: "start", partial: output });
-			if (last?.role === "toolResult") {
-				const text = "REPORT: " + (last.isError ? "tool failed: " : "") + last.content.map((part) => part.text ?? "").join("").trim();
+			// The request to hand the report in comes after an earlier reply (a time reminder may follow it).
+			const lastReply = context.messages.map((message) => message.role).lastIndexOf("assistant");
+			const askedForReport =
+				lastReply !== -1 &&
+				context.messages
+					.slice(lastReply + 1)
+					.some((message) => message.role === "user" && JSON.stringify(message.content).includes("submit_report"));
+			if (askedForReport) {
+				// Asked to hand the report in: the text above is the report, so submit_report with an empty report.
+				const toolCall = { type: "toolCall", id: "call_scripted_submit", name: "submit_report", arguments: { report: "", questions: [] } };
+				output.content.push(toolCall);
+				output.stopReason = "toolUse";
+				events.push({ type: "toolcall_start", contentIndex: 0, partial: output });
+				events.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: output });
+				events.push({ type: "done", reason: "toolUse", message: output });
+			} else if (last?.role === "toolResult") {
+				const text = "REPORT: " + (last.isError ? "tool failed: " : "") + last.content.map((part) => part.text ?? "").join("").trim() + "\\nFindings: the file above was read in full and no other file was needed to answer the task.";
 				output.content.push({ type: "text", text });
 				events.push({ type: "text_start", contentIndex: 0, partial: output });
 				events.push({ type: "text_delta", contentIndex: 0, delta: text, partial: output });
@@ -133,12 +151,14 @@ describe("sub-agent on a model from an extension (real worker process)", () => {
 		});
 		const [first] = result.details.results;
 		expect(first.error).toBeUndefined();
-		expect(first).toMatchObject({ status: "completed", toolUseCount: 1 });
+		// The read, then the report handed in with submit_report once the worker asked for it.
+		expect(first).toMatchObject({ status: "completed", toolUseCount: 2, reportSubmission: "tool" });
 		expect(first.output).toContain("REPORT:");
 		expect(first.output).toContain("BLUE-HERON-42");
 		expect(first.transcript[0]).toMatchObject({ toolName: "read", status: "completed" });
+		expect(first.transcript[1]).toMatchObject({ toolName: "submit_report", status: "completed" });
 		// Whoever reads the report is told what the worker's copy of the folder left out.
-		expect((first.unresolved ?? []).some((note) => note.includes("未带入镜像") && note.includes(".env"))).toBe(true);
+		expect((first.unresolved ?? []).some((note) => note.includes("未带入副本") && note.includes(".env"))).toBe(true);
 	}, 120_000);
 
 	it("says in one plain line that the model does not exist in the worker when its extension is not handed over", async () => {
@@ -154,7 +174,7 @@ describe("sub-agent on a model from an extension (real worker process)", () => {
 		expect(first.error).not.toContain("httpIdleTimeoutMs");
 		expect(first.error).not.toContain("--list-models");
 		// A task that failed has no report: the list of left-out files is not hung under its error.
-		expect((first.unresolved ?? []).some((note) => note.includes("未带入镜像"))).toBe(false);
+		expect((first.unresolved ?? []).some((note) => note.includes("未带入副本"))).toBe(false);
 	}, 120_000);
 
 	it("does not start a worker whose provider extension cannot be loaded", async () => {
@@ -187,10 +207,11 @@ describe("sub-agent on a model from an extension (real worker process)", () => {
 		});
 		const [first] = result.details.results;
 		expect(first.error).toBeUndefined();
-		expect(first).toMatchObject({ status: "completed", toolUseCount: 1 });
+		expect(first).toMatchObject({ status: "completed", toolUseCount: 2, reportSubmission: "tool" });
 		expect(first.output).toContain("BLUE-HERON-42");
-		// The call was MyHarness's own `read`, which the worker's guards see, not a card for a tool claude ran itself.
-		expect(first.transcript.map((entry) => entry.toolName)).toEqual(["read"]);
+		// Both calls were MyHarness's own tools, which the worker's guards see, not cards for tools claude ran itself: the
+		// read, then submit_report once the worker asked for the report.
+		expect(first.transcript.map((entry) => entry.toolName)).toEqual(["read", "submit_report"]);
 
 		const entries = readFileSync(log, "utf8")
 			.trim()

@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorktreeArchiveRecords } from "../src/git/worktrees/archive-records.ts";
 import type { GitWorktree } from "../src/git/worktrees/manager.ts";
+import { subagentPoolLockPath, subagentPoolSlotName } from "../src/git/worktrees/pool-layout.ts";
 import type { WebHost } from "../src/modes/web/host.ts";
 import type { RequestContext, RouteHandler, WebHttpServer } from "../src/modes/web/http-server.ts";
 import { registerGitRoutes } from "../src/modes/web/routes-git.ts";
@@ -21,6 +22,9 @@ const mocks = vi.hoisted(() => ({
 	detachAsync: vi.fn(),
 	attach: vi.fn(),
 	removeAsync: vi.fn(),
+	combineWorktree: vi.fn(),
+	enterWorktree: vi.fn(),
+	deleteBranchAndCopies: vi.fn(),
 }));
 
 vi.mock("../src/git/repository/integration.ts", async (importOriginal) => ({
@@ -41,6 +45,9 @@ vi.mock("../src/application/use-cases/git-worktree.ts", () => ({
 		list = mocks.listWorktrees;
 		listAsync = mocks.listWorktreesAsync;
 		delete = mocks.deleteWorktree;
+		combine = mocks.combineWorktree;
+		enter = mocks.enterWorktree;
+		deleteBranchAndCopies = mocks.deleteBranchAndCopies;
 	},
 }));
 
@@ -68,12 +75,20 @@ const subagentCopyPath = path.join(fixtureRoot, "subagent-copy");
 const userArchivedPath = path.join(fixtureRoot, "user-archived-copy");
 const temporaryCopyPath = path.join(tmpdir(), "myharness-archive-route-fixture", "run-1");
 const prunableCopyPath = path.join(fixtureRoot, "prunable-copy");
+// A copy of the sub-agent copy pool: long-lived infrastructure under its stable folder name.
+const poolCopyPath = path.join(fixtureRoot, "myharness-subagent-pool-1");
 
 const mainWorktree: GitWorktree = { path: repositoryRoot, branch: "main", isMain: true, locked: false };
 const manualCopy: GitWorktree = { path: manualCopyPath, branch: "task-0101-0900", isMain: false, locked: false };
 const subagentCopy: GitWorktree = {
 	path: subagentCopyPath,
 	branch: "myharness-subagent-abc123",
+	isMain: false,
+	locked: false,
+};
+const poolCopy: GitWorktree = {
+	path: poolCopyPath,
+	branch: "myharness-subagent-abc456",
 	isMain: false,
 	locked: false,
 };
@@ -139,6 +154,7 @@ beforeEach(() => {
 		repositoryRoot,
 		manualCopyPath,
 		subagentCopyPath,
+		poolCopyPath,
 		userArchivedPath,
 		temporaryCopyPath,
 		prunableCopyPath,
@@ -150,6 +166,7 @@ beforeEach(() => {
 		mainWorktree,
 		manualCopy,
 		subagentCopy,
+		poolCopy,
 		userArchivedCopy,
 		temporaryCopy,
 		prunableCopy,
@@ -164,6 +181,7 @@ beforeEach(() => {
 	mocks.detach.mockReturnValue({ ok: true });
 	mocks.detachAsync.mockResolvedValue({ ok: true });
 	mocks.attach.mockReturnValue({ ok: true });
+	mocks.combineWorktree.mockReturnValue({ ok: true, status: "merged" });
 	mocks.deleteWorktree.mockReturnValue({ ok: true });
 	// A copy the app created on purpose: its origin record keeps it out of the automatic archive rule.
 	new WorktreeArchiveRecords(agentDir).update(manualCopyPath, { origin: "manual" });
@@ -212,8 +230,9 @@ describe("worktree archive routes", () => {
 		mocks.readActivity.mockClear();
 		await listCopies();
 		// Two Git processes per copy: archived copies, the main copy and prunable ones must not pay it on every menu open.
+		// The pool copy is never archived, so it is still an active copy and its activity is read like any other.
 		const read = mocks.readActivity.mock.calls.map(([worktree]) => (worktree as GitWorktree).path);
-		expect(read).toEqual([manualCopyPath]);
+		expect(read).toEqual([manualCopyPath, poolCopyPath]);
 	});
 
 	it("records the archive time and the branch that restoring has to check out again", async () => {
@@ -305,6 +324,111 @@ describe("worktree archive routes", () => {
 		expect(result).toMatchObject({ ok: true });
 		expect(mocks.attach).toHaveBeenCalledExactlyOnceWith(subagentCopyPath, "myharness-subagent-abc123");
 		expect(new WorktreeArchiveRecords(agentDir).get(subagentCopyPath)?.archivedAt).toBeUndefined();
+	});
+
+	it("refuses to combine a pool copy and combines a normal copy", async () => {
+		await listCopies();
+		// Combining would merge the branch and delete the copy's folder, so a pool copy is refused before Git runs.
+		// The combine handler is synchronous, so the refusal surfaces as a sync throw wrapped in a rejected promise.
+		const refused = async () => createHarness().post("/api/git/worktrees/combine", { branch: poolCopy.branch });
+		await expect(refused()).rejects.toMatchObject({
+			status: 409,
+		});
+		expect(mocks.combineWorktree).not.toHaveBeenCalled();
+
+		const result = (await createHarness().post("/api/git/worktrees/combine", { branch: manualCopy.branch })) as {
+			ok: boolean;
+		};
+		expect(result).toMatchObject({ ok: true });
+		expect(mocks.combineWorktree).toHaveBeenCalledWith(repositoryRoot, manualCopy.branch);
+	});
+
+	it("refuses to archive a pool copy by hand", async () => {
+		await listCopies();
+		await expect(
+			createHarness().post("/api/git/worktrees/archive", { path: poolCopyPath, archived: true }),
+		).rejects.toMatchObject({ status: 409 });
+		expect(mocks.detach).not.toHaveBeenCalled();
+		expect(new WorktreeArchiveRecords(agentDir).get(poolCopyPath)).toBeUndefined();
+	});
+
+	it("derives the pool busy state from the real main worktree, not the copy whose branch is main", async () => {
+		// The main worktree sits on another branch; a normal copy holds the branch named main, so `listing.main`
+		// points at that copy while the pool hashes its state under the first entry of the listing.
+		const devMain: GitWorktree = { path: repositoryRoot, branch: "dev", isMain: false, locked: false };
+		const copyOnMain: GitWorktree = { path: manualCopyPath, branch: "main", isMain: true, locked: false };
+		const shifted = {
+			ok: true,
+			repositoryRoot,
+			main: copyOnMain,
+			worktrees: [devMain, copyOnMain, poolCopy, subagentCopy],
+		};
+		mocks.listWorktrees.mockReturnValue(shifted);
+		mocks.listWorktreesAsync.mockResolvedValue(shifted);
+
+		const owner = {
+			version: 1,
+			pid: process.pid,
+			host: hostname(),
+			token: "test",
+			acquiredAt: new Date().toISOString(),
+			purpose: "test",
+		};
+		const lock = subagentPoolLockPath(agentDir, repositoryRoot, subagentPoolSlotName(1));
+		mkdirSync(path.dirname(lock), { recursive: true });
+		writeFileSync(lock, JSON.stringify(owner));
+		let copies = await listCopies();
+		expect(copies.get(poolCopyPath)).toMatchObject({ pool: true, poolBusy: true });
+
+		rmSync(lock);
+		// A lock under the state directory of the copy that merely carries the branch name is not the pool's.
+		const wrong = subagentPoolLockPath(agentDir, manualCopyPath, subagentPoolSlotName(1));
+		mkdirSync(path.dirname(wrong), { recursive: true });
+		writeFileSync(wrong, JSON.stringify(owner));
+		copies = await listCopies();
+		expect(copies.get(poolCopyPath)).toMatchObject({ pool: true, poolBusy: false });
+	});
+
+	it("refuses to enter a busy pool copy or delete its branch with the copies", async () => {
+		mocks.enterWorktree.mockResolvedValue({ ok: true });
+		mocks.deleteBranchAndCopies.mockResolvedValue({ ok: true });
+		const lock = subagentPoolLockPath(agentDir, repositoryRoot, subagentPoolSlotName(1));
+		mkdirSync(path.dirname(lock), { recursive: true });
+		writeFileSync(
+			lock,
+			JSON.stringify({
+				version: 1,
+				pid: process.pid,
+				host: hostname(),
+				token: "test",
+				acquiredAt: new Date().toISOString(),
+				purpose: "test",
+			}),
+		);
+		try {
+			const enter = async () => createHarness().post("/api/git/worktrees/enter", { path: poolCopyPath });
+			await expect(enter()).rejects.toMatchObject({ status: 409 });
+			expect(mocks.enterWorktree).not.toHaveBeenCalled();
+			const cascade = async () =>
+				createHarness().post("/api/git/branches/delete", {
+					name: poolCopy.branch,
+					force: true,
+					deleteWorktrees: true,
+				});
+			await expect(cascade()).rejects.toMatchObject({ status: 409 });
+			expect(mocks.deleteBranchAndCopies).not.toHaveBeenCalled();
+		} finally {
+			rmSync(lock, { force: true });
+		}
+		// Once the task let go, the same actions go through.
+		await createHarness().post("/api/git/worktrees/enter", { path: poolCopyPath });
+		expect(mocks.enterWorktree).toHaveBeenCalledTimes(1);
+		await createHarness().post("/api/git/branches/delete", {
+			name: poolCopy.branch,
+			force: true,
+			deleteWorktrees: true,
+		});
+		expect(mocks.deleteBranchAndCopies).toHaveBeenCalledTimes(1);
 	});
 
 	it("refuses to archive or clear while a task is running", async () => {

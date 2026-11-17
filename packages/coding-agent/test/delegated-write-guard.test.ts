@@ -3,6 +3,7 @@ import {
 	createDelegatedWriteGuardExtensionSource,
 	evaluateDelegatedWriteToolCall,
 	isPathWithinJail,
+	pathValueEscapesJail,
 	WRITE_GUARD_BLOCK_MARKER,
 } from "../src/tools/shell/delegated-write-guard.ts";
 
@@ -169,6 +170,50 @@ describe("delegated write guard: jail containment", () => {
 	});
 });
 
+describe("delegated write guard: normalization-aware path check (file: URLs fail closed)", () => {
+	it("rejects file: URLs that the tools would resolve outside the jail, in any case", () => {
+		// The tools resolve these through resolveToCwd/normalizePath (fileURLToPath) to absolute paths outside;
+		// the lexical jail check used to read them as relative names inside the copy and allow them.
+		expect(pathValueEscapesJail("file:///C:/Windows/evil.txt", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("file:///C:/outside/evil.txt", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("FILE:///C:/Windows/evil.txt", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("File:///C:/Windows/evil.txt", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("  file:///C:/Windows/evil.txt  ", ROOT)).toBe(true);
+		// Even a file: URL that names something inside the jail is rejected fail-closed.
+		expect(pathValueEscapesJail("file:///C:/work/jail/a.ts", ROOT)).toBe(true);
+	});
+
+	it("rejects the other normalizePath conversions the lexical check cannot follow", () => {
+		// Tilde expansion goes to the user's home; an @-prefixed file: URL is stripped before the URL conversion.
+		expect(pathValueEscapesJail("~/evil", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("~\\evil", ROOT)).toBe(true);
+		expect(pathValueEscapesJail("@file:///C:/Windows/evil.txt", ROOT)).toBe(true);
+		// Unicode space variants are normalized to spaces before resolution; the check normalizes them too.
+		expect(pathValueEscapesJail("src/a\u3000b.ts", ROOT)).toBe(false);
+	});
+
+	it("still allows plain relative and absolute paths inside the jail", () => {
+		expect(pathValueEscapesJail("src/a.ts", ROOT)).toBe(false);
+		expect(pathValueEscapesJail("./src/a.ts", ROOT)).toBe(false);
+		expect(pathValueEscapesJail("@src/a.ts", ROOT)).toBe(false);
+		expect(pathValueEscapesJail(`${ROOT}/a.ts`, ROOT)).toBe(false);
+		expect(pathValueEscapesJail("", ROOT)).toBe(false);
+	});
+
+	it("blocks the file tools when the value is a file: URL the tools would resolve outside", () => {
+		expect(file("read", { path: "file:///C:/Windows/evil.txt" })).toContain("越出本任务 worktree");
+		expect(file("write", { path: "file:///C:/Windows/evil.txt", content: "x" })).toContain("越出本任务 worktree");
+		expect(file("edit", { path: "FILE:///C:/Windows/evil.txt", edits: [] })).toContain("越出本任务 worktree");
+		expect(file("ls", { directory: "file:///C:/Windows" })).toContain("越出本任务 worktree");
+		expect(file("grep", { query: "x", path: "file:///C:/Windows" })).toContain("越出本任务 worktree");
+		expect(file("find", { path: "file:///C:/Windows", pattern: "*.txt" })).toContain("越出本任务 worktree");
+		expect(file("symbols", { path: "file:///C:/Windows" })).toContain("越出本任务 worktree");
+		// Inside the copy, plain relative paths keep working.
+		expect(file("read", { path: "src/a.ts" })).toBeUndefined();
+		expect(file("write", { path: `${ROOT}/docs/b.md`, content: "x" })).toBeUndefined();
+	});
+});
+
 describe("delegated write guard: generated extension source", () => {
 	it("embeds the marker and the worktree env override and stays valid JavaScript", async () => {
 		const source = createDelegatedWriteGuardExtensionSource();
@@ -203,6 +248,55 @@ describe("delegated write guard: generated extension source", () => {
 		} finally {
 			if (previous === undefined) delete process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE;
 			else process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE = previous;
+		}
+	});
+
+	it("blocks file: URL paths the same way the generated guard runs in the worker", async () => {
+		const source = createDelegatedWriteGuardExtensionSource();
+		// The generated source embeds the normalization-aware check via toString; it must be self-contained.
+		expect(source).toContain("plainPathValue");
+		const handlers: Array<(event: { toolName: string; input: Record<string, unknown> }) => Promise<unknown>> = [];
+		const stubPi = {
+			on: (_event: string, handler: (typeof handlers)[number]) => {
+				handlers.push(handler);
+			},
+		};
+		const evaluated = source.replace("export default function (pi) {", "function guard(pi) {");
+		new Function("pi", `${evaluated}\nguard(pi);`)(stubPi);
+		const previous = process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE;
+		process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE = ROOT;
+		try {
+			const fileUrl = await handlers[0]({ toolName: "write", input: { path: "file:///C:/Windows/evil.txt" } });
+			expect(fileUrl).toMatchObject({ block: true });
+			expect((fileUrl as { reason: string }).reason).toContain(WRITE_GUARD_BLOCK_MARKER);
+			const fileUrlRead = await handlers[0]({ toolName: "read", input: { path: "FILE:///C:/Windows/x" } });
+			expect(fileUrlRead).toMatchObject({ block: true });
+			const stillInside = await handlers[0]({ toolName: "write", input: { path: "src/a.ts" } });
+			expect(stillInside).toBeUndefined();
+		} finally {
+			if (previous === undefined) delete process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE;
+			else process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE = previous;
+		}
+	});
+});
+
+describe("delegated write guard: bare key=value arguments", () => {
+	it("checks the value of a bare key=value argument as a path", () => {
+		// `dd of=` and an environment prefix both hand the value to the program as a path.
+		expect(shell("dd if=README.md of=C:/Users/example/outside.txt bs=1 count=1")).toContain("越出本任务 worktree");
+		expect(shell("TMPDIR=C:/Users/example mktemp -d")).toContain("越出本任务 worktree");
+		expect(shell("TMPDIR=/c/Users/example mktemp -d")).toContain("越出本任务 worktree");
+		expect(shell("dd if=README.md of=../outside.img")).toContain("越出本任务 worktree");
+	});
+
+	it("keeps ordinary key=value arguments inside the copy available", () => {
+		for (const command of [
+			"FOO=bar npm test",
+			"dd if=README.md of=out.img",
+			"CI=true npx vitest --run",
+			"KEY= node x.js",
+		]) {
+			expect(shell(command), command).toBeUndefined();
 		}
 	});
 });

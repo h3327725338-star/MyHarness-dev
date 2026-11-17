@@ -20,6 +20,7 @@ import {
 	runGit,
 	setLocalGitIdentity,
 } from "../src/git/repository/integration.ts";
+import { isSubagentPoolSlotPath } from "../src/git/worktrees/pool-layout.ts";
 import { evaluateDelegatedWriteToolCall } from "../src/tools/shell/delegated-write-guard.ts";
 import {
 	buildSubAgentArgs,
@@ -66,7 +67,7 @@ describe("sub-agent runtime settings: capability mode", () => {
 });
 
 describe("delegated tool lists", () => {
-	it("keeps the historical read-only set plus the web tools, and adds exactly edit/write/pwsh/apply_rename for read-write", () => {
+	it("keeps the historical read-only set plus the web tools and submit_report, and adds exactly edit/write/pwsh/apply_rename for read-write", () => {
 		expect([...DELEGATED_TOOL_NAMES]).toEqual([
 			"read",
 			"grep",
@@ -76,6 +77,7 @@ describe("delegated tool lists", () => {
 			"symbols",
 			"web_search",
 			"web_fetch",
+			"submit_report",
 		]);
 		expect([...DELEGATED_WRITE_TOOL_NAMES]).toEqual([
 			"read",
@@ -86,6 +88,7 @@ describe("delegated tool lists", () => {
 			"symbols",
 			"web_search",
 			"web_fetch",
+			"submit_report",
 			"edit",
 			"write",
 			"pwsh",
@@ -103,7 +106,7 @@ describe("delegated tool lists", () => {
 		});
 		const toolsIndex = args.indexOf("--tools");
 		expect(toolsIndex).toBeGreaterThan(-1);
-		expect(args[toolsIndex + 1]).toBe("read,grep,find,ls,bash,symbols,web_search,web_fetch");
+		expect(args[toolsIndex + 1]).toBe("read,grep,find,ls,bash,symbols,web_search,web_fetch,submit_report");
 		// Read-write only changes the tool list, not any other flag.
 		const writeArgs = buildSubAgentArgs({
 			provider: "openai",
@@ -114,7 +117,7 @@ describe("delegated tool lists", () => {
 			mode: "read-write",
 		});
 		expect(writeArgs[writeArgs.indexOf("--tools") + 1]).toBe(
-			"read,grep,find,ls,bash,symbols,web_search,web_fetch,edit,write,pwsh,apply_rename",
+			"read,grep,find,ls,bash,symbols,web_search,web_fetch,submit_report,edit,write,pwsh,apply_rename",
 		);
 		// Every other flag is untouched by the mode.
 		const stripTools = (list: string[]) => {
@@ -276,6 +279,27 @@ describe("sub-agent tool definition wording", () => {
 	});
 });
 
+interface WorkflowSchemaShape {
+	properties: {
+		phases: {
+			items: { properties: { tasks: { items: { properties: Record<string, unknown>; required?: string[] } } } };
+		};
+	};
+}
+
+/** The schema without the read-write-only per-task `access` field. */
+function withoutAccess(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutAccess);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value)
+				.filter(([key]) => key !== "access")
+				.map(([key, inner]) => [key, withoutAccess(inner)]),
+		);
+	}
+	return value;
+}
+
 describe("workflow/ultracode wording follows the same mode", () => {
 	it("keeps read-only profiles verbatim and swaps the capability clauses for read-write", () => {
 		const readOnlyWorkflow = createInvestigationToolDefinition(process.cwd(), "workflow", {
@@ -350,12 +374,22 @@ describe("workflow/ultracode wording follows the same mode", () => {
 			}
 			return value;
 		};
-		expect(stripDescriptions(JSON.parse(readWriteJson))).toEqual(stripDescriptions(JSON.parse(readOnlyJson)));
+		// Read-write tasks also take the optional `access` (read or write); nothing else differs.
+		const readWriteTask = (JSON.parse(readWriteJson) as WorkflowSchemaShape).properties.phases.items.properties.tasks
+			.items;
+		const readOnlyTask = (JSON.parse(readOnlyJson) as WorkflowSchemaShape).properties.phases.items.properties.tasks
+			.items;
+		expect(readWriteTask.properties.access).toBeDefined();
+		expect(readWriteTask.required).not.toContain("access");
+		expect(readOnlyTask.properties.access).toBeUndefined();
+		expect(stripDescriptions(withoutAccess(JSON.parse(readWriteJson)))).toEqual(
+			stripDescriptions(JSON.parse(readOnlyJson)),
+		);
 		expect(readWriteJson).not.toBe(readOnlyJson);
 		expect(readOnlyJson).toContain("must not require modifying files");
 		expect(readOnlyJson).toContain("Read-only Explore tasks run in parallel");
 		expect(readWriteJson).not.toContain("must not require modifying files");
-		expect(readWriteJson).toContain("inside its own Git worktree");
+		expect(readWriteJson).toContain("only inside its own copy");
 		expect(readWriteJson).toContain("Explore tasks run in parallel within this phase");
 	});
 });
@@ -442,90 +476,116 @@ describe("read-write dispatch in non-Git workspaces falls back to temp sandbox",
 		}
 	});
 
-	it.each(["read-only", "read-write"] as const)("mirrors input and cleans up in %s mode", async (mode) => {
-		const plainDir = mkdtempSync(join(tmpdir(), "myharness-rw-nongit-"));
-		createdDirectories.push(plainDir);
-		writeFileSync(join(plainDir, "orig.txt"), "origin\n", "utf8");
-		const agentDir = mkdtempSync(join(tmpdir(), "myharness-rw-agent-"));
-		createdDirectories.push(agentDir);
-		const scratch = mkdtempSync(join(tmpdir(), "myharness-rw-nongit-entry-"));
-		createdDirectories.push(scratch);
-		const entryPath = join(scratch, "worker.mjs");
-		const envDumpPath = join(scratch, "env.json");
-		writeFileSync(
-			entryPath,
-			[
-				'import { writeFileSync, readFileSync } from "node:fs";',
-				'import { join } from "node:path";',
-				'if (readFileSync(join(process.cwd(), "orig.txt"), "utf8") !== "origin\\n") throw new Error("missing mirror input");',
-				'writeFileSync(join(process.cwd(), "orig.txt"), "changed only in mirror");',
-				`writeFileSync(${JSON.stringify(envDumpPath)}, JSON.stringify({ cwd: process.cwd(), mode: process.env.MYHARNESS_INTERNAL_DELEGATED_MODE, worktree: process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE, origin: process.env.MYHARNESS_INTERNAL_SANDBOX_ORIGIN }));`,
-				`writeFileSync(join(process.cwd(), "agent-change.txt"), "written inside the sandbox\\n");`,
-				`process.stdout.write(${JSON.stringify(
-					JSON.stringify({
-						type: "agent_end",
-						messages: [
-							{
-								role: "assistant",
-								content: [
-									{
-										type: "toolCall",
-										id: "call-1",
-										name: mode === "read-write" ? "edit" : "read",
-										arguments: { path: "orig.txt" },
-									},
-								],
-								timestamp: 1,
-							},
-							{
-								role: "toolResult",
-								toolCallId: "call-1",
-								toolName: mode === "read-write" ? "edit" : "read",
-								content: [{ type: "text", text: "ok" }],
-								isError: false,
-								timestamp: 2,
-							},
-							{ role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 3 },
-						],
-					}),
-				)} + "\\n");`,
-			].join("\n"),
-			"utf8",
-		);
-		previousEntry = process.env.MYHARNESS_CLI_ENTRY;
-		previousAgentDir = process.env[ENV_AGENT_DIR];
-		process.env.MYHARNESS_CLI_ENTRY = entryPath;
-		process.env[ENV_AGENT_DIR] = agentDir;
-		const settings = resolveSubAgentRuntimeSettings({
-			enabled: true,
-			provider: "faux",
-			model: "faux-model",
-			thinkingLevel: "off",
-			mode,
-		});
-		const result = await runExploreBatch({
-			cwd: plainDir,
-			tasks: [{ description: "Try", prompt: "Change something." }],
-			settings,
-		});
-		const dump = JSON.parse(readFileSync(envDumpPath, "utf8")) as {
-			cwd: string;
-			mode?: string;
-			worktree?: string;
-			origin?: string;
-		};
-		// The worker runs in a temp sandbox, not in the origin and not in a Git worktree dir.
-		expect(dump.cwd).not.toBe(plainDir);
-		expect(dump.cwd.includes("myharness-sandbox-")).toBe(true);
-		expect(dump.mode).toBe(mode === "read-write" ? "read-write" : undefined);
-		expect(dump.worktree).toBe(mode === "read-write" ? dump.cwd : undefined);
-		expect(dump.origin).toBe(realpathSync.native(plainDir));
-		// Sandbox is auto-removed after a clean run; origin stays clean.
-		expect(existsSync(dump.cwd)).toBe(false);
-		expect(readFileSync(join(plainDir, "orig.txt"), "utf8")).toBe("origin\n");
-		expect(existsSync(join(plainDir, "agent-change.txt"))).toBe(false);
-		expect(result.details.results[0]?.status).toBe("completed");
-	});
+	it.each(["read-only", "read-write"] as const)(
+		"mirrors input into a kept pool copy and never writes back in %s mode",
+		async (mode) => {
+			const plainDir = mkdtempSync(join(tmpdir(), "myharness-rw-nongit-"));
+			createdDirectories.push(plainDir);
+			writeFileSync(join(plainDir, "orig.txt"), "origin\n", "utf8");
+			const agentDir = mkdtempSync(join(tmpdir(), "myharness-rw-agent-"));
+			createdDirectories.push(agentDir);
+			const scratch = mkdtempSync(join(tmpdir(), "myharness-rw-nongit-entry-"));
+			createdDirectories.push(scratch);
+			const entryPath = join(scratch, "worker.mjs");
+			const envDumpPath = join(scratch, "env.json");
+			writeFileSync(
+				entryPath,
+				[
+					'import { writeFileSync, readFileSync } from "node:fs";',
+					'import { join } from "node:path";',
+					'if (readFileSync(join(process.cwd(), "orig.txt"), "utf8") !== "origin\\n") throw new Error("missing mirror input");',
+					'writeFileSync(join(process.cwd(), "orig.txt"), "changed only in mirror");',
+					`writeFileSync(${JSON.stringify(envDumpPath)}, JSON.stringify({ cwd: process.cwd(), mode: process.env.MYHARNESS_INTERNAL_DELEGATED_MODE, worktree: process.env.MYHARNESS_INTERNAL_DELEGATED_WORKTREE, origin: process.env.MYHARNESS_INTERNAL_SANDBOX_ORIGIN }));`,
+					`writeFileSync(join(process.cwd(), "agent-change.txt"), "written inside the sandbox\\n");`,
+					`process.stdout.write(${JSON.stringify(
+						JSON.stringify({
+							type: "agent_end",
+							messages: [
+								{
+									role: "assistant",
+									content: [
+										{
+											type: "toolCall",
+											id: "call-1",
+											name: mode === "read-write" ? "edit" : "read",
+											arguments: { path: "orig.txt" },
+										},
+									],
+									timestamp: 1,
+								},
+								{
+									role: "toolResult",
+									toolCallId: "call-1",
+									toolName: mode === "read-write" ? "edit" : "read",
+									content: [{ type: "text", text: "ok" }],
+									isError: false,
+									timestamp: 2,
+								},
+								{ role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 3 },
+							],
+						}),
+					)} + "\\n");`,
+				].join("\n"),
+				"utf8",
+			);
+			previousEntry = process.env.MYHARNESS_CLI_ENTRY;
+			previousAgentDir = process.env[ENV_AGENT_DIR];
+			process.env.MYHARNESS_CLI_ENTRY = entryPath;
+			process.env[ENV_AGENT_DIR] = agentDir;
+			const settings = resolveSubAgentRuntimeSettings({
+				enabled: true,
+				provider: "faux",
+				model: "faux-model",
+				thinkingLevel: "off",
+				mode,
+			});
+			const result = await runExploreBatch({
+				cwd: plainDir,
+				tasks: [{ description: "Try", prompt: "Change something." }],
+				settings,
+			});
+			const dump = JSON.parse(readFileSync(envDumpPath, "utf8")) as {
+				cwd: string;
+				mode?: string;
+				worktree?: string;
+				origin?: string;
+			};
+			// The worker runs in a mirror from the pool under the agent directory, not in the origin and not in Git.
+			expect(dump.cwd).not.toBe(plainDir);
+			expect(pathIdentityKey(dump.cwd).startsWith(pathIdentityKey(join(agentDir, "sandboxes")))).toBe(true);
+			expect(dump.mode).toBe(mode === "read-write" ? "read-write" : undefined);
+			expect(dump.worktree).toBe(mode === "read-write" ? dump.cwd : undefined);
+			expect(dump.origin).toBe(realpathSync.native(plainDir));
+			// The copy stays in the pool with the task's changes; the origin is never written to.
+			expect(existsSync(dump.cwd)).toBe(true);
+			expect(readFileSync(join(plainDir, "orig.txt"), "utf8")).toBe("origin\n");
+			expect(existsSync(join(plainDir, "agent-change.txt"))).toBe(false);
+			const first = result.details.results[0];
+			expect(first?.status).toBe("completed");
+			expect(first?.worktreePath).toBe(dump.cwd);
+			expect(first?.changedFiles).toEqual(["created:agent-change.txt", "modified:orig.txt"]);
+
+			// The next task reuses the same copy: the changes left in it are saved first, then it matches the origin again.
+			const second = await runExploreBatch({
+				cwd: plainDir,
+				tasks: [{ description: "Again", prompt: "Change something." }],
+				settings,
+			});
+			const secondDump = JSON.parse(readFileSync(envDumpPath, "utf8")) as { cwd: string };
+			expect(secondDump.cwd).toBe(dump.cwd);
+			expect(second.details.results[0]?.status).toBe("completed");
+			const savedNote = (second.details.results[0]?.unresolved ?? []).find((note) =>
+				note.includes("已在重用前另存到"),
+			);
+			expect(savedNote).toBeDefined();
+			const savedRoot = savedNote?.slice(savedNote.indexOf("另存到 ") + "另存到 ".length) ?? "";
+			expect(readFileSync(join(savedRoot, "files", "agent-change.txt"), "utf8")).toBe(
+				"written inside the sandbox\n",
+			);
+			expect(readFileSync(join(savedRoot, "files", "orig.txt"), "utf8")).toBe("changed only in mirror");
+			expect(readFileSync(join(plainDir, "orig.txt"), "utf8")).toBe("origin\n");
+		},
+	);
 });
 
 describe("read-write batch end-to-end through the fake delegated worker", () => {
@@ -657,7 +717,7 @@ describe("read-write batch end-to-end through the fake delegated worker", () => 
 		expect(result.text).toContain(dump.cwd);
 	});
 
-	it("removes a clean worktree and its branch after the task and reports nothing to keep", async () => {
+	it("keeps a clean copy in the pool, releases its branch, and reports nothing to keep", async () => {
 		const { repoDir, agentDir } = makeRepository();
 		const scratch = mkdtempSync(join(tmpdir(), "myharness-rw-e2e-clean-"));
 		createdDirectories.push(scratch);
@@ -692,15 +752,17 @@ describe("read-write batch end-to-end through the fake delegated worker", () => 
 		const dump = JSON.parse(readFileSync(envDumpPath, "utf8")) as { cwd: string };
 		const task = result.details.results[0];
 		expect(task.status).toBe("completed");
-		// A clean copy is archived instead of deleted: the folder stays, the generated branch is released.
+		// A clean copy stays in the pool for the next task: the folder stays, the generated branch is released (and so
+		// not reported).
 		expect(existsSync(dump.cwd)).toBe(true);
 		expect(task.worktreePath).toBe(dump.cwd);
-		expect(task.branchName).toMatch(/^myharness-subagent-/);
+		expect(isSubagentPoolSlotPath(dump.cwd)).toBe(true);
+		expect(task.branchName).toBeUndefined();
 		expect(task.changedFiles).toBeUndefined();
 		expect(runGit(repoDir, ["branch", "--list", "myharness-subagent-*"]).stdout.trim()).toBe("");
 	});
 
-	it("leaves the read-only dispatch path byte-for-byte behavior: no worktree, no mode env", async () => {
+	it("runs a read-only task in a detached read-only copy from the pool, with no write mode env", async () => {
 		const { repoDir, agentDir } = makeRepository();
 		const scratch = mkdtempSync(join(tmpdir(), "myharness-ro-e2e-"));
 		createdDirectories.push(scratch);
@@ -727,14 +789,20 @@ describe("read-write batch end-to-end through the fake delegated worker", () => 
 			mode?: string;
 			worktree?: string;
 		};
-		// VI.6: read-only tasks still run in the original cwd with no delegated env.
-		expect(dump.cwd).toBe(repoDir);
+		// Read-only tasks run in a copy of the workspace taken at dispatch, never in the workspace itself, and get no
+		// write capability env: the copy is a detached pool worktree.
+		expect(dump.cwd).not.toBe(repoDir);
+		expect(pathIdentityKey(dump.cwd).startsWith(pathIdentityKey(join(agentDir, "worktrees")))).toBe(true);
+		expect(isSubagentPoolSlotPath(dump.cwd)).toBe(true);
 		expect(dump.mode).toBeUndefined();
 		expect(dump.worktree).toBeUndefined();
-		expect(result.details.results[0].worktreePath).toBeUndefined();
-		expect(existsSync(join(agentDir, "worktrees"))).toBe(false);
+		expect(runGit(dump.cwd, ["symbolic-ref", "--quiet", "HEAD"]).ok).toBe(false);
+		const task = result.details.results[0];
+		expect(task.worktreePath).toBe(dump.cwd);
+		expect(task.access).toBe("read");
+		expect(task.branchName).toBeUndefined();
 		// The read-only transcript still validates as before.
-		expect(result.details.results[0].status).toBe("completed");
+		expect(task.status).toBe("completed");
 	});
 
 	it("hands the worker the workspace's uncommitted files and tells it what could not be carried over", async () => {
@@ -809,9 +877,7 @@ describe("read-write batch end-to-end through the fake delegated worker", () => 
 		expect(seen.prompt).toContain("nested-repo");
 		const task = result.details.results[0];
 		expect(task.status).toBe("completed");
-		expect(task.unresolved?.some((item) => item.includes("未带入 Worktree") && item.includes("nested-repo"))).toBe(
-			true,
-		);
+		expect(task.unresolved?.some((item) => item.includes("未带入副本") && item.includes("nested-repo"))).toBe(true);
 		// The imported files are not the worker's changes: an untouched copy is archived, not cleaned up.
 		expect(task.worktreePath).toBeDefined();
 		expect(existsSync(task.worktreePath!)).toBe(true);

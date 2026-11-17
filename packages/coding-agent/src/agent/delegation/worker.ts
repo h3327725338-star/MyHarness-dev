@@ -8,8 +8,10 @@ import { flushRawStdout, restoreStdout, takeOverStdout, writeRawStdout } from ".
 import { resolveCliModel } from "../../providers/runtime/model-resolver.ts";
 import { SessionManager } from "../../session/manager/index.ts";
 import { parseArgs } from "../../startup/args.ts";
+import { noteDelegatedAssistantText, setDelegatedReportQuestions } from "../../tools/submit-report.ts";
 import { setDelegatedCapabilities } from "../runtime/role.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../runtime/services.ts";
+import { runDelegatedReportFollowUps } from "./report-follow-up.ts";
 
 /**
  * One stdin line of the delegated worker protocol. The parent writes the
@@ -21,18 +23,26 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../r
  * mismatch between a long-running parent and a freshly started worker must not
  * silently drop the task.
  */
-export function parseDelegatedWorkerLine(line: string): { type: "prompt" | "steer"; text: string } | undefined {
+export function parseDelegatedWorkerLine(
+	line: string,
+): { type: "prompt" | "steer"; text: string; questions?: string[] } | undefined {
 	const trimmed = line.trim();
 	if (!trimmed) return undefined;
-	let value: { type?: unknown; text?: unknown };
+	let value: { type?: unknown; text?: unknown; questions?: unknown };
 	try {
-		value = JSON.parse(trimmed) as { type?: unknown; text?: unknown };
+		value = JSON.parse(trimmed) as { type?: unknown; text?: unknown; questions?: unknown };
 	} catch {
 		return undefined;
 	}
 	const text = typeof value.text === "string" ? value.text : "";
 	if (text.trim() === "") return undefined;
-	if (value.type === "prompt") return { type: "prompt", text };
+	if (value.type === "prompt") {
+		// The task's questions: `submit_report` checks each submission against them (tools/submit-report.ts).
+		const questions = Array.isArray(value.questions)
+			? value.questions.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+			: [];
+		return questions.length > 0 ? { type: "prompt", text, questions } : { type: "prompt", text };
+	}
 	if (value.type === "steer") return { type: "steer", text };
 	return undefined;
 }
@@ -102,6 +112,7 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 				if (input.type === "prompt") {
 					if (!promptSeen) {
 						promptSeen = true;
+						setDelegatedReportQuestions(input.questions);
 						resolveInitialPrompt(input.text);
 					}
 					return;
@@ -162,7 +173,22 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 			});
 			session = created.session;
 			await session.bindExtensions({ mode: "headless", onError: (error) => console.error(error.error) });
-			session.subscribe((event) => writeRawStdout(`${JSON.stringify(event)}\n`));
+			session.subscribe((event) => {
+				writeRawStdout(`${JSON.stringify(event)}\n`);
+				// The worker's submit_report checks whether any reply already carried text before accepting an
+				// empty report field (tools/submit-report.ts); this event stream is how the tool can know.
+				if (event.type !== "message_end") return;
+				const message = (event as { message?: { role?: unknown; content?: unknown } }).message;
+				if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
+				const text = message.content
+					.filter(
+						(part): part is { type: "text"; text: string } =>
+							typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text",
+					)
+					.map((part) => part.text)
+					.join("\n");
+				noteDelegatedAssistantText(text);
+			});
 			const promptText = await initialPrompt;
 			if (promptText !== null) {
 				// Steers that arrived before the session existed are queued and
@@ -176,6 +202,8 @@ export async function runDelegatedWorker(args: string[]): Promise<void> {
 					}
 				}
 				await session.prompt(promptText);
+				// One more turn when the reply was cut off or the report was never handed in (report-follow-up.ts).
+				await runDelegatedReportFollowUps(session);
 			}
 		} finally {
 			// The parent keeps stdin open for steering reminders, so release the

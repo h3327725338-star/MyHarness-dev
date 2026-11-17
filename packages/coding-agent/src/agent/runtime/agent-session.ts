@@ -125,7 +125,11 @@ import type { BashOperations } from "../../tools/shell/bash.ts";
 import type { BashResult } from "../../tools/shell/executor.ts";
 import { backgroundJobManager } from "../../tools/shell/job-manager.ts";
 import { SessionBashRunner } from "../../tools/shell/session-bash.ts";
-import type { SubAgentBackgroundProgress, SubAgentBackgroundTask } from "../../tools/sub-agent.ts";
+import {
+	resolveExploreMaxTasks,
+	type SubAgentBackgroundProgress,
+	type SubAgentBackgroundTask,
+} from "../../tools/sub-agent.ts";
 import type { SymbolsCodeIntelligenceServices } from "../../tools/symbols-runtime.ts";
 import { toolIdempotency } from "../../tools/tool-idempotency.ts";
 import { cleanupOrphanedToolResults } from "../../tools/tool-result-persistence.ts";
@@ -141,6 +145,7 @@ import {
 	type SubAgentDispatchState,
 	type SubAgentStateSnapshot,
 } from "../delegation/background-work.ts";
+import { scheduleCopyPoolPrewarm } from "../delegation/copy-pool.ts";
 import { resolveWorkerModelSupport } from "../delegation/worker-model.ts";
 import {
 	VisionAssistantManager,
@@ -668,6 +673,24 @@ export class AgentSession {
 			isBuiltinConfigured,
 		);
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		// A workspace whose sub-agent copy pool already exists gets it topped up and read once while idle, so the next
+		// dispatch does not wait for new copies or an antivirus scan (agent/delegation/copy-pool.ts).
+		if (this._agentRole === "main") {
+			try {
+				const subAgent = this.settingsManager.getSubAgentSettings();
+				if (subAgent.enabled) {
+					scheduleCopyPoolPrewarm({
+						agentDir: config.agentDir ?? getAgentDir(),
+						cwd: config.cwd,
+						size: resolveExploreMaxTasks(subAgent),
+						delayMs: 60_000,
+						onlyIfPoolExists: true,
+					});
+				}
+			} catch {
+				// Prewarming is an optimization; a settings problem is reported by the paths that need the settings.
+			}
+		}
 		this._traceCoordinator = new AgentSessionTraceCoordinator({
 			cwd: config.cwd,
 			traceDir: join(config.agentDir ?? getAgentDir(), "traces"),
@@ -699,6 +722,11 @@ export class AgentSession {
 				: undefined;
 		const workflowToolOptions = {
 			getSettings: () => this._subAgentSettings(),
+			// Phase results are kept with this conversation's other artifacts (see workflow/engine.ts).
+			getArtifactsDir: () => {
+				const scope = artifactScope(this.sessionManager);
+				return scope ? ensureSessionArtifacts(scope) : undefined;
+			},
 			trace: this._traceCoordinator.writer,
 			getTraceParentScope: () => this._traceCoordinator.activeScope,
 			onControlsReady: (toolCallId: string, controls: WorkflowToolControls) =>
@@ -713,6 +741,7 @@ export class AgentSession {
 			settingsManager: this.settingsManager,
 			customTools: this._agentRole === "main" ? (config.customTools ?? []) : [],
 			includeExtensionTools: this._agentRole !== "delegated",
+			delegatedReportTool: this._agentRole === "delegated",
 			codeIntelligence: config.codeIntelligence,
 			baseToolsOverride: config.baseToolsOverride,
 			allowedToolNames,

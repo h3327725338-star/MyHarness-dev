@@ -8,22 +8,30 @@ import type { AgentTool, ThinkingLevel } from "@myharness/agent-core";
 import { stripModelGuidance } from "@myharness/ai";
 import type { Message } from "@myharness/ai/compat";
 import { type Static, Type } from "typebox";
+import { beginCopyPoolUse, scheduleCopyPoolPrewarm } from "../agent/delegation/copy-pool.ts";
 import {
 	collectDelegatedEventMessages,
 	createDelegatedEventState,
 	type DelegatedJsonEvent,
 	extractDelegatedMessageToolEvidence,
 } from "../agent/delegation/event-parser.ts";
+import { acquireMirrorCopy, type MirrorCopyHandle, releaseMirrorCopy } from "../agent/delegation/mirror-pool.ts";
 import { registerDelegatedSandboxWorker } from "../agent/delegation/non-git-sandbox.ts";
+import {
+	CONTINUE_TRUNCATED_TEXT,
+	REQUEST_REPORT_AFTER_TEXT,
+	REQUEST_REPORT_WITHOUT_TEXT,
+} from "../agent/delegation/report-follow-up.ts";
+import {
+	acquirePooledWorktree,
+	createWorkspaceSnapshot,
+	type PooledWorktreeHandle,
+	releasePooledWorktree,
+} from "../agent/delegation/worktree-pool.ts";
 import {
 	DELEGATED_SANDBOX_ORIGIN_ENV,
 	type DelegatedSandboxHandle,
-	type DelegatedWorktreeHandle,
 	detectDelegatedWorkspace,
-	finalizeDelegatedSandbox,
-	finalizeDelegatedWorktree,
-	prepareDelegatedSandbox,
-	prepareDelegatedWorktree,
 } from "../agent/delegation/worktree-sandbox.ts";
 import {
 	DELEGATED_TOOL_NAMES,
@@ -47,8 +55,16 @@ import { getMyHarnessInvocation } from "../utils/myharness-invocation.ts";
 import { killProcessTreeAndWait } from "../utils/shell.ts";
 import type { BusinessToolDefinition } from "./contracts/index.ts";
 import { awaitForegroundDispatch, type DispatchRegistrar } from "./dispatch-control.ts";
-import { createDelegatedWriteGuardExtensionSource } from "./shell/delegated-write-guard.ts";
+import { createDelegatedWriteGuardExtensionSource, DELEGATED_READ_ROOTS_ENV } from "./shell/delegated-write-guard.ts";
 import { createReadOnlyGuardExtensionSource, isReadOnlyGuardBlockedToolResult } from "./shell/read-only-guard.ts";
+import {
+	normalizeSubmittedReport,
+	REPORT_QUESTION_STATUSES,
+	REPORT_TEXT_MIN_BYTES,
+	type ReportQuestionStatus,
+	SUBMIT_REPORT_TOOL_NAME,
+	type SubmittedQuestionStatus,
+} from "./submit-report.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { FULL_TEXT_OUTPUT } from "./tool-result-persistence.ts";
 import { truncateHead } from "./truncate.ts";
@@ -82,15 +98,34 @@ function subAgentTasksDescription(advertisedMaxTasks: number): string {
 const SUB_AGENT_BACKGROUND_DESCRIPTION =
 	"Preferred. Run the Explore tasks in the background and keep working on independent steps while they run; results arrive automatically. Omit only when you have nothing else to do until the results are in.";
 
-function createSubAgentTaskItemSchema(mode: SubAgentMode) {
-	return Type.Object({
+/** Description of the per-task `access` field (read-write mode only); shared with the workflow task schema. */
+export const SUB_AGENT_ACCESS_DESCRIPTION =
+	"read: investigation, review or research only; the task runs in a read-only copy and cannot change files. write: the task may edit files and run commands inside its own copy. Mark every task that does not need to change files as read. Default: write";
+
+/** Description of the per-task `readPaths` field; shared with the workflow task schema. */
+export const SUB_AGENT_READ_PATHS_DESCRIPTION =
+	"Absolute paths of folders or files outside the sub-agent's own copy that it may read with read, grep, find, ls and symbols (for example logs, reports or data folders); they are read-only for the sub-agent and cannot be used from its shell";
+
+/** Description of the per-task `questions` field; shared with the workflow task schema. */
+export const SUB_AGENT_QUESTIONS_DESCRIPTION =
+	"Specific questions to answer; the sub-agent hands in one status per question with its report (answered, partial, unavailable when the material cannot be reached, not_done), and any partial or not_done question returns the task as not complete";
+
+/** The per-task `access` field of read-write mode; read-only mode has no such field (every task reads only). */
+export function createSubAgentAccessSchema() {
+	return Type.Optional(
+		Type.Union([Type.Literal("read"), Type.Literal("write")], { description: SUB_AGENT_ACCESS_DESCRIPTION }),
+	);
+}
+
+function subAgentTaskItemProperties(mode: SubAgentMode) {
+	return {
 		description: Type.String({
 			description: "Short name for this independent exploration task",
 		}),
 		prompt: Type.String({
 			description:
 				mode === "read-write"
-					? "Clearly describe the investigation scope and the changes the sub-agent should make; it edits only inside its own Git worktree and never commits"
+					? "Clearly describe the investigation scope and, for a write task, the changes the sub-agent should make; it edits only inside its own copy and never commits"
 					: "Clearly describe the investigation scope and the expected findings to check; must not require modifying files",
 		}),
 		goal: Type.Optional(Type.String({ description: "The bounded question this task must answer" })),
@@ -99,15 +134,27 @@ function createSubAgentTaskItemSchema(mode: SubAgentMode) {
 		),
 		questions: Type.Optional(
 			Type.Array(Type.String(), {
-				description:
-					'Specific questions to answer; the report must answer each one and end with a "## Completion checklist" section, otherwise the task is returned as partial',
+				description: SUB_AGENT_QUESTIONS_DESCRIPTION,
 			}),
 		),
 		expectedOutput: Type.Optional(Type.String({ description: "Expected evidence-oriented output" })),
 		stopConditions: Type.Optional(
 			Type.Array(Type.String(), { description: "Conditions for stopping the investigation" }),
 		),
-	});
+		readPaths: Type.Optional(Type.Array(Type.String(), { description: SUB_AGENT_READ_PATHS_DESCRIPTION })),
+	};
+}
+
+function createSubAgentTaskItemSchema(mode: SubAgentMode) {
+	// Read-only mode keeps the historical task shape; read-write adds the optional `access`. The static type is the
+	// read-write superset either way.
+	return mode === "read-write"
+		? Type.Object({ ...subAgentTaskItemProperties(mode), access: createSubAgentAccessSchema() })
+		: (Type.Object(subAgentTaskItemProperties(mode)) as unknown as ReturnType<typeof readWriteTaskItemSchema>);
+}
+
+function readWriteTaskItemSchema() {
+	return Type.Object({ ...subAgentTaskItemProperties("read-write"), access: createSubAgentAccessSchema() });
 }
 
 function createSubAgentSchemaBody(mode: SubAgentMode, advertisedMaxTasks: number) {
@@ -121,7 +168,8 @@ function createSubAgentSchemaBody(mode: SubAgentMode, advertisedMaxTasks: number
 	};
 }
 
-const subAgentSchema = Type.Object(createSubAgentSchemaBody("read-only", SETTINGS_DEFAULTS.defaultSubAgentMaxTasks));
+// The read-write body is the superset (it adds the optional per-task `access`), so the static input type covers both.
+const subAgentSchema = Type.Object(createSubAgentSchemaBody("read-write", SETTINGS_DEFAULTS.defaultSubAgentMaxTasks));
 
 /**
  * The `tasks` array binds `maxItems` to the live `subAgent.maxTasks` value, while its description and the tool
@@ -142,7 +190,7 @@ export function formatDelegatedTaskPrompt(task: SubAgentTaskSpec): string {
 	if (task.questions?.length) {
 		sections.push(`Questions:\n${task.questions.map((item) => `- ${item}`).join("\n")}`);
 		sections.push(
-			"Report requirement: answer every question under Questions item by item in the final report, and end the report with a '## Completion checklist' section containing the two lines '- answered: <number of answered questions>' and '- unanswered: <each unanswered question, separated by semicolons; write none if everything is answered>'. A question that cannot be answered must appear under unanswered together with the missing evidence.",
+			"Report requirement: answer every question under Questions item by item in the final report, then hand the report in with submit_report, giving one entry per question in the same order with its status (answered, partial, unavailable, not_done). Use unavailable when you investigated but the material does not exist or cannot be reached, and say in note where you looked and what blocked you.",
 		);
 	}
 	if (task.expectedOutput) sections.push(`Expected output:\n${task.expectedOutput}`);
@@ -156,42 +204,228 @@ export interface ExploreReportCompleteness {
 	complete: boolean;
 	unanswered: string[];
 	note: string;
+	/** False when the report carries no checklist at all, so nothing about its questions could be read. */
+	checklistFound?: boolean;
 }
 
-const UNANSWERED_LINE_PATTERN = /^\s*(?:[-*]\s*)?unanswered\s*[:：]\s*(.*)$/gim;
+/**
+ * The `unanswered:` line of a free-text checklist, in the wordings models actually write: `- unanswered: none`,
+ * `**Unanswered questions:** None.`, `未回答：无`. Only read when a worker did not hand its report in with
+ * `submit_report` (see `evaluateExploreReportCompleteness`).
+ */
+const UNANSWERED_LINE_PATTERN =
+	/^\s*(?:[-*]\s*)?(?:\*\*)?(?:unanswered(?:\s+questions?)?|未回答(?:的?问题)?)(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.*)$/gim;
+/**
+ * A declaration that nothing is unanswered, optionally followed by a remark: `none`, `none (all four answered above)`,
+ * `无（均已回答）`, `0`. The remark is commentary, never a list of questions.
+ */
+const NOTHING_UNANSWERED_PATTERN =
+	/^(?:none|no|n\/a|nothing|nil|-+|0|无|没有|暂无|全部已?回答|均已回答)(?=$|[\s.。,，;；:：!！()（）[\]【】*_-])/i;
 
 /**
- * Explore reports for tasks with Questions must end with a self-declared
- * checklist (see system-prompts roles/explore.md). This check trusts only the
- * sub-agent's own declaration: a missing checklist or any declared unanswered
- * item downgrades the task to partial so the Main Agent sees exactly which
- * questions still need work.
+ * Fallback for a report that was not handed in with `submit_report`: read the self-declared checklist at the end of
+ * the text. This trusts only the sub-agent's own declaration: a missing checklist or any declared unanswered item
+ * makes the task not complete, so the Main Agent sees exactly which questions still need work.
  */
 export function evaluateExploreReportCompleteness(
 	questions: readonly string[] | undefined,
 	report: string,
 ): ExploreReportCompleteness {
 	const required = (questions ?? []).map((item) => item.trim()).filter((item) => item !== "");
-	if (required.length === 0) return { complete: true, unanswered: [], note: "" };
-	const declaredLines = [...report.matchAll(UNANSWERED_LINE_PATTERN)].map((match) => match[1] ?? "");
+	if (required.length === 0) return { complete: true, unanswered: [], note: "", checklistFound: true };
+	const declaredLines = [...report.matchAll(UNANSWERED_LINE_PATTERN)].map((match) => (match[1] ?? "").trim());
 	if (declaredLines.length === 0) {
 		return {
 			complete: false,
 			unanswered: required,
-			note: `报告未提供 Completion checklist 清单，无法确认 ${required.length} 个问题是否逐项回答。`,
+			note: `报告既没有用 submit_report 提交，也没有 Completion checklist 清单，无法确认 ${required.length} 个问题是否逐项回答。`,
+			checklistFound: false,
 		};
 	}
 	const unanswered = declaredLines
+		.filter((chunk) => !NOTHING_UNANSWERED_PATTERN.test(chunk.replace(/^[-*\s]+/, "")))
 		.flatMap((chunk) => chunk.split(/[;；]+/))
 		.map((item) => item.replace(/^[-*\s]+/, "").trim())
-		.filter((item) => item !== "" && !/^(none|no|n\/a|-+)$/i.test(item) && item !== "无");
+		.filter((item) => item !== "" && !NOTHING_UNANSWERED_PATTERN.test(item));
 	return unanswered.length === 0
-		? { complete: true, unanswered: [], note: "" }
+		? { complete: true, unanswered: [], note: "", checklistFound: true }
 		: {
 				complete: false,
 				unanswered,
 				note: `子 Agent 在报告中声明以下问题未回答：${unanswered.join("；")}。`,
+				checklistFound: true,
 			};
+}
+
+/** One question of the task with the status the worker handed in (or the status the fallback could read). */
+export type ExploreQuestionStatus = SubmittedQuestionStatus;
+
+/** What a handed-in report means for its task: every question answered, some only unreachable, or not complete. */
+export interface SubmittedReportVerdict {
+	outcome: "complete" | "data_gaps" | "incomplete";
+	statuses: ExploreQuestionStatus[];
+	/** `question: note` of every question whose material could not be reached. */
+	dataGaps: string[];
+	/** `question: note` of every partial or not done question. */
+	unfinished: string[];
+}
+
+function normalizeQuestionKey(value: string): string {
+	return value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+/** Line a same-count submission up with the task's questions by position (the historical behavior). */
+function alignSubmittedByPosition(
+	required: readonly string[],
+	submitted: readonly ExploreQuestionStatus[],
+): ExploreQuestionStatus[] {
+	return required.map((question, index) => ({ ...submitted[index], question }));
+}
+
+/**
+ * Line the submitted statuses up with the task's questions. When the counts match and every submitted entry matches
+ * exactly one required question by the normalized key (the worker may list them in another order), align by key;
+ * anything else keeps the historical positional alignment.
+ */
+function alignSubmittedByQuestion(
+	required: readonly string[],
+	submitted: readonly ExploreQuestionStatus[],
+): ExploreQuestionStatus[] {
+	const byKey = new Map<string, ExploreQuestionStatus>();
+	for (const entry of submitted) {
+		const key = normalizeQuestionKey(entry.question);
+		if (key === "" || byKey.has(key)) return alignSubmittedByPosition(required, submitted);
+		byKey.set(key, entry);
+	}
+	// Two required questions that normalize to the same key cannot be told apart by text: keep the positions.
+	const requiredKeys = required.map(normalizeQuestionKey);
+	if (new Set(requiredKeys).size !== requiredKeys.length || !requiredKeys.every((key) => byKey.has(key))) {
+		return alignSubmittedByPosition(required, submitted);
+	}
+	return required.map((question) => ({ ...byKey.get(normalizeQuestionKey(question))!, question }));
+}
+
+/**
+ * Line the submitted statuses up with the task's questions: by position when the counts match (the tool already
+ * enforces that), else by text. A question the submission does not cover counts as not done.
+ */
+export function evaluateSubmittedReport(
+	questions: readonly string[] | undefined,
+	submitted: readonly ExploreQuestionStatus[],
+): SubmittedReportVerdict {
+	const required = (questions ?? []).map((item) => item.trim()).filter((item) => item !== "");
+	let statuses: ExploreQuestionStatus[];
+	if (required.length === 0) statuses = [...submitted];
+	else if (submitted.length === required.length) {
+		statuses = alignSubmittedByQuestion(required, submitted);
+	} else {
+		const byKey = new Map(submitted.map((entry) => [normalizeQuestionKey(entry.question), entry]));
+		statuses = required.map(
+			(question) =>
+				byKey.get(normalizeQuestionKey(question)) ?? {
+					question,
+					status: "not_done" as const,
+					note: "提交的报告没有给出这个问题的状态",
+				},
+		);
+		statuses = statuses.map((entry, index) => ({ ...entry, question: required[index] }));
+	}
+	const describe = (entry: ExploreQuestionStatus) =>
+		entry.note ? `${entry.question}：${entry.note}` : entry.question;
+	const dataGaps = statuses.filter((entry) => entry.status === "unavailable").map(describe);
+	const unfinished = statuses
+		.filter((entry) => entry.status === "partial" || entry.status === "not_done")
+		.map(describe);
+	return {
+		outcome: unfinished.length > 0 ? "incomplete" : dataGaps.length > 0 ? "data_gaps" : "complete",
+		statuses,
+		dataGaps,
+		unfinished,
+	};
+}
+
+/** Chinese label of one handed-in question status, for the reports the Main Agent and the user read. */
+export const QUESTION_STATUS_LABEL: Record<ReportQuestionStatus, string> = {
+	answered: "已回答",
+	partial: "部分回答",
+	unavailable: "查过但资料拿不到",
+	not_done: "没做",
+};
+
+/** The `submit_report` the worker's tool accepted last, read from the transcript; `undefined` when there is none. */
+export function findSubmittedReport(messages: readonly Message[]):
+	| {
+			report: string;
+			questions: ExploreQuestionStatus[];
+			messageText: string;
+			/** Text of the truncated reply the accepted reply continued, when it does (`continue_truncated`). */
+			continuedText?: string;
+	  }
+	| undefined {
+	let acceptedId: string | undefined;
+	for (const message of messages) {
+		if (message.role === "toolResult" && message.toolName === SUBMIT_REPORT_TOOL_NAME && !message.isError) {
+			acceptedId = message.toolCallId;
+		}
+	}
+	if (!acceptedId) return undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "assistant") continue;
+		const call = message.content.find(
+			(part): part is Extract<(typeof message.content)[number], { type: "toolCall" }> =>
+				part.type === "toolCall" && part.id === acceptedId,
+		);
+		if (!call) continue;
+		const args = (call.arguments ?? {}) as Record<string, unknown>;
+		let normalized: { report: string; questions: ExploreQuestionStatus[] };
+		try {
+			normalized = normalizeSubmittedReport(args, []);
+		} catch {
+			// The worker's own tool accepted this call; keep whatever entries carry a known status.
+			const raw = Array.isArray(args.questions) ? (args.questions as Array<Record<string, unknown>>) : [];
+			normalized = {
+				report: typeof args.report === "string" ? args.report.trim() : "",
+				questions: raw
+					.filter((item) => (REPORT_QUESTION_STATUSES as readonly unknown[]).includes(item?.status))
+					.map((item) => ({
+						question: typeof item.question === "string" ? item.question : "",
+						status: item.status as ReportQuestionStatus,
+						...(typeof item.note === "string" && item.note.trim() ? { note: item.note.trim() } : {}),
+					})),
+			};
+		}
+		return { ...normalized, messageText: assistantText(message), ...continuedReportText(messages, index) };
+	}
+	return undefined;
+}
+
+/**
+ * After a `continue_truncated` follow-up the reply that hands the report in only carries the tail: the head is the
+ * earlier reply the output limit cut off. The two are one report, so the head text travels with the submission and
+ * the dispatcher reads the merged whole (see the fullOutput assembly in `runExploreTask`).
+ */
+function continuedReportText(
+	messages: readonly Message[],
+	callMessageIndex: number,
+): { continuedText?: string } | undefined {
+	// Every earlier reply the output limit cut off while it was writing text (no tool call) is a piece of the report:
+	// such a reply ends the run, so only a follow-up can come after it. Collect all of them back to the previous
+	// complete text reply, skipping replies that only made tool calls in between (a check after the cut, for example),
+	// so a report cut twice keeps every piece in order.
+	const pieces: string[] = [];
+	for (let index = callMessageIndex - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "assistant") continue;
+		if (assistantContainsToolCall(message)) continue;
+		const text = assistantText(message);
+		if (message.stopReason !== "length") {
+			if (text !== "") break;
+			continue;
+		}
+		if (text !== "") pieces.unshift(text);
+	}
+	return pieces.length > 0 ? { continuedText: pieces.join("\n") } : undefined;
 }
 
 export interface SubAgentRuntimeSettings {
@@ -238,6 +472,7 @@ export type ResolvedSubAgentRuntimeSettings = Required<
 		SubAgentRuntimeSettings,
 		| "mode"
 		| "chatMode"
+		| "maxTasks"
 		| "symbolsEnabled"
 		| "contextWindow"
 		| "providerExtensionPath"
@@ -290,8 +525,13 @@ export interface SubAgentToolTrace {
 	resultSummary?: string;
 }
 
-const INVESTIGATION_TOOL_NAMES = new Set<string>(DELEGATED_TOOL_NAMES);
-const INVESTIGATION_WRITE_TOOL_NAMES = new Set<string>(DELEGATED_WRITE_TOOL_NAMES);
+// Handing in the report is not investigation: a task that only called submit_report did no work.
+const INVESTIGATION_TOOL_NAMES = new Set<string>(
+	DELEGATED_TOOL_NAMES.filter((name) => name !== SUBMIT_REPORT_TOOL_NAME),
+);
+const INVESTIGATION_WRITE_TOOL_NAMES = new Set<string>(
+	DELEGATED_WRITE_TOOL_NAMES.filter((name) => name !== SUBMIT_REPORT_TOOL_NAME),
+);
 
 /**
  * A delegated task counts as having done real work when its transcript shows a
@@ -313,6 +553,12 @@ export type ExploreTaskStopReason =
 	| "max_turns_reached"
 	| "stalled"
 	| "incomplete_answer"
+	/** The worker never handed its report in with submit_report and its text carries no readable checklist. */
+	| "report_not_submitted"
+	/** The output limit cut the reply off before any report text was written. */
+	| "output_truncated"
+	/** The worker ended without writing any report text. */
+	| "no_report"
 	| "context_budget"
 	| "timeout"
 	| "cancelled"
@@ -373,7 +619,21 @@ export interface ExploreTaskResult {
 	recommendedNextInvestigation?: string[];
 	diagnostics?: ExploreTaskDiagnostics;
 	contextTelemetry?: ExploreTaskContextTelemetry;
-	/** Read-write tasks only: own worktree kept because it has uncommitted changes. */
+	/**
+	 * How the report reached the dispatcher: `tool` through `submit_report`; `text` when the worker never handed it in
+	 * and its reply text was read instead (shown as "没按格式提交").
+	 */
+	reportSubmission?: "tool" | "text";
+	/** One status per question of the task, as handed in (or as the text fallback could read it). */
+	questionStatuses?: ExploreQuestionStatus[];
+	/**
+	 * Questions investigated whose material could not be reached (`question: note`). A completed task with entries here
+	 * is "complete with data gaps": not a failure, but the Main Agent must know what is missing.
+	 */
+	dataGaps?: string[];
+	/** `read` tasks ran in a read-only copy; `write` tasks could edit inside their own copy. */
+	access?: "read" | "write";
+	/** The copy (worktree or file mirror of the pool) the task ran in. */
 	worktreePath?: string;
 	branchName?: string;
 	changedFiles?: string[];
@@ -476,6 +736,8 @@ export function resolveSubAgentRuntimeSettings(
 	return {
 		mode: settings.mode === "read-write" ? "read-write" : "read-only",
 		chatMode: settings.chatMode,
+		// The pool keeps at least this many copies ready (see agent/delegation/copy-pool.ts).
+		maxTasks: resolveExploreMaxTasks(settings),
 		symbolsEnabled: settings.symbolsEnabled,
 		provider: settings.provider ?? "",
 		model: settings.model ?? "",
@@ -513,7 +775,10 @@ function waitForProcessStop(pid: number | undefined): Promise<boolean> {
 const EXPLORE_SYSTEM_PROMPT = loadSystemPrompt("roles/explore.md");
 const EXPLORE_WRITE_SYSTEM_PROMPT = loadSystemPrompt("roles/explore-write.md");
 
-/** The Explore report the task prompt asks for ends with a `## Completion checklist` section. */
+/**
+ * Marker of the free-text checklist section: the legacy fallback parser reads it (and only it) when a worker never
+ * handed its report in with `submit_report`. A handed-in report does not carry it.
+ */
 const COMPLETION_CHECKLIST_PATTERN = /^#{1,6}\s*Completion checklist\s*$/im;
 /** Text longer than this is never a lone acknowledgement: real acknowledgements are short sign-offs. */
 const ACKNOWLEDGEMENT_MAX_LENGTH = 200;
@@ -559,7 +824,7 @@ const ACKNOWLEDGEMENT_ONLY_PATTERN = {
 	},
 };
 /** Below this many UTF-8 bytes a tool-call-free turn reads as a remark rather than as a report body. */
-const REPORT_CANDIDATE_MIN_BYTES = 96;
+const REPORT_CANDIDATE_MIN_BYTES = REPORT_TEXT_MIN_BYTES;
 /** A short closing turn only loses to an earlier turn that carries this multiple of its content. */
 const REPORT_DOMINANCE_RATIO = 8;
 const REPORT_SHORT_CLOSING_BYTES = 512;
@@ -573,7 +838,7 @@ function isRemarkLikeCandidate(text: string): boolean {
 	return ACKNOWLEDGEMENT_ONLY_PATTERN.test(text) || reportCandidateBytes(text) < REPORT_CANDIDATE_MIN_BYTES;
 }
 
-/** The `## Completion checklist` tail the Explore prompt requires at the end of a real report. */
+/** The free-text checklist tail the legacy fallback parser looks for at the end of an unsubmitted report. */
 function hasCompletionChecklist(text: string): boolean {
 	return COMPLETION_CHECKLIST_PATTERN.test(text);
 }
@@ -581,8 +846,9 @@ function hasCompletionChecklist(text: string): boolean {
 /**
  * Pick the report among the tool-call-free assistant turns that carry text (newest last). The newest turn normally
  * wins - it is the final answer - but a trailing turn must never erase the report above it when it only
- * acknowledges a steering reminder ("好的，收到") or is a short sign-off while an earlier turn carries the report the
- * Explore prompt asks for. `## Completion checklist` is the strongest report signal; a missing checklist stays the
+ * acknowledges a steering reminder ("好的，收到") or is a short sign-off while an earlier turn carries the real
+ * report. A free-text `## Completion checklist` is the strongest report signal for the legacy fallback parser (a
+ * report handed in with `submit_report` does not carry one); a missing checklist stays the
  * report's own problem, because `evaluateExploreReportCompleteness` still decides the partial / `incomplete_answer`
  * verdict from whichever text this function selects. These rules only choose the text, never the verdict.
  */
@@ -624,19 +890,72 @@ export function pickReportCandidate(candidates: readonly string[]): string {
  * the real report either, so empty candidates are skipped, not adopted. Only when no assistant message carries usable
  * text at all does the last one stand in.
  */
-export function getFinalAssistantText(messages: Message[]): string {
+export function getFinalAssistantText(messages: readonly Message[]): string {
 	let lastAssistant: Message | undefined;
 	const candidates: string[] = [];
+	// A reply the output limit cut off is continued by the next reply (report-follow-up.ts): the two are one report.
+	let continuesPrevious = false;
 	for (let index = 0; index < messages.length; index++) {
 		const message = messages[index];
 		if (message.role !== "assistant") continue;
 		lastAssistant = message;
-		if (assistantContainsToolCall(message)) continue;
+		if (assistantContainsToolCall(message)) {
+			continuesPrevious = false;
+			continue;
+		}
 		const text = assistantText(message);
-		if (text !== "") candidates.push(text);
+		if (text !== "") {
+			if (continuesPrevious && candidates.length > 0) candidates[candidates.length - 1] += text;
+			else candidates.push(text);
+		}
+		continuesPrevious = text !== "" && message.stopReason === "length";
 	}
 	if (candidates.length > 0) return pickReportCandidate(candidates);
 	return lastAssistant ? assistantText(lastAssistant) : "";
+}
+
+/**
+ * The reasoning the worker's last replies produced, for a task that ended without report text: the user decided such a
+ * task is reported as failed together with what the model was thinking. Only replies after the last tool result count
+ * (that is where the report should have been). Providers that return no reasoning text, or only an encrypted or
+ * redacted form, leave nothing to show; the caller says so.
+ */
+export function collectFinalReasoning(messages: readonly Message[], maxBytes = 12 * 1024): string {
+	const parts: string[] = [];
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "toolResult") {
+			// The trailing submit_report result only ends the run; the reasoning written just before handing it in is
+			// still the last thing the model produced, so skip it and keep scanning.
+			if (message.toolName === SUBMIT_REPORT_TOOL_NAME) continue;
+			break;
+		}
+		if (message.role !== "assistant") continue;
+		const thinking = message.content
+			.filter(
+				(part): part is Extract<(typeof message.content)[number], { type: "thinking" }> => part.type === "thinking",
+			)
+			.filter((part) => !part.redacted && typeof part.thinking === "string" && part.thinking.trim() !== "")
+			.map((part) => part.thinking.trim())
+			.join("\n\n");
+		if (thinking) parts.unshift(thinking);
+	}
+	const text = parts.join("\n\n---\n\n");
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	// Keep the end: it is the part closest to the report that was never written.
+	const buffer = Buffer.from(text, "utf8");
+	let start = buffer.length - maxBytes;
+	while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
+	return `[前面部分已省略]\n${buffer.subarray(start).toString("utf8")}`;
+}
+
+/** Stop reason of the worker's last reply, or `undefined` when it wrote none. */
+function lastAssistantStopReason(messages: readonly Message[]): string | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "assistant") return message.stopReason;
+	}
+	return undefined;
 }
 
 /** Keep the head of a string within `maxBytes` without ever cutting inside a UTF-8 codepoint. */
@@ -871,6 +1190,8 @@ function cloneExploreTaskResult(result: ExploreTaskResult): ExploreTaskResult {
 		conflicts: result.conflicts ? [...result.conflicts] : undefined,
 		unresolved: result.unresolved ? [...result.unresolved] : undefined,
 		changedFiles: result.changedFiles ? [...result.changedFiles] : undefined,
+		questionStatuses: result.questionStatuses?.map((entry) => ({ ...entry })),
+		dataGaps: result.dataGaps ? [...result.dataGaps] : undefined,
 		recommendedNextInvestigation: result.recommendedNextInvestigation
 			? [...result.recommendedNextInvestigation]
 			: undefined,
@@ -904,14 +1225,31 @@ function formatTaskReport(result: ExploreTaskResult, full = false): string {
 	const diagnostics = result.diagnostics
 		? `诊断：重复操作 ${result.diagnostics.repeatedOperations} 次，连续工具错误 ${result.diagnostics.consecutiveToolErrors} 次，无进展轮次 ${result.diagnostics.noProgressTurns} 次\n`
 		: "";
+	const verdictNote =
+		status === "completed" && result.dataGaps?.length
+			? "（完成，有资料缺口）"
+			: result.reportSubmission === "text"
+				? "（没按格式提交，按正文解析）"
+				: "";
+	const copyLabel = result.access === "read" ? "只读副本" : "读写副本";
 	return [
-		`### [${result.description}] ${status}${result.stopReason ? ` · ${result.stopReason}` : ""}`,
+		`### [${result.description}] ${status}${result.stopReason ? ` · ${result.stopReason}` : ""}${verdictNote}`,
 		`目标：${full ? (result.goal ?? result.prompt) : truncateDisplay(result.goal ?? result.prompt, 1_200)}`,
 		`工具调用：${result.toolUseCount} · turns：${result.turnCount ?? 0} · tokens：${result.tokens}`,
 		result.worktreePath
-			? `读写 Worktree：${result.worktreePath}${result.branchName ? `（分支 ${result.branchName}）` : ""}`
+			? `${copyLabel}：${result.worktreePath}${result.branchName ? `（分支 ${result.branchName}）` : ""}`
 			: "",
 		result.changedFiles?.length ? formatItems("改动文件", result.changedFiles) : "",
+		result.questionStatuses?.length
+			? formatItems(
+					"问题状态",
+					result.questionStatuses.map(
+						(entry) =>
+							`${QUESTION_STATUS_LABEL[entry.status]}：${entry.question}${entry.note ? `（${entry.note}）` : ""}`,
+					),
+				)
+			: "",
+		result.dataGaps?.length ? formatItems("资料缺口（查过但拿不到，不算失败）", result.dataGaps) : "",
 		result.lastMeaningfulProgress ? `最近有效进展：${result.lastMeaningfulProgress}` : "",
 		formatItems("已覆盖范围", result.coveredScope),
 		formatItems("已知发现", result.findings),
@@ -931,9 +1269,11 @@ function formatFinalResult(results: ExploreTaskResult[], full = false): string {
 	const partial = results.filter((result) => result.status === "partial").length;
 	const covered = [...new Set(results.flatMap((result) => result.coveredScope ?? []))].slice(0, MAX_STRUCTURED_ITEMS);
 	const unresolved = [...new Set(results.flatMap((result) => result.unresolved ?? []))].slice(0, MAX_STRUCTURED_ITEMS);
+	const withGaps = results.filter((result) => result.status === "completed" && result.dataGaps?.length).length;
+	const notSubmitted = results.filter((result) => result.reportSubmission === "text").length;
 	const sections = results.map((result) => formatTaskReport(result, full));
 	const formatted = [
-		`Explore：${completed}/${results.length} 个任务完成，${partial} 个保留部分结果`,
+		`Explore：${completed}/${results.length} 个任务完成${withGaps ? `（其中 ${withGaps} 个有资料缺口）` : ""}，${partial} 个保留部分结果${notSubmitted ? `，${notSubmitted} 个没按格式提交` : ""}`,
 		formatItems("Covered Scope", covered),
 		formatItems("Unresolved Scope", unresolved),
 		sections.join("\n\n---\n\n"),
@@ -1060,6 +1400,8 @@ async function runExploreTask(options: {
 	/** Non-Git fallback: original workspace the sandbox worker may read (read-only). */
 	sandboxOrigin?: string;
 	sandboxHandle?: DelegatedSandboxHandle;
+	/** Absolute paths outside the copy this task may read with the read-only file tools (see delegated-write-guard.ts). */
+	readRoots?: string[];
 }): Promise<ExploreTaskResult> {
 	const eventState = createDelegatedEventState();
 	const messages = eventState.messages;
@@ -1135,6 +1477,7 @@ async function runExploreTask(options: {
 					...(options.mode === "read-write" ? { MYHARNESS_INTERNAL_DELEGATED_MODE: "read-write" } : {}),
 					...(options.mode === "read-write" ? { MYHARNESS_INTERNAL_DELEGATED_WORKTREE: options.cwd } : {}),
 					...(options.sandboxOrigin ? { [DELEGATED_SANDBOX_ORIGIN_ENV]: options.sandboxOrigin } : {}),
+					...(options.readRoots?.length ? { [DELEGATED_READ_ROOTS_ENV]: JSON.stringify(options.readRoots) } : {}),
 					...(options.traceContext ? getRuntimeTraceEnvironment(options.traceContext) : {}),
 				},
 			});
@@ -1151,11 +1494,16 @@ async function runExploreTask(options: {
 			// 任务 prompt 与运行中提醒都通过 stdin 以 NDJSON 行传入：
 			// 避免超长命令行触发 ENAMETOOLONG，并允许向运行中的子会话注入 steering 提醒。
 			child.stdin?.on("error", () => {});
-			const writeWorkerInput = (payload: { type: "prompt" | "steer"; text: string }) => {
+			const writeWorkerInput = (payload: { type: "prompt" | "steer"; text: string; questions?: string[] }) => {
 				if (!child.stdin?.writable) return false;
 				return child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
 			};
-			writeWorkerInput({ type: "prompt", text: options.prompt });
+			// The questions travel with the prompt so the worker's submit_report can check each submission.
+			writeWorkerInput({
+				type: "prompt",
+				text: options.prompt,
+				...(options.questions?.length ? { questions: options.questions } : {}),
+			});
 			let buffer = "";
 			let settled = false;
 			let stopKind: "aborted" | "timeout" | "max_turns_reached" | "stalled" | undefined;
@@ -1485,8 +1833,21 @@ async function runExploreTask(options: {
 
 	reconcileMessageToolEvidence(currentResult, messages, options.cwd);
 	collectTranscriptEvidence(currentResult, options.cwd);
-	const fullOutput = getFinalAssistantText(messages);
+	// The report the worker handed in with submit_report wins; its empty `report` means "the text I already wrote".
+	// After a `continue_truncated` follow-up that text is the merged head (the cut-off reply) and tail (the reply that
+	// hands the report in), so the full output keeps both halves.
+	const submitted = findSubmittedReport(messages);
+	const textReport = getFinalAssistantText(messages);
+	const fullOutput = submitted
+		? submitted.report ||
+			(submitted.continuedText && submitted.messageText
+				? `${submitted.continuedText}\n${submitted.messageText}`
+				: "") ||
+			submitted.messageText ||
+			textReport
+		: textReport;
 	const output = truncateSubAgentOutput(fullOutput);
+	currentResult.access = options.mode === "read-write" ? "write" : "read";
 	currentResult.durationMs = Date.now() - startedAt;
 	if (currentResult.tokenUsage) {
 		currentResult.tokens =
@@ -1536,52 +1897,67 @@ async function runExploreTask(options: {
 		emitProgress();
 		return currentResult;
 	}
-	if (exitCode !== 0 || output === "") {
-		// Prefer the child's real error message (model request failure, provider
-		// error, timeout...) over a generic exit-code string so the parent UI can
-		// tell the user what actually went wrong.
-		const childError = [...messages]
-			.reverse()
-			.find(
-				(message) =>
-					message.role === "assistant" &&
-					"errorMessage" in message &&
-					typeof (message as { errorMessage?: unknown }).errorMessage === "string" &&
-					(message as { errorMessage: string }).errorMessage.length > 0,
-			);
-		const stderrText = stderr.trim();
-		const childErrorMessage =
-			stderrText ||
-			(childError
-				? ((childError as { errorMessage: string }).errorMessage ??
-					`Sub-agent process exited with code ${exitCode}`)
-				: `Sub-agent process exited with code ${exitCode}`);
-		// A child that emitted not a single event never started the task (bad entry,
-		// parent/worker version skew, startup crash). Say that plainly instead of
-		// handing raw stderr back as if it were the sub-agent's report.
-		const errorMessage =
-			messages.length === 0
-				? `子 Agent 进程未产生任何事件（退出码 ${exitCode}），任务没有真正开始${stderrText ? `；进程输出：${stderrText}` : ""}`
-				: exitCode === 0 && output === "" && !stderrText && !childError
-					? "子 Agent 正常结束但没有产出最终报告正文（最后几条 assistant 消息均无文本，可能是收敛提醒后的空回复或 thinking-only 消息）；已保留工具证据与覆盖清单，建议重派该任务并要求在最终回复正文直接给出答案"
-					: childErrorMessage;
-		if (hasUsefulResult(currentResult)) {
-			currentResult.status = "partial";
-			finalizePartialResult(
-				currentResult,
-				classifyChildFailure(errorMessage, Boolean(childError)),
-				errorMessage,
-				options.cwd,
-				fullOutput,
-			);
-		} else {
-			currentResult.status = "failed";
-			currentResult.stopReason = classifyChildFailure(errorMessage, Boolean(childError));
-			currentResult.error = errorMessage;
-			currentResult.lastToolInfo = currentResult.error;
-		}
+	const childError = [...messages]
+		.reverse()
+		.find(
+			(message) =>
+				message.role === "assistant" &&
+				"errorMessage" in message &&
+				typeof (message as { errorMessage?: unknown }).errorMessage === "string" &&
+				(message as { errorMessage: string }).errorMessage.length > 0,
+		);
+	const stderrText = stderr.trim();
+	if (exitCode === 0 && output === "" && messages.length > 0 && !stderrText && !childError) {
+		// The worker ran to its end (including the follow-up turns of report-follow-up.ts) without any report text. The
+		// user decided this is a failure, reported together with the reasoning the model produced instead.
+		finalizeMissingReport(currentResult, messages, options.cwd);
 		emitProgress();
 		return currentResult;
+	}
+	if (exitCode !== 0 || output === "") {
+		// A nonzero worker exit after an accepted report does not downgrade the verdict (V3): the report was handed in
+		// and accepted before the process died, so the verdict comes from the report below; only the exit itself is
+		// kept as a note. Cancellation by the user and an empty report body still take the failure paths.
+		if (submitted && output !== "" && currentResult.status !== "cancelled") {
+			pushUniqueLimited(
+				currentResult.unresolved,
+				`子 Agent 进程在交回报告后异常退出（退出码 ${exitCode}${stderrText ? `；输出：${stderrText}` : ""}），报告判定不受影响`,
+			);
+		} else {
+			// Prefer the child's real error message (model request failure, provider
+			// error, timeout...) over a generic exit-code string so the parent UI can
+			// tell the user what actually went wrong.
+			const childErrorMessage =
+				stderrText ||
+				(childError
+					? ((childError as { errorMessage: string }).errorMessage ??
+						`Sub-agent process exited with code ${exitCode}`)
+					: `Sub-agent process exited with code ${exitCode}`);
+			// A child that emitted not a single event never started the task (bad entry,
+			// parent/worker version skew, startup crash). Say that plainly instead of
+			// handing raw stderr back as if it were the sub-agent's report.
+			const errorMessage =
+				messages.length === 0
+					? `子 Agent 进程未产生任何事件（退出码 ${exitCode}），任务没有真正开始${stderrText ? `；进程输出：${stderrText}` : ""}`
+					: childErrorMessage;
+			if (hasUsefulResult(currentResult)) {
+				currentResult.status = "partial";
+				finalizePartialResult(
+					currentResult,
+					classifyChildFailure(errorMessage, Boolean(childError)),
+					errorMessage,
+					options.cwd,
+					fullOutput,
+				);
+			} else {
+				currentResult.status = "failed";
+				currentResult.stopReason = classifyChildFailure(errorMessage, Boolean(childError));
+				currentResult.error = errorMessage;
+				currentResult.lastToolInfo = currentResult.error;
+			}
+			emitProgress();
+			return currentResult;
+		}
 	}
 	if (!hasSuccessfulInvestigationEvidence(currentResult.transcript, options.mode)) {
 		currentResult.status = "failed";
@@ -1591,46 +1967,96 @@ async function runExploreTask(options: {
 		emitProgress();
 		return currentResult;
 	}
+	currentResult.goal ??= currentResult.prompt;
+	const setFullOutput = (value: string) =>
+		Object.defineProperty(currentResult, "fullOutput", { value, enumerable: false, configurable: true });
+	if (submitted) {
+		const verdict = evaluateSubmittedReport(options.questions, submitted.questions);
+		currentResult.reportSubmission = "tool";
+		if (verdict.statuses.length > 0) currentResult.questionStatuses = verdict.statuses;
+		if (verdict.dataGaps.length > 0) {
+			currentResult.dataGaps = verdict.dataGaps;
+			for (const item of verdict.dataGaps) pushUniqueLimited(currentResult.unresolved, `资料拿不到：${item}`);
+		}
+		currentResult.output = output;
+		setFullOutput(fullOutput);
+		if (verdict.outcome === "incomplete") {
+			currentResult.status = "partial";
+			currentResult.stopReason = "incomplete_answer";
+			currentResult.error = `子 Agent 提交的报告里有问题没有完成：${verdict.unfinished.join("；")}`;
+			for (const item of verdict.unfinished) pushUniqueLimited(currentResult.unresolved, `问题未完成：${item}`);
+			currentResult.recommendedNextInvestigation ??= [];
+			pushUniqueLimited(currentResult.recommendedNextInvestigation, "针对没有完成的问题做定向补查");
+			currentResult.lastToolInfo = "提交的报告里有问题没有完成";
+			emitProgress();
+			return currentResult;
+		}
+		currentResult.status = "completed";
+		currentResult.stopReason = "completed";
+		currentResult.lastToolInfo = verdict.dataGaps.length > 0 ? "完成（有资料缺口）" : "完成";
+		emitProgress();
+		return currentResult;
+	}
+	// Not handed in with submit_report, even after the follow-up request: read the text, and say so.
+	currentResult.reportSubmission = "text";
 	const completeness = evaluateExploreReportCompleteness(options.questions, fullOutput);
 	if (!completeness.complete) {
 		currentResult.status = "partial";
-		currentResult.stopReason = "incomplete_answer";
-		currentResult.error = completeness.note;
-		currentResult.goal ??= currentResult.prompt;
+		currentResult.stopReason = completeness.checklistFound === false ? "report_not_submitted" : "incomplete_answer";
+		currentResult.error = `没按格式提交（未调用 submit_report）。${completeness.note}`;
 		for (const item of completeness.unanswered) {
 			pushUniqueLimited(currentResult.unresolved, `问题未逐项回答：${item}`);
 		}
 		currentResult.recommendedNextInvestigation ??= [];
 		pushUniqueLimited(currentResult.recommendedNextInvestigation, "针对未回答的问题做定向补查");
-		const annotatedOutput = `${fullOutput}\n\n[自动检查] ${completeness.note}`;
+		const annotatedOutput = `${fullOutput}\n\n[自动检查] 没按格式提交（未调用 submit_report），以下按正文解析：${completeness.note}`;
 		currentResult.output = truncateSubAgentOutput(annotatedOutput);
-		Object.defineProperty(currentResult, "fullOutput", {
-			value: annotatedOutput,
-			enumerable: false,
-			configurable: true,
-		});
-		currentResult.lastToolInfo = "报告未满足问题逐项回答要求，已标记为 partial";
+		setFullOutput(annotatedOutput);
+		currentResult.lastToolInfo = "没按格式提交，正文里也确认不了问题是否答完";
 		emitProgress();
 		return currentResult;
 	}
 	currentResult.status = "completed";
-	// Never hand the main Agent a completed task with an empty body: if extraction produced no
-	// text at all, replace the missing report with an explicit diagnostic that names the failure
-	// and the remedy. A truncated body plus a pointer beats a silently empty one.
-	currentResult.output =
-		output !== ""
-			? output
-			: "[诊断] 子 Agent 标记为已完成，但最终报告正文为空（未能从任何无工具调用的 assistant 消息中提取到文本）；上方证据/覆盖清单来自工具事件对账，建议重派该任务或在任务中明确要求“必须在最终回复正文直接给出答案”，或检查本次 Explore 的落盘文件。";
 	currentResult.stopReason = "completed";
-	currentResult.goal ??= currentResult.prompt;
-	Object.defineProperty(currentResult, "fullOutput", {
-		value: fullOutput,
-		enumerable: false,
-		configurable: true,
-	});
-	currentResult.lastToolInfo = "完成";
+	currentResult.output = output;
+	setFullOutput(fullOutput);
+	currentResult.lastToolInfo = "完成（没按格式提交，按正文解析）";
 	emitProgress();
 	return currentResult;
+}
+
+/**
+ * A task that ended without any report text is a failure. Its result says why (the output limit cut the reply off
+ * before any text, or the worker simply wrote none even after being asked once more), attaches the reasoning the model
+ * produced when the provider returned it, and keeps the tool evidence collected so far.
+ */
+function finalizeMissingReport(result: ExploreTaskResult, messages: readonly Message[], cwd: string): void {
+	collectTranscriptEvidence(result, cwd);
+	const truncated = lastAssistantStopReason(messages) === "length";
+	const followUpTexts = [REQUEST_REPORT_AFTER_TEXT, REQUEST_REPORT_WITHOUT_TEXT, CONTINUE_TRUNCATED_TEXT];
+	const askedAgain = messages.some(
+		(message) =>
+			message.role === "user" && followUpTexts.some((text) => JSON.stringify(message.content).includes(text)),
+	);
+	const reason = truncated
+		? `模型输出达到这个模型设置的输出上限，还没写出报告正文就被截断${askedAgain ? "（已续过一轮，仍被截断）" : ""}。`
+		: `子 Agent 结束时没有写出报告正文${askedAgain ? "（已追问一次，仍没有）" : ""}。`;
+	const reasoning = collectFinalReasoning(messages);
+	result.status = "failed";
+	result.stopReason = truncated ? "output_truncated" : "no_report";
+	result.error = reason;
+	result.goal ??= result.prompt;
+	result.lastToolInfo = truncated ? "输出被截断，没有写出报告" : "没有写出报告";
+	const body = [
+		`[失败] ${reason}`,
+		reasoning
+			? `模型最后生成的推理过程（服务方返回的原文）：\n${reasoning}`
+			: "服务方没有返回推理原文（或只返回了加密/隐藏的推理），无法附上推理过程。",
+		formatItems("已覆盖范围", result.coveredScope),
+		formatItems("证据", result.evidence),
+	].join("\n\n");
+	result.output = truncateSubAgentOutput(body);
+	Object.defineProperty(result, "fullOutput", { value: body, enumerable: false, configurable: true });
 }
 
 export function buildSubAgentArgs(options: {
@@ -1694,6 +2120,11 @@ export interface RunExploreBatchOptions {
 	parentTraceScope?: RuntimeTraceScope;
 	phaseId?: string;
 	workflowRunId?: string;
+	/**
+	 * Absolute paths outside their copies that every task of the batch may read with the read-only file tools (the
+	 * workflow engine passes its phase results folder). Each task may add its own `readPaths`.
+	 */
+	extraReadRoots?: string[];
 }
 
 export interface ExploreBatchResult {
@@ -1702,12 +2133,78 @@ export interface ExploreBatchResult {
 	details: SubAgentToolDetails;
 }
 
+/** The access a task runs with: read-only mode allows reading only; read-write mode follows the task (default write). */
+export function resolveTaskAccess(mode: SubAgentMode, task: Pick<SubAgentTaskSpec, "access">): "read" | "write" {
+	if (mode !== "read-write") return "read";
+	return task.access === "read" ? "read" : "write";
+}
+
+/** The copy one task runs in: a pooled Git worktree or a pooled file mirror of a non-Git folder. */
+type TaskCopy = { kind: "worktree"; handle: PooledWorktreeHandle } | { kind: "mirror"; handle: MirrorCopyHandle };
+
+function taskCopyPath(copy: TaskCopy | undefined): string | undefined {
+	if (!copy) return undefined;
+	return copy.kind === "worktree" ? copy.handle.worktreePath : copy.handle.sandboxPath;
+}
+
+/**
+ * The locations outside its own copy a task may read: the batch's extra read roots (a workflow's phase results) plus
+ * the task's own `readPaths`, as absolute paths without duplicates. The worker's write guard receives exactly this list.
+ */
+export function resolveTaskReadRoots(
+	cwd: string,
+	extraReadRoots: readonly string[] | undefined,
+	readPaths: readonly string[] | undefined,
+): string[] {
+	return [
+		...new Set(
+			[...(extraReadRoots ?? []), ...(readPaths ?? [])]
+				.map((item) => item.trim())
+				.filter((item) => item !== "")
+				.map((item) => path.resolve(cwd, item)),
+		),
+	];
+}
+
+function describeReadRoots(readRoots: readonly string[]): string {
+	if (readRoots.length === 0) return "";
+	return `\n\n[可读清单] Outside your copy you may also read these locations, with the read, grep, find, ls and symbols tools and absolute paths only (not from the shell); they are read-only for you:\n${readRoots.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function describeWorktreeCopy(handle: PooledWorktreeHandle): string {
+	const lines = [
+		`[副本说明] You run in a copy of the Main Agent's workspace taken when this task was dispatched (snapshot commit ${handle.snapshot.commit.slice(0, 12)}): ${handle.worktreePath}. Use paths relative to your current directory; when the task names the Main Agent's workspace (${handle.snapshot.repositoryRoot}) by an absolute path, use the same path relative to your copy. Edits the Main Agent makes after dispatch are not visible to you.`,
+		handle.access === "read"
+			? "This copy is read-only for you: do not create, modify or delete files."
+			: `Your edits stay in this copy on branch ${handle.branchName ?? "(detached)"}; never commit.`,
+	];
+	if (handle.snapshot.importNotes.length > 0) {
+		lines.push(
+			`Workspace snapshot notes (these uncommitted files of the Main Agent's workspace are NOT in your copy):\n${handle.snapshot.importNotes.map((note) => `- ${note}`).join("\n")}`,
+		);
+	}
+	return `\n\n${lines.join("\n")}`;
+}
+
+function describeMirrorCopy(handle: MirrorCopyHandle): string {
+	return `\n\n[沙箱说明]工作区文件已同步到独立副本 ${handle.sandboxPath}（${handle.importedFiles} 个文件，${handle.importedBytes} 字节；本次只同步变化的 ${handle.copiedFiles} 个文件，移除 ${handle.removedFiles} 个，用时 ${handle.preparationMs}ms）。优先用相对路径（如 ./课件.pdf）读取；${handle.access === "read" ? "这个副本对你只读，不要创建、修改或删除文件。" : "所有修改和临时文件只留在副本里，不写回宿主。"}原工作区 ${handle.originCwd} 仅可通过 read/grep/find/ls/symbols 绝对路径补读，不得通过 bash/pwsh/edit/write 访问或修改。副本${handle.complete ? "已按过滤规则完成" : "不完整，不能将缺失文件当成不存在"}。\n未带入副本的项目：\n${handle.importNotes.length ? handle.importNotes.map((note) => `- ${note}`).join("\n") : "- 无"}`;
+}
+
 export async function runExploreBatch(options: RunExploreBatchOptions): Promise<ExploreBatchResult> {
 	const mode: SubAgentMode = options.settings.mode === "read-write" ? "read-write" : "read-only";
+	const agentDir = getAgentDir();
+	const endPoolUse = beginCopyPoolUse();
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "myharness-sub-agent-"));
-	const systemPromptPath = path.join(tempDir, "explore-prompt.md");
-	const guardPath = path.join(tempDir, mode === "read-write" ? "delegated-write-guard.js" : "read-only-guard.js");
+	const readPromptPath = path.join(tempDir, "explore-prompt.md");
+	const writePromptPath = path.join(tempDir, "explore-write-prompt.md");
+	const readGuardPath = path.join(tempDir, "read-only-guard.js");
+	const writeGuardPath = path.join(tempDir, "delegated-write-guard.js");
+	const taskAccess = options.tasks.map((task) => resolveTaskAccess(mode, task));
 	const taskPrompts = options.tasks.map(formatDelegatedTaskPrompt);
+	// Batch-wide readable roots plus the task's own, as absolute paths (relative ones are the Main Agent's workspace).
+	const taskReadRoots = options.tasks.map((task) =>
+		resolveTaskReadRoots(options.cwd, options.extraReadRoots, task.readPaths),
+	);
 	const parentTraceScope = options.parentTraceScope;
 	const taskTraceContexts = options.tasks.map((task) => {
 		if (!options.trace || !parentTraceScope) return undefined;
@@ -1747,6 +2244,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 			meaningfulProgressCount: 0,
 		},
 		contextTelemetry: { compactions: 0 },
+		access: taskAccess[index],
 		transcript: [],
 	}));
 	const emitProgress = () => {
@@ -1762,18 +2260,40 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 		});
 	};
 
-	const sandboxHandles: Array<DelegatedSandboxHandle | undefined> = options.tasks.map(() => undefined);
-	const sandboxErrors: Array<string | undefined> = options.tasks.map(() => undefined);
+	const copies: Array<TaskCopy | undefined> = options.tasks.map(() => undefined);
+	const copyErrors: Array<string | undefined> = options.tasks.map(() => undefined);
+	// Notes about a task's copy written before its worker starts (saved leftover changes); kept through every update.
+	const copyNotes: string[][] = options.tasks.map(() => []);
+	const released: boolean[] = options.tasks.map(() => false);
 	const taskControllers = options.tasks.map(() => new AbortController());
 	options.onKillReady?.((index) => taskControllers[index]?.abort());
 	const taskSignalFor = (index: number) =>
 		options.signal ? AbortSignal.any([options.signal, taskControllers[index].signal]) : taskControllers[index].signal;
-	const cleanupSandbox = async (index: number) => {
-		const handle = sandboxHandles[index];
-		if (!handle) return;
-		const finalized = await finalizeDelegatedSandbox(handle);
-		if (finalized.removed) sandboxHandles[index] = undefined;
-		if (finalized.error) results[index].unresolved = pushUniqueLimited(results[index].unresolved, finalized.error);
+	/** Known once the workspace was inspected; a dispatch that failed before that schedules no prewarm. */
+	let workspaceIsGit: boolean | undefined;
+	/** Give one task's copy back to the pool and record what the task left in it. Runs once per task. */
+	const releaseCopy = async (index: number) => {
+		const copy = copies[index];
+		if (!copy || released[index]) return;
+		released[index] = true;
+		// Updated in place: the result carries the untruncated report as a non-enumerable `fullOutput`, which a spread
+		// copy would drop (the Main Agent's full-text file would then hold only the truncated report).
+		if (copy.kind === "worktree") {
+			const finalized = await releasePooledWorktree(copy.handle);
+			Object.assign(results[index], {
+				worktreePath: copy.handle.worktreePath,
+				...(copy.handle.branchName && finalized.dirty ? { branchName: copy.handle.branchName } : {}),
+				...(finalized.dirty ? { changedFiles: finalized.changedFiles } : {}),
+			});
+			if (finalized.error) results[index].unresolved = pushUniqueLimited(results[index].unresolved, finalized.error);
+		} else {
+			const finalized = await releaseMirrorCopy(copy.handle);
+			Object.assign(results[index], {
+				worktreePath: copy.handle.sandboxPath,
+				...(finalized.changedFiles.length ? { changedFiles: finalized.changedFiles } : {}),
+			});
+			if (finalized.error) results[index].unresolved = pushUniqueLimited(results[index].unresolved, finalized.error);
+		}
 	};
 	try {
 		for (let index = 0; index < taskTraceContexts.length; index++) {
@@ -1793,6 +2313,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 				childRunId: traceTask.context.runId,
 				agentId: traceTask.context.agentId,
 				description: traceTask.task.description,
+				access: taskAccess[index],
 				maxTurns: resolvedSubAgentMaxTurns(options.settings.maxTurns),
 				stallTimeoutMs: resolvedSubAgentStallTimeoutMs(options.settings.stallTimeoutMs),
 				totalRuntimeLimitMs: resolvedTaskTimeoutMs(
@@ -1800,102 +2321,124 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 				),
 			});
 		}
+		const needsRead = taskAccess.includes("read");
+		const needsWrite = taskAccess.includes("write");
 		await Promise.all([
-			fs.promises.writeFile(
-				systemPromptPath,
-				mode === "read-write" ? EXPLORE_WRITE_SYSTEM_PROMPT : EXPLORE_SYSTEM_PROMPT,
-				{ encoding: "utf8", mode: 0o600 },
-			),
-			fs.promises.writeFile(
-				guardPath,
-				mode === "read-write"
-					? createDelegatedWriteGuardExtensionSource()
-					: createReadOnlyGuardExtensionSource("Sub Agent 已拦截命中的修改型 Bash 命令。", {
-							mode: "delegated",
-							adjudicator: {
-								provider: options.settings.provider,
-								model: options.settings.model,
-								agentDir: getAgentDir(),
-							},
+			...(needsRead
+				? [
+						fs.promises.writeFile(readPromptPath, EXPLORE_SYSTEM_PROMPT, { encoding: "utf8", mode: 0o600 }),
+						fs.promises.writeFile(
+							readGuardPath,
+							createReadOnlyGuardExtensionSource("Sub Agent 已拦截命中的修改型 Bash 命令。", {
+								mode: "delegated",
+								adjudicator: {
+									provider: options.settings.provider,
+									model: options.settings.model,
+									agentDir,
+								},
+							}),
+							{ encoding: "utf8", mode: 0o600 },
+						),
+					]
+				: []),
+			...(needsWrite
+				? [
+						fs.promises.writeFile(writePromptPath, EXPLORE_WRITE_SYSTEM_PROMPT, {
+							encoding: "utf8",
+							mode: 0o600,
 						}),
-				{ encoding: "utf8", mode: 0o600 },
-			),
+						fs.promises.writeFile(writeGuardPath, createDelegatedWriteGuardExtensionSource(), {
+							encoding: "utf8",
+							mode: 0o600,
+						}),
+					]
+				: []),
 		]);
 		emitProgress();
-		// Workspace-adaptive dispatch: Git workspaces keep the historical Git worktree
-		// isolation untouched; non-Git workspaces fall back to per-task temp sandboxes
-		// (never `git init`, never writes into the origin workspace).
+		// Every task runs in a copy from the pool, never in the Main Agent's workspace: a pooled Git worktree synced to
+		// one snapshot of the workspace, or, outside Git, a pooled file mirror (never `git init`, never a write into the
+		// origin folder). A copy that cannot be prepared fails the dispatch or that task; nothing falls back to the host.
 		const workspace = detectDelegatedWorkspace(options.cwd);
 		if (!workspace.ok) throw new Error(workspace.error);
-		const workspaceIsGit = workspace.isGit;
-		// Read-write tasks each run inside their own fresh Git worktree, created
-		// up front so an unusable workspace fails the whole dispatch with a clear
-		// reason instead of after some workers already started.
-		const worktreeHandles: Array<DelegatedWorktreeHandle | undefined> = options.tasks.map(() => undefined);
-
-		if (mode === "read-write" && workspaceIsGit) {
+		workspaceIsGit = workspace.isGit;
+		if (workspaceIsGit) {
+			for (const result of results) result.lastToolInfo = "正在给工作区拍快照…";
+			emitProgress();
+			const snapshot = await createWorkspaceSnapshot(options.cwd, agentDir, options.signal);
+			if (!snapshot.ok) throw new Error(`无法派出子代理：${snapshot.error}`);
 			for (let index = 0; index < options.tasks.length; index++) {
-				const prepared = prepareDelegatedWorktree({ cwd: options.cwd, agentDir: getAgentDir() });
-				if (!prepared.ok) {
-					for (const handle of worktreeHandles) {
-						if (handle) finalizeDelegatedWorktree(handle);
-					}
-					throw new Error(`无法派出读写子代理：${prepared.error}`);
-				}
-				worktreeHandles[index] = prepared.handle;
-			}
-		} else if (!workspaceIsGit) {
-			// Assemble independent mirrors before dispatch. Failure never runs a writable worker on the host.
-			for (let index = 0; index < options.tasks.length; index++) {
-				results[index].lastToolInfo = "正在准备工作区文件镜像…";
+				results[index].lastToolInfo = "正在准备副本…";
 				emitProgress();
-				const prepared = await prepareDelegatedSandbox({
-					originCwd: options.cwd,
-					signal: taskSignalFor(index),
-					onCreated: (handle) => {
-						sandboxHandles[index] = handle;
-					},
+				const acquired = await acquirePooledWorktree({
+					agentDir,
+					snapshot: snapshot.snapshot,
+					access: taskAccess[index],
+					signal: options.signal,
 				});
-				if (prepared.ok) sandboxHandles[index] = prepared.handle;
-				else sandboxErrors[index] = prepared.error;
+				if (!acquired.ok) {
+					// No task may start on a half-prepared batch: give back what was taken and fail the dispatch.
+					for (let taken = 0; taken < index; taken++) await releaseCopy(taken);
+					throw new Error(`无法派出子代理：${acquired.error}`);
+				}
+				copies[index] = { kind: "worktree", handle: acquired.handle };
+				if (acquired.handle.savedChanges) {
+					const saved = acquired.handle.savedChanges;
+					copyNotes[index].push(
+						`副本 ${acquired.handle.slotName} 里上一个任务留下的 ${saved.files} 个未合并改动，已在重用前存为提交 ${saved.commit.slice(0, 12)}（分支 ${saved.branch}）`,
+					);
+				}
+			}
+		} else {
+			for (let index = 0; index < options.tasks.length; index++) {
+				results[index].lastToolInfo = "正在同步工作区副本…";
+				emitProgress();
+				const acquired = await acquireMirrorCopy({
+					agentDir,
+					originCwd: options.cwd,
+					access: taskAccess[index],
+					signal: taskSignalFor(index),
+				});
+				if (acquired.ok) {
+					copies[index] = { kind: "mirror", handle: acquired.handle };
+					if (acquired.handle.savedChanges) {
+						const saved = acquired.handle.savedChanges;
+						copyNotes[index].push(
+							`副本 ${acquired.handle.slotName} 里上一个任务留下的 ${saved.files} 个改动，已在重用前另存到 ${saved.path}`,
+						);
+					}
+				} else copyErrors[index] = acquired.error;
 			}
 		}
 		// Per-task abort controllers: the panel can kill a single Explore task
 		// while the rest of the batch keeps running.
 		const lastProgressAt = options.tasks.map(() => undefined as string | undefined);
-		// Uncommitted files of the Main Agent's workspace that could not be copied into a worktree: the worker is told.
-		const workerCwdFor = (index: number): string => {
-			const worktree = worktreeHandles[index];
-			if (mode === "read-write" && worktree) return worktree.worktreePath;
-			const sandbox = sandboxHandles[index];
-			if (sandbox) return sandbox.sandboxPath;
-			return options.cwd;
-		};
 		const workerPromptFor = (index: number): string => {
 			const base = taskPrompts[index] ?? options.tasks[index]?.prompt ?? "";
-			const notes = worktreeHandles[index]?.importNotes ?? [];
-			const withWorktreeNotes =
-				notes.length === 0
-					? base
-					: `${base}\n\nWorkspace snapshot notes (these uncommitted files of the Main Agent's workspace are NOT in your worktree):\n${notes.map((note) => `- ${note}`).join("\n")}`;
-			const sandbox = sandboxHandles[index];
-			if (!sandbox) return withWorktreeNotes;
-			return `${withWorktreeNotes}\n\n[沙箱说明]工作区文件已复制到独立沙箱 ${sandbox.sandboxPath}（${sandbox.importedFiles} 个文件，${sandbox.importedBytes} 字节，装配 ${sandbox.preparationMs}ms）。优先用相对路径（如 ./课件.pdf）读取；所有修改和临时文件只留在沙箱，结束后删除，不写回宿主。原工作区 ${sandbox.originCwd} 仅可通过 read/grep/find/ls/symbols 绝对路径补读，不得通过 bash/pwsh/edit/write 访问或修改。镜像${sandbox.complete ? "已按过滤规则完成" : "不完整，不能将缺失文件当成不存在"}。\n未带入镜像的项目：\n${sandbox.importNotes.length ? sandbox.importNotes.map((note) => `- ${note}`).join("\n") : "- 无"}`;
+			const copy = copies[index];
+			const copyNote = !copy
+				? ""
+				: copy.kind === "worktree"
+					? describeWorktreeCopy(copy.handle)
+					: describeMirrorCopy(copy.handle);
+			return `${base}${copyNote}${describeReadRoots(taskReadRoots[index] ?? [])}`;
 		};
 		const taskSettlements = await Promise.allSettled(
 			options.tasks.map(async (task, index) => {
 				const traceContext = taskTraceContexts[index]?.context;
-				const sandbox = sandboxHandles[index];
+				const copy = copies[index];
+				const access = taskAccess[index];
 				try {
-					if (sandboxErrors[index]) throw new Error(sandboxErrors[index]);
-					results[index] = await runExploreTask({
-						cwd: workerCwdFor(index),
-						sandboxOrigin: sandbox?.originCwd,
-						sandboxHandle: sandbox,
+					if (copyErrors[index]) throw new Error(copyErrors[index]);
+					const cwd = taskCopyPath(copy);
+					if (!cwd) throw new Error("子代理没有可用的副本，已拒绝在主工作区运行");
+					const finished = await runExploreTask({
+						cwd,
+						sandboxOrigin: copy?.kind === "mirror" ? copy.handle.originCwd : undefined,
+						readRoots: taskReadRoots[index],
 						provider: options.settings.provider,
 						model: options.settings.model,
 						chatMode: options.settings.chatMode,
-						mode,
+						mode: access === "write" ? "read-write" : "read-only",
 						symbolsEnabled: options.settings.symbolsEnabled,
 						thinkingLevel: options.settings.thinkingLevel,
 						contextWindow: options.settings.contextWindow,
@@ -1904,8 +2447,8 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 						prompt: workerPromptFor(index),
 						goal: task.goal ?? task.prompt,
 						questions: task.questions,
-						systemPromptPath,
-						guardPath,
+						systemPromptPath: access === "write" ? writePromptPath : readPromptPath,
+						guardPath: access === "write" ? writeGuardPath : readGuardPath,
 						signal: taskSignalFor(index),
 						taskTimeoutMs: options.settings.taskTimeoutMs,
 						totalRuntimeLimitMs: options.settings.totalRuntimeLimitMs,
@@ -1915,7 +2458,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 						repeatedOperationDetection: options.settings.repeatedOperationDetection,
 						traceContext,
 						onProgress: (result) => {
-							results[index] = result;
+							results[index] = { ...result, unresolved: mergeUnresolved(copyNotes[index], result.unresolved) };
 							if (
 								options.trace &&
 								parentTraceScope &&
@@ -1940,18 +2483,24 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 							emitProgress();
 						},
 					});
+					finished.unresolved = mergeUnresolved(copyNotes[index], finished.unresolved);
+					results[index] = finished;
 					if (options.trace && parentTraceScope && traceContext) {
-						await options.trace.record(parentTraceScope, "task-finished", {
-							taskId: traceContext.taskId,
-							childRunId: traceContext.runId,
-							status: results[index].status,
-							toolUseCount: results[index].toolUseCount,
-							turnCount: results[index].turnCount,
-							tokens: results[index].tokens,
-							stopReason: results[index].stopReason,
-							findings: results[index].findings?.length ?? 0,
-							durationMs: results[index].durationMs,
-						});
+						await options.trace
+							.record(parentTraceScope, "task-finished", {
+								taskId: traceContext.taskId,
+								childRunId: traceContext.runId,
+								status: results[index].status,
+								toolUseCount: results[index].toolUseCount,
+								turnCount: results[index].turnCount,
+								tokens: results[index].tokens,
+								stopReason: results[index].stopReason,
+								reportSubmission: results[index].reportSubmission,
+								dataGaps: results[index].dataGaps?.length ?? 0,
+								findings: results[index].findings?.length ?? 0,
+								durationMs: results[index].durationMs,
+							})
+							.catch(() => {});
 					}
 					emitProgress();
 				} catch (error) {
@@ -1967,33 +2516,43 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 								: error instanceof Error
 									? error.message
 									: String(error);
-					results[index] = {
-						...results[index],
+					// Object.assign instead of a spread: `fullOutput` is non-enumerable, and a spread copy would drop the
+					// untruncated report a finished task had already attached (for example when the trace above threw).
+					Object.assign(results[index], {
+						unresolved: mergeUnresolved(copyNotes[index], results[index].unresolved),
 						status,
 						error: message,
 						lastToolInfo: status === "timeout" ? "执行超时" : status === "cancelled" ? "已取消" : message,
-					};
+					});
 					emitProgress();
 					if (options.trace && parentTraceScope && traceContext) {
-						await options.trace.record(parentTraceScope, "task-finished", {
-							taskId: traceContext.taskId,
-							childRunId: traceContext.runId,
-							status,
-							error: message,
-							stopReason: timeout ? "timeout" : cancelled ? "cancelled" : "runtime_error",
-							toolUseCount: results[index].toolUseCount,
-							turnCount: results[index].turnCount,
-							tokens: results[index].tokens,
-						});
+						await options.trace
+							.record(parentTraceScope, "task-finished", {
+								taskId: traceContext.taskId,
+								childRunId: traceContext.runId,
+								status,
+								error: message,
+								stopReason: timeout ? "timeout" : cancelled ? "cancelled" : "runtime_error",
+								toolUseCount: results[index].toolUseCount,
+								turnCount: results[index].turnCount,
+								tokens: results[index].tokens,
+							})
+							// Same as task-progress: a trace failure must not rewrite the settlement.
+							.catch(() => {});
 					}
 				} finally {
-					// What the mirror left out matters to whoever reads a report made from that mirror. A task that
-					// failed has no report: the list would only bury the one line that says why it failed.
-					if (sandbox && results[index].status !== "failed") {
-						for (const note of sandbox.importNotes)
-							results[index].unresolved = pushUniqueLimited(results[index].unresolved, `未带入镜像：${note}`);
+					// What the copy left out matters to whoever reads a report made from that copy. A task that failed has
+					// no report: the list would only bury the one line that says why it failed.
+					if (copy && results[index].status !== "failed") {
+						const notes = copy.kind === "worktree" ? copy.handle.snapshot.importNotes : copy.handle.importNotes;
+						for (const note of notes) {
+							results[index].unresolved = pushUniqueLimited(
+								results[index].unresolved,
+								copy.kind === "worktree" ? `未带入副本的未提交文件：${note}` : `未带入副本：${note}`,
+							);
+						}
 					}
-					await cleanupSandbox(index);
+					await releaseCopy(index);
 				}
 			}),
 		);
@@ -2012,32 +2571,7 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 			normalizedRejectedTask = true;
 		}
 		if (normalizedRejectedTask) emitProgress();
-
-		// Finalize every read-write worktree: each one is archived (its folder, commits and uncommitted files stay on
-		// disk for later inspection) and reported, never deleted.
-		if (mode === "read-write") {
-			for (let index = 0; index < worktreeHandles.length; index++) {
-				const handle = worktreeHandles[index];
-				if (!handle) continue;
-				const finalized = finalizeDelegatedWorktree(handle);
-				for (const note of handle.importNotes) {
-					results[index].unresolved = pushUniqueLimited(
-						results[index].unresolved,
-						`未带入 Worktree 的未提交文件：${note}`,
-					);
-				}
-				results[index] = {
-					...results[index],
-					worktreePath: handle.worktreePath,
-					branchName: handle.branchName,
-					...(finalized.dirty ? { changedFiles: finalized.changedFiles } : {}),
-				};
-				if (finalized.error) {
-					results[index].unresolved = pushUniqueLimited(results[index].unresolved, finalized.error);
-				}
-			}
-			emitProgress();
-		}
+		emitProgress();
 
 		const details: SubAgentToolDetails = {
 			completed: results.filter((result) => result.status === "completed").length,
@@ -2059,13 +2593,30 @@ export async function runExploreBatch(options: RunExploreBatchOptions): Promise<
 			details,
 		};
 	} finally {
-		for (let index = 0; index < sandboxHandles.length; index++) await cleanupSandbox(index);
+		for (let index = 0; index < copies.length; index++) await releaseCopy(index).catch(() => {});
+		endPoolUse();
+		// Top the pool up and let the antivirus read new files while the computer is idle, not at the next dispatch.
+		if (workspaceIsGit !== undefined) {
+			scheduleCopyPoolPrewarm({
+				agentDir,
+				cwd: options.cwd,
+				isGit: workspaceIsGit,
+				size: resolveExploreMaxTasks({ maxTasks: options.settings.maxTasks }),
+			});
+		}
 		await fs.promises.rm(tempDir, { recursive: true, force: true }).catch((error) => {
 			console.warn(
 				`清理子代理提示目录失败（已保留 ${tempDir}）：${error instanceof Error ? error.message : String(error)}`,
 			);
 		});
 	}
+}
+
+/** Notes recorded on a task before its worker started (saved leftover changes) survive the worker's own list. */
+function mergeUnresolved(before: readonly string[] | undefined, after: readonly string[] | undefined): string[] {
+	let merged = [...(after ?? [])];
+	for (const item of before ?? []) merged = pushUniqueLimited(merged, item);
+	return merged;
 }
 
 function batchOutcomeStatus(details: SubAgentToolDetails): "completed" | "partial" | "failed" {
@@ -2091,15 +2642,15 @@ export function createSubAgentToolDefinition(
 		label: "Agent",
 		description:
 			mode === "read-write"
-				? `Dispatch up to ${advertisedMaxTasks} parallel read-write scouts: use it as the first step whenever a task has 2 or more independently actionable directions (independent files or modules, multi-source comparison, parallel topics, per-section work, batch tests), and do the work directly only for single-point, single-file, strictly ordered, or simple factual work. Give every task a work order that names the exact files or topics in scope, the expected deliverable, and the isolation red line. Each sub-agent may edit files and run commands only inside its own Git worktree (a separate checkout kept under the settings directory, made from the current HEAD plus a copy of the workspace's uncommitted changes as they are now, so it sees the same files you see; your later edits are not visible to it, and your workspace cannot be read from it by absolute path); it can never commit, push, merge or stage, cannot start further sub-agents, and reports its worktree path, branch and changed files back with the result. Git worktree changes stay uncommitted for the Main Agent, which reviews every diff, integrates the changes, runs the real verification, and repairs defects itself. In a non-Git folder each task instead receives a filtered independent file mirror in a temporary sandbox; use relative paths there, and changes are disposable, never written back to the host. Mirror preparation failure never runs a writable worker in the host folder. Applying it as the highest-priority first step in every chat mode is the default working style: never start a single-threaded pass on a task with 2 or more independent directions.`
-				: `Dispatch up to ${advertisedMaxTasks} parallel read-only scouts: use it as the first step whenever a task has 2 or more independently actionable directions (independent files or modules, multi-source comparison, parallel topics, per-section work, batch tests), and do the work directly only for single-point, single-file, strictly ordered, or simple factual work. Give every task a work order that names the exact files or topics in scope, the expected deliverable, and the isolation red line. Sub-agents cannot modify the project. Non-Git folders are copied into per-task filtered file mirrors before workers start; use relative paths and observe the reported skipped files. The Main Agent reviews every receipt, verifies key findings, and repairs gaps itself. Applying it as the highest-priority first step in every chat mode is the default working style: never start a single-threaded pass on a task with 2 or more independent directions.`,
+				? `Dispatch up to ${advertisedMaxTasks} parallel read-write scouts: use it as the first step whenever a task has 2 or more independently actionable directions (independent files or modules, multi-source comparison, parallel topics, per-section work, batch tests), and do the work directly only for single-point, single-file, strictly ordered, or simple factual work. Give every task a work order that names the exact files or topics in scope, the expected deliverable, and the isolation red line. Mark a task access read when it only investigates, reviews or researches, and write when it must change files. Each sub-agent runs in its own copy of the workspace taken at dispatch: in Git, its own Git worktree from a reusable pool kept under the settings directory, synced to the current HEAD plus the workspace's uncommitted changes as they are now, so it sees the same files you see; your later edits are not visible to it. A write task may edit files and run commands only inside its copy; a read task may not change anything. Your workspace cannot be read from a copy by absolute path: list folders or files outside it that a task must read in readPaths. A sub-agent can never commit, push, merge or stage, cannot start further sub-agents, hands in its report with one status per question, and reports its copy path and changed files back with the result, plus the branch only when the copy kept changes. Its changes stay in its copy for the Main Agent, which reviews every diff, integrates the changes, runs the real verification, and repairs defects itself. In a non-Git folder each task instead receives a filtered file mirror from the same kind of reusable pool; use relative paths there, and changes are never written back to the host. Copy preparation failure never runs a writable worker in the host folder. Applying it as the highest-priority first step in every chat mode is the default working style: never start a single-threaded pass on a task with 2 or more independent directions.`
+				: `Dispatch up to ${advertisedMaxTasks} parallel read-only scouts: use it as the first step whenever a task has 2 or more independently actionable directions (independent files or modules, multi-source comparison, parallel topics, per-section work, batch tests), and do the work directly only for single-point, single-file, strictly ordered, or simple factual work. Give every task a work order that names the exact files or topics in scope, the expected deliverable, and the isolation red line. Sub-agents cannot modify the project. Each task reads a copy of the workspace taken at dispatch from a reusable pool (a Git worktree, or a filtered file mirror outside Git); use relative paths, observe the reported skipped files, and list folders or files outside the workspace that a task must read in readPaths. Every sub-agent hands in its report with one status per question. The Main Agent reviews every receipt, verifies key findings, and repairs gaps itself. Applying it as the highest-priority first step in every chat mode is the default working style: never start a single-threaded pass on a task with 2 or more independent directions.`,
 		promptSnippet: loadSystemPrompt("tools/agent/snippet.md", promptVariables),
 		promptGuidelines: [
 			...loadSystemPromptLines("tools/agent/guidelines.md", promptVariables),
 			`当前允许的最大子智能体并发/派发上限为 ${advertisedMaxTasks}，单次派发任务严禁超过该数量；如需更多方向，必须保留全部方向并分批推进，每批至多 ${advertisedMaxTasks} 个，首批完成后根据回执再派下一批，全程任何时刻活动子任务数不超过 ${advertisedMaxTasks}，严禁合并或丢弃任务。`,
 			...(mode === "read-write"
 				? [
-						"Read-write Explore sub-agents edit only inside their own Git worktree, never commit, push, merge or stage, and never start further sub-agents; their result reports the worktree path, branch and changed files. Each worktree starts as a snapshot of the current workspace (HEAD plus its uncommitted changes): refer to files by paths relative to the project root, because absolute paths of your own workspace are not readable from a worktree.",
+						"Read-write Explore sub-agents with access write edit only inside their own copy (their own Git worktree from the reusable pool, or a file mirror outside Git); tasks with access read cannot change their copy. They never commit, push, merge or stage, and never start further sub-agents; their result reports the copy path and changed files, and the branch only when the copy kept changes. Each copy starts as a snapshot of the current workspace (HEAD plus its uncommitted changes): refer to files by paths relative to the project root, because absolute paths of your own workspace are not readable from a copy unless listed in readPaths.",
 					]
 				: []),
 		],

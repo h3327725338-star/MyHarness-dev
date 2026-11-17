@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Static, Type } from "typebox";
@@ -7,6 +8,7 @@ import type { RuntimeTrace, RuntimeTraceScope } from "../observability/runtime-t
 import type { BusinessToolDefinition } from "../tools/contracts/index.ts";
 import { awaitForegroundDispatch, type DispatchRegistrar } from "../tools/dispatch-control.ts";
 import {
+	createSubAgentAccessSchema,
 	DEFAULT_SUB_AGENT_TASK_TIMEOUT_MS,
 	type ExploreBatchResult,
 	type ExploreTaskResult,
@@ -16,14 +18,17 @@ import {
 	resolveExploreMaxTasks,
 	resolveSubAgentRuntimeSettings,
 	runExploreBatch,
+	SUB_AGENT_QUESTIONS_DESCRIPTION,
+	SUB_AGENT_READ_PATHS_DESCRIPTION,
 	type SubAgentRuntimeSettings,
+	truncateHeadKeepingContent,
 } from "../tools/sub-agent.ts";
 import { wrapToolDefinition } from "../tools/tool-definition-wrapper.ts";
 import { FULL_TEXT_OUTPUT } from "../tools/tool-result-persistence.ts";
 import { INVESTIGATION_TOOL_PROFILES, type InvestigationToolKind } from "../ultracode/profile.ts";
 
-function createInvestigationTaskSchema(mode: SubAgentMode) {
-	return Type.Object({
+function investigationTaskProperties(mode: SubAgentMode) {
+	return {
 		description: Type.String({
 			description:
 				mode === "read-write"
@@ -33,20 +38,33 @@ function createInvestigationTaskSchema(mode: SubAgentMode) {
 		prompt: Type.String({
 			description:
 				mode === "read-write"
-					? "Clearly describe the investigation scope, the facts to confirm, and the evidence to return; in the current read-write mode a task may also ask the sub-agent to edit files or run commands, but only inside its own Git worktree and it never commits"
+					? "Clearly describe the investigation scope, the facts to confirm, and the evidence to return; in the current read-write mode a write task may also ask the sub-agent to edit files or run commands, but only inside its own copy and it never commits"
 					: "Clearly describe the investigation scope, the facts to confirm, and the evidence to return; must not require modifying files",
 		}),
 		goal: Type.Optional(Type.String({ description: "The bounded question this task must answer" })),
 		scope: Type.Optional(Type.Array(Type.String(), { description: "Files, modules, or runtime areas in scope" })),
 		questions: Type.Optional(
 			Type.Array(Type.String(), {
-				description:
-					'Specific questions to answer; the report must answer each one and end with a "## Completion checklist" section, otherwise the task is returned as partial',
+				description: SUB_AGENT_QUESTIONS_DESCRIPTION,
 			}),
 		),
 		expectedOutput: Type.Optional(Type.String({ description: "Expected evidence-oriented output" })),
 		stopConditions: Type.Optional(Type.Array(Type.String(), { description: "Conditions for stopping" })),
-	});
+		readPaths: Type.Optional(Type.Array(Type.String(), { description: SUB_AGENT_READ_PATHS_DESCRIPTION })),
+	};
+}
+
+function readWriteInvestigationTaskSchema() {
+	return Type.Object({ ...investigationTaskProperties("read-write"), access: createSubAgentAccessSchema() });
+}
+
+/** Read-only mode keeps the historical task shape; read-write adds the optional per-task `access`. */
+function createInvestigationTaskSchema(mode: SubAgentMode) {
+	return mode === "read-write"
+		? readWriteInvestigationTaskSchema()
+		: (Type.Object(investigationTaskProperties(mode)) as unknown as ReturnType<
+				typeof readWriteInvestigationTaskSchema
+			>);
 }
 
 function createInvestigationPhaseSchema(mode: SubAgentMode, maxTasks: number) {
@@ -81,8 +99,8 @@ function createInvestigationSchema(
 	});
 }
 
-const workflowSchema = createInvestigationSchema(1, "read-only", resolveExploreMaxTasks());
-const ultracodeSchema = createInvestigationSchema(2, "read-only", resolveExploreMaxTasks());
+const workflowSchema = createInvestigationSchema(1, "read-write", resolveExploreMaxTasks());
+const ultracodeSchema = createInvestigationSchema(2, "read-write", resolveExploreMaxTasks());
 const WORKFLOW_DEADLINE_GRACE_MS = 30 * 1_000;
 const WORKFLOW_BATCH_DRAIN_TIMEOUT_MS = 5_000;
 
@@ -155,6 +173,11 @@ export interface WorkflowToolOptions {
 	onControlsRelease?: (toolCallId: string) => void;
 	/** Registers the run with the session, which can stop it or move it to the background. */
 	dispatch?: DispatchRegistrar;
+	/**
+	 * This conversation's artifacts folder. Phase results are kept in `<artifacts>/workflow-runs/<run>/` so they can be
+	 * looked at after the run; without a folder (an in-memory session) they go to a temporary folder removed at the end.
+	 */
+	getArtifactsDir?: () => string | undefined;
 }
 
 export type UltracodeToolOptions = WorkflowToolOptions;
@@ -243,17 +266,102 @@ function formatFinalOutput(
 	].join("\n");
 }
 
+/** Longest summary of a previous phase written straight into each task of the next phase. */
+const PHASE_SUMMARY_MAX_BYTES = 8 * 1024;
+const PHASE_SUMMARY_EXCERPT_BYTES = 900;
+
+function clipBytes(text: string, maxBytes: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= maxBytes) return text;
+	let end = maxBytes;
+	while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+	return `${buffer.subarray(0, end).toString("utf8")}…`;
+}
+
+function taskVerdictLabel(task: ExploreTaskResult): string {
+	if (task.status === "completed") {
+		if (task.dataGaps?.length) return "completed with data gaps";
+		return task.reportSubmission === "text" ? "completed (report not handed in properly)" : "completed";
+	}
+	return task.stopReason ? `${task.status} (${task.stopReason})` : task.status;
+}
+
+/**
+ * A compact summary of one finished phase, written directly into every task of the next phase. The bounded results
+ * file stays the full source; this summary means a task that cannot read the file still starts from the previous
+ * phase's outcome instead of from nothing.
+ */
+export function summarizePhaseForNextPhase(results: readonly ExploreTaskResult[]): string {
+	const sections = results.map((task) => {
+		const lines = [`- [${task.description}] ${taskVerdictLabel(task)}`];
+		const open = (task.questionStatuses ?? []).filter((entry) => entry.status !== "answered");
+		for (const entry of open.slice(0, 6)) {
+			lines.push(
+				`  - question ${entry.status}: ${clipBytes(entry.question, 200)}${entry.note ? ` (${clipBytes(entry.note, 200)})` : ""}`,
+			);
+		}
+		for (const item of (task.unresolved ?? []).slice(0, 4)) lines.push(`  - unresolved: ${clipBytes(item, 240)}`);
+		const body = (task.output || task.error || "").replace(/\s+/g, " ").trim();
+		if (body) lines.push(`  - report excerpt: ${clipBytes(body, PHASE_SUMMARY_EXCERPT_BYTES)}`);
+		return lines.join("\n");
+	});
+	return truncateHeadKeepingContent(sections.join("\n"), { maxBytes: PHASE_SUMMARY_MAX_BYTES, maxLines: 400 });
+}
+
 function appendPreviousPhaseContext(
 	prompt: string,
-	previousPhase: { name: string; filePath: string } | undefined,
+	previousPhase: { name: string; filePath: string; summary?: string } | undefined,
 ): string {
 	if (!previousPhase) return prompt;
+	const summary = previousPhase.summary?.trim()
+		? `\n\nCompact summary of that phase (read the file for the full findings and evidence):\n${previousPhase.summary.trim()}`
+		: "";
 	return `${prompt}
 
 The structured, bounded results of the previous phase "${previousPhase.name}" were saved to a file:
 <previous_phase_results_file>${previousPhase.filePath}</previous_phase_results_file>
+This file lies outside your own copy; it is on your readable list, so read it with the read tool by this absolute path (not with the shell).${summary}
 
-Read this summary before starting. Use its findings, evidence, conflicts, covered scope, and unresolved items as the starting point. Do not rescan the whole repository; only perform targeted checks for unresolved or conflicting points.`;
+Read the file before starting. Use its findings, evidence, conflicts, covered scope, and unresolved items as the starting point. Do not rescan the whole repository; only perform targeted checks for unresolved or conflicting points.`;
+}
+
+/** A folder name made of the run's start time, tool kind and name: sortable and readable in the artifacts folder. */
+function workflowRunFolderName(kind: string, name: string): string {
+	const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
+	const slug =
+		name
+			.normalize("NFKC")
+			.replace(/[<>:"/\\|?*\x00-\x1f\s]+/g, "-")
+			.replace(/^[-.]+|[-.]+$/g, "")
+			.slice(0, 40) || "run";
+	return `${stamp}-${kind}-${slug}-${randomBytes(3).toString("hex")}`;
+}
+
+/**
+ * Where a run's phase results go: the conversation's artifacts folder (kept), or a temporary folder that is removed
+ * when the run ends when the session has none.
+ */
+async function createPhaseResultsDir(
+	kind: string,
+	name: string,
+	getArtifactsDir: (() => string | undefined) | undefined,
+): Promise<{ dir: string; keep: boolean }> {
+	let artifacts: string | undefined;
+	try {
+		artifacts = getArtifactsDir?.();
+	} catch {
+		artifacts = undefined;
+	}
+	if (artifacts) {
+		const dir = join(artifacts, "workflow-runs", workflowRunFolderName(kind, name));
+		try {
+			await mkdir(dir, { recursive: true });
+			return { dir, keep: true };
+		} catch {
+			// Fall through to a temporary folder: the run must not fail because the artifacts folder is unwritable.
+		}
+	}
+	return { dir: await mkdtemp(join(tmpdir(), "myharness-workflow-")), keep: false };
 }
 
 /**
@@ -265,18 +373,18 @@ const READ_WRITE_CAPABILITY_WORDING: ReadonlyArray<readonly [string, string]> = 
 	["multiple read-only Explores", "multiple Explores"],
 	[
 		"sub-agents may not modify files or create further agents",
-		"sub-agents never start further agents; in the current read-write mode each may edit only inside its own Git worktree and never commits or pushes",
+		"sub-agents never start further agents; in the current read-write mode a task with access write may edit only inside its own copy (its own Git worktree from the reusable pool, or a file mirror outside Git) and a task with access read cannot change its copy; each never commits or pushes",
 	],
 	["read-only multi-Agent workflow", "multi-Agent workflow"],
 	["read-only workflow for complex tasks", "workflow for complex tasks"],
 	["multiple nonoverlapping read-only tasks", "multiple nonoverlapping tasks"],
 	[
 		"Workflow sub-Agents may investigate only; they must not modify files or create lower-level Agents. The Main Agent performs all modifications personally after workflow returns.",
-		"In read-write mode each Workflow sub-agent may edit files and run commands only inside its own Git worktree and never starts lower-level Agents; its result reports the worktree path, branch and changed files. The Main Agent reviews those changes and performs any commit.",
+		"In read-write mode each Workflow sub-agent with access write may edit files and run commands only inside its own copy (its own Git worktree from the reusable pool, or a file mirror outside Git); a task with access read cannot change its copy. No sub-agent starts lower-level Agents; the result reports the copy path, the branch when the copy kept changes, and the changed files. Mark investigation and review tasks with access read. The Main Agent reviews those changes and performs any commit.",
 	],
 	[
 		"All sub-Agents may only investigate, read, search, and run verification commands that do not modify the project. They must not modify files or create lower-level Agents. The Main Agent performs all modifications, then must call Ultracode again for independent verification and run necessary type checks, tests, or builds.",
-		"In read-write mode each sub-agent may edit files and run commands only inside its own Git worktree and never starts lower-level Agents; its result reports the worktree path, branch and changed files. The Main Agent reviews those changes, performs any commit, and must call Ultracode again for independent verification and run necessary type checks, tests, or builds.",
+		"In read-write mode each sub-agent with access write may edit files and run commands only inside its own copy (its own Git worktree from the reusable pool, or a file mirror outside Git); a task with access read cannot change its copy. No sub-agent starts lower-level Agents; the result reports the copy path, the branch when the copy kept changes, and the changed files. Mark investigation and review tasks with access read. The Main Agent reviews those changes, performs any commit, and must call Ultracode again for independent verification and run necessary type checks, tests, or builds.",
 	],
 ];
 
@@ -423,8 +531,10 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 			};
 
 			const compactOutputs: Array<{ name: string; text: string }> = [];
-			const fullOutputs: Array<{ name: string; text: string; filePath: string }> = [];
+			const fullOutputs: Array<{ name: string; text: string; filePath: string; summary: string }> = [];
 			let resultsDir: string | undefined;
+			// Kept results live in the conversation's artifacts folder; a temporary folder is removed at the end.
+			let keepResultsDir = false;
 			let activePhaseTraceScope: RuntimeTraceScope | undefined;
 			let activePhaseTimedOut = false;
 			let workflowTimedOut = false;
@@ -488,7 +598,9 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 							}, workflowTimeoutMs);
 						});
 					}
-					resultsDir = await mkdtemp(join(tmpdir(), "myharness-workflow-"));
+					const createdResultsDir = await createPhaseResultsDir(kind, params.name, options?.getArtifactsDir);
+					resultsDir = createdResultsDir.dir;
+					keepResultsDir = createdResultsDir.keep;
 					for (let index = 0; index < params.phases.length; index++) {
 						if (runSignal?.aborted) throw new Error(`${profile.label} 已中止。`);
 						const phase = params.phases[index];
@@ -540,14 +652,18 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 								parentTraceScope: phaseTraceScope,
 								phaseId,
 								workflowRunId,
+								// Every task may read the phase results folder: the engine tells it to read a file there.
+								extraReadRoots: resultsDir ? [resultsDir] : [],
 								tasks: phase.tasks.map((task) => ({
 									description: task.description,
 									prompt: appendPreviousPhaseContext(task.prompt, previousPhase),
+									...(task.access ? { access: task.access } : {}),
 									goal: task.goal,
 									scope: task.scope,
 									questions: task.questions,
 									expectedOutput: task.expectedOutput,
 									stopConditions: task.stopConditions,
+									...(task.readPaths?.length ? { readPaths: task.readPaths } : {}),
 								})),
 								onProgress: (progress) => {
 									if (!phaseActive) return;
@@ -645,11 +761,23 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 						}
 
 						compactOutputs.push({ name: phase.name, text: result.text });
-						// 结构化、有界结果落盘；完整文本仍由 Sub Agent 工具的 sidecar 保留，避免阶段间复制超长上下文
-						// 上下文内联进每个任务的 prompt 导致 LLM 上下文溢出。
+						// The bounded results go to `phase-N.md`, the file the next phase reads; the complete text goes next to it as
+						// `phase-N-full.md` so the run can be looked at afterwards. Inlining either into every task's prompt would
+						// overflow the model context, so the next phase gets the file plus a compact summary.
 						const phaseResultsFile = join(resultsDir, `phase-${index}.md`);
 						await writeFile(phaseResultsFile, result.text, { encoding: "utf8", mode: 0o600 });
-						fullOutputs.push({ name: phase.name, text: result.fullText, filePath: phaseResultsFile });
+						if (keepResultsDir) {
+							await writeFile(join(resultsDir, `phase-${index}-full.md`), result.fullText, {
+								encoding: "utf8",
+								mode: 0o600,
+							}).catch(() => {});
+						}
+						fullOutputs.push({
+							name: phase.name,
+							text: result.fullText,
+							filePath: phaseResultsFile,
+							summary: summarizePhaseForNextPhase(phaseDetails.results),
+						});
 					}
 
 					details.status = details.phases.some((phase) => phase.status === "partial") ? "partial" : "completed";
@@ -660,8 +788,14 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 							phaseCount: details.phases.length,
 						});
 					}
-					const text = formatFinalOutput(profile.label, params.name, compactOutputs, details.status);
-					const fullText = formatFinalOutput(profile.label, params.name, fullOutputs, details.status);
+					const keptNote =
+						keepResultsDir && resultsDir
+							? `
+
+Phase results are kept in: ${resultsDir}`
+							: "";
+					const text = `${formatFinalOutput(profile.label, params.name, compactOutputs, details.status)}${keptNote}`;
+					const fullText = `${formatFinalOutput(profile.label, params.name, fullOutputs, details.status)}${keptNote}`;
 					const result = {
 						content: [{ type: "text" as const, text }],
 						details: cloneDetails(details),
@@ -731,7 +865,7 @@ export function createInvestigationToolDefinition<K extends InvestigationToolKin
 				} finally {
 					if (workflowDeadlineTimer) clearTimeout(workflowDeadlineTimer);
 					removeParentAbortListener?.();
-					if (resultsDir) {
+					if (resultsDir && !keepResultsDir) {
 						await rm(resultsDir, { recursive: true, force: true }).catch(() => {});
 					}
 					options?.onControlsRelease?.(toolCallId);

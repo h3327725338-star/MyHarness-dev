@@ -440,6 +440,11 @@ button.status-pill { cursor: pointer; }
 /* Basis 0: a long note takes only what the name and the count leave, it never squeezes the name. */
 .sub-note { flex: 1 1 0; min-width: 0; font-size: var(--fs-xs); }
 .sub-note.bad { color: var(--danger); }
+/* A sub-agent task's own report verdict: complete with data gaps (accent, not a warning), or a report handed in as
+   plain text (neutral). The same states as the activity bar's .sa-state (composer.css). */
+.sub-state { flex: none; padding: 0 5px; border-radius: var(--r-pill); background: var(--surface-hover); color: var(--text-3); font-size: var(--fs-mini); line-height: 15px; white-space: nowrap; }
+.sub-state.gaps { background: var(--accent-soft); color: var(--accent); }
+.c-accent { color: var(--accent); }
 .sub-detail { margin: 2px 0 6px 24px; padding: 8px 10px; background: var(--bg-inset); border-radius: var(--r-md); font-size: var(--fs-body); max-height: 360px; overflow: auto; overscroll-behavior: contain; }
 .sub-list { margin: 0; padding-left: 18px; }
 

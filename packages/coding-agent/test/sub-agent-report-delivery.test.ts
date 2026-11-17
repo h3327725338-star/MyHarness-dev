@@ -4,14 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "@myharness/ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { RuntimeTrace, RuntimeTraceScope } from "../src/observability/runtime-trace.ts";
 import { SessionManager } from "../src/session/manager/index.ts";
 import {
+	collectFinalReasoning,
 	createSubAgentTool,
 	createSubAgentToolDefinition,
+	evaluateSubmittedReport,
+	findSubmittedReport,
 	getFinalAssistantText,
 	pickReportCandidate,
 	resolveSubAgentRuntimeSettings,
 	runExploreBatch,
+	type SubAgentToolDetails,
 	truncateHeadKeepingContent,
 	truncateSubAgentOutput,
 } from "../src/tools/sub-agent.ts";
@@ -86,6 +91,67 @@ function workerSource(reportText: string, trailingTurns: string, withAgentEnd = 
 	return lines.join("\n");
 }
 
+/**
+ * NDJSON source of a fake delegated worker whose last act is an accepted `submit_report` round trip: an investigation
+ * remark with a read call, optionally a truncated head reply, then the reply that hands the report in (with optional
+ * reply text) and its accepted tool result. An optional exit code lets the process die after the hand-in (V3).
+ */
+function submitReportWorkerSource(options: {
+	tailText?: string;
+	report?: string;
+	headText?: string;
+	questions?: Array<{ question: string; status: string }>;
+	exitCode?: number;
+}): string {
+	const remark = remarkWithToolCall;
+	const readResult = toolResultMessage;
+	const head =
+		options.headText === undefined
+			? undefined
+			: {
+					role: "assistant",
+					timestamp: 3,
+					content: [{ type: "text", text: options.headText }],
+					stopReason: "length",
+				};
+	const tailTimestamp = head ? 4 : 3;
+	const tail = {
+		role: "assistant",
+		timestamp: tailTimestamp,
+		content: [
+			...(options.tailText ? [{ type: "text", text: options.tailText }] : []),
+			{
+				type: "toolCall",
+				id: "submit-1",
+				name: "submit_report",
+				arguments: { report: options.report ?? "", questions: options.questions ?? [] },
+			},
+		],
+		stopReason: "stop",
+	};
+	const submitResult = {
+		role: "toolResult",
+		toolCallId: "submit-1",
+		toolName: "submit_report",
+		content: [{ type: "text", text: "Report received." }],
+		isError: false,
+		timestamp: tailTimestamp + 1,
+	};
+	const messages = [remark, readResult, ...(head ? [head] : []), tail, submitResult];
+	const events = [
+		{ type: "message_end", message: remark },
+		{ type: "tool_result_end", message: readResult },
+		...(head ? [{ type: "message_end", message: head }] : []),
+		{ type: "message_end", message: tail },
+		{ type: "tool_result_end", message: submitResult },
+		{ type: "agent_end", messages },
+	];
+	return [
+		...events.map((event) => `process.stdout.write(JSON.stringify(${JSON.stringify(event)}) + "\\n");`),
+		...(options.exitCode ? [`process.exitCode = ${options.exitCode};`] : []),
+	].join("\n");
+}
+
 const directories: string[] = [];
 let previousEntry: string | undefined;
 
@@ -107,6 +173,11 @@ async function runOneTask(
 	name: string,
 	source: string,
 	task: { description?: string; prompt?: string; questions?: string[] } = {},
+	batch: {
+		trace?: RuntimeTrace;
+		parentTraceScope?: RuntimeTraceScope;
+		onProgress?: (details: SubAgentToolDetails) => void;
+	} = {},
 ) {
 	const directory = await useWorker(name, source);
 	const result = await runExploreBatch({
@@ -119,12 +190,15 @@ async function runOneTask(
 			},
 		],
 		settings: batchSettings(),
+		...(batch.trace ? { trace: batch.trace, parentTraceScope: batch.parentTraceScope } : {}),
+		...(batch.onProgress ? { onProgress: batch.onProgress } : {}),
 	});
 	return { directory, result, taskResult: result.details.results[0] };
 }
 
-function enabledTool() {
-	return createSubAgentTool(process.cwd(), {
+/** The tool, dispatching in `cwd`: the fake worker's own temporary folder, never the repository under test. */
+function enabledTool(cwd: string) {
+	return createSubAgentTool(cwd, {
 		getSettings: () => ({ enabled: true, provider: "p", model: "m", thinkingLevel: "off" }),
 	});
 }
@@ -216,7 +290,8 @@ describe("P2: a confirmation or sign-off after the report must not replace the r
 	}, 30_000);
 
 	it("keeps the checklist verdict when the report above the sign-off has no checklist", async () => {
-		// Choosing the report must not weaken the incomplete_answer check: no checklist anywhere is still partial.
+		// Choosing the report must not weaken the completeness check: a report that was neither handed in with
+		// submit_report nor carries a checklist is still partial, recorded as not handed in properly.
 		const { taskResult } = await runOneTask(
 			"P2 missing checklist",
 			workerSource(REPORT_BODY, acknowledgementTurn(4)),
@@ -225,7 +300,8 @@ describe("P2: a confirmation or sign-off after the report must not replace the r
 			},
 		);
 		expect(taskResult.status).toBe("partial");
-		expect(taskResult.stopReason).toBe("incomplete_answer");
+		expect(taskResult.stopReason).toBe("report_not_submitted");
+		expect(taskResult.reportSubmission).toBe("text");
 		expect(taskResult.output).toContain("Completion checklist");
 		expect(taskResult.output).toContain(REPORT_BODY);
 	}, 30_000);
@@ -279,16 +355,18 @@ describe("P4: a stream that breaks before agent_end must still deliver the repor
 
 	it("names the diagnosis when a broken stream carries no report text at all", async () => {
 		const { taskResult, result } = await runOneTask("P4 empty stream", workerSource("", thinkingOnlyTurn(4), false));
-		expect(taskResult.status).not.toBe("completed");
+		expect(taskResult.status).toBe("failed");
 		expect(taskResult.output.trim()).not.toBe("");
-		expect(result.text).toContain("没有产出最终报告正文");
+		expect(result.text).toContain("没有写出报告正文");
+		// The reasoning the model produced instead of a report is attached.
+		expect(result.text).toContain("报告已经输出过了。");
 	}, 30_000);
 });
 
 describe("P5: a truncated preview must name the file that holds the full report", () => {
 	it("attaches the original full text whenever the main Agent only sees a preview", async () => {
-		await useWorker("P5 symbol", workerSource(LONG_MULTILINE_REPORT, ""));
-		const tool = enabledTool();
+		const workerDirectory = await useWorker("P5 symbol", workerSource(LONG_MULTILINE_REPORT, ""));
+		const tool = enabledTool(workerDirectory);
 		const raw = (await tool.execute("call-preview", oneTaskArgs, undefined, undefined)) as unknown as Record<
 			string | symbol,
 			unknown
@@ -311,7 +389,7 @@ describe("P5: a truncated preview must name the file that holds the full report"
 		const sessionsDir = join(sessionRoot, "sessions");
 		await mkdir(sessionsDir, { recursive: true });
 		const sessionManager = SessionManager.create(workerDirectory, sessionsDir);
-		const result = await wrapToolWithResultPersistence(enabledTool(), sessionManager).execute(
+		const result = await wrapToolWithResultPersistence(enabledTool(workerDirectory), sessionManager).execute(
 			"call-overcap",
 			oneTaskArgs,
 			undefined,
@@ -334,7 +412,7 @@ describe("P5: a truncated preview must name the file that holds the full report"
 		const sessionsDir = join(sessionRoot, "sessions");
 		await mkdir(sessionsDir, { recursive: true });
 		const sessionManager = SessionManager.create(workerDirectory, sessionsDir);
-		const result = await wrapToolWithResultPersistence(enabledTool(), sessionManager).execute(
+		const result = await wrapToolWithResultPersistence(enabledTool(workerDirectory), sessionManager).execute(
 			"call-sidecar",
 			oneTaskArgs,
 			undefined,
@@ -356,11 +434,15 @@ describe("P5: a truncated preview must name the file that holds the full report"
 
 describe("P6: no report body must come back as an explicit diagnosis, never blank", () => {
 	it("reports why a normally finished child produced no report body and keeps the tool evidence", async () => {
+		// No report text at all is a failure (the user's rule), never a silent partial; the reason and the model's own
+		// reasoning come back instead of a blank.
 		const { taskResult, result } = await runOneTask("P6 no body", workerSource("", thinkingOnlyTurn(4)));
-		expect(taskResult.status).toBe("partial");
+		expect(taskResult.status).toBe("failed");
+		expect(taskResult.stopReason).toBe("no_report");
 		expect(taskResult.output.trim()).not.toBe("");
-		expect(taskResult.error).toContain("没有产出最终报告正文");
-		expect(result.text).toContain("没有产出最终报告正文");
+		expect(taskResult.error).toContain("没有写出报告正文");
+		expect(result.text).toContain("没有写出报告正文");
+		expect(result.text).toContain("报告已经输出过了。");
 		expect(result.text.trim()).not.toBe("");
 		expect(taskResult.evidence).toContain("Read(a.txt)：已读取 1 行");
 	}, 30_000);
@@ -371,6 +453,301 @@ describe("P6: no report body must come back as an explicit diagnosis, never blan
 		expect(taskResult.status === "completed" ? taskResult.output.trim() !== "" : true).toBe(true);
 		expect(taskResult.output).toBe(REPORT_BODY);
 	}, 30_000);
+});
+
+describe("V2: same-count submissions line up by question key, not blindly by position", () => {
+	it("aligns by normalized key when the worker listed the questions in another order", () => {
+		const verdict = evaluateSubmittedReport(
+			["Q1 守卫在哪？", "Q2 测试在哪？"],
+			[
+				{ question: "q2 测试在哪？", status: "unavailable", note: "登录墙挡住了" },
+				{ question: "q1 守卫在哪？", status: "answered" },
+			],
+		);
+		expect(verdict.statuses.map((entry) => entry.question)).toEqual(["Q1 守卫在哪？", "Q2 测试在哪？"]);
+		expect(verdict.statuses[0]).toMatchObject({ status: "answered" });
+		expect(verdict.statuses[1]).toMatchObject({ status: "unavailable", note: "登录墙挡住了" });
+		expect(verdict.outcome).toBe("data_gaps");
+		expect(verdict.dataGaps).toEqual(["Q2 测试在哪？：登录墙挡住了"]);
+	});
+
+	it("keeps the positional alignment when the keys do not match the task questions", () => {
+		const verdict = evaluateSubmittedReport(
+			["守卫在哪？", "测试在哪？"],
+			[
+				{ question: "第一项的意思？", status: "answered" },
+				{ question: "第二项的意思？", status: "answered" },
+			],
+		);
+		expect(verdict.statuses.map((entry) => [entry.question, entry.status])).toEqual([
+			["守卫在哪？", "answered"],
+			["测试在哪？", "answered"],
+		]);
+	});
+
+	it("keeps the positional alignment when two entries collapse to the same key", () => {
+		const verdict = evaluateSubmittedReport(
+			["A", "B"],
+			[
+				{ question: "a", status: "partial", note: "x" },
+				{ question: "A", status: "answered" },
+			],
+		);
+		expect(verdict.statuses.map((entry) => [entry.question, entry.status])).toEqual([
+			["A", "partial"],
+			["B", "answered"],
+		]);
+	});
+});
+
+describe("V2b: required questions that share a key", () => {
+	it("keeps the positional alignment when two required questions normalize to the same key", () => {
+		const verdict = evaluateSubmittedReport(
+			["Is X covered?", "Is  X  covered!"],
+			[
+				{ question: "Is X covered?", status: "answered" },
+				{ question: "Something else", status: "not_done", note: "no time" },
+			],
+		);
+		expect(verdict.statuses.map((entry) => entry.status)).toEqual(["answered", "not_done"]);
+		expect(verdict.outcome).toBe("incomplete");
+	});
+});
+
+describe("V5b: every cut-off piece of the report travels with an empty hand-in", () => {
+	const assistant = (text: string, stopReason: string, toolCall?: Record<string, unknown>) =>
+		({
+			role: "assistant",
+			content: [...(text ? [{ type: "text", text }] : []), ...(toolCall ? [toolCall] : [])],
+			stopReason,
+		}) as unknown as Message;
+	const user = (text: string) => ({ role: "user", content: text }) as unknown as Message;
+	const submit = { type: "toolCall", id: "s1", name: "submit_report", arguments: { report: "" } };
+	const accepted = {
+		role: "toolResult",
+		toolName: "submit_report",
+		toolCallId: "s1",
+		isError: false,
+		content: [{ type: "text", text: "Report received." }],
+	} as unknown as Message;
+
+	it("keeps both pieces of a report cut twice", () => {
+		const found = findSubmittedReport([
+			user("task"),
+			assistant("done with the checks", "stop"),
+			assistant("HEAD X", "length"),
+			user("continue"),
+			assistant("MIDDLE Y", "length"),
+			user("write the final report"),
+			assistant("TAIL Z", "toolUse", submit),
+			accepted,
+		]);
+		expect(found?.continuedText).toBe("HEAD X\nMIDDLE Y");
+		expect(found?.messageText).toBe("TAIL Z");
+	});
+
+	it("keeps the head when a tool call came between the cut and the hand-in", () => {
+		const found = findSubmittedReport([
+			user("task"),
+			assistant("HEAD X", "length"),
+			user("continue"),
+			assistant("", "toolUse", { type: "toolCall", id: "r1", name: "read", arguments: { path: "a.ts" } }),
+			{ role: "toolResult", toolName: "read", toolCallId: "r1", isError: false, content: [] } as unknown as Message,
+			assistant("TAIL Z", "toolUse", submit),
+			accepted,
+		]);
+		expect(found?.continuedText).toBe("HEAD X");
+	});
+
+	it("carries no earlier text when nothing was cut off", () => {
+		const found = findSubmittedReport([
+			user("task"),
+			assistant("an earlier complete reply", "stop"),
+			assistant("THE REPORT", "toolUse", submit),
+			accepted,
+		]);
+		expect(found?.continuedText).toBeUndefined();
+	});
+});
+
+describe("V5: after continue_truncated the handed-in report is the merged head and tail", () => {
+	it("hands the Main Agent the merged head and tail instead of only the tail", async () => {
+		const head = "# 调查报告\n第一段结论与证据路径。\n第二段展开说明，写到一半被输出上限截断";
+		const tail = "，这里接着写完。\n第三段结论与建议后续补查。";
+		const { taskResult } = await runOneTask(
+			"V5 merged",
+			submitReportWorkerSource({
+				headText: head,
+				tailText: tail,
+				questions: [{ question: "问题一", status: "answered" }],
+			}),
+			{ questions: ["问题一"] },
+		);
+		expect(taskResult.status).toBe("completed");
+		expect(taskResult.stopReason).toBe("completed");
+		expect(taskResult.reportSubmission).toBe("tool");
+		expect(taskResult.output).toBe(`${head}\n${tail}`);
+	}, 30_000);
+
+	it("keeps the plain hand-in behavior when the reply was not a continuation", async () => {
+		const { taskResult } = await runOneTask(
+			"V5 plain",
+			submitReportWorkerSource({
+				tailText: "",
+				report: REPORT_BODY,
+				questions: [{ question: "问题一", status: "answered" }],
+			}),
+			{ questions: ["问题一"] },
+		);
+		expect(taskResult.status).toBe("completed");
+		expect(taskResult.output).toBe(REPORT_BODY);
+	}, 30_000);
+});
+
+describe("V3: a nonzero worker exit after an accepted report keeps the report's verdict", () => {
+	it("completes the task from the accepted report and keeps the exit as a note", async () => {
+		const { taskResult } = await runOneTask(
+			"V3 exit after report",
+			submitReportWorkerSource({
+				report: REPORT_BODY,
+				questions: [{ question: "问题一", status: "answered" }],
+				exitCode: 3,
+			}),
+			{ questions: ["问题一"] },
+		);
+		expect(taskResult.status).toBe("completed");
+		expect(taskResult.stopReason).toBe("completed");
+		expect(taskResult.reportSubmission).toBe("tool");
+		expect(taskResult.output).toBe(REPORT_BODY);
+		expect(taskResult.unresolved?.join("\n")).toContain("退出码 3");
+	}, 30_000);
+
+	it("still fails when the process dies with no report body at all", async () => {
+		const { taskResult } = await runOneTask(
+			"V3 no body",
+			submitReportWorkerSource({
+				report: "",
+				tailText: "",
+				questions: [{ question: "问题一", status: "answered" }],
+				exitCode: 3,
+			}),
+			{ questions: ["问题一"] },
+		);
+		expect(taskResult.status === "completed").toBe(false);
+	}, 30_000);
+});
+
+describe("V4/V6: a trace or progress failure must not rewrite the finished verdict or drop the report", () => {
+	it("keeps the completed verdict when the task-finished trace record rejects", async () => {
+		const calls: string[] = [];
+		const trace = {
+			createId: (prefix: string) => `${prefix}-1`,
+			createChildContext: () => ({
+				runId: "run-child",
+				sessionId: "sess",
+				agentId: "agent-child",
+				role: "delegated" as const,
+				traceDir: "trace-dir",
+			}),
+			record: async (_scope: unknown, type: string) => {
+				calls.push(type);
+				if (type === "task-finished") throw new Error("trace sink down");
+			},
+		} as unknown as RuntimeTrace;
+		const parentScope = {
+			runId: "run-parent",
+			sessionId: "sess",
+			agentId: "agent-parent",
+			role: "main",
+		} as RuntimeTraceScope;
+		const { taskResult } = await runOneTask(
+			"V4 trace down",
+			submitReportWorkerSource({ report: REPORT_BODY, questions: [{ question: "问题一", status: "answered" }] }),
+			{ questions: ["问题一"] },
+			{ trace, parentTraceScope: parentScope },
+		);
+		expect(calls).toContain("task-finished");
+		expect(taskResult.status).toBe("completed");
+		expect(taskResult.output).toBe(REPORT_BODY);
+	}, 30_000);
+
+	it("keeps the untruncated report when the progress consumer crashes after the task finished", async () => {
+		// LONG report over the 20KB per-task cap so the fullOutput and the truncated output differ.
+		const longReport = `${REPORT_BODY}\n${Array.from({ length: 3_000 }, (_v, i) => `第 ${i} 行结论证据。`).join("\n")}`;
+		let completedSeen = 0;
+		const { result, taskResult } = await runOneTask(
+			"V6 progress crash",
+			submitReportWorkerSource({ report: longReport, questions: [{ question: "问题一", status: "answered" }] }),
+			{ questions: ["问题一"] },
+			{
+				onProgress: (details) => {
+					if (details.results[0]?.status !== "completed") return;
+					completedSeen += 1;
+					// The first sighting is inside the task's own progress; the second comes after the finished
+					// result was recorded — throwing there used to drop the non-enumerable fullOutput.
+					if (completedSeen === 2) throw new Error("progress consumer crashed");
+				},
+			},
+		);
+		expect(completedSeen).toBeGreaterThanOrEqual(2);
+		// The settlement catch reports the crash as a failed task, but the report it handed in survives.
+		expect(taskResult.status).toBe("failed");
+		expect(taskResult.output).toContain(REPORT_BODY);
+		expect(taskResult.output.length).toBeLessThan(longReport.length);
+		expect(result.text).not.toContain("第 2999 行结论证据。");
+		expect(result.fullText).toContain("第 2999 行结论证据。");
+	}, 30_000);
+});
+
+describe("collectFinalReasoning: reasoning written before the trailing submit_report result", () => {
+	it("attaches the reasoning that was written just before an accepted submit_report", () => {
+		const messages = [
+			{
+				role: "assistant",
+				timestamp: 1,
+				content: [
+					{ type: "thinking", thinking: "证据已经汇总，正在写结论。" },
+					{ type: "toolCall", id: "submit-1", name: "submit_report", arguments: {} },
+				],
+				stopReason: "stop",
+			},
+			{
+				role: "toolResult",
+				toolCallId: "submit-1",
+				toolName: "submit_report",
+				content: [{ type: "text", text: "Report received." }],
+				isError: false,
+				timestamp: 2,
+			},
+		] as unknown as Message[];
+		expect(collectFinalReasoning(messages)).toBe("证据已经汇总，正在写结论。");
+	});
+
+	it("still stops at the first non-submit_report tool result", () => {
+		const messages = [
+			{
+				role: "assistant",
+				timestamp: 1,
+				content: [{ type: "thinking", thinking: "更早的推理。" }],
+				stopReason: "stop",
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: 2,
+			},
+			{
+				role: "assistant",
+				timestamp: 3,
+				content: [{ type: "thinking", thinking: "报告前的推理。" }],
+				stopReason: "stop",
+			},
+		] as unknown as Message[];
+		expect(collectFinalReasoning(messages)).toBe("报告前的推理。");
+	});
 });
 
 describe("C1-C3: the advertised task cap matches the runtime cap", () => {
@@ -397,7 +774,8 @@ describe("C1-C3: the advertised task cap matches the runtime cap", () => {
 	});
 
 	it("tells the model how to split when it sends more tasks than the live cap", async () => {
-		const tool = enabledTool();
+		// Refused before anything is copied or started, so the folder does not matter.
+		const tool = enabledTool(process.cwd());
 		const tooMany = {
 			tasks: Array.from({ length: 4 }, (_value, index) => ({
 				description: `Task ${index + 1}`,
@@ -413,7 +791,7 @@ describe("C1-C3: the advertised task cap matches the runtime cap", () => {
 		expect(result.details).toMatchObject({ completed: 0, total: 4 });
 	});
 
-	it("changes only description strings between modes and keeps every schema constraint", () => {
+	it("changes only description strings and the optional per-task access between modes and keeps every schema constraint", () => {
 		const settings = { enabled: true, provider: "p", model: "m", thinkingLevel: "off", maxTasks: 5 } as const;
 		const readOnly = JSON.stringify(
 			createSubAgentToolDefinition(process.cwd(), { getSettings: () => settings }).parameters,
@@ -439,6 +817,11 @@ describe("C1-C3: the advertised task cap matches the runtime cap", () => {
 		// maxItems follows the live cap in both modes, so it must match after stripping descriptions.
 		expect(parsedReadOnly.properties.tasks.maxItems).toBe(5);
 		expect(parsedReadWrite.properties.tasks.maxItems).toBe(5);
+		// Read-write tasks may say whether they only read (`access`); it is optional and read-only mode has no such field.
+		expect(parsedReadWrite.properties.tasks.items.properties.access).toBeDefined();
+		expect(parsedReadWrite.properties.tasks.items.required).not.toContain("access");
+		expect(parsedReadOnly.properties.tasks.items.properties.access).toBeUndefined();
+		delete parsedReadWrite.properties.tasks.items.properties.access;
 		expect(stripDescriptions(parsedReadWrite)).toEqual(stripDescriptions(parsedReadOnly));
 		expect(readWrite).not.toBe(readOnly);
 		expect(readOnly).toContain("at most 5");

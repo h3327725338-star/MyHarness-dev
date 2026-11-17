@@ -13,6 +13,9 @@ export type DelegatedCapabilities = "read-only" | "read-write";
  * from the saved settings, where the global Web Search switch decides whether they are registered at all
  * (see the `webSearchEnabled` gate in the session tool registry). A worker therefore never gains web
  * access the Main session does not have.
+ *
+ * `submit_report` is how a worker hands in its final report (tools/submit-report.ts). It is registered only in
+ * delegated sessions and is not an investigation tool: it never counts as evidence of work done.
  */
 export const DELEGATED_TOOL_NAMES = [
 	"read",
@@ -23,12 +26,13 @@ export const DELEGATED_TOOL_NAMES = [
 	"symbols",
 	"web_search",
 	"web_fetch",
+	"submit_report",
 ] as const;
 
 /**
  * Read-write delegated tools: the read-only set plus the write tools the main agent's
  * write configuration already ships with (`edit`, `write`, `pwsh`, `apply_rename`). Edits are still
- * confined to the worker's own Git worktree by the delegated write guard.
+ * confined to the worker's own copy (a pooled Git worktree, or a file mirror outside Git) by the delegated write guard.
  */
 export const DELEGATED_WRITE_TOOL_NAMES = [...DELEGATED_TOOL_NAMES, "edit", "write", "pwsh", "apply_rename"] as const;
 

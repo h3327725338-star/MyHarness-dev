@@ -1,11 +1,16 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Message } from "@myharness/ai/compat";
 import { describe, expect, it } from "vitest";
 import {
 	buildSubAgentArgs,
+	collectFinalReasoning,
 	createSubAgentToolDefinition,
 	evaluateExploreReportCompleteness,
+	evaluateSubmittedReport,
+	findSubmittedReport,
+	getFinalAssistantText,
 	hasSuccessfulInvestigationEvidence,
 	resolvedTaskTimeoutMs,
 	resolveExploreMaxTasks,
@@ -13,6 +18,7 @@ import {
 	runExploreBatch,
 	truncateSubAgentOutput,
 } from "../src/tools/sub-agent.ts";
+import { SUBMIT_REPORT_TOOL_NAME } from "../src/tools/submit-report.ts";
 
 describe("sub agent", () => {
 	it("refuses to run while disabled", async () => {
@@ -152,7 +158,7 @@ describe("sub agent", () => {
 		expect(args).toContain("--no-extensions");
 		expect(args).toContain("--no-context-files");
 		expect(args.slice(args.indexOf("--tools") + 1, args.indexOf("--model"))).toEqual([
-			"read,grep,find,ls,bash,symbols,web_search,web_fetch",
+			"read,grep,find,ls,bash,symbols,web_search,web_fetch,submit_report",
 		]);
 		expect(args).not.toContain("agent");
 		expect(args).toContain("openai/gpt-test");
@@ -213,7 +219,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Fixed path", prompt: "Inspect the project." }],
 				settings: {
 					provider: "fixed-provider",
@@ -288,7 +294,7 @@ describe("sub agent", () => {
 			await writeFile(entryPath, "process.stdin.resume(); setInterval(() => {}, 1000);\n", "utf8");
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Hang", prompt: "Never finishes" }],
 				settings: {
 					provider: "test",
@@ -319,7 +325,7 @@ describe("sub agent", () => {
 			await writeFile(entryPath, childSource, "utf8");
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Silent child", prompt: "Inspect nothing." }],
 				settings: {
 					provider: "test",
@@ -367,7 +373,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Bounded loop", prompt: "Inspect a bounded scope." }],
 				settings: {
 					provider: "test",
@@ -460,7 +466,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Repeated read", prompt: "Inspect one file." }],
 				settings: {
 					provider: "test",
@@ -505,7 +511,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Stall", prompt: "Inspect evidence.ts." }],
 				settings: {
 					provider: "test",
@@ -592,7 +598,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Tool errors", prompt: "Find the missing symbol." }],
 				settings: {
 					provider: "test",
@@ -683,7 +689,7 @@ describe("sub agent", () => {
 			);
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			const result = await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Guard blocks", prompt: "Inspect the repository." }],
 				settings: {
 					provider: "test",
@@ -776,7 +782,7 @@ describe("sub agent", () => {
 			await writeFile(entryPath, [`console.log(${JSON.stringify(JSON.stringify(endEvent))});`].join("\n"), "utf8");
 			process.env.MYHARNESS_CLI_ENTRY = entryPath;
 			return await runExploreBatch({
-				cwd: process.cwd(),
+				cwd: tempDir,
 				tasks: [{ description: "Checklist task", prompt: "Inspect the project.", questions }],
 				settings: { provider: "test", model: "test", thinkingLevel: "high", taskTimeoutMs: 15_000 },
 			});
@@ -790,7 +796,8 @@ describe("sub agent", () => {
 	it("downgrades a question task whose report lacks the checklist", async () => {
 		const result = await runReportWithChecklist("调查完毕，未提供清单。", ["Does the guard allow pipes?"]);
 		const taskResult = result.details.results[0];
-		expect(taskResult).toMatchObject({ status: "partial", stopReason: "incomplete_answer" });
+		expect(taskResult).toMatchObject({ status: "partial", stopReason: "report_not_submitted" });
+		expect(taskResult?.reportSubmission).toBe("text");
 		expect(taskResult?.output).toContain("调查完毕，未提供清单。");
 		expect(taskResult?.output).toContain("[自动检查]");
 		expect(taskResult?.unresolved).toContain("问题未逐项回答：Does the guard allow pipes?");
@@ -808,5 +815,328 @@ describe("sub agent", () => {
 		const taskResult = result.details.results[0];
 		expect(taskResult).toMatchObject({ status: "partial", stopReason: "incomplete_answer" });
 		expect(taskResult?.unresolved).toContain("问题未逐项回答：Where is Y?");
+	});
+});
+
+function testAssistant(timestamp: number, content: unknown[], extra: Record<string, unknown> = {}): Message {
+	return { role: "assistant", content, timestamp, ...extra } as unknown as Message;
+}
+
+function testToolResult(timestamp: number, callId: string, toolName: string, isError = false): Message {
+	return {
+		role: "toolResult",
+		toolCallId: callId,
+		toolName,
+		content: [{ type: "text", text: "ok" }],
+		isError,
+		timestamp,
+	} as unknown as Message;
+}
+
+describe("evaluateSubmittedReport", () => {
+	const questions = ["守卫在哪？", "测试在哪？"];
+
+	it("marks every question answered as complete", () => {
+		const verdict = evaluateSubmittedReport(questions, [
+			{ question: "守卫在哪？", status: "answered" },
+			{ question: "测试在哪？", status: "answered" },
+		]);
+		expect(verdict.outcome).toBe("complete");
+		expect(verdict.dataGaps).toEqual([]);
+		expect(verdict.unfinished).toEqual([]);
+	});
+
+	it("reports data gaps for unavailable questions and stays complete otherwise", () => {
+		const verdict = evaluateSubmittedReport(questions, [
+			{ question: "守卫在哪？", status: "answered" },
+			{ question: "测试在哪？", status: "unavailable", note: "登录墙挡住了" },
+		]);
+		expect(verdict.outcome).toBe("data_gaps");
+		expect(verdict.dataGaps).toEqual(["测试在哪？：登录墙挡住了"]);
+		expect(verdict.unfinished).toEqual([]);
+	});
+
+	it("reports a task incomplete when a question is partial or not done", () => {
+		for (const status of ["partial", "not_done"] as const) {
+			const verdict = evaluateSubmittedReport(questions, [
+				{ question: "守卫在哪？", status: "answered" },
+				{ question: "测试在哪？", status, note: "说明" },
+			]);
+			expect(verdict.outcome).toBe("incomplete");
+			expect(verdict.unfinished).toEqual([`测试在哪？：说明`]);
+		}
+	});
+
+	it("lines the statuses up with the task questions by position when the counts match", () => {
+		const verdict = evaluateSubmittedReport(questions, [
+			{ question: "q1 的意思？", status: "answered" },
+			{ question: "q2 的意思？", status: "answered" },
+		]);
+		expect(verdict.statuses.map((entry) => entry.question)).toEqual(questions);
+		expect(verdict.statuses[0].status).toBe("answered");
+		expect(verdict.statuses[1].status).toBe("answered");
+	});
+
+	it("lines the statuses up by text when the counts differ", () => {
+		const verdict = evaluateSubmittedReport(questions, [
+			{ question: "测试在哪？", status: "unavailable", note: "找不到" },
+		]);
+		expect(verdict.statuses[0]).toEqual({
+			question: "守卫在哪？",
+			status: "not_done",
+			note: "提交的报告没有给出这个问题的状态",
+		});
+		expect(verdict.statuses[1]).toMatchObject({ question: "测试在哪？", status: "unavailable", note: "找不到" });
+		expect(verdict.outcome).toBe("incomplete");
+	});
+
+	it("counts a question the submission does not cover as not_done", () => {
+		const verdict = evaluateSubmittedReport(
+			["A", "B", "C"],
+			[
+				{ question: "a", status: "answered" },
+				{ question: "c", status: "answered" },
+			],
+		);
+		expect(verdict.statuses.map((entry) => entry.question)).toEqual(["A", "B", "C"]);
+		expect(verdict.statuses[1]).toEqual({
+			question: "B",
+			status: "not_done",
+			note: "提交的报告没有给出这个问题的状态",
+		});
+		expect(verdict.outcome).toBe("incomplete");
+	});
+
+	it("keeps the handed-in statuses unchanged for a task without Questions", () => {
+		const submitted = [{ question: "q", status: "answered" as const }];
+		expect(evaluateSubmittedReport(undefined, submitted).statuses).toEqual(submitted);
+		expect(evaluateSubmittedReport([], submitted).outcome).toBe("complete");
+	});
+
+	it("normalizes question text when matching by key", () => {
+		const verdict = evaluateSubmittedReport(
+			["Where is the guard (path)?"],
+			[{ question: "where is the guard path", status: "answered" }],
+		);
+		expect(verdict.outcome).toBe("complete");
+		expect(verdict.statuses[0].question).toBe("Where is the guard (path)?");
+	});
+});
+
+describe("findSubmittedReport", () => {
+	function submitCall(timestamp: number, callId: string, args: Record<string, unknown>): Message {
+		return testAssistant(timestamp, [
+			{ type: "text", text: "交报告。" },
+			{ type: "toolCall", id: callId, name: SUBMIT_REPORT_TOOL_NAME, arguments: args },
+		]);
+	}
+
+	it("reads the accepted call arguments by toolCallId", () => {
+		const report = "# 报告\n## Completion checklist\n- answered: 1\n- unanswered: none";
+		const questions = [{ question: "守卫在哪？", status: "answered" }];
+		const messages = [
+			submitCall(1, "call-a", { report, questions }),
+			testToolResult(2, "call-a", SUBMIT_REPORT_TOOL_NAME),
+		];
+		const found = findSubmittedReport(messages);
+		expect(found).toBeDefined();
+		expect(found?.report).toBe(report);
+		expect(found?.questions).toEqual(questions);
+		expect(found?.messageText).toBe("交报告。");
+	});
+
+	it("ignores a failed submit_report call and reads the accepted one", () => {
+		const messages = [
+			submitCall(1, "call-bad", { report: "缺条目的报告", questions: [{ question: "q", status: "wrong" }] }),
+			testToolResult(2, "call-bad", SUBMIT_REPORT_TOOL_NAME, true),
+			submitCall(3, "call-good", { report: "好的报告", questions: [{ question: "q", status: "answered" }] }),
+			testToolResult(4, "call-good", SUBMIT_REPORT_TOOL_NAME),
+		];
+		expect(findSubmittedReport(messages)?.report).toBe("好的报告");
+	});
+
+	it("returns undefined when every submit_report call failed", () => {
+		const messages = [
+			submitCall(1, "call-bad", { report: "x", questions: [] }),
+			testToolResult(2, "call-bad", SUBMIT_REPORT_TOOL_NAME, true),
+		];
+		expect(findSubmittedReport(messages)).toBeUndefined();
+	});
+
+	it("returns undefined without any submit_report call", () => {
+		expect(findSubmittedReport([testAssistant(1, [{ type: "text", text: "正文" }])])).toBeUndefined();
+	});
+
+	it("prefers the last accepted submission", () => {
+		const messages = [
+			submitCall(1, "call-1", { report: "第一版", questions: [] }),
+			testToolResult(2, "call-1", SUBMIT_REPORT_TOOL_NAME),
+			submitCall(3, "call-2", { report: "第二版", questions: [] }),
+			testToolResult(4, "call-2", SUBMIT_REPORT_TOOL_NAME),
+		];
+		expect(findSubmittedReport(messages)?.report).toBe("第二版");
+	});
+
+	it("keeps entries with known statuses when the stored arguments are incomplete", () => {
+		const messages = [
+			submitCall(1, "call-1", {
+				report: "报告",
+				questions: [
+					{ question: "q1", status: "answered", note: "x" },
+					{ question: "q2", status: "未来状态" },
+				],
+			}),
+			testToolResult(2, "call-1", SUBMIT_REPORT_TOOL_NAME),
+		];
+		const found = findSubmittedReport(messages);
+		expect(found?.questions).toEqual([{ question: "q1", status: "answered", note: "x" }]);
+	});
+});
+
+describe("evaluateExploreReportCompleteness: free-text fallback leniency", () => {
+	const questions = ["Q1", "Q2"];
+
+	it("accepts `unanswered: none` with a remark in parentheses", () => {
+		for (const line of [
+			"- unanswered: none（均已回答）",
+			"unanswered: none (all four answered above)",
+			"- unanswered: 无（见上文说明）",
+		]) {
+			const verdict = evaluateExploreReportCompleteness(questions, `正文\n\n## Completion checklist\n${line}`);
+			expect(verdict, line).toMatchObject({ complete: true, unanswered: [], checklistFound: true });
+		}
+	});
+
+	it("accepts the Chinese `未回答：无` wording", () => {
+		const verdict = evaluateExploreReportCompleteness(questions, "结论。\n\n未回答：无");
+		expect(verdict).toMatchObject({ complete: true, unanswered: [], checklistFound: true });
+	});
+
+	it("accepts the bold `**Unanswered questions: None.**` wording", () => {
+		const verdict = evaluateExploreReportCompleteness(questions, "结论。\n**Unanswered questions: None.**");
+		expect(verdict).toMatchObject({ complete: true, unanswered: [], checklistFound: true });
+	});
+
+	it("still lists declared real unanswered items", () => {
+		const verdict = evaluateExploreReportCompleteness(
+			questions,
+			"结论。\n- unanswered: 未能确认 provider 版本；缺少 usage 日志",
+		);
+		expect(verdict.complete).toBe(false);
+		expect(verdict.checklistFound).toBe(true);
+		expect(verdict.unanswered).toEqual(["未能确认 provider 版本", "缺少 usage 日志"]);
+		expect(verdict.note).toContain("未回答");
+	});
+
+	it("marks a report without any checklist as not complete", () => {
+		const verdict = evaluateExploreReportCompleteness(questions, "只有正文。");
+		expect(verdict).toMatchObject({ complete: false, checklistFound: false });
+		expect(verdict.unanswered).toEqual(questions);
+	});
+
+	it("is complete without questions", () => {
+		expect(evaluateExploreReportCompleteness(undefined, "正文")).toMatchObject({
+			complete: true,
+			checklistFound: true,
+		});
+	});
+});
+
+describe("getFinalAssistantText: truncated reply continuation", () => {
+	it("joins a reply cut off by the output limit with the following continuation", () => {
+		const first = testAssistant(1, [{ type: "text", text: "报告第一段" }], { stopReason: "length" });
+		const second = testAssistant(2, [{ type: "text", text: "报告第二段" }], { stopReason: "stop" });
+		expect(getFinalAssistantText([first, second])).toBe("报告第一段报告第二段");
+	});
+
+	it("joins several continuations into one report", () => {
+		const messages = [
+			testAssistant(1, [{ type: "text", text: "A" }], { stopReason: "length" }),
+			testAssistant(2, [{ type: "text", text: "B" }], { stopReason: "length" }),
+			testAssistant(3, [{ type: "text", text: "C" }], { stopReason: "stop" }),
+		];
+		expect(getFinalAssistantText(messages)).toBe("ABC");
+	});
+
+	it("stops joining at a reply that carries a tool call", () => {
+		const messages = [
+			testAssistant(1, [{ type: "text", text: "第一段" }], { stopReason: "length" }),
+			testAssistant(
+				2,
+				[
+					{ type: "text", text: "备注。" },
+					{ type: "toolCall", id: "r1", name: "read", arguments: { path: "a.ts" } },
+				],
+				{ stopReason: "length" },
+			),
+			testAssistant(3, [{ type: "text", text: "最终报告" }]),
+		];
+		expect(getFinalAssistantText(messages)).toBe("最终报告");
+	});
+
+	it("does not join when the cut-off reply carries no text", () => {
+		const messages = [
+			testAssistant(1, [], { stopReason: "length" }),
+			testAssistant(2, [{ type: "text", text: "报告" }]),
+		];
+		expect(getFinalAssistantText(messages)).toBe("报告");
+	});
+});
+
+describe("collectFinalReasoning", () => {
+	const toolResult = testToolResult(2, "r1", "read");
+
+	it("keeps only the thinking produced after the last tool result", () => {
+		const messages = [
+			testAssistant(1, [{ type: "thinking", thinking: "调查中的想法。" }]),
+			toolResult,
+			testAssistant(3, [{ type: "thinking", thinking: "报告还没写。" }]),
+			testAssistant(4, [{ type: "thinking", thinking: "要收尾了。" }]),
+		];
+		const reasoning = collectFinalReasoning(messages);
+		expect(reasoning).toContain("报告还没写。");
+		expect(reasoning).toContain("要收尾了。");
+		expect(reasoning).not.toContain("调查中的想法。");
+		expect(reasoning).toContain("---");
+	});
+
+	it("stops at the last tool result even when an earlier turn had thinking", () => {
+		const messages = [
+			testAssistant(1, [{ type: "thinking", thinking: "早的想法。" }]),
+			toolResult,
+			testAssistant(3, [{ type: "text", text: "没有思考只有正文。" }]),
+		];
+		expect(collectFinalReasoning(messages)).toBe("");
+	});
+
+	it("skips redacted thinking parts", () => {
+		const messages = [
+			testAssistant(1, [
+				{ type: "thinking", redacted: true, encrypted_content: "secret" },
+				{ type: "thinking", thinking: "可见的想法。" },
+			]),
+		];
+		const reasoning = collectFinalReasoning(messages);
+		expect(reasoning).toBe("可见的想法。");
+		expect(reasoning).not.toContain("secret");
+	});
+
+	it("keeps the tail of the reasoning when it is over the byte cap", () => {
+		const head = Array.from({ length: 30 }, (_value, index) => `开头第${index + 1}段思考。`).join("");
+		const tail = "结尾最接近报告的想法。";
+		const messages = [testAssistant(1, [{ type: "thinking", thinking: `${head}\n${tail}` }])];
+		const reasoning = collectFinalReasoning(messages, 64);
+		expect(reasoning).toContain("[前面部分已省略]");
+		expect(reasoning.endsWith(tail)).toBe(true);
+		// Only the final segments survive the cap.
+		expect(reasoning).not.toContain("开头第1段");
+		expect(reasoning).toContain("开头第30段");
+		// The tail never cuts inside a UTF-8 codepoint.
+		expect(reasoning).not.toContain("\uFFFD");
+	});
+
+	it("returns the whole reasoning when it fits the cap", () => {
+		const messages = [testAssistant(1, [{ type: "thinking", thinking: "短的想法。" }])];
+		expect(collectFinalReasoning(messages, 4096)).toBe("短的想法。");
 	});
 });

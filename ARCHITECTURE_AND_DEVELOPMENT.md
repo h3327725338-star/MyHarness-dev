@@ -56,7 +56,7 @@ dev-desktop.cmd → packages/desktop（Electron 宿主，服务进程）
 | --- | --- |
 | `startup/` | Web 启动参数、帮助、文件与初始消息输入、浏览器命令、设置表与延迟启动维护（`deferred-maintenance.ts`：延后清理原子写临时文件、空会话目录与确认无活动所有者的委托沙箱） |
 | `agent/runtime/` | Agent 生命周期、运行时服务与 SDK、会话桥 |
-| `agent/delegation/` | 内部委托 worker、事件解析、后台任务与隔离目录生命周期；`non-git-sandbox.ts` 为普通工作区提供过滤后的独立文件镜像，Git Worktree 逻辑保持独立 |
+| `agent/delegation/` | 内部委托 worker、事件解析、后台任务与子代理副本池：`worktree-pool.ts`（Git 工作区）和 `mirror-pool.ts`（普通文件夹，过滤规则在 `non-git-sandbox.ts`）提供长期复用的副本，`slot-lock.ts` 管占用锁，`copy-pool.ts` 管空闲预热；`report-follow-up.ts` 是 worker 交报告前的续写与追问 |
 | `session/` | Session 格式、JSONL、投影、持久化、锁与 migration；`artifacts/` 管理对话产出、来源保留及可重建的工作区/全局引用索引；`memory/` 管理 Data 内三层长期记忆的存储、归档、索引、恢复和旧目录迁移 |
 | `context/` | 上下文预算与压缩 |
 | `config/` | Settings、路径、Trust 与兼容迁移 |

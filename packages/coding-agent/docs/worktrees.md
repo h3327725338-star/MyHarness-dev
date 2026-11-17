@@ -15,3 +15,5 @@ Web UI 的分支浮层与输入框上方的「合回 main」按钮提供一键�
 Worktree 默认创建在 agent data 目录的 `worktrees/<repository>/<branch>/` 下，主仓库目录的启动方式保持不变。删除操作使用正常的 `git worktree remove`，如果目录有未提交修改，Git 会拒绝删除并保留原状态。
 
 副本用完不会自动删除：子智能体或脚本留下的副本会被标记为已归档（记录在 agent data 目录的 `worktrees/archive/`），从活动列表移到「已归档副本」组，文件夹、提交和未提交改动都留在原处。读取副本列表时，已归档副本和 prunable 副本不再返回 `changes`/`ahead`（每个已归档副本原本要跑两条 Git 命令，几百个归档会拖住整个服务），它们只显示「已归档」状态；删除仍以 `git worktree remove` 的真实结果为准，脏副本会被 Git 拒绝并由界面提供强制删除确认。删除给 Git 10 分钟（Windows 上带完整 `node_modules` 的副本、或 Git 反复重试被占用的文件时会很慢），因为中途被停掉的删除会先删掉副本的 `.git` 链接文件，留下一个半删的文件夹，之后 Git 每次都以 “validation failed … .git does not exist” 拒绝；遇到这种 Git 标为 prunable、且 Git 记录正好指向该文件夹的副本，删除改为直接删完文件夹和这条记录（无法再检查改动，提交仍在共享仓库里，分支保留）。Git for Windows 遇到 junction（如 npm 放在 `node_modules` 里的工作区链接）会报告成功却留下文件夹，删除后剩下的文件夹也一并清掉，junction 只解除链接、不跟进去删。恢复、清空与强制清空的完整行为见 [Web UI](web-ui.md) 的「归档」小节。
+
+子智能体的副本池（`myharness-subagent-pool-<n>`，与其他副本放在同一个 `worktrees/<repository>/` 目录下）是长期复用的副本：派发时取空闲副本、全被占用时新建，永不自动删除或归档；复用前副本里遗留的改动先存成 Git 提交。规则见 [设置](settings.md) 的 Sub Agent 一节。

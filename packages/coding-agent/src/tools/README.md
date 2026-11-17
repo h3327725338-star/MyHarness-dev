@@ -17,7 +17,8 @@
 | `truncate.ts` | 按行数和字节数截断输出 |
 | `output-accumulator.ts` | 流式输出累积，内存有上限 |
 | `path-utils.ts` | 工具参数里的路径展开与解析 |
-| `sub-agent.ts` | `agent` 工具：启动只读或读写的 Explore 子进程（前台或后台批次）；非 Git 工作区先装配过滤后的独立文件镜像，失败不回宿主运行，逐任务 finally 清理（机制见 `agent/delegation/non-git-sandbox.ts`），通过 NDJSON stdin 下发任务与“收敛提醒” steering 消息，收集结果、超时与停滞检测；只有 stall watchdog、墙钟超时、`maxTurns` 和取消会真正终止任务，重复操作/连续工具失败/无新信息只注入提醒；带 `questions` 的任务要求逐项回答并附 `## Completion checklist`，缺失即记为 `partial`（`stopReason: "incomplete_answer"`）；`runExploreBatch()` 也被 `workflow/` 使用 |
+| `sub-agent.ts` | `agent` 工具：启动只读或读写的 Explore 子进程（前台或后台批次）；每个任务从副本池取一个副本运行（Git 工作区用 `agent/delegation/worktree-pool.ts`，普通文件夹用 `mirror-pool.ts`；读写模式里任务可用 `access` 标为只读），准备失败不回宿主运行；`readPaths` 和 workflow 的阶段结果目录组成任务的「可读清单」交给 guard；通过 NDJSON stdin 下发任务与“收敛提醒” steering 消息，收集结果、超时与停滞检测；只有 stall watchdog、墙钟超时、`maxTurns` 和取消会真正终止任务，重复操作/连续工具失败/无新信息只注入提醒；报告以 `submit_report` 的逐题状态判定（完成 / 完成但有资料缺口 / 没完成），没交时按正文解析并标为「没按格式提交」，没有正文时记为 `failed` 并附推理原文；`runExploreBatch()` 也被 `workflow/` 使用 |
+| `submit-report.ts` | `submit_report` 工具（只在委派子进程里注册）：子 Agent 交最终报告并逐题给状态（`answered`/`partial`/`unavailable`/`not_done`），按任务的问题数校验，接受后结束这一轮 |
 | `symbols.ts` | `symbols` 工具：符号、定义、引用、诊断等查询，以及 find_existing / read_symbol / impact / rename_preview 组合操作（实现在 `symbols/workflow/`） |
 | `apply-rename.ts` | `apply_rename` 工具：按 rename_preview 的计划写入；与 `symbols` 同受 `codeIntelligence.symbolsEnabled` 控制，复用 apply_patch 的文件队列与整体回滚，任一文件哈希变化则整份拒绝 |
 | `workspace.ts` | `workspace` 工具（仅桌面端）：内置浏览器与右侧工作区的结构化控制。浏览器命令经服务进程到 Electron 主进程的 IPC 通道操作 `WebContentsView`（含导航、DOM/可访问性/交互元素、点击/输入/滚动、页内查找、工作区文件上传、截图、下载取消/重试、网络与站点权限状态），工作区命令转发给页面（页面拥有标签列表和媒体元素）并以其回报的状态为准；只在 `MYHARNESS_DESKTOP_HOST=1` 且 IPC 已连接时注册。站点权限只能由页面里的用户决定，工具不能授予。需要登录或人机验证的页面由 `handoff` 交给用户（标签上显示请求，调用等到用户完成、拒绝、超时，或验证/登录自己结束；回合停止时撤回），人机验证页面上的输入类操作被拒绝；`bookmarks` 按关键词查书签及其用途说明，`bookmark_note` 让 Agent 做任务时补写或改好书签的用途（宿主拒绝改用户自己写的）。 |
@@ -60,7 +61,7 @@
 | `job-tools.ts` | `job_list`、`job_output`、`job_kill` 三个内置工具的定义与创建。`job_list`、`job_kill` 只管本会话的任务；`job_output` 有 taskId 就能读本进程里任何会话的任务（只读），比如定时任务开出的新对话检查原对话的后台命令 |
 | `session-scope.ts` | 会话所有权作用域解析：优先读取 `ctx.sessionManager.getSessionId()`，退回 cwd，隔离不同会话的任务列表、终止和状态 |
 | `shell-session.ts` | `preserve_state` 状态保持机制：尾部探针构建、探针解析与输出剥离、环境变量差分、跨进程调用状态注入 |
-| `delegated-write-guard.ts` | 读写型子智能体的落笔边界：文件/Glob 参数与 shell（可执行文件、内联代码、`cd`、重定向、变量路径）必须留在任务 worktree 内；`agent`/`workflow`/`ultracode` 及同类派发工具一律拦截，标记 `[delegated-write-guard]` |
+| `delegated-write-guard.ts` | 读写型子智能体的落笔边界：文件/Glob 参数与 shell（可执行文件、内联代码、`cd`、重定向、变量路径）必须留在任务副本内；「可读清单」（`MYHARNESS_INTERNAL_DELEGATED_READ_ROOTS`）上的位置只放行 read/grep/find/ls/symbols 的绝对路径；`agent`/`workflow`/`ultracode` 及同类派发工具一律拦截，标记 `[delegated-write-guard]` |
 | `null-redirect-guard.ts` | `findBashNullDeviceRedirect()`：bash 里 `>nul` 会建出真文件并破坏 Git，属引号感知的纯扫描，不执行命令 |
 | `read-only-guard.ts` | 子 Agent 的只读 Bash 守卫：按 shell 序列段（管道、`&&`、`;`）逐段用只读允许列表 + 危险选项/拒绝列表判定，诊断重定向（`2>/dev/null`）与临时路径写入不影响判定，可选的模型裁决；拦截结果带 `[read-only-guard]` 标记和具体原因，不计入连续工具失败 |
 
@@ -130,4 +131,4 @@
 - Shell 执行、输出截断、结果落盘各只有一份实现，新工具复用它们。
 - 文件写操作（`edit`、`write`）修改已存在文件时要求“先读后改”，改前校验读取状态与文件是否过期，写后刷新状态；非本地文件系统（自定义 operations）跳过校验。`apply_patch` 的 Update 与 Delete 同样执行这一检查（它只使用本地文件系统）。
 - Web Search 的搜索规划（搜什么、读哪些页）由 Agent 决定；工具只负责并发、缓存、取消、超时和逐项诊断。任何下载都必须先过 `url.ts` 的检查。
-- 相关测试：`tools.test.ts`、`read-state.test.ts`、`tool-result-persistence.test.ts`、`bash-executor.test.ts`、`read-only-bash-guard*.test.ts`、`file-mutation-queue.test.ts`、`sub-agent.test.ts`、`symbols-tool-*.test.ts`、`github-tool.test.ts`、`memory-intelligence.test.ts`、`web-search*.test.ts`、`web-fetch-documents.test.ts`、`ask-user-and-todo-tools.test.ts`。
+- 相关测试：`tools.test.ts`、`read-state.test.ts`、`tool-result-persistence.test.ts`、`bash-executor.test.ts`、`read-only-bash-guard*.test.ts`、`file-mutation-queue.test.ts`、`sub-agent.test.ts`、`submit-report.test.ts`、`delegated-read-roots.test.ts`、`symbols-tool-*.test.ts`、`github-tool.test.ts`、`memory-intelligence.test.ts`、`web-search*.test.ts`、`web-fetch-documents.test.ts`、`ask-user-and-todo-tools.test.ts`。

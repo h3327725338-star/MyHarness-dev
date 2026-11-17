@@ -63,6 +63,12 @@ const PATH_LIKE_KEYS = new Set(["path", "file_path", "dir", "directory"]);
 
 /** Env var pointing a temp-sandbox worker back at the read-only origin workspace (non-Git fallback). */
 const SANDBOX_ORIGIN_ENV = "MYHARNESS_INTERNAL_SANDBOX_ORIGIN";
+/**
+ * Env var with the extra read-only roots of this task, as a JSON array of absolute paths: the folders the dispatcher
+ * explicitly lets the worker read outside its own copy (the previous phase's results of a workflow, folders the Main
+ * Agent named). Only the read-only file tools may use them; nothing there may be written or reached from the shell.
+ */
+export const DELEGATED_READ_ROOTS_ENV = "MYHARNESS_INTERNAL_DELEGATED_READ_ROOTS";
 /** Read-only file tools that may read from the sandbox origin in non-Git fallback mode. */
 const SANDBOX_READABLE_TOOLS = new Set(["read", "grep", "find", "ls", "symbols"]);
 
@@ -72,11 +78,39 @@ function getSandboxOrigin(explicitOrigin?: string): string | undefined {
 	return raw;
 }
 
-/** True when a read path stays inside the sandbox jail or inside the read-only origin workspace. */
-function isAllowedSandboxReadPath(candidate: string, root: string, origin?: string): boolean {
+/** The extra read-only roots: the explicit list when given, else the worker's environment. Malformed input is none. */
+function getExtraReadRoots(explicitRoots?: readonly string[]): string[] {
+	if (Array.isArray(explicitRoots)) {
+		return explicitRoots.filter((item) => typeof item === "string" && item.trim() !== "");
+	}
+	const raw = typeof process !== "undefined" ? process.env?.MYHARNESS_INTERNAL_DELEGATED_READ_ROOTS : undefined;
+	if (typeof raw !== "string" || raw.trim() === "") return [];
+	try {
+		const parsed = JSON.parse(raw);
+		return Array.isArray(parsed)
+			? parsed.filter((item) => typeof item === "string" && item.trim() !== "" && !item.trim().startsWith("~"))
+			: [];
+	} catch {
+		return [];
+	}
+}
+
+/** True when a read path stays inside the jail, the read-only origin workspace, or one of the extra read roots. */
+function isAllowedSandboxReadPath(
+	candidate: string,
+	root: string,
+	origin?: string,
+	readRoots?: readonly string[],
+): boolean {
 	if (isPathWithinJail(candidate, root)) return true;
 	const resolvedOrigin = getSandboxOrigin(origin);
 	if (resolvedOrigin && isPathWithinJail(candidate, resolvedOrigin)) return true;
+	// Only absolute paths can name a read root: a relative path always resolves against the worker's own copy.
+	const normalized = normalizeSlashes(candidate.trim());
+	if (!isDriveAbsolute(normalized) && !isUnixAbsolute(normalized)) return false;
+	for (const readRoot of getExtraReadRoots(readRoots)) {
+		if (isPathWithinJail(candidate, readRoot)) return true;
+	}
 	return false;
 }
 
@@ -168,6 +202,25 @@ function lowerForCompare(value: string): string {
 }
 
 /**
+ * Mirror of the file tools' own path normalization (`resolveToCwd` →
+ * `normalizePath` with `{ normalizeUnicodeSpaces: true, stripAtPrefix: true }`):
+ * returns the value the tools will actually resolve, or `undefined` when that
+ * value is not a plain relative or absolute path. A `file:` URL becomes an
+ * absolute path via `fileURLToPath` and a tilde expands to the user's home, so
+ * the lexical jail check on the raw text would not see the same path the tools
+ * touch; both are rejected fail-closed (case-insensitively for `file:`).
+ */
+function plainPathValue(raw: string): string | undefined {
+	let value = raw.trim();
+	if (value.startsWith("@")) value = value.slice(1);
+	// The same unicode space variants the tools normalize before resolving.
+	value = value.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+	if (/^file:/i.test(value)) return undefined;
+	if (value === "~" || value.startsWith("~/") || value.startsWith("~\\")) return undefined;
+	return value;
+}
+
+/**
  * Collapse `.`/`..` segments against an absolute base without touching the
  * filesystem, so symlinked paths are not resolved here (documented limitation:
  * the jail is lexical; the worker's own cwd is always inside the jail).
@@ -209,7 +262,11 @@ export function pathValueEscapesJail(rawPath: unknown, root: string): boolean {
 	const value = rawPath.trim();
 	if (value === "") return false; // empty path means the session root itself, which is the jail
 	if (value.startsWith("@")) return pathValueEscapesJail(value.slice(1), root);
-	return !isPathWithinJail(value, root);
+	// Check the value the tools will resolve, not the raw text: a `file:` URL or
+	// a tilde path resolves elsewhere and would otherwise sneak past this check.
+	const plain = plainPathValue(value);
+	if (plain === undefined) return true;
+	return !isPathWithinJail(plain, root);
 }
 
 function globValueEscapesJail(raw: unknown): boolean {
@@ -287,6 +344,12 @@ function escapePathTokenReason(rawToken: string, root: string): string | undefin
 	if (token.startsWith("@")) return escapePathTokenReason(token.slice(1), root);
 	const equals = token.indexOf("=");
 	if (token.startsWith("-") && equals > 0) token = normalizeSlashes(token.slice(equals + 1));
+	else if (equals > 0) {
+		// `dd of=C:/outside`, `TMPDIR=C:/outside cmd`: the value of a bare `key=value` argument is used as a path by
+		// the program, so it is checked by the same rules instead of reading the whole token as a relative name.
+		const valueReason = escapePathTokenReason(token.slice(equals + 1), root);
+		if (valueReason) return `命令中 ${token.slice(0, equals)}= 的值越出本任务 worktree：${rawToken}`;
+	}
 	if (token.startsWith("-")) return undefined;
 	const lower = token.toLowerCase();
 	if (lower === "~" || lower.startsWith("~/")) return `路径指向用户主目录，越出本任务 worktree：${rawToken}`;
@@ -385,6 +448,7 @@ export function evaluateDelegatedWriteToolCall(
 	input: Record<string, unknown> | undefined,
 	root: string,
 	origin?: string,
+	readRoots?: readonly string[],
 ): string | undefined {
 	const normalized = toolName.toLowerCase();
 	if (isWriteGuardDispatchToolName(normalized)) {
@@ -404,8 +468,10 @@ export function evaluateDelegatedWriteToolCall(
 	for (const value of pathValues) {
 		if (mayReadOrigin) {
 			if (typeof value !== "string" || value.trim() === "") continue;
-			const stripped = value.trim().startsWith("@") ? value.trim().slice(1) : value;
-			if (!isAllowedSandboxReadPath(stripped, root, origin)) return `路径越出本任务 worktree：${value}`;
+			// Same fail-closed normalization as the jailed tools: `file:` URLs and tilde paths are rejected.
+			const plain = plainPathValue(value.trim());
+			if (plain === undefined) return `路径越出本任务 worktree：${value}`;
+			if (!isAllowedSandboxReadPath(plain, root, origin, readRoots)) return `路径越出本任务 worktree：${value}`;
 			continue;
 		}
 		if (pathValueEscapesJail(value, root)) return `路径越出本任务 worktree：${value}`;
@@ -449,11 +515,13 @@ const WRITE_GUARD_DEPS = {
 const SANDBOX_ORIGIN_ENV = "MYHARNESS_INTERNAL_SANDBOX_ORIGIN";
 const SANDBOX_READABLE_TOOLS = new Set(["read", "grep", "find", "ls", "symbols"]);
 const getSandboxOrigin = ${getSandboxOrigin.toString()};
+const getExtraReadRoots = ${getExtraReadRoots.toString()};
 const isAllowedSandboxReadPath = ${isAllowedSandboxReadPath.toString()};
 const normalizeSlashes = ${normalizeSlashes.toString()};
 const isDriveAbsolute = ${isDriveAbsolute.toString()};
 const isUnixAbsolute = ${isUnixAbsolute.toString()};
 const lowerForCompare = ${lowerForCompare.toString()};
+const plainPathValue = ${plainPathValue.toString()};
 const resolveLexically = ${resolveLexically.toString()};
 const isPathWithinJail = ${isPathWithinJail.toString()};
 const pathValueEscapesJail = ${pathValueEscapesJail.toString()};

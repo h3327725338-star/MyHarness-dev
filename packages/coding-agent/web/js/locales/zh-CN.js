@@ -1470,6 +1470,15 @@ export const zhCN = {
 	"Waiting for {agents}": "等待 {agents}",
 	"{agents} still running in the background": "后台仍有 {agents}在运行",
 	"Stop the run and all sub-agents (Esc)": "停止当前任务和全部子智能体 (Esc)",
+	// A report's own verdict states (task.dataGaps / task.reportSubmission), shown as badges and lists
+	"Completed with data gaps": "完成（有资料缺口）",
+	"Report not handed in properly": "没按格式提交",
+	"Data gaps": "资料缺口",
+	"Question statuses": "问题状态",
+	"Answered": "已回答",
+	"Partly answered": "部分回答",
+	"Material unreachable": "查过但资料拿不到",
+	"Not done": "没做",
 
 	// ---- Statuses that arrive as words from the server
 	completed: "已完成",
@@ -2442,6 +2451,11 @@ export const zhCN = {
 	"Create and enter a copy": "创建并进入副本",
 	"My copies": "我的副本",
 	"Sub-agent copies": "子智能体副本",
+	// The sub-agent copy pool: long-lived reusable copies shown with their own badges
+	"Pool": "池",
+	"In use": "使用中",
+	"Kept in the sub-agent copy pool for reuse; never archived, never cleared": "留在子智能体副本池里复用；不会归档，也不会被清空删除",
+	"A sub-agent task is using this copy right now": "有子智能体任务正在使用这个副本",
 	"Archived": "已归档",
 	"Archived copies": "已归档副本",
 	"Archived {when}: kept on disk, nothing deleted": "{when}归档：文件仍在磁盘上，没有删除任何内容",
@@ -3460,6 +3474,9 @@ export const serverTextEn = {
 		// Sub-agents
 		["初始化中…", "Starting…"],
 		["后台运行中…", "Running in the background…"],
+		["正在给工作区拍快照…", "Taking a snapshot of the workspace…"],
+		["正在准备副本…", "Preparing a copy…"],
+		["正在同步工作区副本…", "Syncing the workspace copy…"],
 		["完成", "Done"],
 		["执行失败", "Failed"],
 		["执行完成", "Finished"],
@@ -3471,6 +3488,14 @@ export const serverTextEn = {
 		["模型产生了新的调查分析", "The model produced new analysis"],
 		["报告未满足问题逐项回答要求，已标记为 partial", "The report did not answer every task question as required; marked as partial"],
 		["子 Agent 未执行调查工具，返回内容不能视为完成", "The sub-agent ran no investigation tool, so its answer cannot count as complete"],
+		// Sub-agent task outcomes (sub-agent.ts lastToolInfo and report verdict notes)
+		["完成（有资料缺口）", "Completed (with data gaps)"],
+		["完成（没按格式提交，按正文解析）", "Completed (report not handed in properly; parsed from the reply text)"],
+		["没按格式提交，正文里也确认不了问题是否答完", "Report not handed in properly; the reply text does not say whether the questions were answered either"],
+		["输出被截断，没有写出报告", "The output was truncated before any report was written"],
+		["没有写出报告", "No report was written"],
+		["提交的报告里有问题没有完成", "The submitted report has questions that were not completed"],
+		["提交的报告没有给出这个问题的状态", "The submitted report did not give a status for this question"],
 		// Slash command descriptions (startup/slash-commands.ts)
 		["打开设置菜单", "Open the settings menu"],
 		["打开改动（Diff）面板", "Open the Diff panel"],
@@ -3642,6 +3667,13 @@ export const serverTextEn = {
 		[/^后台 Explore (.+) 失败：(.+)$/, (m) => `Background Explore ${m[1]} failed: ${m[2]}`],
 		[/^已启动后台 Explore (.+)（(\d+) 个任务）。完成结果会自动通知主 Agent。$/, (m) => `Started background Explore ${m[1]} (${m[2]} tasks). The main agent is notified when it finishes.`],
 		[/^Explore：(\d+)\/(\d+) 已完成.*$/, (m) => `Explore: ${m[1]}/${m[2]} done`],
+		[/^没按格式提交（未调用 submit_report）。([^]*)$/, (m) => `Report not handed in properly (submit_report was never called). ${m[1]}`],
+		[/^子 Agent 进程在交回报告后异常退出（退出码 ([^；）]+)(?:；输出：([^]*))?），报告判定不受影响$/, (m) => `The sub-agent process exited abnormally after handing in its report (exit code ${m[1]}${m[2] ? `; output: ${m[2]}` : ""}); the report's verdict stands`],
+		// Sub-agent report verdicts (sub-agent.ts): the error and the unresolved-item and status-note leads
+		[/^子 Agent 提交的报告里有问题没有完成：([^]*)$/, (m) => `The submitted report has unfinished questions: ${m[1]}`],
+		[/^资料拿不到：([^]*)$/, (m) => `Material unreachable: ${m[1]}`],
+		[/^问题未完成：([^]*)$/, (m) => `Question not completed: ${m[1]}`],
+		[/^问题未逐项回答：([^]*)$/, (m) => `Question not answered item by item: ${m[1]}`],
 	],
 	// "<Chinese lead>：<detail>" where only the lead is known: keep the detail as it is.
 	leads: map([
@@ -3716,6 +3748,12 @@ export const serverTextZh = {
 		[/^CI still fails after (\d+) repair rounds\.$/, (m) => `修复 ${m[1]} 轮后 CI 仍未通过。`],
 		[/^Your commit instructions stopped this commit: (.+)$/s, (m) => `你的 Commit 提示词阻止了这次提交：${m[1]}`],
 		[/^The repair turn ended: (.+)$/s, (m) => `这一轮修复没有正常结束：${m[1]}`],
+		// Worktrees: the sub-agent copy pool (routes-git.ts)
+		[/^This pool copy is running a sub-agent task; stop the task before deleting it\.$/, () => "这个副本池副本正在运行子智能体任务，请先停止任务再删除。"],
+		[/^This pool copy is running a sub-agent task; stop the task before entering it\.$/, () => "这个副本池副本正在运行子智能体任务，请先停止任务再进入。"],
+		[/^This pool copy is running a sub-agent task; stop the task before starting it\.$/, () => "这个副本池副本正在运行子智能体任务，请先停止任务再启动。"],
+		[/^Pool copies are reused by sub-agent tasks and cannot be combined into main\.$/, () => "副本池的副本供子智能体任务复用，不能合并到 main。"],
+		[/^Pool copies are reused by sub-agent tasks and cannot be archived\.$/, () => "副本池的副本供子智能体任务复用，不能归档。"],
 		// Scheduled tasks (schedules/service.ts, routes-schedules.ts)
 		[/^No scheduled task has the id .+\.$/, () => "找不到这个定时任务，它可能已在另一台电脑上删除。"],
 		[/^That time has already passed \(.+\)\.(?: It is now (.+)\.)?$/, (m) => (m[1] ? `这个时间已经过去了。现在是 ${m[1]}。` : "这个时间已经过去了。")],
