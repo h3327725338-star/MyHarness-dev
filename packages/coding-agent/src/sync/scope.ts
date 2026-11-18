@@ -70,6 +70,8 @@ export interface ScanOptions {
 	memoryMetadataCache?: Map<string, { signature: string; id: string; name: string }>;
 	/** Async callers supply an already traversed memory listing. */
 	memories?: MemoryFile[];
+	/** For receive only: resolve just these keys, including the scope checks of their parent workspace/session. */
+	keys?: ReadonlySet<string>;
 	/** Keyed by file path; a session.json whose size and time did not change is not read again. */
 	sessionMetadataCache?: Map<string, SessionMetadataCacheEntry>;
 }
@@ -136,7 +138,8 @@ function travelingSessionMetadata(entity: ScannedEntity, cache: Map<string, Sess
 	entity.size = Buffer.byteLength(inline);
 }
 
-function walkFiles(directory: string, visit: (file: string) => void): void {
+function walkFiles(directory: string, visit: (file: string) => void, paths?: ReadonlySet<string>): void {
+	if (paths && !paths.has(directory)) return;
 	if (!existsSync(directory)) return;
 	let entries: Dirent[];
 	try {
@@ -147,8 +150,8 @@ function walkFiles(directory: string, visit: (file: string) => void): void {
 	for (const entry of entries) {
 		if (entry.isSymbolicLink()) continue;
 		const full = join(directory, entry.name);
-		if (entry.isDirectory()) walkFiles(full, visit);
-		else if (entry.isFile()) visit(full);
+		if (entry.isDirectory()) walkFiles(full, visit, paths);
+		else if (entry.isFile() && (!paths || paths.has(full))) visit(full);
 	}
 }
 
@@ -222,14 +225,46 @@ export async function scanLocalEntitiesAsync(options: ScanOptions, sliceMs = 12)
 
 /** The scan itself; it yields between Workspaces and Sessions so a caller can let other work run. */
 function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>): Generator<void, void, void> {
-	const { dataRoot, agentDir, modeState } = options;
+	const { dataRoot, agentDir, modeState, keys } = options;
+	const wants = (key: string) => !keys || keys.has(key);
+	const workspaces = new Set<string>();
+	const sessions = new Set<string>();
+	const paths = new Set<string>();
+	for (const key of keys ?? []) {
+		const [kind, ...rest] = key.split(":");
+		const id = rest.join(":");
+		const parts = id.split("/");
+		// Match the enumerated local names without interpreting Windows separators as key segments.
+		if (
+			parts.some(
+				(part) =>
+					!part ||
+					part === "." ||
+					part === ".." ||
+					part.includes("\u0000") ||
+					(sep === "\\" && part.includes(sep)),
+			)
+		)
+			continue;
+		if (kind === "workspace" && parts.length === 1) workspaces.add(id);
+		if (kind === "session" && parts.length === 2) {
+			workspaces.add(parts[0]!);
+			sessions.add(id);
+		}
+		if (kind === "file" && parts[0] === "workspaces" && parts.length >= 4) {
+			workspaces.add(parts[1]!);
+			if (parts[2] === "sessions" && parts.length >= 6) sessions.add(`${parts[1]}/${parts[3]}`);
+			for (let length = 3; length <= parts.length; length++)
+				paths.add(join(getWorkspacesDir(dataRoot), ...parts.slice(1, length)));
+		}
+	}
 	const headerCache = options.headerCache ?? new Map<string, HeaderCacheEntry>();
 	const sessionMetadataCache = options.sessionMetadataCache ?? new Map<string, SessionMetadataCacheEntry>();
 
 	// 1. All memories, including archives and pending quarantine entries.
 	for (const memory of options.memories ?? listMemoryFiles(dataRoot, { metadataCache: options.memoryMetadataCache })) {
 		const absolute = join(dataRoot, memory.path);
-		if (!isFile(absolute) || !memory.path.endsWith(".md")) continue;
+		if (!wants(`memory:${memory.path}`) || !isFile(absolute) || !memory.path.endsWith(".md")) continue;
 		const stat = statSync(absolute);
 		entities.set(`memory:${memory.path}`, {
 			key: `memory:${memory.path}`,
@@ -247,13 +282,14 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 	// 2. General Sessions and the Workspaces that own them.
 	const generalWorkspaces = new Set<string>();
 	const workspaceMeta = new Map<string, Record<string, unknown> | undefined>();
-	const registryModes = readRegistryModes(agentDir, dataRoot);
+	const registryModes = !keys || workspaces.size ? readRegistryModes(agentDir, dataRoot) : new Map<string, string[]>();
 	const workspacesRoot = getWorkspacesDir(dataRoot);
-	if (existsSync(workspacesRoot)) {
+	if ((!keys || workspaces.size) && existsSync(workspacesRoot)) {
 		for (const workspaceId of readdirSync(workspacesRoot, { withFileTypes: true })) {
 			yield;
 			if (!workspaceId.isDirectory() || workspaceId.isSymbolicLink()) continue;
 			const workspace = workspaceId.name;
+			if (keys && !workspaces.has(workspace)) continue;
 			const registry = registryModes.get(workspace);
 			// A Workspace the user removed from every list keeps its files but is not published again.
 			if (registry && registry.length === 0) continue;
@@ -270,11 +306,13 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 				(registry ? registry.includes("general") : metadataModes.includes("general"));
 			if (general) generalWorkspaces.add(workspace);
 			const sessionsRoot = join(getWorkspaceDir(dataRoot, workspace), SESSIONS_DIR);
-			if (!existsSync(sessionsRoot)) continue;
+			if ((keys && ![...sessions].some((id) => id.startsWith(`${workspace}/`))) || !existsSync(sessionsRoot))
+				continue;
 			for (const session of readdirSync(sessionsRoot, { withFileTypes: true })) {
 				yield;
 				if (!session.isDirectory() || session.isSymbolicLink()) continue;
 				const sessionId = session.name;
+				if (keys && !sessions.has(`${workspace}/${sessionId}`)) continue;
 				const conversationDir = join(getSessionDir(dataRoot, workspace, sessionId), CONVERSATION_DIR);
 				if (!existsSync(conversationDir)) continue;
 				const files = readdirSync(conversationDir, { withFileTypes: true })
@@ -332,84 +370,92 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 		}
 		for (const directory of WORKSPACE_FILE_DIRS) {
 			const folder = join(getWorkspaceDir(dataRoot, workspaceId), directory);
-			walkFiles(folder, (file) => addFile(entities, dataRoot, file));
+			walkFiles(folder, (file) => addFile(entities, dataRoot, file), keys ? paths : undefined);
 		}
 		const sessionsRoot = join(getWorkspaceDir(dataRoot, workspaceId), SESSIONS_DIR);
-		if (existsSync(sessionsRoot)) {
+		if ((!keys || paths.has(sessionsRoot)) && existsSync(sessionsRoot)) {
 			for (const session of readdirSync(sessionsRoot, { withFileTypes: true })) {
 				if (!session.isDirectory() || session.isSymbolicLink()) continue;
 				if (!entities.has(`session:${workspaceId}/${session.name}`)) continue;
 				yield;
 				for (const category of ["uploads", "artifacts", "metadata", "notes", "files", "tool-results"] as const) {
-					walkFiles(join(getSessionDir(dataRoot, workspaceId, session.name), category), (file) =>
-						addFile(entities, dataRoot, file),
+					walkFiles(
+						join(getSessionDir(dataRoot, workspaceId, session.name), category),
+						(file) => addFile(entities, dataRoot, file),
+						keys ? paths : undefined,
 					);
 				}
 				const metadataId = toPosix(relative(dataRoot, getSessionMetadataPath(dataRoot, workspaceId, session.name)));
 				const metadata = entities.get(`file:${metadataId}`);
 				if (metadata) travelingSessionMetadata(metadata, sessionMetadataCache);
 				// Legacy uploads live inside the conversation folder, beside the JSONL rather than in a session uploads folder.
-				walkFiles(join(getSessionDir(dataRoot, workspaceId, session.name), CONVERSATION_DIR), (file) => {
-					if (!file.endsWith(".jsonl")) addFile(entities, dataRoot, file);
-				});
+				walkFiles(
+					join(getSessionDir(dataRoot, workspaceId, session.name), CONVERSATION_DIR),
+					(file) => {
+						if (!file.endsWith(".jsonl")) addFile(entities, dataRoot, file);
+					},
+					keys ? paths : undefined,
+				);
 			}
 		}
 	}
 
 	// 4. Both personal prompts and the General drafts live in the agent directory, not the Data root.
-	const stateFile = join(agentDir, "chat-mode-state.json");
-	let stateMtime = Date.now();
-	try {
-		stateMtime = statSync(stateFile).mtimeMs;
-	} catch {
-		// No state file yet: drafts and prompt are simply empty.
-	}
-	const updatedAt = new Date(stateMtime).toISOString();
-	let general: ReturnType<ModeStateStore["get"]>;
-	try {
-		general = modeState.get("general");
-	} catch {
-		general = { drafts: {} } as ReturnType<ModeStateStore["get"]>;
-	}
-	const prompts = modeState.getPersonalPrompts();
-	// A separate kind prevents older clients from applying Coding content to General.
-	for (const [id, kind, name] of [
-		["general", "prompt", "General personal prompt"],
-		["coding", "coding-prompt", "Coding personal prompt"],
-	] as const) {
-		const prompt = prompts[id];
-		// Omit an empty prompt so a new device can receive text, or a previously synced value can be deleted.
-		if (!prompt) continue;
-		const key = `${kind}:${id}`;
-		entities.set(key, {
-			key,
-			kind,
-			id,
-			inline: prompt,
-			updatedAt,
-			mtimeMs: stateMtime,
-			size: Buffer.byteLength(prompt),
-			meta: { name },
-		});
-	}
-	for (const [sessionId, draft] of Object.entries(general.drafts)) {
-		if (!draft || (!draft.text && draft.attachments.length === 0)) continue;
-		const content = stableJson({ text: draft.text, attachments: draft.attachments });
-		entities.set(`draft:${sessionId}`, {
-			key: `draft:${sessionId}`,
-			kind: "draft",
-			id: sessionId,
-			inline: content,
-			updatedAt,
-			mtimeMs: stateMtime,
-			size: Buffer.byteLength(content),
-			meta: { name: `Draft ${sessionId}` },
-		});
+	if (!keys || [...keys].some((key) => /^(?:prompt|coding-prompt|draft):/u.test(key))) {
+		const stateFile = join(agentDir, "chat-mode-state.json");
+		let stateMtime = Date.now();
+		try {
+			stateMtime = statSync(stateFile).mtimeMs;
+		} catch {
+			// No state file yet: drafts and prompt are simply empty.
+		}
+		const updatedAt = new Date(stateMtime).toISOString();
+		let general: ReturnType<ModeStateStore["get"]>;
+		try {
+			general = modeState.get("general");
+		} catch {
+			general = { drafts: {} } as ReturnType<ModeStateStore["get"]>;
+		}
+		const prompts = modeState.getPersonalPrompts();
+		// A separate kind prevents older clients from applying Coding content to General.
+		for (const [id, kind, name] of [
+			["general", "prompt", "General personal prompt"],
+			["coding", "coding-prompt", "Coding personal prompt"],
+		] as const) {
+			const prompt = prompts[id];
+			// Omit an empty prompt so a new device can receive text, or a previously synced value can be deleted.
+			if (!prompt || !wants(`${kind}:${id}`)) continue;
+			const key = `${kind}:${id}`;
+			entities.set(key, {
+				key,
+				kind,
+				id,
+				inline: prompt,
+				updatedAt,
+				mtimeMs: stateMtime,
+				size: Buffer.byteLength(prompt),
+				meta: { name },
+			});
+		}
+		for (const [sessionId, draft] of Object.entries(general.drafts)) {
+			if (!wants(`draft:${sessionId}`) || !draft || (!draft.text && draft.attachments.length === 0)) continue;
+			const content = stableJson({ text: draft.text, attachments: draft.attachments });
+			entities.set(`draft:${sessionId}`, {
+				key: `draft:${sessionId}`,
+				kind: "draft",
+				id: sessionId,
+				inline: content,
+				updatedAt,
+				mtimeMs: stateMtime,
+				size: Buffer.byteLength(content),
+				meta: { name: `Draft ${sessionId}` },
+			});
+		}
 	}
 
 	// 5. The saved prompts of the Web UI (My prompts). Only that list leaves the preferences file; an empty list is the
 	// absence of a value, so clearing it becomes an explicit delete, as for the personal prompt.
-	const savedPrompts = readSavedPrompts(agentDir);
+	const savedPrompts = wants("saved-prompts:web") ? readSavedPrompts(agentDir) : [];
 	if (savedPrompts.length > 0) {
 		const prefsFile = join(agentDir, WEB_PREFS_FILE);
 		let prefsMtime = Date.now();
@@ -432,8 +478,8 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 	}
 
 	// 6. The built-in browser's bookmarks, new-tab shortcuts, site settings and sealed sign-in vaults (browser-data.ts).
-	for (const file of listBrowserFiles(agentDir)) {
-		if (!isFile(file.path)) continue;
+	for (const file of !keys || [...keys].some((key) => key.startsWith("browser:")) ? listBrowserFiles(agentDir) : []) {
+		if (!wants(`browser:${file.id}`) || !isFile(file.path)) continue;
 		const stat = statSync(file.path);
 		if (stat.size > MAX_SCANNED_FILE_BYTES) continue;
 		entities.set(`browser:${file.id}`, {
@@ -450,8 +496,8 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 
 	// 7. The scheduled tasks (schedules/store.ts): one record, published as normalized text so equal lists are equal on
 	// every computer. Deleted tasks stay in it as tombstones, so the record itself is never deleted.
-	const schedules = readScheduleList(agentDir);
-	if (scheduleListHasContent(schedules)) {
+	const schedules = wants("schedules:list") ? readScheduleList(agentDir) : undefined;
+	if (schedules && scheduleListHasContent(schedules)) {
 		let schedulesMtime = Date.now();
 		try {
 			schedulesMtime = statSync(join(agentDir, SCHEDULES_FILE)).mtimeMs;
@@ -473,7 +519,7 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 
 	// 8. The configuration that travels (settings-data.ts): Providers and models, saved API keys, model and agent
 	// settings, model prompts and web search keys, each one record of normalized text.
-	for (const record of readSettingsRecords(agentDir)) {
+	for (const record of readSettingsRecords(agentDir, (id) => wants(`settings:${id}`))) {
 		entities.set(`settings:${record.id}`, {
 			key: `settings:${record.id}`,
 			kind: "settings",

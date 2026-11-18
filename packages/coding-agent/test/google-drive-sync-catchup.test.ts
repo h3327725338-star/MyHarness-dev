@@ -34,6 +34,8 @@ class SharedDrive {
 	readonly folders = new Map<string, Map<string, StoredFile>>();
 	readonly hiddenObjects = new Set<string>();
 	readonly failingReads = new Set<string>();
+	readonly hiddenBatches = new Set<string>();
+	beforeFullList?: () => Promise<void>;
 	readonly reads: { device: string; folder: RemoteFolder; name: string }[] = [];
 	readonly lists: { device: string; folder: RemoteFolder; createdAfter?: string }[] = [];
 	readonly located: { device: string; hashes: string[] }[] = [];
@@ -59,15 +61,19 @@ class SharedDrive {
 					);
 				return Promise.resolve({ folderId: "folder-1", folderName: "MyHarness", syncId: "space-1", url: "u" });
 			},
-			list: (folder, options = {}) => {
+			list: async (folder, options = {}) => {
 				this.lists.push({
 					device,
 					folder,
 					...(options.createdAfter ? { createdAfter: options.createdAfter } : {}),
 				});
 				const after = options.createdAfter;
+				if (folder === "batches" && !after) await this.beforeFullList?.();
 				const files: RemoteFile[] = [...this.folders.get(folder)!.entries()]
-					.filter(([, file]) => !after || file.createdTime > after)
+					.filter(
+						([name, file]) =>
+							(folder !== "batches" || !this.hiddenBatches.has(name)) && (!after || file.createdTime > after),
+					)
 					.map(([name, file]) => ({
 						id: `file-${name}`,
 						name,
@@ -149,6 +155,7 @@ interface Device {
 	engine: SyncEngine;
 	store: SyncLocalStore;
 	progress: SyncProgress[];
+	restart(): SyncEngine;
 }
 
 const roots: string[] = [];
@@ -162,20 +169,23 @@ function device(drive: SharedDrive, name: string, deviceId: string, options: Par
 	mkdirSync(dataRoot, { recursive: true });
 	const store = new SyncLocalStore(agentDir);
 	const progress: SyncProgress[] = [];
-	const engine = new SyncEngine({
-		agentDir,
-		dataRoot,
-		deviceId,
-		deviceName: name,
-		store,
-		accountKey: "account-1",
-		onStatus: (status) => {
-			if (status.progress) progress.push(status.progress);
-		},
-		...options,
-	});
-	engine.setDrive(drive.view(deviceId));
-	return { agentDir, dataRoot, engine, store, progress };
+	const restart = () => {
+		const engine = new SyncEngine({
+			agentDir,
+			dataRoot,
+			deviceId,
+			deviceName: name,
+			store: new SyncLocalStore(agentDir),
+			accountKey: "account-1",
+			onStatus: (status) => {
+				if (status.progress) progress.push(status.progress);
+			},
+			...options,
+		});
+		engine.setDrive(drive.view(deviceId));
+		return engine;
+	};
+	return { agentDir, dataRoot, engine: restart(), store, progress, restart };
 }
 
 function writeWorkspace(root: string, workspaceId = "ws1"): void {
@@ -519,7 +529,7 @@ describe("Google Drive sync catch-up", () => {
 		expect(b.engine.status().pendingDownloads).toBe(0);
 	});
 
-	it("lists only what Drive created since the last listing, and everything again on a manual run", async () => {
+	it("resumes incremental listing after restart and on a manual run", async () => {
 		const drive = new SharedDrive();
 		const a = device(drive, "desktop", "device-a");
 		const b = device(drive, "laptop", "device-b");
@@ -535,9 +545,141 @@ describe("Google Drive sync catch-up", () => {
 		expect(listings.at(-1)!.createdAfter).toBeDefined();
 		expect(readFileSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "two.txt"), "utf8")).toBe("2");
 
+		writeUpload(a.dataRoot, "three.txt", "3");
+		await a.engine.runOnce();
+		const restarted = b.restart();
+		await restarted.runManual("download");
+		const manual = drive.lists
+			.filter((item) => item.device === "device-b" && item.folder === "batches")
+			.slice(listings.length);
+		expect(manual.length).toBeGreaterThan(0);
+		expect(manual.every((call) => call.createdAfter)).toBe(true);
+		expect(readFileSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "three.txt"), "utf8")).toBe("3");
+	});
+
+	it("retries a persisted batch outside the overlap after restart", async () => {
+		const drive = new SharedDrive();
+		const b = device(drive, "laptop", "device-b");
+		writeWorkspace(b.dataRoot);
+		const old = drive.addBatch("device-x", BASE_TIME, [
+			drive.fileOp("workspaces/ws1/uploads/old.txt", "old", "device-x", 1),
+		]);
+		drive.failingReads.add(old);
+		const oldDate = drive.folders.get("batches")!.get(old)!.createdTime;
+		const newer = drive.addBatch("device-y", BASE_TIME + 3_600_000, []);
+		drive.folders.get("batches")!.get(newer)!.createdTime = new Date(BASE_TIME + 3_600_000).toISOString();
+		await b.engine.runOnce();
+		expect(b.engine.status().pendingDownloads).toBe(1);
+		drive.failingReads.clear();
+		const before = drive.lists.length;
+		await b.restart().runManual("download");
+		expect(drive.lists[before]!.createdAfter! > oldDate).toBe(true);
+		expect(readFileSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "old.txt"), "utf8")).toBe("old");
+	});
+
+	it("falls back to a full listing if the checkpoint belongs to a different space or is corrupt", async () => {
+		const drive = new SharedDrive();
+		const b = device(drive, "laptop", "device-b");
+		drive.addBatch("device-x", BASE_TIME, []);
 		await b.engine.runManual("download");
-		const manual = drive.lists.filter((item) => item.device === "device-b" && item.folder === "batches");
-		expect(manual[listings.length]!.createdAfter).toBeUndefined();
+		const checkpoint = b.store.loadBatchListing("account-1")!;
+		b.store.saveBatchListing("account-1", { ...checkpoint, syncId: "different-space" });
+		let before = drive.lists.length;
+		await b.restart().runManual("download");
+		expect(drive.lists[before]!.createdAfter).toBeUndefined();
+		const file = readdirSync(b.store.dir).find((name) => name.endsWith(".batches.json"))!;
+		writeFileSync(join(b.store.dir, file), "truncated{");
+		before = drive.lists.length;
+		await b.restart().runManual("download");
+		expect(drive.lists[before]!.createdAfter).toBeUndefined();
+	});
+
+	it("does not block manual sync on a background audit and recovers a late batch below the applied watermark", async () => {
+		const drive = new SharedDrive();
+		const b = device(drive, "laptop", "device-b");
+		writeWorkspace(b.dataRoot);
+		const old = drive.addBatch("device-x", BASE_TIME, [
+			drive.fileOp("workspaces/ws1/uploads/late.txt", "late", "device-x", 1),
+		]);
+		drive.folders.get("batches")!.get(old)!.createdTime = new Date(BASE_TIME).toISOString();
+		drive.hiddenBatches.add(old);
+		const top = drive.addBatch("device-x", BASE_TIME + 3_600_000, []);
+		drive.folders.get("batches")!.get(top)!.createdTime = new Date(BASE_TIME + 3_600_000).toISOString();
+		await b.engine.runManual("download");
+		expect(b.store.state("account-1").appliedUpTo?.["device-x"]).toBe((BASE_TIME + 3_600_000).toString(36));
+		const checkpoint = b.store.loadBatchListing("account-1")!;
+		b.store.saveBatchListing("account-1", { ...checkpoint, fullAt: Date.now() - 31 * 60_000 });
+		b.store.saveConfig({ ...b.store.config(), enabled: true });
+		const engine = b.restart();
+		let releaseAudit!: () => void;
+		const audit = new Promise<void>((resolve) => {
+			releaseAudit = resolve;
+		});
+		drive.beforeFullList = () => audit;
+		try {
+			await engine.start();
+			const before = drive.lists.length;
+			await engine.runManual("download");
+			expect(drive.lists.slice(before).map((call) => Boolean(call.createdAfter))).toEqual([true, false]);
+			await engine.runManual("download");
+			expect(existsSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "late.txt"))).toBe(false);
+			drive.hiddenBatches.clear();
+			releaseAudit();
+			await vi.waitFor(async () => {
+				await engine.runManual("download");
+				expect(readFileSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "late.txt"), "utf8")).toBe("late");
+			});
+		} finally {
+			releaseAudit();
+			await engine.stop();
+		}
+	});
+
+	it("keeps an old batch reopened when the listing is interrupted", async () => {
+		const drive = new SharedDrive();
+		const b = device(drive, "laptop", "device-b");
+		writeWorkspace(b.dataRoot);
+		const old = drive.addBatch("device-x", BASE_TIME, [
+			drive.fileOp("workspaces/ws1/uploads/retry.txt", "retry", "device-x", 1),
+		]);
+		drive.failingReads.add(old);
+		await b.engine.runManual("download");
+		const state = b.store.state("account-1");
+		b.store.saveState({
+			...state,
+			appliedUpTo: { "device-x": (BASE_TIME + 1000).toString(36) },
+			reopenedBatches: [old],
+		});
+		const engine = b.restart();
+		const port = drive.view("device-b");
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		engine.setDrive({
+			...port,
+			list: async (...args) => {
+				entered();
+				await blocked;
+				return port.list(...args);
+			},
+		});
+		const run = engine.runManual("download");
+		try {
+			await started;
+			await engine.stop();
+		} finally {
+			release();
+			await run;
+		}
+		expect(b.store.state("account-1").reopenedBatches).toEqual([old]);
+		drive.failingReads.clear();
+		await b.restart().runManual("download");
+		expect(readFileSync(join(b.dataRoot, "workspaces", "ws1", "uploads", "retry.txt"), "utf8")).toBe("retry");
 	});
 
 	it("reports reading the change lists, then writing what they name", async () => {

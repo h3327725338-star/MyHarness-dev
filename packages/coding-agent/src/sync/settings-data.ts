@@ -484,9 +484,13 @@ export interface ScannedSettingsRecord {
 }
 
 /** What this computer has to publish, read from the files as they are now. */
-export function readSettingsRecords(agentDir: string): ScannedSettingsRecord[] {
+export function readSettingsRecords(
+	agentDir: string,
+	include?: (id: SettingsRecordId) => boolean,
+): ScannedSettingsRecord[] {
 	const records: ScannedSettingsRecord[] = [];
 	for (const id of SETTINGS_RECORD_IDS) {
+		if (include && !include(id)) continue;
 		if (isFolderRecord(id)) {
 			const folder = folderText(agentDir, id);
 			if (folder) records.push({ id, text: folder.text, mtimeMs: folder.mtimeMs, name: NAMES[id] });

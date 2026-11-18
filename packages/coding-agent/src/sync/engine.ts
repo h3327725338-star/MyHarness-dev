@@ -381,6 +381,9 @@ export class SyncEngine {
 	private appliedNotice = { workspaces: false, sessions: false, memories: false, settings: false, at: 0 };
 	/** The batch names Drive listed, kept between passes so a pass can list only what is new (see listBatches). */
 	private batchListing: { names: Set<string>; newest?: string; fullAt: number } | undefined;
+	private listingGeneration = 0;
+	private listingLoaded = false;
+	private reconciliation: { startedAt: number; files?: Awaited<ReturnType<DrivePort["list"]>> } | undefined;
 	/**
 	 * Counts stop() calls. A pass remembers the count it started with, so stopping ends a long download between two
 	 * changes, while a pass started afterwards (a manual run with sync switched off) still runs.
@@ -413,6 +416,10 @@ export class SyncEngine {
 	/** Another Drive or sync space: names and change lists learned from the previous one do not apply to it. */
 	private forgetListing(): void {
 		this.batchListing = undefined;
+		this.listedBatches = undefined;
+		this.listingLoaded = false;
+		this.listingGeneration += 1;
+		this.reconciliation = undefined;
 		this.manifestCache.clear();
 	}
 
@@ -559,6 +566,7 @@ export class SyncEngine {
 	async stop(): Promise<void> {
 		this.stopped = true;
 		this.stopCount += 1;
+		this.reconciliation = undefined;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
 		if (this.debounceTimer) clearTimeout(this.debounceTimer);
@@ -681,7 +689,7 @@ export class SyncEngine {
 			let pullError: unknown;
 			try {
 				// Every pass keeps listing until nothing new is left, so a long backlog is not spread over many polls.
-				await this.pull(true, mode !== "auto");
+				await this.pull();
 			} catch (error) {
 				// A download that keeps failing must not hold this device's own changes back: upload them anyway, then
 				// report the download failure. Concurrent edits are still detected by the version vectors.
@@ -713,6 +721,7 @@ export class SyncEngine {
 			}
 		} finally {
 			this.running = false;
+			if (this.phase === "idle") this.reconcileListingInBackground();
 			this.lastPassEndedAt = Date.now();
 			this.saveHashCache();
 			this.bases.flush();
@@ -1074,14 +1083,18 @@ export class SyncEngine {
 	}
 
 	/** Everything of this computer that belongs to the sync scope, as it is on disk now (scope.ts). */
-	private async scanLocal(): Promise<Map<string, ScannedEntity>> {
+	private async scanLocal(keys?: ReadonlySet<string>): Promise<Map<string, ScannedEntity>> {
 		return scanLocalEntitiesAsync({
 			dataRoot: this.options.dataRoot,
 			agentDir: this.options.agentDir,
 			modeState: this.modeState,
 			headerCache: this.headerCache,
 			sessionMetadataCache: this.sessionMetadataCache,
-			memories: await listMemoryFilesAsync(this.options.dataRoot, { metadataCache: this.memoryMetadataCache }),
+			keys,
+			memories: await listMemoryFilesAsync(this.options.dataRoot, {
+				metadataCache: this.memoryMetadataCache,
+				paths: keys && new Set([...keys].filter((key) => key.startsWith("memory:")).map((key) => key.slice(7))),
+			}),
 		});
 	}
 
@@ -1389,17 +1402,15 @@ export class SyncEngine {
 
 	/**
 	 * Apply remote batches. Every pass lists Drive again after each round until nothing new is left, so batches that
-	 * arrive while a long download runs are fetched too instead of waiting for the next pass. A manual run starts from a
-	 * full listing; automatic passes mostly list only what Drive created since the previous listing (listBatches).
+	 * arrive while a long download runs are fetched too instead of waiting for the next pass.
 	 */
-	private async pull(drain = false, fullListing = false): Promise<void> {
-		if (drain) this.setManualStage("download", 0, 0);
-		const rounds = drain ? MAX_DRAIN_ROUNDS : 1;
+	private async pull(): Promise<void> {
+		this.setManualStage("download", 0, 0);
 		// A batch still waiting is tried once per call, so later rounds cannot use up its deferrals.
 		const seen = new Set<string>();
 		this.waitingInPass = 0;
-		for (let round = 0; round < rounds; round += 1) {
-			const handled = await this.pullRound(seen, fullListing && round === 0);
+		for (let round = 0; round < MAX_DRAIN_ROUNDS; round += 1) {
+			const handled = await this.pullRound(seen);
 			if (handled === 0 || this.interrupted()) break;
 		}
 	}
@@ -1412,12 +1423,12 @@ export class SyncEngine {
 	 * the newest version first, so the older versions of a record are seen to be covered already and never downloaded.
 	 * Contents download many at a time; the changes themselves are still written one after the other.
 	 */
-	private async pullRound(seen: Set<string>, fullListing: boolean): Promise<number> {
+	private async pullRound(seen: Set<string>): Promise<number> {
 		const drive = this.drive;
 		if (!drive) return 0;
 		this.missingObjects.clear();
-		this.currentScan = await this.scanLocal();
-		const names = await this.listBatches(drive, fullListing);
+		const names = await this.listBatches(drive);
+		if (!names) return 0;
 		this.listedBatches = names;
 		this.foldApplied();
 		const known = new Set(this.state.appliedBatches);
@@ -1467,30 +1478,135 @@ export class SyncEngine {
 		return round.handled;
 	}
 
-	/**
-	 * Names in the batches folder. A full listing reads every page; between full listings (manual runs, a new start,
-	 * every FULL_LISTING_MS) only the files Drive created since the newest one already seen are listed, with an overlap
-	 * for files that show up in listings a little late. A backlog of thousands of batches cost several pages per pass.
-	 */
-	private async listBatches(drive: DrivePort, full: boolean): Promise<string[]> {
+	private restoreBatchListing(): void {
+		if (this.listingLoaded) return;
+		this.listingLoaded = true;
+		const saved = this.store.loadBatchListing(this.state.accountKey);
+		if (
+			saved &&
+			saved.syncId === this.state.syncId &&
+			saved.folderId === this.state.folderId &&
+			saved.deviceId === this.options.deviceId &&
+			saved.fullAt <= Date.now() &&
+			(!saved.newest || Date.parse(saved.newest) <= Date.now())
+		) {
+			this.batchListing = { names: new Set(saved.names), newest: saved.newest, fullAt: saved.fullAt };
+		}
+	}
+
+	/** Keep both the cursor and every observed name: a pending batch can be older than the next query window. */
+	private async listBatches(drive: DrivePort): Promise<string[] | undefined> {
+		this.restoreBatchListing();
 		const known = this.batchListing;
-		const since =
-			!full && known?.newest && Date.now() - known.fullAt < FULL_LISTING_MS ? Date.parse(known.newest) : Number.NaN;
-		const incremental = known !== undefined && Number.isFinite(since);
+		const generation = this.listingGeneration;
+		const since = known?.newest ? Date.parse(known.newest) - LISTING_OVERLAP_MS : undefined;
 		const files = await drive.list(
 			"batches",
-			incremental ? { createdAfter: new Date(since - LISTING_OVERLAP_MS).toISOString() } : undefined,
+			since === undefined ? undefined : { createdAfter: new Date(since).toISOString() },
 		);
-		let newest = incremental ? known.newest : undefined;
-		for (const file of files)
-			if (file.createdTime && (!newest || file.createdTime > newest)) newest = file.createdTime;
-		if (incremental) {
-			for (const file of files) known.names.add(file.name);
-			known.newest = newest;
-			return [...known.names];
+		if (generation !== this.listingGeneration || this.interrupted()) return undefined;
+		const reconciled = this.reconciliation?.files ? this.reconciliation : undefined;
+		const listing = {
+			names: new Set(known?.names),
+			newest: known?.newest,
+			fullAt: known?.fullAt ?? Date.now(),
+		};
+		let dirty = !known || Boolean(reconciled);
+		if (reconciled) listing.fullAt = reconciled.startedAt;
+		else if (since === undefined) {
+			listing.fullAt = Date.now();
+			dirty = true;
 		}
-		this.batchListing = { names: new Set(files.map((file) => file.name)), newest, fullAt: Date.now() };
-		return files.map((file) => file.name);
+		const reopened = new Set(this.state.reopenedBatches);
+		const handled = new Set(this.state.appliedBatches);
+		let late = false;
+		for (const file of [...files, ...(reconciled?.files ?? [])]) {
+			const createdTime = file.createdTime ? Date.parse(file.createdTime) : Number.NaN;
+			if (
+				Number.isFinite(createdTime) &&
+				createdTime <= Date.now() &&
+				(!listing.newest || createdTime > Date.parse(listing.newest))
+			) {
+				listing.newest = new Date(createdTime).toISOString();
+				dirty = true;
+			}
+			if (listing.names.has(file.name)) continue;
+			listing.names.add(file.name);
+			dirty = true;
+			// A newly visible file can sort below the applied watermark (late listing, equal time or device clock skew).
+			if (
+				known &&
+				batchCovered(this.state, file.name) &&
+				!handled.has(file.name) &&
+				!handled.has(file.name.replace(/\.json$/u, "")) &&
+				!this.state.issues?.[`batch:${file.name}`]
+			) {
+				reopened.add(file.name);
+				late = true;
+			}
+		}
+		if (late) {
+			// Commit exceptions before the listing remembers these names as already seen.
+			const previous = this.state.reopenedBatches;
+			this.state.reopenedBatches = [...reopened];
+			try {
+				this.flushState();
+			} catch (error) {
+				this.state.reopenedBatches = previous;
+				throw error;
+			}
+		}
+		if (reconciled) this.reconciliation = undefined;
+		this.batchListing = listing;
+		if (dirty && this.state.syncId && this.state.folderId) {
+			try {
+				this.store.saveBatchListing(this.state.accountKey, {
+					version: 1,
+					syncId: this.state.syncId,
+					folderId: this.state.folderId,
+					deviceId: this.options.deviceId,
+					fullAt: listing.fullAt,
+					...(listing.newest ? { newest: listing.newest } : {}),
+					names: [...listing.names],
+				});
+			} catch {
+				// The checkpoint is a shortcut. Restart can list again if the directory is unwritable.
+			}
+		}
+		return [...listing.names];
+	}
+
+	/** Run the slow directory audit without holding the foreground sync pass or blocking a manual check. */
+	private reconcileListingInBackground(): void {
+		const drive = this.drive;
+		const listing = this.batchListing;
+		const startedAt = Date.now();
+		if (
+			this.stopped ||
+			this.config.paused ||
+			!drive ||
+			!listing?.newest ||
+			startedAt - listing.fullAt < FULL_LISTING_MS ||
+			this.reconciliation
+		)
+			return;
+		const job: NonNullable<SyncEngine["reconciliation"]> = { startedAt };
+		this.reconciliation = job;
+		void drive.list("batches").then(
+			(files) => {
+				if (this.reconciliation !== job) return;
+				job.files = files;
+				this.scheduleSoon();
+			},
+			() => {
+				// Retry the audit later without making an otherwise successful incremental pass fail.
+				if (this.reconciliation === job) {
+					setTimeout(() => {
+						if (this.reconciliation === job) this.reconciliation = undefined;
+					}, RETRY_AFTER_ERROR_MS).unref();
+				}
+			},
+		);
 	}
 
 	/**
@@ -1645,6 +1761,7 @@ export class SyncEngine {
 				this.pendingDownloads = tasks.length + this.waitingInPass + round.waiting;
 				this.emitStatus();
 			}
+			if (tasks.length > 0) this.currentScan = await this.scanLocal(new Set(groups.keys()));
 			this.locateDownloads(tasks);
 			await this.mapLimit(tasks, OBJECT_CONCURRENCY, async (task) => {
 				for (const change of task) {

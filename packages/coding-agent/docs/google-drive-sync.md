@@ -492,6 +492,8 @@ Everything device-specific lives below `<agentDir>/sync/`:
   taken at. A file that still has both is not read again, also after a restart; anything else is streamed through the
   hash again. Without it the first pass after every start read and hashed every synced file (about 1.2 GB for a large
   library) and held the server for 10–20 s. Deleting it only costs that one slower pass.
+- `state-<account>.json.batches.json` — a local cache of the cloud listing position, last full audit time and observed
+  batch names, scoped to the account, sync folder and device. It is not part of the sync protocol.
 - `credentials.json` — access/refresh token, written with mode 0600 and atomic replace;
 - `backups/`, `recovered/` — previous and unapplied versions, at most 20 per key.
 
@@ -512,7 +514,9 @@ end-to-end encrypted: Google stores the data under the account's normal Drive pr
   retry is scheduled by itself. A timeout is not retried inside the same request.
 - A download round first learns everything it has to change: the change lists of the new batches (16 read at a time; one
   that cannot be read now waits for the next pass instead of failing the whole pass, and change lists of batches that
-  still wait are kept in memory so a retry does not read them again), or a device's snapshot (see above). Then it groups
+  still wait are kept in memory so a retry does not read them again), or a device's snapshot (see above). It checks only
+  the local records named by those changes and skips the receive-side scan when there are none. Upload scanning is
+  unchanged. Then it groups
   the changes by record and starts with the newest version of each record (a version that covers another always has
   the larger counter sum), so once that one is written, every older version of the same record is recognised as covered
   and is never downloaded. If the newest version has to wait, the older ones are tried and the best available version
@@ -536,9 +540,10 @@ end-to-end encrypted: Google stores the data under the account's normal Drive pr
   fetch, in order, and finds their ids 25 names a query and four queries at a time; a download whose id is still being
   looked up waits for that answer instead of asking again. The sub-folders of `sync-v1` are also resolved once instead
   of on every pass.
-- The batches folder is listed in full on start, on a manual run and every 30 minutes; in between, a pass lists only the
-  files Drive created since the newest one already seen (with 10 minutes of overlap for files that appear in listings a
-  little late), instead of reading every page of a folder with thousands of batches on every pass.
+- Normal and manual checks reuse the local listing checkpoint even after restart. They list only files Drive created
+  since the newest one already seen, with 10 minutes of overlap. Known batches that still need processing remain
+  retryable outside that window. Once the last full listing is 30 minutes old, a full audit runs in the background and
+  its results are merged into a later pass. A missing, invalid or mismatched checkpoint falls back to a full listing.
 - Errors retry after ~30 s; offline changes stay queued because the pending queue is the difference from the last
   committed state. While Drive cannot be reached the queue is still counted from the local files, so "Waiting to
   upload" shows the real number offline, and the next retry after the network returns continues on its own.

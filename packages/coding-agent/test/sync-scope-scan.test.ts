@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getSessionDir, getWorkspaceMetadataPath, UNBOUND_WORKSPACE_ID } from "../src/config/paths/index.ts";
 import { ModeStateStore } from "../src/session/mode-state.ts";
@@ -53,6 +53,22 @@ describe("sync scope scan", () => {
 		expect(keys.filter((key) => key.startsWith("session:"))).toHaveLength(40);
 		expect(keys.filter((key) => key.endsWith("note.txt"))).toHaveLength(40);
 		expect(keys.some((key) => /\.lock/u.test(key))).toBe(false);
+	});
+
+	it("finds the same local file versions without reading unrelated session headers", async () => {
+		const options = library(4);
+		const session = getSessionDir(options.dataRoot, "ws-general", "session-1");
+		const file = process.platform === "win32" ? "note.txt" : "note:local.txt";
+		write(join(session, "artifacts", file), "unpublished update");
+		const key = `file:workspaces/ws-general/sessions/session-1/artifacts/${file}`;
+		const dataRoot = relative(process.cwd(), options.dataRoot);
+		const whole = scanLocalEntities({ ...options, dataRoot });
+		const headerCache = new Map();
+		const selected = await scanLocalEntitiesAsync({ ...options, dataRoot, keys: new Set([key]), headerCache }, 0);
+		expect(whole.has(key)).toBe(true);
+		expect(selected.get(key)).toEqual(whole.get(key));
+		expect([...headerCache.keys()]).toEqual([join(session, "conversation", "session-1.jsonl")]);
+		expect([...selected.keys()].filter((name) => name.startsWith("file:"))).toEqual([key]);
 	});
 
 	it("includes the General chats of the default group, which has no Workspace, but not its Coding chats", () => {

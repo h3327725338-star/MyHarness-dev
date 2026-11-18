@@ -8,6 +8,16 @@ import { ensureDir, nowIso, readJsonFile, sha256, shortHash, writeJsonFile, writ
 
 const STATE_VERSION = 1;
 const HASH_CACHE_VERSION = 1;
+
+export interface BatchListingCheckpoint {
+	version: 1;
+	syncId: string;
+	folderId: string;
+	deviceId: string;
+	fullAt: number;
+	newest?: string;
+	names: string[];
+}
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 
 /** A local file's content hash, valid while the file keeps this size and modification time. */
@@ -201,6 +211,29 @@ export class SyncLocalStore {
 			this.hashCachePath(accountKey),
 			`${JSON.stringify({ version: HASH_CACHE_VERSION, entries })}\n`,
 		);
+	}
+
+	loadBatchListing(accountKey: string): BatchListingCheckpoint | undefined {
+		const value = readJsonFile<BatchListingCheckpoint>(`${this.statePath(accountKey)}.batches.json`);
+		if (
+			value?.version !== 1 ||
+			typeof value.syncId !== "string" ||
+			typeof value.folderId !== "string" ||
+			typeof value.deviceId !== "string" ||
+			!Number.isFinite(value.fullAt) ||
+			value.fullAt <= 0 ||
+			(value.newest !== undefined &&
+				(typeof value.newest !== "string" || !Number.isFinite(Date.parse(value.newest)))) ||
+			!Array.isArray(value.names) ||
+			!value.names.every((name) => typeof name === "string" && name.length > 0)
+		)
+			return undefined;
+		return value;
+	}
+
+	saveBatchListing(accountKey: string, checkpoint: BatchListingCheckpoint): void {
+		ensureDir(this.dir);
+		writeJsonFile(`${this.statePath(accountKey)}.batches.json`, checkpoint);
 	}
 
 	saveState(state: SyncState): void {

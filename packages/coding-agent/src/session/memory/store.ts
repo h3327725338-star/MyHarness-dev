@@ -209,11 +209,21 @@ export function listMemoryFiles(dataRoot: string, options: MemoryListOptions = {
 }
 
 /** Request-facing traversal: scoped at the directory level, with asynchronous I/O even for the global view. */
-export async function listMemoryFilesAsync(dataRoot: string, options: MemoryListOptions = {}): Promise<MemoryFile[]> {
+export async function listMemoryFilesAsync(
+	dataRoot: string,
+	options: MemoryListOptions & { paths?: ReadonlySet<string> } = {},
+): Promise<MemoryFile[]> {
+	const wanted = options.paths;
+	const parents = new Set<string>();
+	for (const relative of wanted ?? []) {
+		const segments = relative.split("/");
+		for (let i = 1; i < segments.length; i++) parents.add(path.resolve(dataRoot, ...segments.slice(0, i)));
+	}
 	const result: MemoryFile[] = [];
 	const checked = new Set<string>();
 	const seen = new Set<string>();
 	const entries = async (directory: string): Promise<fs.Dirent[]> => {
+		if (wanted && !parents.has(path.resolve(directory))) return [];
 		// Reuse ancestor checks only within this traversal, never across requests.
 		assertDirectPath(directory, checked);
 		try {
@@ -237,6 +247,8 @@ export async function listMemoryFilesAsync(dataRoot: string, options: MemoryList
 		for (const item of await entries(directory)) {
 			if (!item.isFile() || !item.name.endsWith(".md")) continue;
 			const file = path.join(directory, item.name);
+			const relative = path.relative(dataRoot, file).replace(/\\/g, "/");
+			if (wanted && !wanted.has(relative)) continue;
 			// `item` is a regular file (a link reports itself as one, not as a file) inside a folder checked above, so
 			// the file needs no two more filesystem calls of its own: with thousands of memories they added up to a
 			// visible pause in every sync pass.
@@ -252,7 +264,7 @@ export async function listMemoryFilesAsync(dataRoot: string, options: MemoryList
 			const id = parsed ? String(parsed.frontmatter.id ?? "") : cached!.id;
 			options.metadataCache?.set(file, { signature, name, id });
 			result.push({
-				path: path.relative(dataRoot, file).replace(/\\/g, "/"),
+				path: relative,
 				scope,
 				workspaceId,
 				sessionId,
@@ -284,7 +296,7 @@ export async function listMemoryFilesAsync(dataRoot: string, options: MemoryList
 				sessionId,
 			);
 	}
-	if (options.metadataCache)
+	if (options.metadataCache && !wanted)
 		for (const file of options.metadataCache.keys()) {
 			if (!seen.has(file)) options.metadataCache.delete(file);
 		}

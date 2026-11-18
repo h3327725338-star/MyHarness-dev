@@ -52,6 +52,7 @@ MyHarness/
 - `config.json`：设备 ID/名称、开关、暂停、OAuth client id 与 client secret、云端文件夹与账号标签；
 - `state-<account hash>.json`：每个 Google 账号独立的版本向量、墓碑、已应用批次、待绑定工作区、冲突、无法自动解决的问题；
 - `hashes-<account hash>.json`：本机已同步文件的内容哈希，连同取哈希时的大小和修改时间；大小和时间都没变的文件不再重读（重启后也一样），否则流式重新计算。没有它时，每次启动后的第一轮要把全部同步文件（大库约 1.2 GB）读一遍算哈希，服务会卡住 10–20 秒；删掉它只会让下一轮慢一次。待上传队列逐个文件流式计算哈希并分片让出事件循环，不会长时间占住服务。
+- `state-*.json.batches.json`：按账号、同步空间和设备隔离的本机查询进度，记录已见批次名、最新创建时间和上次完整核对时间；缺失或无效时重新完整查询；
 - `credentials.json`：OAuth 令牌，0600 原子写；
 - `backups/`、`recovered/`：覆盖前的本机版本与未应用的另一版，按 key 保留最近 20 份。
 
@@ -65,7 +66,7 @@ MyHarness/
 
 ### 对外接口
 
-`service.ts` 的 `SyncService` 是 Web 层唯一入口：`status()`、`updateConfig()`、`connect()`、`disconnect()`、`runNow()`、`startManual("download" | "sync")`、`bindWorkspace()`、`start()`、`dispose()`。手动“立即下载 / 立即同步”由引擎的 `runManual()` 执行：等当前一轮结束后再跑，下载会反复列出批次直到没有新的，进度在状态的 `manual` 里；暂停时拒绝。自动轮次同样反复列出直到没有新批次，任何轮次正在搬运的数量都在状态的 `progress`（`{ stage, done, total, step? }`）里，最多每 250ms 推送一次；下载分两步：`read` 计读取云端变更清单的数量，`apply` 计下载并写入的记录数量。搬运过东西的轮次 1.5 秒后接着跑下一轮。下载一轮先弄清要改什么（新批次的清单 16 个并行读取，读失败的留到下一轮、不让整轮失败，未处理完的清单缓存在内存里不重复读；或读设备快照），再按记录分组、每条记录先试最新版本（覆盖旧版本的版本向量计数和一定更大），写下最新版后同一记录的旧版本都算已覆盖、不再下载；内容 16 个并行下载、内存预算 192 MB，写入仍逐条串行，但连续写满 12 ms 后下一条先让出一次事件循环，文件在后台线程写入并刷盘，下载几千个文件时服务不再一直卡到最后一个写完；下载前先把这一轮要下载的对象一起查好位置（`locateObjects`，每次查询 25 个名字、最多 4 个查询同时进行），下载时不再每个对象先单独查一次；一个批次的所有变更都有着落后才记为已处理。批次目录在启动、手动运行和每 30 分钟时完整列出，其余轮次只列出最新已见文件之后创建的（重叠 10 分钟）。Drive 限速（429，或 403 `userRateLimitExceeded`/`rateLimitExceeded`）指数退避重试最多 5 次，拒绝权限的 403 不重试。已处理批次按设备记水位（`appliedUpTo`，见 `foldAppliedBatches`），列表上限 50,000 条，每轮下载结束时折叠；应用某设备的快照后它的水位直接移到快照的 `upTo`。同步引擎本身可由测试直接构造：`new SyncEngine({ agentDir, dataRoot, deviceId, deviceName, store, accountKey })` 后 `setDrive()` + `runOnce()`。
+`service.ts` 的 `SyncService` 是 Web 层唯一入口：`status()`、`updateConfig()`、`connect()`、`disconnect()`、`runNow()`、`startManual("download" | "sync")`、`bindWorkspace()`、`start()`、`dispose()`。手动“立即下载 / 立即同步”由引擎的 `runManual()` 执行：等当前一轮结束后再跑，下载会反复列出批次直到没有新的，进度在状态的 `manual` 里；暂停时拒绝。自动轮次同样反复列出直到没有新批次，任何轮次正在搬运的数量都在状态的 `progress`（`{ stage, done, total, step? }`）里，最多每 250ms 推送一次；下载分两步：`read` 计读取云端变更清单的数量，`apply` 计下载并写入的记录数量。搬运过东西的轮次 1.5 秒后接着跑下一轮。下载一轮先弄清要改什么（新批次的清单 16 个并行读取，读失败的留到下一轮、不让整轮失败，未处理完的清单缓存在内存里不重复读；或读设备快照），再按记录分组、每条记录先试最新版本（覆盖旧版本的版本向量计数和一定更大），写下最新版后同一记录的旧版本都算已覆盖、不再下载；内容 16 个并行下载、内存预算 192 MB，写入仍逐条串行，但连续写满 12 ms 后下一条先让出一次事件循环，文件在后台线程写入并刷盘，下载几千个文件时服务不再一直卡到最后一个写完；下载前先把这一轮要下载的对象一起查好位置（`locateObjects`，每次查询 25 个名字、最多 4 个查询同时进行），下载时不再每个对象先单独查一次；一个批次的所有变更都有着落后才记为已处理。重启和手动运行都续用本机的批次查询进度，增量查询保留 10 分钟重叠；已发现但未处理的旧批次仍会重试。每 30 分钟在后台完整核对，结果并入后续轮次。接收端只扫描清单涉及的本机记录，没有待应用变更时跳过接收扫描；上传扫描不变。Drive 限速（429，或 403 `userRateLimitExceeded`/`rateLimitExceeded`）指数退避重试最多 5 次，拒绝权限的 403 不重试。已处理批次按设备记水位（`appliedUpTo`，见 `foldAppliedBatches`），列表上限 50,000 条，每轮下载结束时折叠；应用某设备的快照后它的水位直接移到快照的 `upTo`。同步引擎本身可由测试直接构造：`new SyncEngine({ agentDir, dataRoot, deviceId, deviceName, store, accountKey })` 后 `setDrive()` + `runOnce()`。
 
 ### 依赖
 
