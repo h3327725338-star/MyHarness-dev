@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import agyShell, {
 	AGY_SUMMARY_ARG,
 	acpSupport,
+	agyToolCatalog,
 	appendedPrompt,
 	appendPromptFor,
 	appendsSystemPrompt,
@@ -173,6 +174,21 @@ describe("agy-shell tool schemas", () => {
 	const workspace = createWorkspaceToolDefinition();
 	const branches: any[] = (workspace.parameters as any).anyOf;
 	const summary = { [AGY_SUMMARY_ARG]: "List the open tabs" };
+
+	it("keeps a large browser declaration callable while moving its manual outside the MCP budget", () => {
+		const full = toolForAgy(workspace);
+		const {
+			declarations: [wire],
+			manual,
+		} = agyToolCatalog([full]);
+		expect(Buffer.byteLength(JSON.stringify(wire))).toBeLessThan(Buffer.byteLength(JSON.stringify(full)) / 2);
+		expect(manual).toContain(full.description);
+		expect(manual).toContain(full.inputSchema.properties.url.description);
+		expect(wire.inputSchema.properties.operation.enum).toEqual(full.inputSchema.properties.operation.enum);
+		expect(agyAccepts(wire.inputSchema, { operation: "tabs", ...summary })).toBe(true);
+		expect(agyAccepts(wire.inputSchema, { operation: "invalid", ...summary })).toBe(false);
+		expect(agyToolCatalog([])).toEqual({ declarations: [], manual: "" });
+	});
 
 	it("reproduces why agy could not call the built-in browser's tool at all", () => {
 		const offeredBefore = JSON.parse(JSON.stringify(workspace.parameters));

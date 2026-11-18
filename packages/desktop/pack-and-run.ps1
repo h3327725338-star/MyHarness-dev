@@ -23,6 +23,13 @@ Set-Location -LiteralPath $Root
 # 固定产物位置，避免从带 MYHARNESS_ARTIFACTS_DIR 的终端启动时落到会话临时目录。
 $OutputRoot = Join-Path $Root "dist\desktop"
 $env:MYHARNESS_DESKTOP_OUTPUT = $OutputRoot
+
+# Local opt-in: use the installed app's home, including its data directory.
+$sharedHome = Join-Path $env:USERPROFILE ".myharness"
+if (Test-Path -LiteralPath (Join-Path $sharedHome "desktop-shared-data.enabled") -PathType Leaf) {
+	$env:MYHARNESS_DESKTOP_CWD = $sharedHome
+	$env:MYHARNESS_DATA_ROOT = Join-Path $sharedHome "data"
+}
 $ExecutableName = "MyHarness"
 $CurrentDir = Join-Path $OutputRoot "current"
 $PreviousDir = Join-Path $OutputRoot "previous"

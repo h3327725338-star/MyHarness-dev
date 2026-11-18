@@ -475,6 +475,46 @@ export function toolForAgy(tool: { name: string; description?: string; parameter
 	};
 }
 
+// agy can omit a whole MCP declaration (LoadedCustomization.STATUS_TRUNCATED).
+// Keep large manuals in the host instructions, outside the MCP declaration budget.
+// This is our size target, not a limit promised by agy.
+export function agyToolCatalog(tools: ReturnType<typeof toolForAgy>[]) {
+	const manuals: string[] = [];
+	const declarations = tools.map((tool) => {
+		if (Buffer.byteLength(JSON.stringify(tool)) <= 4096) return tool;
+		const notes: string[] = [];
+		const compact = (schema: any, location: string): any => {
+			if (!isRecord(schema)) return schema;
+			const copy = { ...schema };
+			if (typeof copy.description === "string") {
+				notes.push(`${location}: ${copy.description}`);
+				delete copy.description;
+			}
+			for (const key of ["properties", "$defs", "definitions", "patternProperties"]) {
+				if (isRecord(copy[key]))
+					copy[key] = Object.fromEntries(
+						Object.entries(copy[key]).map(([k, v]) => [k, compact(v, `${location}.${k}`)]),
+					);
+			}
+			for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"]) {
+				if (Array.isArray(copy[key]))
+					copy[key] = copy[key].map((v: any, i: number) => compact(v, `${location}.${key}[${i}]`));
+			}
+			for (const key of ["items", "additionalProperties"])
+				if (isRecord(copy[key])) copy[key] = compact(copy[key], `${location}.${key}`);
+			return copy;
+		};
+		const inputSchema = compact(tool.inputSchema, tool.name);
+		manuals.push([`Tool manual for ${tool.name}`, tool.description, ...notes].join("\n"));
+		return {
+			...tool,
+			inputSchema,
+			description: `${tool.description.split(/(?<=[.!?])\s|\n/u, 1)[0].slice(0, 220)} See the ${tool.name} tool manual in the host instructions.`,
+		};
+	});
+	return { declarations, manual: manuals.join("\n\n") };
+}
+
 /** Whether a tool's own schema has an argument of this name, at the top or in one of its branches. */
 function declaresArgument(schema: any, name: string): boolean {
 	return [schema, ...(branchesOf(schema) ?? [])].some((part) => isRecord(part?.properties) && name in part.properties);
@@ -1834,9 +1874,13 @@ class AcpSession {
 		return this.tools.map((tool) => tool.name).filter((name) => !CARD_TOOLS.has(name));
 	}
 
-	offeredTools(): any[] {
+	private toolCatalog() {
 		const offered = new Set(offeredNames(this.activeNames()));
-		return this.tools.filter((tool) => offered.has(tool.name)).map(toolForAgy);
+		return agyToolCatalog(this.tools.filter((tool) => offered.has(tool.name)).map(toolForAgy));
+	}
+
+	offeredTools(): any[] {
+		return this.toolCatalog().declarations;
 	}
 
 	/**
@@ -1973,7 +2017,9 @@ class AcpSession {
 	private promptFor(systemPrompt: string | undefined): string {
 		return this.ephemeral
 			? (systemPrompt ?? "").trim()
-			: appendedPrompt(this.activeNames(), systemPrompt, this.appTools);
+			: [appendedPrompt(this.activeNames(), systemPrompt, this.appTools), this.appTools && this.toolCatalog().manual]
+					.filter(Boolean)
+					.join("\n\n");
 	}
 
 	/** Instructions the conversation has not got wait for the next message; ones it has are not sent again. */
