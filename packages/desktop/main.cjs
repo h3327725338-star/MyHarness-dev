@@ -467,7 +467,10 @@ else {
       window.on(event, () => { if (!window.webContents.isDestroyed()) window.webContents.send('desktop:window-state', windowState()); });
     window.on('close', (event) => { if (!finished) { event.preventDefault(); void onCloseRequest(); } });
     await loadShell(startingPage({ ...look, startedAt: launchStartedAt, lastMs: prefs.get().lastStartMs }));
-    if (autostart) window.showInactive(); else window.show();
+    // Electron's maximize can activate the window on Windows, even when it was shown inactive.
+    if (autostart) window.setFocusable(false);
+    window.maximize();
+    if (autostart) window.setFocusable(true); else window.focus();
     startService();
   }).catch((error) => void errorPage(error.stack || error.message));
 }
