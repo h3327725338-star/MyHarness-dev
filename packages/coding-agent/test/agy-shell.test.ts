@@ -1094,8 +1094,14 @@ describe("agy-shell with a stand-in agy", () => {
 		const chat = openChat();
 		const controller = new AbortController();
 		const stopped = chat.send("say started ;; wait", { signal: controller.signal });
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		controller.abort();
+		try {
+			// Stop an active prompt, not the launch of a slow stand-in process.
+			await vi.waitFor(() => expect(requests().some((entry) => entry.method === "session/prompt")).toBe(true), {
+				timeout: 10_000,
+			});
+		} finally {
+			controller.abort();
+		}
 		const final = await stopped;
 		expect(final.type).toBe("error");
 		expect(final.reason).toBe("aborted");
@@ -1126,9 +1132,13 @@ describe("agy-shell with a stand-in agy", () => {
 		const chat = openChat();
 		const controller = new AbortController();
 		const stopped = chat.send("say never", { signal: controller.signal });
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		expect(requests().some((entry) => entry.method === "session/new")).toBe(true);
-		controller.abort();
+		try {
+			await vi.waitFor(() => expect(requests().some((entry) => entry.method === "session/new")).toBe(true), {
+				timeout: 10_000,
+			});
+		} finally {
+			controller.abort();
+		}
 		const final = await stopped;
 		expect(final).toMatchObject({ type: "error", reason: "aborted" });
 		expect(chat.session.running).toBe(false);
