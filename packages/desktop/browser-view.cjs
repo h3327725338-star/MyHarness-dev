@@ -2098,6 +2098,30 @@ exports.createBrowser = (window, log, options = {}) => {
   const READ_HTML_MAX = 4_000_000;
   let readersOpen = 0;
   const readerQueue = [];
+  const searchReaderIds = new Set();
+  let searchReaderPolicyInstalled = false;
+  const protectSearchReader = (contents) => {
+    if (!searchReaderPolicyInstalled) {
+      partition.webRequest.onHeadersReceived({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => {
+        if (details.resourceType !== 'mainFrame' || !searchReaderIds.has(details.webContentsId)) return callback({});
+        const responseHeaders = { ...details.responseHeaders };
+        const policies = [];
+        for (const name of Object.keys(responseHeaders)) {
+          if (name.toLowerCase() !== 'permissions-policy') continue;
+          policies.push(...responseHeaders[name]);
+          delete responseHeaders[name];
+        }
+        // The final dictionary members override any site grants. Descendant frames inherit the denial.
+        policies.push('publickey-credentials-get=(), publickey-credentials-create=()');
+        responseHeaders['Permissions-Policy'] = policies;
+        callback({ responseHeaders });
+      });
+      searchReaderPolicyInstalled = true;
+    }
+    searchReaderIds.add(contents.id);
+    const id = contents.id;
+    contents.once('destroyed', () => searchReaderIds.delete(id));
+  };
   /**
    * Read an address in a reader page of its own: an off-screen rendering page in the tabs' session (the user's
    * sign-ins), muted, without dialogs or popups, never part of the workspace, closed when the reading is done. Unlike a
@@ -2116,6 +2140,14 @@ exports.createBrowser = (window, log, options = {}) => {
     });
     const contents = reader.webContents;
     try {
+      // Native passkey prompts are not JavaScript dialogs or window.open popups.
+      if (value.searchPreview === true) {
+        protectSearchReader(contents);
+        // Service-worker responses can skip webRequest. Give this reader an empty authenticator environment
+        // before navigation so it cannot reach native credentials, without disabling workers or changing sessions.
+        contents.debugger.attach('1.3');
+        await contents.debugger.sendCommand('WebAuthn.enable', { enableUI: false });
+      }
       contents.setAudioMuted(true);
       contents.setFrameRate(15);
       contents.setWindowOpenHandler(() => ({ action: 'deny' }));

@@ -88,7 +88,11 @@ export interface WebSearchServiceOptions {
 	 * The desktop app's built-in browser: reads a page with the user's sign-ins there (tools/workspace.ts
 	 * readInBuiltInBrowser); resolves undefined when this process has no desktop host.
 	 */
-	signedInBrowser?: (url: string, signal: AbortSignal | undefined) => Promise<SignedInPage | undefined>;
+	signedInBrowser?: (
+		url: string,
+		signal: AbortSignal | undefined,
+		searchPreview?: boolean,
+	) => Promise<SignedInPage | undefined>;
 	/** Overrides WEB_SEARCH_LIMITS.searchReadBudgetMs (tests). */
 	searchReadBudgetMs?: number;
 	/** The extension search sources that exist; defaults to the ones extensions registered (see sources.ts). */
@@ -715,12 +719,13 @@ export class WebSearchService {
 	private async readSignedIn(
 		url: string,
 		signal: AbortSignal | undefined,
+		searchPreview: boolean,
 	): Promise<{ page?: ReadPageResult; desktop: boolean }> {
 		const read = this.options.signedInBrowser;
 		if (!read) return { desktop: false };
 		let page: SignedInPage | undefined;
 		try {
-			page = await read(url, signal);
+			page = await read(url, signal, searchPreview);
 		} catch {
 			const aborted = abortError(signal);
 			if (aborted) throw aborted;
@@ -754,7 +759,8 @@ export class WebSearchService {
 			const refused = isAccessBlock(error) || (error instanceof WebSearchError && error.code === "empty_content");
 			if (!refused || signal?.aborted) throw error;
 			const direct = error as WebSearchError;
-			const signedIn = await this.readSignedIn(url, signal);
+			// Only automatic search excerpts enter this method with mayAskPerson=false.
+			const signedIn = await this.readSignedIn(url, signal, !mayAskPerson);
 			if (signedIn.page) return signedIn.page;
 			if (signedIn.desktop) mayAskPerson = false;
 			const unavailable = !this.pageReader

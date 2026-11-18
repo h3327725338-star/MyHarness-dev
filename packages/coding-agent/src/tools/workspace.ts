@@ -247,11 +247,18 @@ export interface BuiltInBrowserPage {
  * so a site the user signed in to there is read signed in. Undefined without a desktop host; rejects when the host could
  * not read it.
  */
-export async function readInBuiltInBrowser(url: string, signal?: AbortSignal): Promise<BuiltInBrowserPage | undefined> {
+export async function readInBuiltInBrowser(
+	url: string,
+	signal?: AbortSignal,
+	searchPreview = false,
+): Promise<BuiltInBrowserPage | undefined> {
 	const link = desktopWorkspaceChannel();
 	if (!link) return undefined;
 	const timeoutMs = 25_000;
-	const request = link.request({ action: "readUrl", url, html: true, timeoutMs }, timeoutMs + 20_000) as Promise<{
+	const request = link.request(
+		{ action: "readUrl", url, html: true, timeoutMs, ...(searchPreview ? { searchPreview: true } : {}) },
+		timeoutMs + 20_000,
+	) as Promise<{
 		ok?: boolean;
 		error?: string;
 		url?: string;

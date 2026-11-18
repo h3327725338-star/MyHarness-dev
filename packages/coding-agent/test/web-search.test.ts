@@ -677,6 +677,38 @@ describe("WebSearchService search", () => {
 		expect(none.cacheHit).toBe(true);
 	});
 
+	it("marks only automatic result excerpts as search previews for the desktop reader", async () => {
+		const url = "https://article.example/";
+		const signedInReads: (boolean | undefined)[] = [];
+		const service = new WebSearchService({
+			settings: SettingsManager.inMemory({
+				webSearch: { enabled: true, engines: ["duckduckgo"], pagesPerSearch: 1 },
+			}),
+			fetchImpl: fakeNetwork({
+				"lite.duckduckgo.com": () => html(ddgHtml([{ title: "Fetch API", url, snippet: "Fetch API article" }])),
+				"article.example": () => html("Forbidden", { status: 403 }),
+			}).fetchImpl,
+			lookup: publicLookup,
+			cache: new WebSearchCache(undefined),
+			browser: null,
+			signedInBrowser: async (url, _signal, searchPreview) => {
+				signedInReads.push(searchPreview);
+				return {
+					url,
+					title: "Fetch API",
+					html: htmlPage("Fetch API", "<p>Readable article about Fetch API</p>"),
+					signIn: false,
+					challenge: false,
+				};
+			},
+		});
+		const search = await service.search({ queries: ["Fetch API"] });
+		const fetched = await service.fetch({ urls: [url], fresh: true });
+		expect(signedInReads).toEqual([true, false]);
+		expect(search.pages[0]).toMatchObject({ url, title: "Fetch API" });
+		expect(fetched.pages[0]).toMatchObject({ url, title: "Fetch API" });
+	});
+
 	it("replaces unreadable pages with the next results and drops pages still loading when the read budget ends", async () => {
 		const results = ["a", "b", "c", "d", "e"].map((name) => ({
 			title: `${name} fetch api`,
