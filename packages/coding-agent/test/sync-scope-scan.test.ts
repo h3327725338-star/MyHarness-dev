@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getSessionDir, getWorkspaceMetadataPath, UNBOUND_WORKSPACE_ID } from "../src/config/paths/index.ts";
+import { ModeStateStore } from "../src/session/mode-state.ts";
 import { scanLocalEntities, scanLocalEntitiesAsync } from "../src/sync/scope.ts";
 
 const roots: string[] = [];
@@ -38,7 +39,7 @@ function library(sessions: number) {
 		mkdirSync(`${conversation}.lock`);
 		write(join(getSessionDir(dataRoot, workspace, id), "artifacts", "note.txt"), `note ${index}`);
 	}
-	const modeState = { get: () => ({ drafts: {} }), getPersonalPrompt: () => "" } as never;
+	const modeState = new ModeStateStore(agentDir);
 	return { dataRoot, agentDir, modeState };
 }
 

@@ -478,8 +478,12 @@ export async function applyDraft(ctx: ApplyContext, record: SyncRecord, data: Ui
 	return outcome;
 }
 
-export async function applyPrompt(ctx: ApplyContext, data: Uint8Array): Promise<ApplyOutcome> {
-	ctx.modeState.setPersonalPrompts({ general: fromUtf8(data) });
+export async function applyPrompt(
+	ctx: ApplyContext,
+	mode: "coding" | "general",
+	data: Uint8Array,
+): Promise<ApplyOutcome> {
+	ctx.modeState.setPersonalPrompt(mode, fromUtf8(data));
 	return { applied: true, workspacesChanged: false, sessionsChanged: false, memoriesChanged: false };
 }
 
@@ -587,8 +591,8 @@ export async function applyDelete(ctx: ApplyContext, record: SyncRecord): Promis
 		outcome.applied = true;
 		return outcome;
 	}
-	if (record.kind === "prompt") {
-		ctx.modeState.setPersonalPrompts({ general: "" });
+	if (record.kind === "prompt" || record.kind === "coding-prompt") {
+		ctx.modeState.setPersonalPrompt(record.kind === "coding-prompt" ? "coding" : "general", "");
 		outcome.applied = true;
 		return outcome;
 	}

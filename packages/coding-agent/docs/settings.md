@@ -19,7 +19,7 @@ Web UI 的每个对话都有自己的 `SettingsManager`，共用同一份 settin
 
 设置 → 智能体 → **新对话默认模型**，可以指定每次新建对话的模型及推理档位。档位选 Default 时使用该模型设置的默认档位；未指定新对话模型时继续使用上次选过的模型；若该模型配置了默认档位则使用它，否则沿用上次档位。配置新对话模型后，点击新对话会创建使用最新默认设置的对话，不复用已有空白对话。该设置独立保存在全局 `newChatModel: { provider, model, thinkingLevel? }`，当前聊天临时切换模型或档位不会覆盖它；旧对话仍恢复自己的模型和档位。显式启动参数优先。删除所引用的模型或 Provider 时清除该设置。
 
-设置 → Providers → 模型中可配置 **默认推理档位**，写入模型的 `defaultThinkingLevel`；未设置时使用最高可用档。独立助手模型选择 Default 时也使用此值，显式选择的档位优先；记忆挑选器和定时任务保留各自的任务默认规则。内置模型档位表及手动覆盖见 [Models](models.md#built-in-presets-manual-overrides-and-default-effort)。
+设置 → Providers → 模型中可配置 **默认推理档位**，写入模型的 `defaultThinkingLevel`；未设置时使用最高可用档。在对话中切换到另一个模型时，若目标模型配置了默认档位，就使用该档位，否则沿用当前档位并按目标模型支持的范围调整。独立助手模型选择 Default 时也使用此值，显式选择的档位优先；记忆挑选器和定时任务保留各自的任务默认规则。内置模型档位表及手动覆盖见 [Models](models.md#built-in-presets-manual-overrides-and-default-effort)。
 
 ## Web 外观与配色主题
 

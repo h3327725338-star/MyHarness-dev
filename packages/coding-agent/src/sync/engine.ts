@@ -2313,8 +2313,9 @@ export class SyncEngine {
 				if (!data) throw new DeferredBatchError(`Waiting for ${operation.key}`);
 				return applyDraft(context, operation, data);
 			case "prompt":
+			case "coding-prompt":
 				if (!data) throw new DeferredBatchError(`Waiting for ${operation.key}`);
-				return applyPrompt(context, data);
+				return applyPrompt(context, operation.kind === "coding-prompt" ? "coding" : "general", data);
 			case "saved-prompts":
 				if (!data) throw new DeferredBatchError(`Waiting for ${operation.key}`);
 				return applySavedPrompts(context, data);
@@ -2594,6 +2595,7 @@ export class SyncEngine {
 	): Promise<boolean> {
 		switch (operation.kind) {
 			case "prompt":
+			case "coding-prompt":
 				return this.mergeRemoteInline(operation, data, local, mergeText);
 			case "draft":
 				return this.mergeRemoteInline(operation, data, local, mergeDraft);
@@ -2944,7 +2946,11 @@ export class SyncEngine {
 			const here = scanned?.inline;
 			if (here === undefined) return false;
 			const merge =
-				conflict.kind === "prompt" ? mergeText : conflict.kind === "draft" ? mergeDraft : mergeSavedPrompts;
+				conflict.kind === "prompt" || conflict.kind === "coding-prompt"
+					? mergeText
+					: conflict.kind === "draft"
+						? mergeDraft
+						: mergeSavedPrompts;
 			const merged = merge(this.bases.get(conflict.key)?.text, here, fromUtf8(copy));
 			if (merged === undefined) return false;
 			if (merged !== here) written = (await this.applyPut(record, utf8(merged))).applied;
@@ -3040,10 +3046,11 @@ function isSafeRecordIdentity(operation: SyncOperation): boolean {
 		const [workspaceId, sessionId, ...rest] = operation.id.split("/");
 		return rest.length === 0 && Boolean(workspaceId && sessionId) && part.test(workspaceId!) && part.test(sessionId!);
 	}
+	if (operation.kind === "prompt") return operation.id === "general" && operation.key === "prompt:general";
+	if (operation.kind === "coding-prompt") return operation.id === "coding" && operation.key === "coding-prompt:coding";
 	if (
 		operation.kind === "workspace" ||
 		operation.kind === "draft" ||
-		operation.kind === "prompt" ||
 		operation.kind === "saved-prompts" ||
 		operation.kind === "schedules"
 	)
@@ -3105,11 +3112,25 @@ function isLocalOnlyOperation(record: { kind: SyncEntityKind; id: string }): boo
 
 /** Kinds whose last common content is kept for a three-way merge (memory-bases.ts); files merge without one. */
 function tracksBase(kind: SyncEntityKind): boolean {
-	return kind === "memory" || kind === "prompt" || kind === "draft" || kind === "saved-prompts" || kind === "settings";
+	return (
+		kind === "memory" ||
+		kind === "prompt" ||
+		kind === "coding-prompt" ||
+		kind === "draft" ||
+		kind === "saved-prompts" ||
+		kind === "settings"
+	);
 }
 
 /** Kinds that merge in mergeRemoteRecord, so an older version's review entry for them is merged from its copy. */
-const MERGED_KINDS = new Set<SyncEntityKind>(["prompt", "draft", "saved-prompts", "schedules", "file"]);
+const MERGED_KINDS = new Set<SyncEntityKind>([
+	"prompt",
+	"coding-prompt",
+	"draft",
+	"saved-prompts",
+	"schedules",
+	"file",
+]);
 
 function vectorSum(vector: VersionVector | undefined): number {
 	let sum = 0;
@@ -3130,6 +3151,7 @@ function compareVersionsNewestFirst(a: PullChange, b: PullChange): number {
 const KIND_RANK: Record<SyncEntityKind, number> = {
 	workspace: 0,
 	prompt: 1,
+	"coding-prompt": 1,
 	"saved-prompts": 1,
 	browser: 1,
 	schedules: 1,
@@ -3183,6 +3205,7 @@ const ENTITY_KINDS = new Set<SyncEntityKind>([
 	"workspace",
 	"draft",
 	"prompt",
+	"coding-prompt",
 	"saved-prompts",
 	"browser",
 	"schedules",

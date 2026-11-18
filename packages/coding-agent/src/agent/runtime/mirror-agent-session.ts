@@ -222,8 +222,8 @@ export class MirrorAgentSession extends AgentSession {
 		return { stopped: [], errors: [], unconfirmed: 0 };
 	}
 
-	override async setModel(model: Parameters<AgentSession["setModel"]>[0]): Promise<void> {
-		await this.requireBridge().command("setModel", { provider: model.provider, id: model.id });
+	override async setModel(...[model, thinkingLevel]: Parameters<AgentSession["setModel"]>): Promise<void> {
+		await this.requireBridge().command("setModel", { provider: model.provider, id: model.id, thinkingLevel });
 	}
 
 	override async useModelInThisSession(): Promise<void> {

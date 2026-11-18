@@ -1269,6 +1269,50 @@ describe("Web host (real runtime with a faux provider)", () => {
 		);
 	});
 
+	it("applies the target model's default effort to the chat and its first request", async () => {
+		const fx = await start();
+		const model = fx.faux.getModel();
+		const base = { ...model, reasoning: true };
+		fx.hub.host.session.modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				{ ...base, id: "deep", name: "Deep" },
+				{
+					...base,
+					id: "astra",
+					name: "Astra",
+					defaultThinkingLevel: "xhigh",
+					thinkingLevelMap: { high: "high", xhigh: "xhigh" },
+				},
+			],
+		});
+		await fx.post("/api/model", { provider: model.provider, id: "deep" });
+		await fx.post("/api/thinking", { level: "high" });
+		expect((await fx.get("/api/state")).thinking.level).toBe("high");
+
+		const efforts: unknown[] = [];
+		fx.faux.setResponses([
+			(_context, options) => {
+				efforts.push(options && "reasoning" in options ? options.reasoning : undefined);
+				return fauxAssistantMessage([fauxText("Astra answer")]);
+			},
+		]);
+		await fx.post("/api/model", { provider: model.provider, id: "astra" });
+		const snapshot = await fx.get("/api/state");
+		expect(snapshot.model).toMatchObject({ id: "astra", defaultThinkingLevel: "xhigh" });
+		expect(snapshot.thinking).toMatchObject({ level: "xhigh", levels: expect.arrayContaining(["high", "xhigh"]) });
+		await fx.post("/api/prompt", { text: "run on the new model" });
+		await fx.waitFor("run_finished");
+		expect(efforts).toEqual(["xhigh"]);
+
+		await fx.post("/api/model", { provider: model.provider, id: "deep" });
+		await fx.post("/api/model", { provider: model.provider, id: "astra", thinkingLevel: "high" });
+		expect((await fx.get("/api/state")).thinking.level).toBe("high");
+		await fx.post("/api/model", { provider: model.provider, id: "astra" });
+		expect((await fx.get("/api/state")).thinking.level).toBe("high");
+	});
+
 	it("archives and restores a saved chat, then physically deletes it and resets the active view", async () => {
 		const fx = await start();
 		fx.faux.setResponses([fauxAssistantMessage([fauxText("saved answer")])]);

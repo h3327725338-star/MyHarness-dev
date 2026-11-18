@@ -310,12 +310,11 @@ export function registerCoreRoutes(server: WebHttpServer, host: WebHost): void {
 		const model = host.session.modelRuntime.getModel(provider, id);
 		if (!model) throw new HttpError(404, `Unknown model ${provider}/${id}`);
 		if (host.session.isStreaming) throw new HttpError(409, "Cannot switch models while the agent is running.");
-		// The effort chosen next to the model in the model menu; without one the session keeps (and clamps) its own.
+		// An explicitly selected effort takes precedence over the target model's default.
 		const level = payload.thinkingLevel;
 		if (level !== undefined && (typeof level !== "string" || !VALID_THINKING.has(level)))
 			throw new HttpError(400, `Invalid thinking level: ${String(level)}`);
-		await host.session.setModel(model);
-		if (typeof level === "string") host.session.setThinkingLevel(level as ThinkingLevel);
+		await host.session.setModel(model, level as ThinkingLevel | undefined);
 		// The context window, the thinking levels and the session totals all follow the new model: push them now, so
 		// every open tab shows the switch itself instead of waiting for the next request to end.
 		host.broadcast("usage", host.usage());

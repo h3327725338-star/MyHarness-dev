@@ -15,7 +15,7 @@ reading the 5,660 change lists. Since then the maintainer has run sync for real 
 
 | Data | Synced |
 | --- | --- |
-| Global, Workspace and Session memories, including archives, pending quarantine and the user profile | Yes |
+| Global, Workspace and Session memories from Coding and General, including archives, pending quarantine and the user profile | Yes |
 | General-mode Workspaces: identity, name, instructions, memory/library switches | Yes |
 | General-mode chats, including the default group of chats that belong to no Workspace: conversation JSONL (branches merged by entry id), handoff metadata, session metadata (without this computer's paths) | Yes |
 | A chat's search index (`metadata/history-index.json`) | No, it describes the chat file on the computer that built it |
@@ -24,7 +24,8 @@ reading the 5,660 change lists. Since then the maintainer has run sync for real 
 | Ordinary files inside a General workspace, after the user turns file sync on | Yes, through the separate file channel below |
 | Files inside a Drive-managed workspace | No, the Google Drive client syncs them |
 | Coding-mode repository files, worktrees and build output | No |
-| General-mode drafts and the General personal prompt | Yes |
+| Coding and General personal prompts | Yes, each mode syncs independently |
+| General-mode drafts | Yes |
 | Saved prompts of the Web UI (Session panel → My prompts) | Yes, only that list; other Web UI preferences stay on each device |
 | Provider configuration (`models.json`), API keys, the preferences that mean the same on every computer (including the proxy and network time limits), model prompts, web search keys, the model of each chat mode, the skills, prompt templates and themes folders | Yes, see “Settings and keys” below |
 | What the Android app of the same Google account sees and sends: chats, Providers with their keys, the default model, memories, bookmarks, its own chat lines and Provider edits | Yes, through `phone-v1/` beside the sync space, see “Phones of the account” below |
@@ -41,12 +42,17 @@ session files. Until such a file has arrived the chat shows a 1x1 placeholder fo
 on the next read; a device still running a version from before image files shows the placeholder for good.
 
 Archive and pin markers (`<conversation>.jsonl.archived`, `.pinned`) travel with the chat, so the other device shows
-the same archived and pinned state. An empty General prompt or draft is represented as a deletion, so clearing it on one
-device clears it on the others; retyping it afterwards is a newer version and is applied again. The saved prompts work the same way (record
-`saved-prompts:web`): an emptied list is a deletion. An arriving list replaces `prefs.savedPrompts` in
+the same archived and pinned state. Clearing either synced personal prompt or a General draft is represented as a
+deletion: it clears that same record on other devices, and retyping it publishes a newer version. The saved prompts
+work the same way (record `saved-prompts:web`): an emptied list is a deletion. An arriving list replaces `prefs.savedPrompts` in
 `<agentDir>/web-ui-prefs.json` with a newer `updatedAt` and keeps every other preference; open pages read it again on
 `sync_applied`. Devices running an older version ignore this record. Both devices changing the list before syncing
 merges the two lists (see Merge rules): every prompt either device added stays, once.
+
+The Coding personal prompt uses `coding-prompt:coding`, separate from `prompt:general`, so an older version cannot
+apply it to General. Update both computers before the first Coding prompt sync. If an older computer already skipped
+that record before it was updated, editing and saving the Coding prompt on an up-to-date computer publishes a new
+version that the other computer can receive.
 
 A chat's `metadata/session.json` records this computer's folder (`cwd`) and chat file path (`conversationPath`). Those
 two fields never travel: the record carries the other fields only, an arriving version is written with this computer's
@@ -276,7 +282,7 @@ Each record has a stable key (`kind:id`) and a per-device version vector.
   the same whichever device merges, so both reach one text and the next pass converges. A browser file is never removed
   because another device deleted it: the file here is published again past the deletion and the other device gets it
   back. Vaults are written by one computer each and never merged.
-- Concurrent edits of the General personal prompt, a draft, the saved prompts list or a chat or Workspace file:
+- Concurrent edits of either mode's personal prompt, a draft, the saved prompts list or a chat or Workspace file:
   merged (`src/sync/record-merge.ts`), so neither edit is lost and no review entry is left. The prompt, a draft's text
   and plain-text files (`.md`, `.markdown`, `.txt`, `.text`, `.csv`, `.tsv`, `.log`, UTF-8, up to 2 MB) merge line by
   line like a memory body, against the last common version for the prompt and drafts and without one for files (so an

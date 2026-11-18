@@ -356,7 +356,7 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 		}
 	}
 
-	// 4. General-mode personal prompt and drafts live in the agent directory, not the Data root.
+	// 4. Both personal prompts and the General drafts live in the agent directory, not the Data root.
 	const stateFile = join(agentDir, "chat-mode-state.json");
 	let stateMtime = Date.now();
 	try {
@@ -371,19 +371,25 @@ function* scanSteps(options: ScanOptions, entities: Map<string, ScannedEntity>):
 	} catch {
 		general = { drafts: {} } as ReturnType<ModeStateStore["get"]>;
 	}
-	const prompt = modeState.getPersonalPrompt("general");
-	// An empty prompt is the absence of a value: leaving it out means another device's text can arrive, and clearing
-	// here becomes an explicit delete record instead of an empty version that would block the other device.
-	if (prompt) {
-		entities.set("prompt:general", {
-			key: "prompt:general",
-			kind: "prompt",
-			id: "general",
+	const prompts = modeState.getPersonalPrompts();
+	// A separate kind prevents older clients from applying Coding content to General.
+	for (const [id, kind, name] of [
+		["general", "prompt", "General personal prompt"],
+		["coding", "coding-prompt", "Coding personal prompt"],
+	] as const) {
+		const prompt = prompts[id];
+		// Omit an empty prompt so a new device can receive text, or a previously synced value can be deleted.
+		if (!prompt) continue;
+		const key = `${kind}:${id}`;
+		entities.set(key, {
+			key,
+			kind,
+			id,
 			inline: prompt,
 			updatedAt,
 			mtimeMs: stateMtime,
 			size: Buffer.byteLength(prompt),
-			meta: { name: "General personal prompt" },
+			meta: { name },
 		});
 	}
 	for (const [sessionId, draft] of Object.entries(general.drafts)) {

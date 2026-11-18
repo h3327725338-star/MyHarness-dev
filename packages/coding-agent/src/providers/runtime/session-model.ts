@@ -11,6 +11,7 @@ import type { Agent, ThinkingLevel } from "@myharness/agent-core";
 import type { Model } from "@myharness/ai/compat";
 import {
 	clampThinkingLevel,
+	getDefaultThinkingLevel,
 	getSupportedThinkingLevels,
 	modelsAreEqual,
 	resetApiProviders,
@@ -102,7 +103,7 @@ export class SessionModelController {
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
+	async setModel(model: Model<any>, explicitLevel?: ThinkingLevel): Promise<void> {
 		const { agent, sessionManager, settingsManager, modelRuntime } = this._host;
 		if (!modelRuntime.isProviderEnabled(model.provider)) {
 			throw new Error(`Provider ${model.provider} is disabled`);
@@ -113,7 +114,7 @@ export class SessionModelController {
 
 		const previousModel = this._model;
 		await this._host.compactBeforeModelDownshift(model);
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(model, explicitLevel);
 		agent.state.model = model;
 		sessionManager.appendModelChange(model.provider, model.id);
 		settingsManager.setDefaultModelAndProvider(model.provider, model.id);
@@ -272,17 +273,14 @@ export class SessionModelController {
 		const len = scopedModels.length;
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
 		await this._host.compactBeforeModelDownshift(next.model);
 		agent.state.model = next.model;
 		sessionManager.appendModelChange(next.model.provider, next.model.id);
 		settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
-		// Apply thinking level.
-		// - Explicit scoped model thinking level overrides current session level
-		// - Undefined scoped model thinking level inherits the current session preference
-		// setThinkingLevel clamps to model capabilities.
+		// setThinkingLevel clamps the selected effort to the new model's capabilities.
 		this._host.setThinkingLevel(thinkingLevel);
 		this._host.notifyModelChanged();
 
@@ -306,7 +304,7 @@ export class SessionModelController {
 		const nextModel = availableModels[nextIndex];
 
 		await this._host.compactBeforeModelDownshift(nextModel);
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		agent.state.model = nextModel;
 		sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
@@ -377,9 +375,12 @@ export class SessionModelController {
 		return !!this._model?.reasoning;
 	}
 
-	private _getThinkingLevelForModelSwitch(explicitLevel?: ThinkingLevel): ThinkingLevel {
+	private _getThinkingLevelForModelSwitch(nextModel: Model<any>, explicitLevel?: ThinkingLevel): ThinkingLevel {
 		if (explicitLevel !== undefined) {
 			return explicitLevel;
+		}
+		if (!modelsAreEqual(this._model, nextModel) && nextModel.defaultThinkingLevel !== undefined) {
+			return getDefaultThinkingLevel(nextModel);
 		}
 		if (!this.supportsThinking()) {
 			return this._host.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;

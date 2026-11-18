@@ -8,7 +8,8 @@
 
 /** What a record represents. Applied by a kind-specific adapter, never by copying whole directories blindly. */
 /**
- * `prompt` is the General personal prompt; `saved-prompts` is the Web UI's list of saved prompts (My prompts);
+ * `prompt` is the General personal prompt, `coding-prompt` is the Coding personal prompt, and `saved-prompts`
+ * is the Web UI's list of saved prompts (My prompts).
  * `browser` is one file of the built-in browser's desktop profile (browser-data.ts); `schedules` is the list of
  * scheduled tasks (schedules/store.ts); `settings` is one part of the configuration that travels (settings-data.ts):
  * Providers and models, saved API keys, model and agent settings, model prompts, web search keys.
@@ -20,6 +21,7 @@ export type SyncEntityKind =
 	| "workspace"
 	| "draft"
 	| "prompt"
+	| "coding-prompt"
 	| "saved-prompts"
 	| "browser"
 	| "schedules"

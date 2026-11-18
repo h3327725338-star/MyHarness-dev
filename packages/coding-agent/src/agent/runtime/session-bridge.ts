@@ -17,6 +17,7 @@
 
 import { randomUUID } from "node:crypto";
 import net from "node:net";
+import type { ThinkingLevel } from "@myharness/agent-core";
 import type { ImageContent } from "@myharness/ai";
 import {
 	removeSessionBridgeDescriptor,
@@ -277,7 +278,7 @@ class BridgeConnection {
 				case "setModel": {
 					const model = session.modelRuntime.getModel(String(args.provider ?? ""), String(args.id ?? ""));
 					if (!model) throw new Error(`Unknown model ${String(args.provider)}/${String(args.id)}`);
-					await session.setModel(model);
+					await session.setModel(model, args.thinkingLevel as ThinkingLevel | undefined);
 					break;
 				}
 				case "setThinkingLevel":

@@ -3261,8 +3261,8 @@ export class AgentSession {
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>): Promise<void> {
-		await this._models.setModel(model);
+	async setModel(model: Model<any>, thinkingLevel?: ThinkingLevel): Promise<void> {
+		await this._models.setModel(model, thinkingLevel);
 	}
 
 	/**

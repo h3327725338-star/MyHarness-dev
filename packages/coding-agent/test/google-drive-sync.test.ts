@@ -293,13 +293,20 @@ describe("Google Drive sync engine", () => {
 		};
 		const general = chat("plain", "general");
 		chat("repo", "coding");
+		const codingMemory = join("workspaces", "unbound", "sessions", "repo", "memory");
+		mkdirSync(join(a.dataRoot, codingMemory), { recursive: true });
+		writeFileSync(
+			join(a.dataRoot, codingMemory, "decision.md"),
+			"---\nid: session/decision\nname: Decision\n---\n\nA Coding session memory.\n",
+		);
 
 		await sync(a, b);
 		const arrived = join(b.dataRoot, "workspaces", "unbound", "sessions", "plain");
 		const conversation = join(arrived, "conversation", basename(general));
 		expect(readFileSync(conversation, "utf8")).toContain("hello from plain");
 		expect(readFileSync(join(arrived, "artifacts", "notes.md"), "utf8")).toBe("notes of plain");
-		expect(existsSync(join(b.dataRoot, "workspaces", "unbound", "sessions", "repo"))).toBe(false);
+		expect(readFileSync(join(b.dataRoot, codingMemory, "decision.md"), "utf8")).toContain("A Coding session memory.");
+		expect(readdirSync(join(b.dataRoot, "workspaces", "unbound", "sessions", "repo"))).toEqual(["memory"]);
 		// The group is not a Workspace on either computer.
 		expect(
 			WorkspaceStore.create(b.agentDir, b.dataRoot)
@@ -1178,35 +1185,46 @@ describe("Google Drive sync engine", () => {
 			expect(drive.batchNames()).toHaveLength(batches);
 		};
 
-		it("merges both edits of the personal prompt, so both computers end with the same text", async () => {
+		it.each(["general", "coding"] as const)("merges both edits of the %s personal prompt", async (mode) => {
 			const drive = new FakeDrive();
 			const a = device(drive, "desktop", "device-a");
 			const b = device(drive, "laptop", "device-b");
 			const prompt = (second: string, fourth: string) => `Answer in Chinese.\n${second}\nUse lists.\n${fourth}`;
-			new ModeStateStore(a.agentDir).setPersonalPrompt("general", prompt("Be brief.", "Cite sources."));
+			const otherMode = mode === "coding" ? "general" : "coding";
+			const desktopState = new ModeStateStore(a.agentDir);
+			const laptopState = new ModeStateStore(b.agentDir);
+			desktopState.setPersonalPrompt(otherMode, "Separate instructions.");
+			desktopState.setPersonalPrompt(mode, prompt("Be brief.", "Cite sources."));
 			await sync(a, b);
-			new ModeStateStore(a.agentDir).setPersonalPrompt("general", prompt("Be brief and direct.", "Cite sources."));
-			new ModeStateStore(b.agentDir).setPersonalPrompt("general", prompt("Be brief.", "Cite sources with links."));
+			expect(laptopState.getPersonalPrompt(mode)).toBe(prompt("Be brief.", "Cite sources."));
+			desktopState.setPersonalPrompt(mode, prompt("Be brief and direct.", "Cite sources."));
+			laptopState.setPersonalPrompt(mode, prompt("Be brief.", "Cite sources with links."));
 
 			await sync(a, b);
 			await sync(a, b);
 
 			// Each computer changed another line of the version both had: both changes are in the result.
-			const desktop = new ModeStateStore(a.agentDir).getPersonalPrompt("general");
+			const desktop = desktopState.getPersonalPrompt(mode);
 			expect(desktop).toBe(prompt("Be brief and direct.", "Cite sources with links."));
-			expect(new ModeStateStore(b.agentDir).getPersonalPrompt("general")).toBe(desktop);
+			expect(laptopState.getPersonalPrompt(mode)).toBe(desktop);
 			await converged(drive, a, b);
 
 			// Both changed the same line: neither version of it is dropped.
-			new ModeStateStore(a.agentDir).setPersonalPrompt("general", prompt("Be brief and direct.", "Cite: desktop"));
-			new ModeStateStore(b.agentDir).setPersonalPrompt("general", prompt("Be brief and direct.", "Cite: laptop"));
+			desktopState.setPersonalPrompt(mode, prompt("Be brief and direct.", "Cite: desktop"));
+			laptopState.setPersonalPrompt(mode, prompt("Be brief and direct.", "Cite: laptop"));
 			await sync(a, b);
 			await sync(a, b);
-			const both = new ModeStateStore(a.agentDir).getPersonalPrompt("general");
+			const both = desktopState.getPersonalPrompt(mode);
 			expect(both).toContain("Cite: desktop");
 			expect(both).toContain("Cite: laptop");
-			expect(new ModeStateStore(b.agentDir).getPersonalPrompt("general")).toBe(both);
+			expect(laptopState.getPersonalPrompt(mode)).toBe(both);
 			await converged(drive, a, b);
+
+			laptopState.setPersonalPrompt(mode, "");
+			await sync(b, a);
+			expect(desktopState.getPersonalPrompt(mode)).toBe("");
+			expect(desktopState.getPersonalPrompt(otherMode)).toBe("Separate instructions.");
+			expect(laptopState.getPersonalPrompt(otherMode)).toBe("Separate instructions.");
 		});
 
 		it("merges a draft and the saved prompts both computers changed instead of keeping one", async () => {
