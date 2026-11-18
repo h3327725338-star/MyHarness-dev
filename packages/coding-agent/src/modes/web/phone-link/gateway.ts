@@ -62,6 +62,7 @@ const EVENTS = new Set([
 	"auto_retry_end",
 	"workspaces_changed",
 	"models_changed",
+	"device_memory_changed",
 	"shutdown",
 ]);
 /** Progress events: when a phone's connection is slow, only the newest of these is kept. */
@@ -121,6 +122,8 @@ const ROUTES: Route[] = [
 	{ method: "GET", path: "/api/sessions/unbound", query: ["mode", "limit", "offset"] },
 	{ method: "GET", path: "/api/sessions/scheduled", query: ["mode"] },
 	{ method: "GET", path: "/api/models" },
+	{ method: "GET", path: "/api/settings/device-memory" },
+	{ method: "POST", path: "/api/settings/device-memory", body: (input) => pick(input, ["enabled"]) },
 	{
 		method: "POST",
 		path: "/api/prompt",

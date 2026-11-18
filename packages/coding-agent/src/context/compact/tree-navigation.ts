@@ -180,7 +180,12 @@ export async function navigateSessionTree(
 		const { model, thinkingLevel } = resolveBranchSummaryModel(host);
 		const { apiKey, headers, env } = await host.resolveSummarizationAuth(model);
 		const branchSummarySettings = host.settingsManager.getBranchSummarySettings();
-		const summary = await generateBranchSummary(entriesToSummarize, {
+		const summaryEntries = host.settingsManager.isMemoryEnabledOnDevice()
+			? entriesToSummarize
+			: entriesToSummarize.filter(
+					(entry) => entry.type !== "custom_message" || entry.customType !== "auto-memory-recall",
+				);
+		const summary = await generateBranchSummary(summaryEntries, {
 			model,
 			contextWindow: host.getEffectiveContextWindow() || undefined,
 			apiKey,

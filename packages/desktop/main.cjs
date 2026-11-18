@@ -7,6 +7,7 @@ const { homedir } = require('node:os');
 const { createBrowser, httpUrl } = require('./browser-view.cjs');
 const { readLegacyPrefs } = require('./legacy-prefs.cjs');
 const { pointShortcutIcons, removeForeignShortcuts } = require('./notification-routing.cjs');
+const { windowsToastOptions } = require('./notification-toast.cjs');
 const { attachPreviewLinks } = require('./preview-links.cjs');
 const { createAppPrefs, loginItem, repairLoginItem } = require('./app-prefs.cjs');
 const { attachZoom, cleanZoom, stepZoom } = require('./zoom.cjs');
@@ -385,17 +386,15 @@ else {
       settleUi(requestId, payload.ok === true, payload.ok === true ? payload.result : payload.error);
       return { ok: true };
     });
-    // Native Windows notifications (toasts) owned by this app instead of PowerShell. The page plays the sound itself, so the
-    // toast is silent; a click brings the window forward and tells the page which chat the notification was about. No
-    // `icon` is passed on purpose: that image is a second logo beside the text, and without it the whole content area
-    // belongs to the message. The small app logo in the toast header comes from the app itself, not from this option.
+    // Let Windows present the banner and its sound together; Electron's 'show' only confirms submission to Windows.
+    // A click brings the window forward and tells the page which chat the notification was about.
     const toasts = new Map();
     showToast = (payload) => {
       if (!Notification.isSupported() || !payload || typeof payload !== 'object') return false;
       const text = (value, max) => String(value ?? '').slice(0, max);
       const tag = text(payload.tag, 200);
       toasts.get(tag)?.close();
-      const toast = new Notification({ title: text(payload.title, 120), body: text(payload.body, 300), silent: true, icon: APP_ICON });
+      const toast = new Notification(windowsToastOptions(payload, join(__dirname, 'icon.png')));
       toast.on('click', () => {
         showWindow();
         if (!window.webContents.isDestroyed()) window.webContents.send('desktop:notification-click', tag);

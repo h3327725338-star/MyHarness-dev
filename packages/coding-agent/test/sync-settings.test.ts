@@ -217,6 +217,7 @@ describe("configuration records", () => {
 		writeJson(dir, "settings.json", {
 			defaultModel: "m1",
 			subAgent: { enabled: true },
+			memoryEnabledOnDevice: false,
 			shellPath: "C:\\tools\\sh.exe",
 			npmCommand: ["pnpm"],
 			// The proxy travels: a PC that needs one to reach the Providers needs it on every PC of the user.
@@ -236,6 +237,7 @@ describe("configuration records", () => {
 			subAgent: { enabled: true },
 			network: { proxy: "http://127.0.0.1:1" },
 			futureSetting: { on: true },
+			memoryEnabledOnDevice: true,
 			shellPath: "X",
 			npmCommand: ["npm"],
 		};
@@ -243,6 +245,7 @@ describe("configuration records", () => {
 		const written = readJson(dir, "settings.json");
 		expect(written.defaultModel).toBe("m2");
 		expect(written.futureSetting).toEqual({ on: true });
+		expect(written.memoryEnabledOnDevice).toBe(false);
 		expect(written.shellPath).toBe("C:\\tools\\sh.exe");
 		expect(written.network).toEqual({ proxy: "http://127.0.0.1:1" });
 		expect(written.npmCommand).toEqual(["pnpm"]);

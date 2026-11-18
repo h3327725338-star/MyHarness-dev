@@ -334,6 +334,40 @@ function RoutesSection() {
 	<//>`;
 }
 
+function PcMemorySwitch({ device }) {
+	const [enabled, setEnabled] = useState(undefined);
+	const [busy, setBusy] = useState(false);
+	useEffect(() => {
+		let live = true;
+		let generation = 0;
+		const refresh = () => {
+			const request = ++generation;
+			pc.deviceMemory().then((value) => {
+				if (live && request === generation && typeof value?.enabled === "boolean") setEnabled(value.enabled);
+			}).catch(() => {});
+		};
+		setEnabled(undefined);
+		window.addEventListener("myharness:pc-memory-changed", refresh);
+		refresh();
+		return () => {
+			live = false;
+			window.removeEventListener("myharness:pc-memory-changed", refresh);
+		};
+	}, [device]);
+	if (enabled === undefined) return null;
+	const title = t("Memory on this PC");
+	return html`<${Row} icon="desktop" title=${title}>
+		${busy ? html`<${Spinner} size=${17} />` : html`<${Switch} label=${title} on=${enabled} onChange=${async (on) => {
+			setBusy(true);
+			try {
+				await attempt(async () => setEnabled((await pc.deviceMemory(on)).enabled));
+			} finally {
+				setBusy(false);
+			}
+		}} />`}
+	<//>`;
+}
+
 function LinkPage({ close }) {
 	const link = useStore((s) => s.pc.link);
 	const [busy, setBusy] = useState(false);
@@ -385,6 +419,7 @@ function LinkPage({ close }) {
 			${shownAddress ? html`<${Row} icon="wifi" title=${t("Address")} value=${shownAddress} />` : null}
 			${since ? html`<${Row} icon="clock" title=${t("Connected since")} value=${since} />` : null}
 			${info.version ? html`<${Row} icon="desktop" title=${t("MyHarness on the PC")} value=${info.version} />` : null}
+			<${PcMemorySwitch} key=${link.paired.deviceId} device=${link.paired.deviceId} />
 		<//>`}
 		${link.paired && info.phase === "online" && info.route === "relay" && link.direct && !link.direct.ok
 			? html`<div class="rows-note">${t("Why not direct: {reason}", { reason: link.direct.reason })} ${t("Tried at {time}; tried again every 2 minutes and when the phone changes networks.", { time: new Date(link.direct.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })}</div>`

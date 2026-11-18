@@ -64,6 +64,8 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 	/** Product metadata, never sent to the model. */
 	timing?: SessionMessageTiming;
+	/** The message was recorded with device memory off; exclude it from later extraction. */
+	skipMemoryExtraction?: true;
 }
 
 /** Thinking-level switch on the active branch; later entries inherit it until the next switch. */

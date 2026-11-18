@@ -133,12 +133,14 @@ function present(notice, fresh) {
 	if (!fresh || shown.has(notice.id)) return;
 	shown.add(notice.id);
 	if (notice.type === "started" || (notice.kind === "agent" && notice.slot)) return;
-	playNotificationSound(notice.sound);
-	if (appFocused() && document.visibilityState === "visible") return;
+	const watching = appFocused() && document.visibilityState === "visible";
+	if (watching || !globalThis.myHarnessDesktop?.notify) playNotificationSound(notice.sound);
+	if (watching) return;
 	void showNotification({
 		title: notice.title,
 		body: [card.meta, card.body].filter(Boolean).join("\n"),
 		tag: `myharness-schedule-${notice.id}`,
+		sound: notice.sound,
 		onClick: () => {
 			if (notice.slot || notice.sessionFile) void openChatOf(notice);
 		},

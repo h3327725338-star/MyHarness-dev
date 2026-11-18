@@ -10,15 +10,16 @@ import {
 	sanitizeMemoryText,
 	selectMemoriesForQuery,
 } from "../../agent/runtime/auto-memory.ts";
-import { getDataDir, UNBOUND_WORKSPACE_ID } from "../../config/paths/index.ts";
-import type { SettingsManager } from "../../config/settings/index.ts";
 import { describeStoredTime, describeZone, localStamp, localTimeZone } from "../../schedules/timing.ts";
-import type { SessionManager } from "../../session/manager/index.ts";
 import { getMemoryPaths } from "../../session/memory/store.ts";
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
 import type { BusinessToolDefinition } from "../contracts/index.ts";
 import { wrapToolDefinition } from "../tool-definition-wrapper.ts";
-import type { MemoryManageOperations } from "./manage.ts";
+import {
+	createSessionMemoryManageOperations,
+	type MemoryManageOperations,
+	type SessionMemoryToolSource,
+} from "./manage.ts";
 
 const DIRECTORY_MAX_BYTES = 16 * 1024;
 const SEARCH_DEFAULT_LIMIT = 8;
@@ -55,6 +56,7 @@ export type MemorySearchToolInput = Static<typeof memorySearchSchema>;
 export type MemoryGetToolInput = Static<typeof memoryGetSchema>;
 
 export interface MemoryToolDetails {
+	manualOnly?: true;
 	mode: "disabled" | "directory" | "search" | "get" | "error";
 	/** Memories visible to this conversation (or, for get, ids asked for). */
 	total?: number;
@@ -68,6 +70,7 @@ export interface MemoryToolDetails {
  * Implementations must only read.
  */
 export interface MemoryToolOperations {
+	isManualOnly?: () => boolean;
 	/** The active memories visible to this conversation, or undefined when Auto Memory is off for it. */
 	loadEntries: () => MemoryEntry[] | undefined;
 	/**
@@ -86,20 +89,13 @@ export interface MemoryToolOptions {
 const unavailableOperations: MemoryToolOperations = { loadEntries: () => undefined };
 
 /** Memory access for a live session: its own Data root, workspace and conversation, gated by the Auto Memory setting. */
-export function createSessionMemoryOperations(source: {
-	sessionManager: Pick<SessionManager, "isPersisted" | "getDataRoot" | "getWorkspaceId" | "getSessionId">;
-	settingsManager: Pick<SettingsManager, "getAutoMemorySettings">;
-}): MemoryToolOperations {
-	const resolveLocation = () => ({
-		dataRoot: source.sessionManager.getDataRoot() ?? getDataDir(),
-		workspaceId: source.sessionManager.getWorkspaceId() ?? UNBOUND_WORKSPACE_ID,
-		sessionId: source.sessionManager.getSessionId(),
-	});
+export function createSessionMemoryOperations(source: SessionMemoryToolSource): MemoryToolOperations {
+	const { context } = createSessionMemoryManageOperations(source);
 	return {
+		isManualOnly: () => context()?.manualOnly === true,
 		loadEntries() {
-			const { sessionManager, settingsManager } = source;
-			if (!sessionManager.isPersisted() || !settingsManager.getAutoMemorySettings().enabled) return undefined;
-			const location = resolveLocation();
+			const location = context();
+			if (!location) return undefined;
 			const paths = getMemoryPaths({
 				dataRoot: location.dataRoot,
 				workspaceId: location.workspaceId,
@@ -112,9 +108,8 @@ export function createSessionMemoryOperations(source: {
 			});
 		},
 		loadCrossEntries() {
-			const { sessionManager, settingsManager } = source;
-			if (!sessionManager.isPersisted() || !settingsManager.getAutoMemorySettings().enabled) return [];
-			const location = resolveLocation();
+			const location = context();
+			if (!location) return [];
 			return readCrossScopeMemoryEntries(location.dataRoot, {
 				workspaceId: location.workspaceId,
 				sessionId: location.sessionId,
@@ -346,8 +341,11 @@ export function createMemorySearchToolDefinition(
 			const scopedCross = scope === undefined ? loaded.cross : loaded.cross.filter((entry) => entry.scope === scope);
 			const requested = typeof limit === "number" && Number.isFinite(limit) ? Math.floor(limit) : undefined;
 			const bounded = requested === undefined ? undefined : Math.min(SEARCH_MAX_LIMIT, Math.max(1, requested));
-			if (!query?.trim()) return formatDirectory(scoped, scopedCross, bounded);
-			return formatSearch(query, loaded.entries, loaded.cross, bounded ?? SEARCH_DEFAULT_LIMIT, scope);
+			const result = !query?.trim()
+				? formatDirectory(scoped, scopedCross, bounded)
+				: formatSearch(query, loaded.entries, loaded.cross, bounded ?? SEARCH_DEFAULT_LIMIT, scope);
+			if (ops.isManualOnly?.()) result.details.manualOnly = true;
+			return result;
 		},
 	};
 }
@@ -430,6 +428,7 @@ export function createMemoryGetToolDefinition(
 			}
 			return textResult(sections.join("\n\n"), {
 				mode: "get",
+				...(ops.isManualOnly?.() ? { manualOnly: true } : {}),
 				total: requested.length,
 				returned: found.length,
 				ids: found,

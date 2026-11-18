@@ -14,8 +14,8 @@ function resources(directory: string): string[] {
 
 describe("built-in prompt resource format", () => {
 	const files = resources(root);
-	it("covers all 94 runtime resources, excluding repository maintenance documents", () => {
-		expect(files).toHaveLength(94);
+	it("covers all 95 runtime resources, excluding repository maintenance documents", () => {
+		expect(files).toHaveLength(95);
 	});
 	for (const file of files) {
 		it(`uses English heading-and-bullet blocks: ${file.slice(root.length + 1)}`, () => {

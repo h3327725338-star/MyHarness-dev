@@ -191,6 +191,7 @@ export const SETTINGS_MENU_SETTING: Readonly<Record<string, string>> = {
 	"clear-on-shrink": "clearOnShrink",
 	"terminal-progress": "showTerminalProgress",
 	"popup-notifications": "popupNotifications",
+	"device-memory": "memoryEnabledOnDevice",
 	"auto-memory": "autoMemory",
 	"memory-picker": "memoryPicker",
 	"sub-agent": "subAgent",
@@ -494,6 +495,15 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				value: s.getEnableSkillCommands(),
 			},
 			// Memory & assistants
+			{
+				id: "memoryEnabledOnDevice",
+				section: "Assistants",
+				label: "Memory on this device",
+				description:
+					"Applies immediately to all chats on this device. While off, only explicitly requested memory operations use a separate local store.",
+				type: "boolean",
+				value: s.isMemoryEnabledOnDevice(),
+			},
 			{
 				id: "conversationNaming",
 				section: "Assistants",
@@ -1282,6 +1292,10 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 				host.refreshSessionHandoff();
 				return;
 			}
+			case "memoryEnabledOnDevice": {
+				s.setMemoryEnabledOnDevice(boolValue(value, id));
+				return;
+			}
 			case "autoMemory": {
 				const ref = modelRefValue(value);
 				const enabled = (value as { enabled?: unknown } | undefined)?.enabled === true;
@@ -1604,6 +1618,17 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		}
 	};
 
+	server.route("GET", "/api/settings/device-memory", () => ({ enabled: settings().isMemoryEnabledOnDevice() }));
+	server.route("POST", "/api/settings/device-memory", async ({ body }) => {
+		const s = settings();
+		s.setMemoryEnabledOnDevice(boolValue(asObject(body).enabled, "enabled"));
+		const unsaved = await s.flush();
+		host.broadcast("settings_changed", { id: "memoryEnabledOnDevice" });
+		host.broadcast("device_memory_changed", {});
+		if (unsaved.length > 0) throw settingNotSaved(unsaved);
+		return { enabled: s.isMemoryEnabledOnDevice() };
+	});
+
 	server.route("GET", "/api/settings", () => {
 		const s = settings();
 		return {
@@ -1622,6 +1647,7 @@ export function registerSettingsRoutes(server: WebHttpServer, host: WebHost): vo
 		await applySetting(id, payload.value);
 		const unsaved = await settings().flush();
 		host.broadcast("settings_changed", { id });
+		if (id === "memoryEnabledOnDevice") host.broadcast("device_memory_changed", {});
 		// The `subAgent` switch also changes the session's active tools (agent/workflow/ultracode), so tell
 		// other tabs to refresh the right-panel tool list as well; the local tab refreshes it directly.
 		if (id === "subAgent") host.broadcast("resources_changed", {});

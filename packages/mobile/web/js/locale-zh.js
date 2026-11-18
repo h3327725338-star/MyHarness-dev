@@ -7,6 +7,7 @@ export const MOBILE_ZH = {
 	// Panes and navigation
 	"This phone": "本机",
 	PC: "电脑",
+	"Memory on this PC": "这台电脑的记忆",
 	Chat: "对话",
 	Chats: "对话列表",
 	Browser: "浏览器",

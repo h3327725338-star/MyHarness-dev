@@ -2667,16 +2667,13 @@ const WAITING_TITLE = { permission: N_("Your confirmation is needed"), question:
 
 /**
  * The Notifications settings (Settings → Safety & privacy): the server sends this when a task completed, failed or was
- * interrupted, or when a confirmation or a question waits for an answer, and the matching setting is on. The page plays
- * the chosen sound, shows a browser notification and tells
- * the server whether it could: without the browser's permission the server shows the system popup instead (see
- * WebHost.announceTaskEnd), so the notification appears either way.
+ * interrupted, or when a confirmation or a question waits for an answer, and the matching setting is on. Windows
+ * plays the sound for a native toast. Without a toast (or outside the desktop host), keep the page sound.
  */
 async function notifyTaskEnd(d, slot) {
-	// The sound always plays. The notification is skipped while the user is looking at that very chat ("Always"), or at
-	// the app at all ("Only when not focused"); a skipped notice counts as shown, so the system popup does not take its place.
-	playNotificationSound(d.sound);
+	// A skipped toast counts as shown, so the system popup does not take its place.
 	const watching = appFocused() && document.visibilityState === "visible" && (d.focus === "unfocused" || activeSlot === slot);
+	if (watching || !globalThis.myHarnessDesktop?.notify) playNotificationSound(d.sound);
 	if (watching) {
 		post("/api/notifications/answer", { id: d.id, shown: true }, slot).catch(() => {});
 		return;
@@ -2699,6 +2696,7 @@ async function notifyTaskEnd(d, slot) {
 		title: `${t(WAITING_TITLE[d.category] || TASK_END_TITLE[d.state] || N_("Task finished"))} · ${chat}`,
 		body: clip(summary, 60),
 		tag: taskTag(slot),
+		sound: d.sound,
 		onClick: () => (d.kind === "waiting" ? openChatAtBottom(slot) : openChatAtLastTurn(slot)),
 	});
 	post("/api/notifications/answer", { id: d.id, shown }, slot).catch(() => {});

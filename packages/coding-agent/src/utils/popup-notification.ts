@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import type { AgentMessage } from "@myharness/agent-core";
 import type { RunState, RunStateSnapshot } from "../agent/runtime/run-state.ts";
 import { RUN_STATE_LABELS } from "../agent/runtime/run-state.ts";
+import type { NotificationSound } from "../config/settings/types.ts";
 import { getRenamePlanPaths } from "../symbols/workflow/rename-plans.ts";
 import { applyPatchPaths } from "../tools/files/apply-patch-parser.ts";
 import { spawnProcess } from "./child-process.ts";
@@ -21,6 +22,8 @@ export interface PopupNotificationContent {
 	message: string;
 	/** Notifications with the same tag replace each other; in the desktop app a click on one brings that chat forward. */
 	tag?: string;
+	/** Windows desktop host plays this as part of the native toast. */
+	sound?: NotificationSound;
 }
 
 /** A command that renders the popup when spawned, or undefined if unsupported. */
@@ -344,6 +347,7 @@ export function sendDesktopNotification(
 			title: content.title,
 			body: content.message,
 			tag: content.tag ?? "",
+			...(content.sound === undefined ? {} : { sound: content.sound }),
 		});
 	} catch {
 		return false;

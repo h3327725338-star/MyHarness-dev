@@ -26,6 +26,7 @@
 | `session/commit-authorization.md` | 当前不存在；显式 `/commit` 的授权和 Git 事务边界由 Coding Agent 源码处理，不会从本目录加载 |
 | `session/handoff.md` | 后台交接摘要请求的职责与输出格式（话题、当前焦点、必要背景、结论与纠正、未完成事项、来源；区分已确认与未验证，中断回复不写成完成；“今天”等日期按任务给出的当前本机时间和每条消息的发送时间推算，推不出就不写；提示词文件本身不含非英文字符） |
 | `session/auto-memory.md` | 仅 Auto Memory 完整启用时追加的记忆优先级约束 |
+| `session/manual-memory.md` | 本机记忆关闭时追加到主智能体的请求，只允许按用户明确要求操作独立手动记忆库 |
 | `session/project-context.md` | 有项目上下文时使用，变量 `projectContext` |
 | `session/artifacts.md` | 持久化结构化 Session 的临时产出存放规则，变量 `artifactsDir`；由 `_getTurnSystemPrompt` 追加实际对话路径，不适用于正式源码或用户指定路径 |
 | `session/working-directory.md` | 当前工作目录，变量 `cwd` |

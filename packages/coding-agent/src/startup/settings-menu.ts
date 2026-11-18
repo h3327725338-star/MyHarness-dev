@@ -101,6 +101,12 @@ export const SETTINGS_MENU: ReadonlyArray<SettingsMenuItem> = [
 	{ id: "mail-connect", label: "Mail Connect", description: "连接 Gmail、Outlook 邮箱", kind: "submenu" },
 	{ id: "default-model", label: "Default Model", description: "选择主用模型", kind: "submenu" },
 	{ id: "fallback-model", label: "Fallback Model", description: "主模型故障时自动接管", kind: "submenu" },
+	{
+		id: "device-memory",
+		label: "Memory on this device",
+		description: "立即切换本机所有聊天的自动记忆",
+		kind: "toggle",
+	},
 	{ id: "auto-memory", label: "Auto Memory", description: "记忆偏好和项目事实", kind: "submenu" },
 	{ id: "memory-picker", label: "Memory Picker", description: "用选定的模型挑选每条消息要用的记忆", kind: "submenu" },
 	{ id: "sub-agent", label: "Sub Agent", description: "并行调查复杂任务", kind: "submenu" },

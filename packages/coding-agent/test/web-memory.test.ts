@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
+import { SettingsManager } from "../src/config/settings/index.ts";
 import type { WebHost } from "../src/modes/web/host.ts";
 import { WebHttpServer } from "../src/modes/web/http-server.ts";
 import { registerFileRoutes } from "../src/modes/web/routes-files.ts";
@@ -21,6 +22,7 @@ it("browses hierarchy scopes and restores archives through the real HTTP routes"
 		completionActive: false,
 		session: {
 			isIdle: true,
+			settingsManager: SettingsManager.inMemory(),
 			sessionManager: {
 				getCwd: () => root,
 				getDataRoot: () => root,
@@ -59,6 +61,9 @@ it("browses hierarchy scopes and restores archives through the real HTTP routes"
 		expect((await restore()).status).toBe(200);
 		expect(readFileSync(file, "utf8")).toContain("old content");
 		expect(listMemoryFiles(root).filter((entry) => entry.archived)).toHaveLength(2);
+		host.session.settingsManager.setMemoryEnabledOnDevice(false);
+		expect((await fetch(`${base}/api/memory?scope=global`)).status).toBe(409);
+		expect((await restore()).status).toBe(409);
 	} finally {
 		await server.close();
 		vi.unstubAllEnvs();

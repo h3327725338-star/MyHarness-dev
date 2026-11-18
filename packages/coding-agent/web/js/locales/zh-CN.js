@@ -327,6 +327,8 @@ export const zhCN = {
 	"Comma-separated patterns; next session. Empty: all.": "逗号分隔；下次 Session 生效；留空全部",
 	"Save memory after each task.": "任务后保存记忆",
 	"Before each message, this model picks the memories that help (about 2 seconds, 5 at most). It sees every memory's name and description plus your message. Off or no model: keyword match only.": "每条消息发出前，由这个模型挑出有用的记忆（约 2 秒，最多等 5 秒）。它会看到所有记忆的名称和描述，以及你这条消息。关闭或没选模型时只用关键词匹配。",
+	"Memory on this device": "本机记忆",
+	"Applies immediately to all chats on this device. While off, only explicitly requested memory operations use a separate local store.": "立即应用到本机所有聊天。关闭后，只有你明确要求时才操作独立的本机记忆库。",
 	"Memory picker": "记忆挑选",
 	"No model (keywords only)": "不用模型（只用关键词）",
 	"Before each message, this model reads your memory list and picks what helps. It waits up to 5 seconds and sees every memory's name and description plus your message. Off or no model: keyword match only.": "每条消息发出前，由这个模型读一遍记忆目录并挑出有用的几条。最多等 5 秒；它会看到所有记忆的名称和描述，以及你这条消息。关闭或没选模型时只用关键词匹配。",

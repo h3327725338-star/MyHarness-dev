@@ -174,6 +174,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 
+	/** Synchronous policy projection after asynchronous context and credential preparation. */
+	projectProviderContext?: (context: AgentContext) => AgentContext;
+
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *

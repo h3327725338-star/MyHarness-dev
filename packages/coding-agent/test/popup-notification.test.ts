@@ -20,6 +20,16 @@ describe("sendDesktopNotification", () => {
 		});
 	});
 
+	it("forwards the chosen sound, including mute, with fallback toasts", () => {
+		const send = vi.fn(() => true);
+		for (const sound of ["glow", "off"] as const) {
+			expect(
+				sendDesktopNotification({ ...content, sound }, { MYHARNESS_DESKTOP_HOST: "1" }, { send, connected: true }),
+			).toBe(true);
+			expect(send).toHaveBeenLastCalledWith(expect.objectContaining({ type: "myharness:notify", sound }));
+		}
+	});
+
 	it("declines outside the desktop app or when the IPC link is closed", () => {
 		const send = vi.fn(() => true);
 		expect(sendDesktopNotification(content, {}, { send, connected: true })).toBe(false);

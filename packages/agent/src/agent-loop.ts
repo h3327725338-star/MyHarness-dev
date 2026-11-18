@@ -535,19 +535,16 @@ async function streamAssistantResponse(
 		messages = await config.transformContext(messages, signal);
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
-
-	// Resolve API key (important for expiring tokens)
+	// Resolve API key before projecting live policy, so a setting changed while waiting for credentials still applies.
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	const projected = config.projectProviderContext?.({ ...context, messages }) ?? { ...context, messages };
+	const converted = config.convertToLlm(projected.messages);
+	const llmContext: Context = {
+		systemPrompt: projected.systemPrompt,
+		messages: Array.isArray(converted) ? converted : await converted,
+		tools: projected.tools,
+	};
 
 	const response = await streamFunction(config.model, llmContext, {
 		...config,

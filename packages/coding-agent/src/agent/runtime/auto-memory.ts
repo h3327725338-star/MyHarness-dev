@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -133,6 +134,8 @@ export type AutoMemoryModelRunner = (options: {
 	settings: Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">>;
 	systemPrompt: string;
 	task: string;
+	/** Ends when device memory is switched off or this session is replaced. */
+	signal?: AbortSignal;
 	/** Set for a request someone is waiting on: it ends with this signal and is not retried. */
 	urgent?: { signal: AbortSignal; timeoutMs: number };
 }) => Promise<string>;
@@ -1171,7 +1174,7 @@ function currentTimeLine(): string {
 function formatTranscript(entries: SessionEntry[], lastEntryId?: string): { text: string; lastEntryId?: string } {
 	const startIndex = lastEntryId ? entries.findIndex((entry) => entry.id === lastEntryId) + 1 : 0;
 	const candidates = entries.slice(Math.max(0, startIndex)).flatMap((entry) => {
-		if (entry.type !== "message") return [];
+		if (entry.type !== "message" || entry.skipMemoryExtraction) return [];
 		if (entry.message.role !== "user" && entry.message.role !== "assistant") return [];
 		const text = contentText(entry.message.content, "\n").trim();
 		if (!text) return [];
@@ -1204,14 +1207,52 @@ export class AutoMemoryManager {
 	private memoryPickerPausedUntil = 0;
 	private backgroundQueue: Promise<void> = Promise.resolve();
 	private readonly disposeController = new AbortController();
+	private readonly workGeneration = new AsyncLocalStorage<AbortSignal>();
+	private deviceGeneration?: AbortSignal;
 	private disposed = false;
 
 	constructor(options: AutoMemoryManagerOptions) {
 		this.options = options;
 		if (options.persisted) {
+			this.watchDeviceSetting();
 			this.scheduleMaintenance();
 			this.scheduleConsolidationCheck(1500);
 		}
+	}
+
+	private readonly deviceSettingChanged = (): void => {
+		if (this.disposed) return;
+		const generation = this.watchDeviceSetting();
+		this.workGeneration.run(generation, () => this.resetDeviceTimers());
+	};
+
+	private resetDeviceTimers(): void {
+		clearTimeout(this.maintenanceTimer);
+		clearTimeout(this.consolidationTimer);
+		this.maintenanceTimer = undefined;
+		this.consolidationTimer = undefined;
+		this.setMaintenanceStatus({ phase: "idle" });
+		this.scheduleMaintenance();
+		this.scheduleConsolidationCheck(1500);
+	}
+
+	private watchDeviceSetting(): AbortSignal {
+		this.deviceGeneration = this.options.settingsManager.getDeviceMemorySignal();
+		this.deviceGeneration.addEventListener("abort", this.deviceSettingChanged, { once: true });
+		return this.deviceGeneration;
+	}
+
+	private get deviceEnabled(): boolean {
+		return this.options.settingsManager.isMemoryEnabledOnDevice();
+	}
+
+	private get workCancelled(): boolean {
+		return this.disposed || !this.deviceEnabled || this.workGeneration.getStore()?.aborted === true;
+	}
+
+	private queueForDevice<T>(queue: Promise<void>, work: () => Promise<T>): Promise<T> {
+		const generation = this.workGeneration.getStore() ?? this.options.settingsManager.getDeviceMemorySignal();
+		return queue.then(() => this.workGeneration.run(generation, work));
 	}
 
 	getMaintenanceStatus(): MemoryMaintenanceStatus {
@@ -1220,7 +1261,7 @@ export class AutoMemoryManager {
 
 	/** Retry a paused maintenance job: reset its attempts and run it again soon. Returns false when there is no job to retry. */
 	async retryMaintenance(): Promise<boolean> {
-		if (this.disposed) return false;
+		if (this.workCancelled) return false;
 		if (!fs.existsSync(this.maintenancePath)) {
 			this.logMaintenance("retry-noop", { reason: "no maintenance.json" });
 			this.setMaintenanceStatus({ phase: "idle" });
@@ -1244,6 +1285,7 @@ export class AutoMemoryManager {
 
 	/** Dismiss a stuck job: move it into the session archive and go idle. Nothing is permanently deleted. Returns the archive file name, or null when there was no job. */
 	async dismissMaintenance(): Promise<string | null> {
+		if (this.workCancelled) return null;
 		if (!fs.existsSync(this.maintenancePath)) {
 			this.logMaintenance("dismiss-noop", { reason: "no maintenance.json" });
 			this.setMaintenanceStatus({ phase: "idle" });
@@ -1306,6 +1348,7 @@ export class AutoMemoryManager {
 		const snapshot = entries.flatMap((entry): SessionEntry[] => {
 			if (entry.type !== "message" || (entry.message.role !== "user" && entry.message.role !== "assistant"))
 				return [];
+			if (entry.skipMemoryExtraction) return [];
 			let text: string;
 			try {
 				text = sanitizeMemoryText(contentText(entry.message.content, "\n"));
@@ -1314,12 +1357,14 @@ export class AutoMemoryManager {
 			}
 			return [{ ...entry, message: { ...entry.message, content: [{ type: "text", text }] } }];
 		});
-		const queued = this.maintenanceEnqueue.then(async () => {
+		const queued = this.queueForDevice(this.maintenanceEnqueue, async () => {
 			try {
 				this.assertActive();
 				const cursor = readState(this.paths.statePath).sessions[this.options.sessionId]?.lastEntryId;
 				const start = cursor ? snapshot.findIndex((entry) => entry.id === cursor) + 1 : 0;
-				const delta = snapshot.slice(Math.max(0, start));
+				const delta = snapshot
+					.slice(Math.max(0, start))
+					.filter((entry) => entry.type === "message" && !entry.skipMemoryExtraction);
 				if (delta.length === 0) {
 					this.logMaintenance("enqueue-noop", { snapshotCount: snapshot.length, cursor });
 					return;
@@ -1328,6 +1373,7 @@ export class AutoMemoryManager {
 				await writeMemoryFile(
 					this.maintenancePath,
 					JSON.stringify({ version: 1, id: jobId, entries: delta, attempts: 0 }),
+					this.checkCommit,
 				);
 				this.logMaintenance("enqueue", { jobId, deltaCount: delta.length, snapshotCount: snapshot.length, cursor });
 				this.setMaintenanceStatus({ phase: "pending" });
@@ -1337,7 +1383,7 @@ export class AutoMemoryManager {
 					snapshotCount: snapshot.length,
 					...describeMaintenanceError(error),
 				});
-				throw error;
+				if (!this.workCancelled) throw error;
 			}
 		});
 		this.maintenanceEnqueue = queued.catch(() => undefined);
@@ -1345,11 +1391,11 @@ export class AutoMemoryManager {
 	}
 
 	private scheduleMaintenance(delay = 1500): void {
-		if (this.disposed) return;
+		if (this.workCancelled) return;
 		if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
 		this.maintenanceTimer = setTimeout(() => {
 			this.maintenanceTimer = undefined;
-			void this.processMaintenance().catch((error) => {
+			void this.queueForDevice(Promise.resolve(), async () => this.processMaintenance()).catch((error) => {
 				this.logMaintenance("maintenance-timer-error", { ...describeMaintenanceError(error) });
 				if (!this.disposed) this.setMaintenanceStatus({ phase: "warning", error: String(error).slice(0, 500) });
 			});
@@ -1358,7 +1404,7 @@ export class AutoMemoryManager {
 	}
 
 	private async processMaintenance(): Promise<void> {
-		if (this.disposed || !this.isEnabled()) return;
+		if (this.workCancelled || !this.isEnabled()) return;
 		if (this.maintenanceProcessing) {
 			this.scheduleMaintenance();
 			return;
@@ -1366,6 +1412,8 @@ export class AutoMemoryManager {
 		this.maintenanceProcessing = true;
 		try {
 			await this.processMaintenanceJob();
+		} catch (error) {
+			if (!this.workCancelled) throw error;
 		} finally {
 			this.maintenanceProcessing = false;
 		}
@@ -1373,6 +1421,7 @@ export class AutoMemoryManager {
 
 	private async processMaintenanceJob(): Promise<void> {
 		await this.maintenanceEnqueue;
+		this.assertActive();
 		assertDirectPath(this.maintenancePath);
 		if (!fs.existsSync(this.maintenancePath)) {
 			this.logMaintenance("maintenance-noop", { reason: "no maintenance.json" });
@@ -1385,6 +1434,7 @@ export class AutoMemoryManager {
 			this.logMaintenance("maintenance-read-error", { ...describeMaintenanceError(error) });
 			throw error;
 		}
+		this.assertActive();
 		if (job.version !== 1 || !Array.isArray(job.entries) || typeof job.id !== "string") {
 			this.logMaintenance("maintenance-invalid-job", { jobId: (job as { id?: unknown }).id });
 			throw new Error("Invalid memory maintenance job");
@@ -1405,11 +1455,12 @@ export class AutoMemoryManager {
 		});
 		this.setMaintenanceStatus({ phase: "processing" });
 		const ok = await this.runExtraction(job.entries);
-		if (this.disposed) return;
+		if (this.workCancelled) return;
 		// Serialize with enqueue so a completed old job cannot erase a newer snapshot.
-		const settled = this.maintenanceEnqueue.then(async () => {
+		const settled = this.queueForDevice(this.maintenanceEnqueue, async () => {
 			this.assertActive();
 			const current = JSON.parse(await fs.promises.readFile(this.maintenancePath, "utf8")) as MemoryMaintenanceJob;
+			this.assertActive();
 			if (current.id !== job.id) {
 				this.logMaintenance("maintenance-superseded", { jobId: job.id, currentJobId: current.id });
 				this.scheduleMaintenance();
@@ -1422,12 +1473,12 @@ export class AutoMemoryManager {
 					this.scheduleMaintenance();
 					return;
 				}
-				await fs.promises.unlink(this.maintenancePath);
+				fs.unlinkSync(this.maintenancePath);
 				this.logMaintenance("maintenance-done", { jobId: job.id, result: "ok" });
 				if (this.maintenanceStatus.phase !== "warning") this.setMaintenanceStatus({ phase: "idle" });
 			} else {
 				job.attempts++;
-				await writeMemoryFile(this.maintenancePath, JSON.stringify(job));
+				await writeMemoryFile(this.maintenancePath, JSON.stringify(job), this.checkCommit);
 				this.logMaintenance("maintenance-done", {
 					jobId: job.id,
 					result: "failed",
@@ -1446,7 +1497,7 @@ export class AutoMemoryManager {
 	}
 
 	private scheduleConsolidationCheck(delay = 30_000): void {
-		if (this.disposed) return;
+		if (this.workCancelled) return;
 		if (this.consolidationTimer) clearTimeout(this.consolidationTimer);
 		this.consolidationTimer = setTimeout(() => {
 			this.consolidationTimer = undefined;
@@ -1459,10 +1510,12 @@ export class AutoMemoryManager {
 	 * 软件开着时，任一存活聊天还会顺带清扫其他到期工作区（含 unbound），不为此新建 runtime。 */
 	runConsolidation(force = false): Promise<boolean> {
 		const settings = this.getSettings();
-		if (this.disposed || !settings) return Promise.resolve(false);
-		const result = this.backgroundQueue.then(async () => {
+		if (this.workCancelled || !settings) return Promise.resolve(false);
+		const result = this.queueForDevice(this.backgroundQueue, async () => {
 			try {
+				this.assertActive();
 				await this.initializeConsolidationState();
+				this.assertActive();
 				const ownDue = force || this.consolidationDue();
 				// 软件开着时，有任意聊天存活就顺带清扫其他到期工作区；未点开聊天的会话私密笔记仍等本人点开。
 				const othersDue = !force && this.listSweepWorkspaceIds().some((id) => this.consolidationDueFor(id));
@@ -1475,6 +1528,7 @@ export class AutoMemoryManager {
 				this.setMaintenanceStatus({ phase: "processing" });
 				if (ownDue) await this.consolidate(settings);
 				if (!force) await this.sweepDueWorkspaces(settings);
+				this.assertActive();
 				this.logMaintenance("consolidation-done", { force, result: "ok" });
 				this.noteConsolidationSuccess();
 				this.setMaintenanceStatus({ phase: "idle" });
@@ -1482,7 +1536,7 @@ export class AutoMemoryManager {
 			} catch (error) {
 				this.logMaintenance("consolidation-done", { force, result: "failed", ...describeMaintenanceError(error) });
 				// 会话替换导致的中止：静默退出，不计失败、不报错、不亮灯。
-				if (this.disposed) return false;
+				if (this.workCancelled) return false;
 				this.reportError("consolidate", error);
 				// 黄灯降噪：瞬时失败静默退避，连续 3 轮仍失败才亮灯，且灯上带最近失败原因。
 				this.noteConsolidationFailure(error);
@@ -1537,7 +1591,7 @@ export class AutoMemoryManager {
 		settings: Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">>,
 	): Promise<void> {
 		for (const workspaceId of this.listSweepWorkspaceIds()) {
-			if (this.disposed) return;
+			if (this.workCancelled) return;
 			try {
 				if (!this.consolidationDueFor(workspaceId)) continue;
 				this.logMaintenance("sweep-start", { sweptWorkspaceId: workspaceId });
@@ -1550,7 +1604,7 @@ export class AutoMemoryManager {
 					...describeMaintenanceError(error),
 				});
 				// 会话替换中止：静默跳过，不计失败、不报错。
-				if (this.disposed) continue;
+				if (this.workCancelled) return;
 				this.reportError("consolidate", error);
 				this.noteConsolidationFailure(error);
 			}
@@ -1649,7 +1703,7 @@ export class AutoMemoryManager {
 				value.sessionIds = [];
 				value.pendingChanges = 0;
 				value.pendingSince = undefined;
-				await writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+				await this.writeState(state);
 			}
 		});
 	}
@@ -1669,7 +1723,7 @@ export class AutoMemoryManager {
 			value.pendingSince = changed.map((entry) => entry.updatedAt).sort()[0];
 			value.revision = 0;
 			state.consolidation[this.paths.workspaceId] = value;
-			await writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+			await this.writeState(state);
 		});
 	}
 
@@ -1677,13 +1731,16 @@ export class AutoMemoryManager {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.deviceGeneration?.removeEventListener("abort", this.deviceSettingChanged);
 		if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
 		if (this.consolidationTimer) clearTimeout(this.consolidationTimer);
 		this.disposeController.abort();
 	}
 
+	private readonly checkCommit = () => this.assertActive();
+
 	private assertActive(): void {
-		if (this.disposed) throw new Error("Auto Memory task cancelled after session replacement");
+		if (this.workCancelled) throw new Error("Auto Memory task cancelled");
 	}
 
 	private get paths(): AutoMemoryPaths {
@@ -1704,7 +1761,7 @@ export class AutoMemoryManager {
 		| (AutoMemorySettings &
 				Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">> & { enabled: true })
 		| undefined {
-		if (!this.options.persisted) return undefined;
+		if (!this.options.persisted || this.workCancelled) return undefined;
 		const settings = this.options.settingsManager.getAutoMemorySettings();
 		if (!settings.enabled) return undefined;
 		const resolved = resolveAssistantModel(settings, this.options.getMainModel?.());
@@ -1733,6 +1790,7 @@ export class AutoMemoryManager {
 	}
 
 	private reportError(operation: "recall" | "pick" | "extract" | "consolidate", error: unknown): void {
+		if (this.workCancelled) return;
 		this.logMaintenance("error", { operation, ...describeMaintenanceError(error) });
 		const normalized = error instanceof Error ? error : new Error(String(error));
 		const key = `${operation}:${normalized.message}`;
@@ -1758,9 +1816,13 @@ export class AutoMemoryManager {
 			taskPreview: truncateLogPreview(parameters.task),
 			customRunner: Boolean(this.options.modelRunner),
 		});
+		const workSignal = AbortSignal.any([
+			this.disposeController.signal,
+			this.workGeneration.getStore() ?? this.options.settingsManager.getDeviceMemorySignal(),
+		]);
 		if (this.options.modelRunner) {
 			try {
-				const output = await this.options.modelRunner(parameters);
+				const output = await this.options.modelRunner({ ...parameters, signal: workSignal });
 				this.assertActive();
 				this.logMaintenance("model-response", {
 					provider: parameters.settings.provider,
@@ -1790,7 +1852,7 @@ export class AutoMemoryManager {
 		const urgent = parameters.urgent;
 		const abortController = new AbortController();
 		const onDispose = () => abortController.abort();
-		this.disposeController.signal.addEventListener("abort", onDispose, { once: true });
+		workSignal.addEventListener("abort", onDispose, { once: true });
 		urgent?.signal.addEventListener("abort", onDispose, { once: true });
 		const timeout = setTimeout(() => abortController.abort(), urgent?.timeoutMs ?? AUTO_MEMORY_TIMEOUT_MS);
 		try {
@@ -1867,7 +1929,7 @@ export class AutoMemoryManager {
 			throw error;
 		} finally {
 			clearTimeout(timeout);
-			this.disposeController.signal.removeEventListener("abort", onDispose);
+			workSignal.removeEventListener("abort", onDispose);
 			urgent?.signal.removeEventListener("abort", onDispose);
 		}
 	}
@@ -1920,7 +1982,7 @@ export class AutoMemoryManager {
 			this.memoryPickerFailures = 0;
 			return numbers.map((number) => rows[number - 1]);
 		} catch (error) {
-			if (signal?.aborted || this.disposed) return undefined;
+			if (signal?.aborted || this.workCancelled) return undefined;
 			this.memoryPickerFailures += 1;
 			if (this.memoryPickerFailures >= MEMORY_PICKER_FAILURES_BEFORE_PAUSE) {
 				this.memoryPickerPausedUntil = Date.now() + MEMORY_PICKER_PAUSE_MS;
@@ -1952,12 +2014,28 @@ export class AutoMemoryManager {
 	 * `signal` 结束正在等的 Memory picker 请求（用户按了停止）。
 	 */
 	async recall(query: string, earlier?: readonly unknown[], signal?: AbortSignal): Promise<CustomMessage | undefined> {
-		if (this.disposed) return undefined;
+		if (this.workCancelled) return undefined;
+		const generation = this.options.settingsManager.getDeviceMemorySignal();
+		return this.workGeneration.run(generation, () =>
+			this.recallForDevice(
+				query,
+				earlier,
+				AbortSignal.any([generation, this.disposeController.signal, ...(signal ? [signal] : [])]),
+			),
+		);
+	}
+
+	private async recallForDevice(
+		query: string,
+		earlier: readonly unknown[] | undefined,
+		signal: AbortSignal,
+	): Promise<CustomMessage | undefined> {
 		const settings = this.getSettings();
 		if (!settings) return undefined;
 		let candidates: MemoryEntry[];
 		try {
-			await migrateLegacyMemories(this.paths.dataRoot, this.options.agentDir);
+			await migrateLegacyMemories(this.paths.dataRoot, this.options.agentDir, this.checkCommit);
+			if (this.workCancelled || signal.aborted) return undefined;
 			candidates = this.loadEntries();
 		} catch (error) {
 			this.reportError("recall", error);
@@ -1976,6 +2054,7 @@ export class AutoMemoryManager {
 				candidates.filter((entry) => !isMemoryProfile(entry)),
 				signal,
 			);
+			if (this.workCancelled || signal.aborted) return undefined;
 			selected = [
 				...(profile ? [profile] : []),
 				...(picked ??
@@ -2110,7 +2189,7 @@ export class AutoMemoryManager {
 	}
 
 	runExtraction(entries: SessionEntry[]): Promise<boolean> {
-		if (this.disposed) return Promise.resolve(false);
+		if (this.workCancelled) return Promise.resolve(false);
 		if (!this.options.persisted) return Promise.resolve(true);
 		const settings = this.getSettings();
 		if (!settings) {
@@ -2122,14 +2201,14 @@ export class AutoMemoryManager {
 			return Promise.resolve(true);
 		}
 		const snapshot = entries.slice();
-		const result = this.backgroundQueue.then(async () => {
-			if (this.disposed) return false;
+		const result = this.queueForDevice(this.backgroundQueue, async () => {
+			if (this.workCancelled) return false;
 			try {
 				await this.extract(snapshot, settings);
 				return true;
 			} catch (error) {
 				// 会话替换导致的中止：静默退出，不计失败、不报错。
-				if (this.disposed) return false;
+				if (this.workCancelled) return false;
 				this.reportError("extract", error);
 				return false;
 			}
@@ -2160,9 +2239,13 @@ export class AutoMemoryManager {
 		});
 	}
 
+	private writeState(state: MemoryState): Promise<void> {
+		return writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`, this.checkCommit);
+	}
+
 	private async writeIndex(): Promise<void> {
 		this.assertActive();
-		await refreshMemoryIndexes(this.paths.dataRoot);
+		await refreshMemoryIndexes(this.paths.dataRoot, this.checkCommit);
 	}
 
 	private async applyOperations(
@@ -2233,8 +2316,9 @@ export class AutoMemoryManager {
 					if (!target || isMemoryProfile(target)) continue;
 					if (!scopeContext && target.scope === "workspace" && this.options.isWorkspaceMemoryEnabled?.() === false)
 						continue;
-					await archiveMemoryFile(target.filePath, "consolidated");
-					await fs.promises.unlink(target.filePath);
+					await archiveMemoryFile(target.filePath, "consolidated", this.checkCommit);
+					this.assertActive();
+					fs.unlinkSync(target.filePath);
 					existing.delete(operation.id);
 					continue;
 				}
@@ -2355,9 +2439,12 @@ export class AutoMemoryManager {
 					updatedBy: allowDelete ? "consolidation" : ctxSessionId,
 				};
 				this.assertActive();
-				if (previous) await archiveMemoryFile(previous.filePath, "updated");
-				await writeMemoryFile(filePath, serializeMemory(entry));
-				if (previous && previous.filePath !== filePath) await fs.promises.unlink(previous.filePath);
+				if (previous) await archiveMemoryFile(previous.filePath, "updated", this.checkCommit);
+				await writeMemoryFile(filePath, serializeMemory(entry), this.checkCommit);
+				if (previous && previous.filePath !== filePath) {
+					this.assertActive();
+					fs.unlinkSync(previous.filePath);
+				}
 				existing.set(id, entry);
 				changedCount++;
 			}
@@ -2368,7 +2455,7 @@ export class AutoMemoryManager {
 				value.pendingSince ??= new Date().toISOString();
 				value.revision = (value.revision ?? 0) + 1;
 				state.consolidation[ctxWorkspaceId] = value;
-				await writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+				await this.writeState(state);
 			}
 			await this.writeIndex();
 		});
@@ -2393,8 +2480,7 @@ export class AutoMemoryManager {
 				(consolidation.pendingChanges ?? 0) > 0 &&
 				((consolidation.pendingChanges ?? 0) >= CONSOLIDATION_MIN_CHANGES ||
 					Date.now() - Date.parse(consolidation.pendingSince ?? "") >= CONSOLIDATION_INTERVAL_MS);
-			this.assertActive();
-			await writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+			await this.writeState(state);
 			return { shouldConsolidate };
 		});
 	}
@@ -2434,7 +2520,8 @@ export class AutoMemoryManager {
 		settings: Required<Pick<AutoMemorySettings, "provider" | "model" | "thinkingLevel">>,
 	): Promise<void> {
 		this.assertActive();
-		await migrateLegacyMemories(this.paths.dataRoot, this.options.agentDir);
+		await migrateLegacyMemories(this.paths.dataRoot, this.options.agentDir, this.checkCommit);
+		this.assertActive();
 		await this.initializeConsolidationState();
 		// 切块推进：226 条这种大任务按 30 条一切，成一块就把游标往前推一块，
 		// 坏一块只抛那一块，已成的游标已落盘，下次重试从新游标往后接着记。
@@ -2523,7 +2610,7 @@ export class AutoMemoryManager {
 			} catch (error) {
 				this.logMaintenance("extract-consolidate-error", { ...describeMaintenanceError(error) });
 				// 会话替换中止：静默退出，不计失败、不亮灯。
-				if (this.disposed) return;
+				if (this.workCancelled) throw error;
 				this.reportError("consolidate", error);
 				this.noteConsolidationFailure(error);
 			}
@@ -2685,7 +2772,7 @@ export class AutoMemoryManager {
 				value.sessionIds = [];
 				value.pendingChanges = 0;
 				value.pendingSince = undefined;
-				await writeMemoryFile(this.paths.statePath, `${JSON.stringify(state, null, 2)}\n`);
+				await this.writeState(state);
 			}
 		});
 	}

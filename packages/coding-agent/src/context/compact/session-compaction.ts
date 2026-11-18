@@ -11,6 +11,8 @@ import type { Agent, AgentMessage, AgentTool, ThinkingLevel } from "@myharness/a
 import { contentText } from "@myharness/ai";
 import type { Model, Usage } from "@myharness/ai/compat";
 import { clampThinkingLevel, getDefaultThinkingLevel } from "@myharness/ai/compat";
+import { AUTO_MEMORY_SYSTEM_PROMPT } from "../../agent/runtime/auto-memory.ts";
+import { projectMemoryMessages } from "../../agent/runtime/memory-mode.ts";
 import type { SettingsManager } from "../../config/settings/index.ts";
 import type { SessionManager } from "../../session/manager/index.ts";
 import { getLatestCompactionEntry } from "../../session/projection/index.ts";
@@ -250,10 +252,15 @@ export class SessionCompactionRunner {
 			branchMessages,
 			...(canReadBack ? { recovery: { sessionId: sessionManager.getSessionId(), userEntries } } : {}),
 		};
+		const memoryEnabled = this._host.settingsManager.isMemoryEnabledOnDevice();
+		const systemPrompt = parentSystemPrompt ?? agent.state.systemPrompt;
 		const result =
 			extensionCompaction ??
 			(await compact(
-				preparation,
+				{
+					...preparation,
+					messagesToSummarize: projectMemoryMessages(preparation.messagesToSummarize, memoryEnabled),
+				},
 				model,
 				auth.apiKey,
 				auth.headers,
@@ -262,13 +269,19 @@ export class SessionCompactionRunner {
 				thinkingLevel,
 				agent.streamFunction,
 				auth.env,
-				parentSystemPrompt ?? agent.state.systemPrompt,
+				memoryEnabled ? systemPrompt : systemPrompt.replace(`\n\n${AUTO_MEMORY_SYSTEM_PROMPT}`, ""),
 				tools,
 				mainModel?.provider === model.provider &&
 					mainModel?.api === model.api &&
 					mainModel?.baseUrl === model.baseUrl,
 				sessionManager.getSessionId(),
-				{ mainRequest, history },
+				{
+					mainRequest: mainRequest && {
+						...mainRequest,
+						messages: projectMemoryMessages(mainRequest.messages, memoryEnabled),
+					},
+					history: { ...history, branchMessages: projectMemoryMessages(history.branchMessages, memoryEnabled) },
+				},
 			));
 		if (signal.aborted) throw new Error("Compaction cancelled");
 		const id = sessionManager.appendCompaction(

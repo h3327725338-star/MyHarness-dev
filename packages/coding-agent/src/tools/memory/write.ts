@@ -28,7 +28,7 @@ import {
 import { loadSystemPrompt } from "../../system-prompts/loader/index.ts";
 import type { BusinessToolDefinition } from "../contracts/index.ts";
 import { wrapToolDefinition } from "../tool-definition-wrapper.ts";
-import type { MemoryManageOperations, MemoryManageOptions } from "./manage.ts";
+import type { MemoryManageContext, MemoryManageOperations, MemoryManageOptions } from "./manage.ts";
 import type { MemoryToolOptions } from "./search.ts";
 
 const MEMORY_WRITE_MAX_ITEMS = 10;
@@ -75,16 +75,11 @@ export type MemoryWriteToolItem = Static<typeof memoryWriteItemSchema>;
 export type MemoryWriteToolInput = Static<typeof memoryWriteSchema>;
 
 export interface MemoryWriteToolDetails {
+	manualOnly?: true;
 	mode: "disabled" | "write" | "error";
 	total?: number;
 	returned?: number;
 	ids?: string[];
-}
-
-interface MemoryWriteContext {
-	dataRoot: string;
-	workspaceId: string;
-	sessionId: string;
 }
 
 const unavailableOperations: MemoryManageOperations = { context: () => undefined };
@@ -147,6 +142,7 @@ export function createMemoryWriteToolDefinition(
 			}
 			return textResult(outcome.sections.join("\n"), {
 				mode: "write",
+				...(context.manualOnly ? { manualOnly: true } : {}),
 				total: list.length,
 				returned: outcome.written.length,
 				ids: outcome.written,
@@ -157,7 +153,7 @@ export function createMemoryWriteToolDefinition(
 
 /** Write one batch inside the memory lock; refreshes indexes and records consolidation bookkeeping on success. */
 async function applyMemoryWrites(
-	context: MemoryWriteContext,
+	context: MemoryManageContext,
 	batch: MemoryWriteToolItem[],
 ): Promise<{ sections: string[]; written: string[] }> {
 	const paths = getMemoryPaths({
@@ -180,14 +176,15 @@ async function applyMemoryWrites(
 		if (outcome.id) written.push(outcome.id);
 	}
 	if (written.length > 0) {
-		await recordMemoryWriteConsolidation(context.dataRoot, context.workspaceId, written.length);
+		if (!context.manualOnly)
+			await recordMemoryWriteConsolidation(context.dataRoot, context.workspaceId, written.length);
 		await refreshMemoryIndexes(context.dataRoot);
 	}
 	return { sections, written };
 }
 
 async function applyMemoryWriteItem(
-	context: MemoryWriteContext,
+	context: MemoryManageContext,
 	paths: { globalDir: string; workspaceDir: string; sessionDir: string },
 	existing: Map<string, MemoryEntry>,
 	item: MemoryWriteToolItem,

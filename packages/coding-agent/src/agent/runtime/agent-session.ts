@@ -161,6 +161,7 @@ import {
 } from "./auto-memory.ts";
 import { type BackgroundJobReportMessage, BackgroundJobReports } from "./background-job-reports.ts";
 import { currentTimeContext } from "./current-time.ts";
+import { isExplicitMemoryRequest, MANUAL_MEMORY_POLICY, MEMORY_TOOLS, projectMemoryMessages } from "./memory-mode.ts";
 import type { CustomMessage } from "./messages.ts";
 import { correlatePrompt } from "./prompt-correlation.ts";
 import {
@@ -914,7 +915,7 @@ export class AgentSession {
 					break;
 				}
 			}
-			const current = messages.filter(
+			const current = projectMemoryMessages(messages, this.settingsManager.isMemoryEnabledOnDevice()).filter(
 				(message, index) =>
 					message.role !== "custom" ||
 					message.customType !== "auto-memory-recall" ||
@@ -1031,7 +1032,24 @@ export class AgentSession {
 			killChildProcessesForSignal(toolSignal);
 		};
 
-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+		this.agent.beforeToolCall = async ({ toolCall, args, context }) => {
+			if (MEMORY_TOOLS.has(toolCall.name) && !this.settingsManager.isMemoryEnabledOnDevice()) {
+				const user = context.messages
+					.slice()
+					.reverse()
+					.find((message) => message.role === "user");
+				if (
+					this._agentRole !== "main" ||
+					toolCall.name === "memory_claim" ||
+					!user ||
+					!isExplicitMemoryRequest(contentText(user.content, "\n"))
+				) {
+					return {
+						block: true,
+						reason: "Device memory is off. Ask for the specific memory operation explicitly.",
+					};
+				}
+			}
 			// Baseline: a delegated session never dispatches further agents, whatever
 			// name a future registration path (MCP, skills) gives such a tool. This
 			// check sits at the single runtime chokepoint every executed tool call
@@ -1151,6 +1169,32 @@ export class AgentSession {
 	 * request has them. The wait is the same one every message has, and Stop ends it.
 	 */
 	private _installQueuedMessageRecall(): void {
+		const previousProjection = this.agent.projectProviderContext;
+		this.agent.projectProviderContext = (context) => {
+			const current = previousProjection?.(context) ?? context;
+			const enabled = this.settingsManager.isMemoryEnabledOnDevice();
+			const systemPrompt = enabled
+				? current.systemPrompt
+				: current.systemPrompt.replace(`\n\n${AUTO_MEMORY_SYSTEM_PROMPT}`, "");
+			return {
+				...current,
+				messages: projectMemoryMessages(current.messages, enabled),
+				systemPrompt:
+					!enabled && this._agentRole === "main" ? `${systemPrompt}\n\n${MANUAL_MEMORY_POLICY}` : systemPrompt,
+				tools: enabled
+					? current.tools
+					: current.tools?.flatMap((tool) => {
+							if (!MEMORY_TOOLS.has(tool.name)) return [tool];
+							if (this._agentRole !== "main" || tool.name === "memory_claim") return [];
+							return [
+								{
+									...tool,
+									description: `Use ${tool.name} only for an explicit user request involving the separate local manual memory store.`,
+								},
+							];
+						}),
+			};
+		};
 		const previousBeforeProviderRequest = this.agent.beforeProviderRequest;
 		this.agent.beforeProviderRequest = async (context, signal) => {
 			const previousUpdate = await previousBeforeProviderRequest?.(context, signal);
@@ -1534,7 +1578,11 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				const entryId = this.sessionManager.appendMessage(event.message, timing);
+				const entryId = this.sessionManager.appendMessage(
+					event.message,
+					timing,
+					!this.settingsManager.isMemoryEnabledOnDevice(),
+				);
 				// The Web UI's edit-and-resend pencil only renders on items that carry this message's persisted
 				// entry id (web/js/transcript.js), and a live item takes that id from entry_appended
 				// (web/js/store.js attachEntryId). Announce the user message as soon as it is persisted; replies
@@ -2248,7 +2296,11 @@ export class AgentSession {
 						message.role !== "branchSummary" &&
 						message.role !== "reloadSummary"
 					)
-						this.sessionManager.appendMessage(message);
+						this.sessionManager.appendMessage(
+							message,
+							undefined,
+							!this.settingsManager.isMemoryEnabledOnDevice(),
+						);
 				}
 				onContextPreflightPersisted?.();
 				this.agent.state.messages = this.sessionManager.buildSessionContext().messages;

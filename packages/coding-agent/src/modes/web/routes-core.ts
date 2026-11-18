@@ -387,7 +387,10 @@ export function registerCoreRoutes(server: WebHttpServer, host: WebHost): void {
 			systemPrompt: agent.state.systemPrompt,
 			contextFiles: loader.getAgentsFiles().agentsFiles,
 			skillsPromptText: active.has("read") ? formatSkillsForPrompt(skills).trim() : "",
-			memoryPolicyText: session.settingsManager.getAutoMemorySettings().enabled ? AUTO_MEMORY_SYSTEM_PROMPT : "",
+			memoryPolicyText:
+				session.settingsManager.isMemoryEnabledOnDevice() && session.settingsManager.getAutoMemorySettings().enabled
+					? AUTO_MEMORY_SYSTEM_PROMPT
+					: "",
 			tools,
 			deferredTools: [...deferred],
 			messages,

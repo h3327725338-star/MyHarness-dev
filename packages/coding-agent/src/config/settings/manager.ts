@@ -275,8 +275,21 @@ function withChangedFields(
 	return mergedSettings;
 }
 
+type DeviceMemorySetting = { enabled: boolean; generation: AbortController; pending?: symbol };
+
+function updateDeviceMemory(state: DeviceMemorySetting, enabled: boolean): void {
+	if (state.enabled === enabled) return;
+	const previous = state.generation;
+	state.enabled = enabled;
+	state.generation = new AbortController();
+	previous.abort();
+}
+const deviceMemorySettings = new Map<string, DeviceMemorySetting>();
+const transientMemorySettings = new WeakMap<SettingsStorage, DeviceMemorySetting>();
+
 export class SettingsManager {
 	private storage: SettingsStorage;
+	private readonly deviceMemory: DeviceMemorySetting;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
@@ -305,6 +318,20 @@ export class SettingsManager {
 		projectTrusted = true,
 	) {
 		this.storage = storage;
+		const key = storage.deviceKey;
+		const shared = key === undefined ? transientMemorySettings.get(storage) : deviceMemorySettings.get(key);
+		this.deviceMemory = shared ?? {
+			enabled: initialGlobal.memoryEnabledOnDevice !== false,
+			generation: new AbortController(),
+		};
+		if (key === undefined) transientMemorySettings.set(storage, this.deviceMemory);
+		else if (!shared) {
+			const state = this.deviceMemory;
+			deviceMemorySettings.set(key, state);
+			storage.watchDeviceMemory?.((enabled) => {
+				if (!state.pending) updateDeviceMemory(state, enabled);
+			});
+		}
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
 		this.projectTrusted = projectTrusted;
@@ -607,8 +634,17 @@ export class SettingsManager {
 		const modifiedFields = new Set(this.modifiedFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
 
-		this.enqueueWrite("global", () => {
-			return this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+		const deviceWrite = modifiedFields.has("memoryEnabledOnDevice") ? this.deviceMemory.pending : undefined;
+		if (modifiedFields.has("memoryEnabledOnDevice")) {
+			// Another chat may have changed the shared switch while this manager still has a dirty snapshot.
+			snapshotGlobalSettings.memoryEnabledOnDevice = this.deviceMemory.enabled;
+		}
+		this.enqueueWrite("global", async () => {
+			try {
+				await this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+			} finally {
+				if (deviceWrite && this.deviceMemory.pending === deviceWrite) this.deviceMemory.pending = undefined;
+			}
 		});
 	}
 
@@ -942,6 +978,23 @@ export class SettingsManager {
 	setContextWindowSettings(settings: ContextWindowSettings): void {
 		this.globalSettings.contextWindow = normalizeContextWindowSettings(settings);
 		this.markModified("contextWindow");
+		this.save();
+	}
+
+	isMemoryEnabledOnDevice(): boolean {
+		return this.deviceMemory.enabled;
+	}
+
+	/** Invalidated on both transitions, so an off/on cycle cannot revive old work. */
+	getDeviceMemorySignal(): AbortSignal {
+		return this.deviceMemory.generation.signal;
+	}
+
+	setMemoryEnabledOnDevice(enabled: boolean): void {
+		this.deviceMemory.pending = this.globalSettingsLoadError ? undefined : Symbol();
+		this.globalSettings.memoryEnabledOnDevice = enabled;
+		this.markModified("memoryEnabledOnDevice");
+		updateDeviceMemory(this.deviceMemory, enabled);
 		this.save();
 	}
 

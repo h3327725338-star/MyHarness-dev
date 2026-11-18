@@ -415,7 +415,11 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		streamDownload(res, full, path.basename(full), size);
 	});
 
+	const requireNormalMemory = () => {
+		if (!host.session.settingsManager.isMemoryEnabledOnDevice()) throw new HttpError(409, "Device memory is off");
+	};
 	server.route("GET", "/api/memory", async ({ url }) => {
+		requireNormalMemory();
 		const dataRoot = artifactDataRoot();
 		await migrateLegacyMemories(dataRoot);
 		const level = url.searchParams.get("scope") ?? "session";
@@ -437,6 +441,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		};
 	});
 	server.route("POST", "/api/memory/restore", async ({ body }) => {
+		requireNormalMemory();
 		const payload = body as { path?: unknown } | null;
 		if (typeof payload?.path !== "string") throw new HttpError(400, "Expected an archive path");
 		// A restore can replace active text. Do not race a running task or its memory extraction.
@@ -446,6 +451,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		return { ok: true };
 	});
 	server.route("POST", "/api/memory/delete", async ({ body }) => {
+		requireNormalMemory();
 		const payload = body as { path?: unknown } | null;
 		if (typeof payload?.path !== "string") throw new HttpError(400, "Expected a memory path");
 		// Permanent deletion removes the active file and all its archived versions. Nothing can be recovered.
@@ -456,6 +462,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		return { ok: true, archiveCount };
 	});
 	server.route("POST", "/api/memory/claim", async ({ body }) => {
+		requireNormalMemory();
 		const payload = body as { path?: unknown } | null;
 		if (typeof payload?.path !== "string") throw new HttpError(400, "Expected a pending memory path");
 		// Claiming moves a quarantined memory into this workspace. Do not race a running task.

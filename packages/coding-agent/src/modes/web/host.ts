@@ -483,6 +483,7 @@ export class WebHost {
 						title: category === "permission" ? "MyHarness · 需要你的确认" : "MyHarness · 需要你的回答",
 						message: body,
 						tag: `myharness-task-${this.slotId}`,
+						sound: settings.sound,
 					});
 				if (this.server.clientCount === 0) popup();
 				else {
@@ -966,6 +967,7 @@ export class WebHost {
 				title: `MyHarness · ${title} · ${folder}`,
 				message: body,
 				tag: `myharness-task-${this.slotId}`,
+				sound: settings.sound,
 			});
 		};
 		if (this.server.clientCount === 0) {
@@ -1704,7 +1706,11 @@ export class WebHost {
 		// changes of the task this run belongs to would stay in the tracker for the next, unrelated task.
 		try {
 			if (succeeded && !indeterminateGit) {
-				if (!session.isMirror && session.settingsManager.getAutoMemorySettings().enabled) {
+				if (
+					!session.isMirror &&
+					session.settingsManager.isMemoryEnabledOnDevice() &&
+					session.settingsManager.getAutoMemorySettings().enabled
+				) {
 					await session.scheduleAutoMemoryMaintenance();
 				}
 				const decisionCheckpoint = session.getGitCheckpoint();

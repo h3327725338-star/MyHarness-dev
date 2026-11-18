@@ -185,6 +185,7 @@ export class Agent {
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	public beforePrompt?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<void>;
 	public beforeProviderRequest?: AgentLoopConfig["beforeProviderRequest"];
+	public projectProviderContext?: AgentLoopConfig["projectProviderContext"];
 	public streamFunction: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	public onPayload?: SimpleStreamOptions["onPayload"];
@@ -478,6 +479,7 @@ export class Agent {
 						}
 					: undefined,
 			beforeProviderRequest: async (context, signal) => await this.beforeProviderRequest?.(context, signal),
+			projectProviderContext: this.projectProviderContext,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,

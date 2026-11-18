@@ -417,6 +417,7 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	subAgent?: SubAgentSettings; // Global-only inspection sub-agent configuration; Bash guard is not a sandbox
+	memoryEnabledOnDevice?: boolean; // Local master switch, never synced
 	autoMemory?: AutoMemorySettings; // Global-only long-term memory configuration
 	conversationNaming?: ConversationNamingSettings; // Global-only background conversation naming
 	memoryPicker?: MemoryPickerSettings; // Global-only model that chooses the memories for each message

@@ -1022,6 +1022,10 @@ function refreshSoon(slot, delay = 400) {
 }
 
 function onEvent(name, data) {
+	if (name === "device_memory_changed") {
+		window.dispatchEvent(new Event("myharness:pc-memory-changed"));
+		return;
+	}
 	if (name === "slots") {
 		slots = Array.isArray(data.slots) ? data.slots : [];
 		for (const id of [...bags.keys()]) if (!slots.some((status) => status.slot === id)) bags.delete(id);
@@ -1381,6 +1385,12 @@ export async function pcBrowser(action, params = {}) {
 
 export const pc = {
 	id: "pc",
+
+	deviceMemory(enabled) {
+		return enabled === undefined
+			? call("GET", "/api/settings/device-memory")
+			: call("POST", "/api/settings/device-memory", { enabled });
+	},
 
 	async init() {
 		config = loadConfig();

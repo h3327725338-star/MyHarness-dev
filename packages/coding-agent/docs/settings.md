@@ -50,7 +50,7 @@ Interactive mode 和 Web UI 都可以在任务完成、失败或中断后显示�
 }
 ```
 
-`turnComplete`：任务完成、失败或中断后何时通知，`never` / `unfocused`（仅窗口未聚焦时）/ `always`，默认 `always`；旧的 `enabled: false` 在未设置 `turnComplete` 时等同 `never`。`onQuestion` / `onPermission`：智能体提问（select / input / editor 对话框，如 `ask_user_question`）或需要确认（confirm 对话框）时是否通知。`sound`：`off` / `soft` / `chime` / `glow`，三个内置提示音由网页用 Web Audio 合成，无音频文件；没有页面打开时回退的系统弹窗只有系统自带的提示音。
+`turnComplete`：任务完成、失败或中断后何时通知，`never` / `unfocused`（仅窗口未聚焦时）/ `always`，默认 `always`；旧的 `enabled: false` 在未设置 `turnComplete` 时等同 `never`。`onQuestion` / `onPermission`：智能体提问（select / input / editor 对话框，如 `ask_user_question`）或需要确认（confirm 对话框）时是否通知。`sound`：`off` / `soft` / `chime` / `glow`，Windows 桌面应用的横幅由系统连同声音一起呈现，三档分别使用 Windows 的默认、邮件和提醒音效；`off` 不响。不弹横幅时的应用内提示和设置页试听仍用原来的合成音；非桌面宿主的系统补弹沿用平台默认行为。
 
 也可以在会话内通过 `/settings` 切换总开关。`style` 支持默认的 `toast` 和需要手动关闭的 `window`；三个 `on...` 字段分别控制完成、异常和中断提醒。
 
@@ -306,6 +306,12 @@ Global，设置 → 智能体 → “跨对话衔接”分组。三个部分共�
   }
 }
 ```
+
+#### 本机记忆（总开关）
+
+在「设置 → 智能体」或 `/settings` 切换「本机记忆」（`memoryEnabledOnDevice`，默认开启）。同一台电脑的所有聊天立即生效，不用重启；手机遥控时可在「电脑连接」改同一个开关。开关不随 Google Drive 同步，手机独立运行的对话也不受它影响。
+
+关闭后停止自动挑选、注入、提取和后台整理；在途记忆任务会取消，未提交的结果不写入。当前聊天正文和已发给模型的请求不回收。只有明确要求执行记忆操作时，主智能体才能查、写、改或删除 `<data>/manual-memory/` 中独立的本机记忆；该库不参与同步或自动整理。重新开启后恢复原库和原配置，继续关闭前已保存的待处理工作，不补提取关闭期间的消息。
 
 <a id="automemory"></a>
 #### autoMemory（Auto Memory）

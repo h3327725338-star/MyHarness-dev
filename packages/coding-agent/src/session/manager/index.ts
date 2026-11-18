@@ -1093,7 +1093,11 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and branchWithSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, timing?: SessionMessageTiming): string {
+	appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		timing?: SessionMessageTiming,
+		skipMemoryExtraction = false,
+	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1101,6 +1105,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 			...(timing ? { timing } : {}),
+			...(skipMemoryExtraction ? { skipMemoryExtraction: true } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

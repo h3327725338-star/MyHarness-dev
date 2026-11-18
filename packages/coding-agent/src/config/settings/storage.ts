@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, watchFile } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import lockfile from "proper-lockfile";
@@ -8,6 +8,9 @@ import { getSettingsFilePaths } from "../paths/index.ts";
 import type { SettingsScope } from "./types.ts";
 
 export interface SettingsStorage {
+	/** Managers sharing this identity also share live device-only settings. */
+	readonly deviceKey?: string;
+	watchDeviceMemory?(onChange: (enabled: boolean) => void): void;
 	/**
 	 * Run `fn` against the current serialized settings for `scope`. Returning
 	 * `undefined` means "no write": that path never takes the file lock or
@@ -72,13 +75,27 @@ function lockHeldError(path: string): Error {
 function ignoreCompromisedSettingsLock(): void {}
 
 export class FileSettingsStorage implements SettingsStorage {
+	readonly deviceKey: string;
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
 
 	constructor(cwd: string, agentDir: string) {
 		const paths = getSettingsFilePaths(cwd, agentDir, CONFIG_DIR_NAME);
 		this.globalSettingsPath = paths.global;
+		this.deviceKey = fileKey(paths.global);
 		this.projectSettingsPath = paths.project;
+	}
+
+	watchDeviceMemory(onChange: (enabled: boolean) => void): void {
+		// Stat polling survives atomic replacements, including a file not yet created at startup.
+		watchFile(this.globalSettingsPath, { persistent: false, interval: 250 }, () => {
+			try {
+				const settings = JSON.parse(readFileSync(this.globalSettingsPath, "utf-8"));
+				onChange(settings.memoryEnabledOnDevice !== false);
+			} catch {
+				// A missing or unreadable file must not turn memory back on.
+			}
+		});
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {

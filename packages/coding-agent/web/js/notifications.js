@@ -44,14 +44,14 @@ export function setDesktopNotificationClick(handler) {
  * can use another way. Notifications with the same `tag` replace each other, so several open tabs show one. A click
  * brings this tab forward and runs `onClick`.
  */
-export async function showNotification({ title, body, tag, onClick }) {
+export async function showNotification({ title, body, tag, sound, onClick }) {
 	// The desktop app shows its own native notification; a click on it comes back by tag and runs `onClick`.
 	const desktop = globalThis.myHarnessDesktop;
 	if (desktop?.notify) {
 		clickHandlers.set(tag, onClick);
 		listenForDesktopClicks(desktop);
 		try {
-			return (await desktop.notify({ title, body, tag })) === true;
+			return (await desktop.notify({ title, body, tag, sound })) === true;
 		} catch {
 			return false;
 		}

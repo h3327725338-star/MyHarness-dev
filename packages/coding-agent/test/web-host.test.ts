@@ -3510,14 +3510,15 @@ describe("Web host (real runtime with a faux provider)", () => {
 		]);
 
 		// The page is asked first; nothing is shown by the server while it may still answer.
+		await fx.post("/api/settings", { id: "notificationSound", value: "glow" }, slot);
 		const one = await run("task one");
 		const first = await fx.waitFor("task_notification", (data) => data.slot === one);
-		expect(first).toMatchObject({ kind: "completed", state: "completed" });
+		expect(first).toMatchObject({ kind: "completed", state: "completed", sound: "glow" });
 		expect(popups()).toHaveLength(0);
 		// The page's browser will not show notifications: the system popup is shown at once, and only once.
 		await fx.post("/api/notifications/answer", { id: first.id, shown: false }, one);
 		expect(popups()).toHaveLength(1);
-		expect(popups()[0]).toMatchObject({ kind: "completed" });
+		expect(popups()[0]).toMatchObject({ kind: "completed", sound: "glow" });
 		expect(popups()[0].title).toContain("MyHarness");
 		await fx.post("/api/notifications/answer", { id: first.id, shown: false }, one);
 		expect(popups()).toHaveLength(1);

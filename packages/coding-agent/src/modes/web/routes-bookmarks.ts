@@ -159,7 +159,7 @@ export function bookmarkUserContext(
 /** The global memories of this Data root while Auto Memory is on; undefined when it is off. */
 function userMemories(host: WebHost): MemoryEntry[] | undefined {
 	const { settingsManager, sessionManager } = host.session;
-	if (!settingsManager.getAutoMemorySettings().enabled) return undefined;
+	if (!settingsManager.isMemoryEnabledOnDevice() || !settingsManager.getAutoMemorySettings().enabled) return undefined;
 	try {
 		const paths = getMemoryPaths({
 			dataRoot: sessionManager.getDataRoot() ?? getDataDir(),

@@ -42,7 +42,7 @@ export function getMemoryPaths(location: MemoryLocation) {
 	};
 }
 
-export async function writeMemoryFile(file: string, content: string): Promise<void> {
+export async function writeMemoryFile(file: string, content: string, beforeCommit?: () => void): Promise<void> {
 	assertDirectPath(file);
 	await fs.promises.mkdir(path.dirname(file), { recursive: true });
 	const ignored = path.join(path.dirname(file), ".gitignore");
@@ -55,7 +55,13 @@ export async function writeMemoryFile(file: string, content: string): Promise<vo
 	const temporary = `${file}.${randomUUID()}.tmp`;
 	await fs.promises.writeFile(temporary, content, { mode: 0o600 });
 	try {
-		await fs.promises.rename(temporary, file);
+		if (beforeCommit) {
+			// No event-loop yield between the mode check and publishing a background result.
+			beforeCommit();
+			fs.renameSync(temporary, file);
+		} else {
+			await fs.promises.rename(temporary, file);
+		}
 	} catch (error) {
 		await fs.promises.unlink(temporary);
 		throw error;
@@ -104,7 +110,7 @@ export async function withMemoryLock<T>(
 }
 
 /** Save a complete old version before replacing or retiring an active memory. Caller owns the lock. */
-export async function archiveMemoryFile(file: string, reason: string): Promise<string> {
+export async function archiveMemoryFile(file: string, reason: string, beforeCommit?: () => void): Promise<string> {
 	assertDirectPath(file);
 	const archive = path.join(
 		path.dirname(file),
@@ -116,6 +122,7 @@ export async function archiveMemoryFile(file: string, reason: string): Promise<s
 	await writeMemoryFile(
 		archive,
 		`---\n${stringifyYaml({ ...parsed.frontmatter, archivedAt: new Date().toISOString(), archiveReason: reason, originalFile: path.basename(file) }).trim()}\n---\n\n${parsed.body}\n`,
+		beforeCommit,
 	);
 	return archive;
 }
@@ -341,7 +348,7 @@ export async function recordMemoryWriteConsolidation(
 let indexMetadataCache: { root: string; files: NonNullable<MemoryListOptions["metadataCache"]> } | undefined;
 
 /** Rebuild global and workspace reference catalogs without copying memory bodies. Caller owns the lock. */
-export async function refreshMemoryIndexes(dataRoot: string): Promise<void> {
+export async function refreshMemoryIndexes(dataRoot: string, beforeCommit?: () => void): Promise<void> {
 	const root = path.resolve(dataRoot);
 	if (indexMetadataCache?.root !== root) indexMetadataCache = { root, files: new Map() };
 	const entries = (await listMemoryFilesAsync(dataRoot, { metadataCache: indexMetadataCache.files })).map(
@@ -350,6 +357,7 @@ export async function refreshMemoryIndexes(dataRoot: string): Promise<void> {
 	await writeMemoryFile(
 		path.join(dataRoot, "memory", "index.json"),
 		`${JSON.stringify({ version: 2, entries }, null, 2)}\n`,
+		beforeCommit,
 	);
 	for (const workspaceId of directories(getWorkspacesDir(dataRoot))) {
 		const own = entries.filter((entry) => entry.workspaceId === workspaceId);
@@ -357,6 +365,7 @@ export async function refreshMemoryIndexes(dataRoot: string): Promise<void> {
 			await writeMemoryFile(
 				path.join(getWorkspaceDir(dataRoot, workspaceId), "memory", "index.json"),
 				`${JSON.stringify({ version: 2, workspaceId, entries: own }, null, 2)}\n`,
+				beforeCommit,
 			);
 	}
 }
@@ -1063,7 +1072,11 @@ export async function restoreMemoryArchive(dataRoot: string, relativePath: strin
 }
 
 /** Copy legacy files once per agent directory. Preserve originals and quarantine ambiguous project ownership. */
-export async function migrateLegacyMemories(dataRoot = getDataDir(), agentDir = getAgentDir()): Promise<void> {
+export async function migrateLegacyMemories(
+	dataRoot = getDataDir(),
+	agentDir = getAgentDir(),
+	beforeCommit?: () => void,
+): Promise<void> {
 	const legacy = path.join(path.resolve(agentDir), "memory");
 	assertDirectPath(legacy);
 	if (!fs.existsSync(legacy)) return;
@@ -1073,6 +1086,7 @@ export async function migrateLegacyMemories(dataRoot = getDataDir(), agentDir = 
 	assertDirectPath(marker);
 	if (fs.existsSync(marker)) return;
 	await withMemoryLock(dataRoot, async () => {
+		beforeCommit?.();
 		if (fs.existsSync(marker)) return;
 		const owners = new Map<string, string[]>();
 		for (const id of directories(getWorkspacesDir(dataRoot))) {
@@ -1114,6 +1128,7 @@ export async function migrateLegacyMemories(dataRoot = getDataDir(), agentDir = 
 				await writeMemoryFile(
 					destination,
 					`---\n${stringifyYaml({ ...parsed.frontmatter, id: `${scope}/${name}`, scope, workspaceId, legacySource: source, legacyId: parsed.frontmatter.id }).trim()}\n---\n\n${parsed.body}\n`,
+					beforeCommit,
 				);
 			}
 		};
@@ -1136,12 +1151,14 @@ export async function migrateLegacyMemories(dataRoot = getDataDir(), agentDir = 
 				await writeMemoryFile(
 					path.join(dataRoot, "memory", "legacy", sourceKey, name),
 					fs.readFileSync(source, "utf8"),
+					beforeCommit,
 				);
 		}
-		await refreshMemoryIndexes(dataRoot);
+		await refreshMemoryIndexes(dataRoot, beforeCommit);
 		await writeMemoryFile(
 			marker,
 			`${JSON.stringify({ version: 1, source: legacy, completedAt: new Date().toISOString(), originalsPreserved: true }, null, 2)}\n`,
+			beforeCommit,
 		);
 	});
 }

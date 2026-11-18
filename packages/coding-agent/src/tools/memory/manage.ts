@@ -1,4 +1,4 @@
-import { relative } from "node:path";
+import { join, relative } from "node:path";
 import type { AgentTool } from "@myharness/agent-core";
 import { type Static, Type } from "typebox";
 import { isSafeMemoryId, readCrossScopeMemoryEntries, readMemoryEntries } from "../../agent/runtime/auto-memory.ts";
@@ -29,6 +29,7 @@ export type MemoryDeleteToolInput = Static<typeof memoryDeleteSchema>;
 export type MemoryClaimToolInput = Static<typeof memoryClaimSchema>;
 
 export interface MemoryManageToolDetails {
+	manualOnly?: true;
 	mode: "disabled" | "delete" | "claim" | "error";
 	total?: number;
 	returned?: number;
@@ -39,6 +40,7 @@ export interface MemoryManageContext {
 	dataRoot: string;
 	workspaceId: string;
 	sessionId: string;
+	manualOnly?: boolean;
 }
 
 /**
@@ -62,16 +64,23 @@ function resolveManageOperations(options?: MemoryManageOptions | MemoryToolOptio
 }
 
 /** Manage access for a live session, gated by the Auto Memory setting like the read tools. */
-export function createSessionMemoryManageOperations(source: {
+export interface SessionMemoryToolSource {
 	sessionManager: Pick<SessionManager, "isPersisted" | "getDataRoot" | "getWorkspaceId" | "getSessionId">;
-	settingsManager: Pick<SettingsManager, "getAutoMemorySettings">;
-}): MemoryManageOperations {
+	settingsManager: Pick<SettingsManager, "getAutoMemorySettings"> &
+		Partial<Pick<SettingsManager, "isMemoryEnabledOnDevice">>;
+}
+
+export function createSessionMemoryManageOperations(source: SessionMemoryToolSource): MemoryManageOperations {
 	return {
 		context() {
 			const { sessionManager, settingsManager } = source;
-			if (!sessionManager.isPersisted() || !settingsManager.getAutoMemorySettings().enabled) return undefined;
+			const manualOnly = settingsManager.isMemoryEnabledOnDevice?.() === false;
+			if (!sessionManager.isPersisted() || (!manualOnly && !settingsManager.getAutoMemorySettings().enabled))
+				return undefined;
+			const dataRoot = sessionManager.getDataRoot() ?? getDataDir();
 			return {
-				dataRoot: sessionManager.getDataRoot() ?? getDataDir(),
+				manualOnly,
+				dataRoot: manualOnly ? join(dataRoot, "manual-memory") : dataRoot,
 				workspaceId: sessionManager.getWorkspaceId() ?? UNBOUND_WORKSPACE_ID,
 				sessionId: sessionManager.getSessionId(),
 			};
@@ -169,6 +178,7 @@ export function createMemoryDeleteToolDefinition(
 			}
 			return textResult(sections.join("\n"), {
 				mode: "delete",
+				...(context.manualOnly ? { manualOnly: true } : {}),
 				total: requested.length,
 				returned: deleted.length,
 				ids: deleted,
@@ -194,6 +204,7 @@ export function createMemoryClaimToolDefinition(
 			if (signal?.aborted) throw new Error("Operation aborted");
 			const context = ops.context();
 			if (!context) return textResult(DISABLED_TEXT, { mode: "disabled" });
+			if (context.manualOnly) return textResult("本机记忆已关闭，不能从原记忆库认领条目。", { mode: "disabled" });
 			const trimmed = id?.trim() ?? "";
 			if (!trimmed || !isSafeMemoryId(trimmed)) {
 				return textResult("请提供待认领记忆的 id（来自 memory_search 的结果，pending/ 开头）。", {

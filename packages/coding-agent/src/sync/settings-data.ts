@@ -153,6 +153,7 @@ const LOCAL_ONLY_SETTINGS_KEYS: ReadonlySet<string> = new Set([
 	"defaultProjectTrust",
 	"externalEditor",
 	"extensions",
+	"memoryEnabledOnDevice",
 	"npmCommand",
 	"officeJwtSecret",
 	"officeServerUrl",
