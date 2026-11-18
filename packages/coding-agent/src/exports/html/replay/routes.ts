@@ -155,8 +155,10 @@ export function buildRoutes({ projection, prefs = {}, detailsLimit }: BuildRoute
 		filePath: string,
 		summary: Record<string, unknown>,
 		patch?: string,
+		commitRun?: number,
 	) => {
 		const params = new URLSearchParams({ id: entryId, runId: String(runId), path: filePath });
+		if (commitRun !== undefined) params.set("commitRun", String(commitRun));
 		routes[`/api/changes/card-diff?${params.toString()}`] = {
 			summary,
 			...(patch ? { patch } : {}),
@@ -165,37 +167,54 @@ export function buildRoutes({ projection, prefs = {}, detailsLimit }: BuildRoute
 
 	for (const entry of projection.entries ?? []) {
 		if (entry.type !== "custom" || entry.customType !== "web-run-changes") continue;
-		const card = (entry.data ?? {}) as { runId?: unknown; files?: unknown[]; patch?: string; deferred?: unknown };
+		const card = (entry.data ?? {}) as {
+			runId?: unknown;
+			files?: unknown[];
+			patch?: string;
+			deferred?: unknown;
+			commits?: Array<{ runId?: unknown; files?: unknown[] }>;
+		};
 		// 被新消息打断的那一轮的改动是隐藏条目，不画卡片（总卡里已含这些文件），导出也不带它的 diff
 		if (card.deferred === true) continue;
 		const runId = Number(card.runId) || 0;
-		const files = Array.isArray(card.files) ? card.files : [];
-		for (const file of files) {
-			if (!file || typeof file !== "object" || typeof (file as { path?: unknown }).path !== "string") continue;
-			const f = file as {
-				path: string;
-				patch?: unknown;
-				patchOmitted?: unknown;
-				additions?: unknown;
-				added?: unknown;
-				deletions?: unknown;
-				removed?: unknown;
-				binary?: unknown;
-				[k: string]: unknown;
-			};
-			const { patch, patchOmitted, ...rest } = f;
-			const summary: Record<string, unknown> = {
-				...rest,
-				additions: Number(f.additions ?? f.added) || 0,
-				deletions: Number(f.deletions ?? f.removed) || 0,
-				binary: f.binary === true,
-			};
-			const single = files.length === 1 && typeof card.patch === "string" ? card.patch : undefined;
-			const effPatch = typeof patch === "string" ? patch : single;
-			if (patchOmitted && !effPatch) {
-				summary.unavailable = "The diff of this file was too large to keep with the chat.";
+		const groups = [
+			{ files: card.files, commitRun: undefined as number | undefined },
+			...(Array.isArray(card.commits)
+				? card.commits
+						.filter((group) => typeof group?.runId === "number")
+						.map((group) => ({ files: group.files, commitRun: Number(group.runId) }))
+				: []),
+		];
+		for (const { files: groupFiles, commitRun } of groups) {
+			const files = Array.isArray(groupFiles) ? groupFiles : [];
+			for (const file of files) {
+				if (!file || typeof file !== "object" || typeof (file as { path?: unknown }).path !== "string") continue;
+				const f = file as {
+					path: string;
+					patch?: unknown;
+					patchOmitted?: unknown;
+					additions?: unknown;
+					added?: unknown;
+					deletions?: unknown;
+					removed?: unknown;
+					binary?: unknown;
+					[k: string]: unknown;
+				};
+				const { patch, patchOmitted, ...rest } = f;
+				const summary: Record<string, unknown> = {
+					...rest,
+					additions: Number(f.additions ?? f.added) || 0,
+					deletions: Number(f.deletions ?? f.removed) || 0,
+					binary: f.binary === true,
+				};
+				const single =
+					commitRun === undefined && files.length === 1 && typeof card.patch === "string" ? card.patch : undefined;
+				const effPatch = typeof patch === "string" ? patch : single;
+				if (patchOmitted && !effPatch) {
+					summary.unavailable = "The diff of this file was too large to keep with the chat.";
+				}
+				cardDiffRoute(entry.id, runId, f.path, summary, effPatch, commitRun);
 			}
-			cardDiffRoute(entry.id, runId, f.path, summary, effPatch);
 		}
 	}
 
@@ -253,7 +272,7 @@ export function lookupRoute(routes: Record<string, unknown>, path: string): unkn
 	if (exact !== undefined) return exact;
 
 	const byPath = routes[pathname];
-	if (byPath !== undefined) return byPath;
+	if (byPath !== undefined && pathname !== "/api/changes/card-diff") return byPath;
 
 	// Query params matching (e.g. /api/changes/card-diff?id=...&runId=...&path=...)
 	const qIndex = path.indexOf("?");
@@ -263,6 +282,8 @@ export function lookupRoute(routes: Record<string, unknown>, path: string): unkn
 			for (const k of Object.keys(routes)) {
 				if (k.startsWith(`${pathname}?`)) {
 					const want = new URL(k, "http://export.invalid");
+					if (pathname === "/api/changes/card-diff" && want.searchParams.size !== targetUrl.searchParams.size)
+						continue;
 					let same = true;
 					want.searchParams.forEach((v, kk) => {
 						if (targetUrl.searchParams.get(kk) !== v) same = false;
@@ -275,7 +296,7 @@ export function lookupRoute(routes: Record<string, unknown>, path: string): unkn
 		}
 	}
 
-	return routes["*"];
+	return byPath ?? routes["*"];
 }
 
 export function modelsFromProjection(projection: ProjectedSession): Record<string, unknown> {

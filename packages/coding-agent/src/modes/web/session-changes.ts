@@ -1,5 +1,5 @@
 import type { SessionEntry } from "../../session/types.ts";
-import type { FileChangeSummary, RunChangeCardFile } from "./changes.ts";
+import type { FileChangeSummary, RunChangeCardFile, RunCommitCard } from "./changes.ts";
 import { isDeferredRunChanges, RUN_CHANGES_ENTRY, runChangesToWire } from "./wire.ts";
 
 export interface SessionFileDiff {
@@ -25,7 +25,7 @@ export function lastClosingRunChanges(entries: readonly SessionEntry[]): number 
 	return -1;
 }
 
-/** Historical edits on the current branch, not a net diff or a claim about uncommitted ownership. */
+/** Historical changes on the current branch, not a net diff or a claim about uncommitted ownership. */
 export function collectSessionChanges(entries: readonly SessionEntry[]): {
 	files: FileChangeSummary[];
 	diffs: Map<string, SessionFileDiff[]>;
@@ -44,18 +44,28 @@ export function collectSessionChanges(entries: readonly SessionEntry[]): {
 			deferred ? { ...(entry.data as object), deferred: undefined } : entry.data,
 		);
 		if (wire?.kind !== "runChanges") continue;
-		const card = entry.data as { files: RunChangeCardFile[] };
-		const cardFilesByPath = new Map<string, RunChangeCardFile>();
-		if (Array.isArray(card.files)) {
-			for (const candidate of card.files) {
-				if (candidate?.path && !cardFilesByPath.has(candidate.path)) {
-					cardFilesByPath.set(candidate.path, candidate);
-				}
+		const card = entry.data as { files?: RunChangeCardFile[]; commits?: RunCommitCard[] };
+		const byPath = new Map<string, { file: (typeof wire.files)[number]; saved: RunChangeCardFile; runId: number }>();
+		// Prefer the task's edit diff. For paths only committed, use the latest commit group in that card.
+		const addGroup = (files: typeof wire.files, savedFiles: RunChangeCardFile[] | undefined, runId: number) => {
+			if (!Array.isArray(savedFiles)) return;
+			const savedByPath = new Map<string, RunChangeCardFile>();
+			for (const saved of savedFiles) {
+				if (saved?.path && !savedByPath.has(saved.path)) savedByPath.set(saved.path, saved);
 			}
+			for (const file of files) {
+				const saved = savedByPath.get(file.path);
+				if (saved && !byPath.has(file.path)) byPath.set(file.path, { file, saved, runId });
+			}
+		};
+		addGroup(wire.files, card.files, wire.runId);
+		for (const group of (wire.commits ?? []).slice().reverse()) {
+			const savedGroup = Array.isArray(card.commits)
+				? card.commits.find((saved) => saved?.runId === group.runId)
+				: undefined;
+			addGroup(group.files, savedGroup?.files, group.runId);
 		}
-		for (const file of wire.files) {
-			const saved = cardFilesByPath.get(file.path);
-			if (!saved) continue;
+		for (const { file, saved, runId } of byPath.values()) {
 			const summary: FileChangeSummary = {
 				path: file.path,
 				status: saved.status,
@@ -81,7 +91,7 @@ export function collectSessionChanges(entries: readonly SessionEntry[]): {
 			const history = diffs.get(file.path) ?? [];
 			history.push({
 				entryId: entry.id,
-				runId: wire.runId,
+				runId,
 				timestamp: entry.timestamp,
 				summary,
 				...(typeof saved.patch === "string" && !saved.patchOmitted ? { patch: saved.patch } : {}),

@@ -648,6 +648,31 @@ describe("W23 数据投影与 wire 补字段对账", () => {
 			expect((diffRes.data as { patch?: string })?.patch).toContain("@@ -1,2 +1,5 @@");
 		});
 
+		it("keeps the edit and commit patches for the same path separate in replay", () => {
+			const projection = projectSession({ file: sessionFilePath });
+			const entry = projection.entries.find(
+				(candidate) => candidate.type === "custom" && candidate.customType === "web-run-changes",
+			);
+			if (!entry || entry.type !== "custom") throw new Error("Missing fixture change card");
+			const path = "a + b.txt";
+			const change = { path, status: "modified", additions: 1, deletions: 1, binary: false };
+			entry.data = {
+				runId: 2,
+				files: [{ ...change, patch: "edit patch" }],
+				commits: [{ runId: 1, files: [{ ...change, patch: "commit patch" }] }],
+			};
+			const { routes } = buildRoutes({ projection });
+			const query = new URLSearchParams({ id: entry.id, runId: "2", path });
+			expect(lookupRoute(routes, `/api/changes/card-diff?${query}`)).toMatchObject({ patch: "edit patch" });
+			query.set("commitRun", "1");
+			query.sort();
+			expect(lookupRoute(routes, `/api/changes/card-diff?${query}`)).toMatchObject({ patch: "commit patch" });
+			query.set("commitRun", "99");
+			expect(lookupRoute(routes, `/api/changes/card-diff?${query}`)).toMatchObject({
+				summary: { unavailable: "This diff was not embedded in the export." },
+			});
+		});
+
 		it("未覆盖的 GET 请求默认返回 {} 不报错", () => {
 			const projection = projectSession({ file: sessionFilePath });
 			const { routes } = buildRoutes({ projection });

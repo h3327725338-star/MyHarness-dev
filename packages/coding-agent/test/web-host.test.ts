@@ -2021,6 +2021,50 @@ describe("Web host (real runtime with a faux provider)", () => {
 		expect(readFileSync(join(fx.project, "notes.txt"), "utf8").replace(/\r\n/g, "\n")).toBe("alpha\nbeta\n");
 	}, 90_000);
 
+	it.each([false, true])(
+		"keeps the committed diff separate from edits (edits=%s)",
+		async (edit) => {
+			const fx = await start();
+			const file = join(fx.project, "notes.txt");
+			writeFileSync(file, "original\n");
+			expect(initializeGitRepository(fx.project).ok).toBe(true);
+			expect(setLocalGitIdentity(fx.project, { name: "Web test", email: "web@example.invalid" }).ok).toBe(true);
+			expect(createInitialGitBaseline(fx.project).ok).toBe(true);
+			writeFileSync(file, "before task\n");
+			const owner = fx.hub.get((await fx.get("/api/state")).slot)!;
+			owner.session.settingsManager.setGitIntegrationEnabled(true);
+			owner.session.settingsManager.setAutoMemorySettings({ enabled: false });
+			await owner.session.settingsManager.flush();
+			const shell = (command: string) =>
+				fauxAssistantMessage([fauxToolCall("bash", { command })], { stopReason: "toolUse" });
+			fx.faux.setResponses([
+				...(edit ? [shell(`node -e "require('fs').writeFileSync('notes.txt', 'during task\\n')"`)] : []),
+				shell("git add -- notes.txt && git commit -m update"),
+				...(edit ? [shell(`node -e "require('fs').writeFileSync('notes.txt', 'after commit\\n')"`)] : []),
+				fauxAssistantMessage([fauxText("Done.")]),
+			]);
+			await fx.post("/api/prompt", { text: "commit notes" });
+			await fx.waitFor("run_finished");
+			const items = (await fx.get("/api/transcript?limit=1")).items;
+			const card = items.find((item: any) => item.kind === "runChanges");
+			expect(card.files).toHaveLength(edit ? 1 : 0);
+			expect(card.commits).toHaveLength(1);
+			const group = card.commits[0];
+			expect(group.files).toMatchObject([{ path: "notes.txt", additions: 1, deletions: 1 }]);
+			const diffUrl = `/api/changes/card-diff?id=${card.id}&path=notes.txt`;
+			const commit = await fx.get(`${diffUrl}&commitRun=${group.runId}`);
+			expect(commit.patch).toContain("-original");
+			expect(commit.patch).toContain(edit ? "+during task" : "+before task");
+			expect(commit.patch).not.toContain("after commit");
+			if (edit) {
+				const editDiff = await fx.get(diffUrl);
+				expect(editDiff.patch).toContain("-before task");
+				expect(editDiff.patch).toContain("+after commit");
+			}
+		},
+		60_000,
+	);
+
 	it("keeps only what the task can account for on its card and lists what changed elsewhere meanwhile", async () => {
 		const fx = await start();
 		writeFileSync(join(fx.project, "notes.txt"), "alpha\n");

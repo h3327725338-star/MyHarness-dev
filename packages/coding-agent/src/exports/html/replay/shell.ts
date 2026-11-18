@@ -87,15 +87,17 @@ export function bootScript({
 		var exact = routes[key(pathname, search)];
 		if (exact !== undefined) return exact;
 		var byPath = routes[pathname];
-		if (byPath !== undefined) return byPath;
+		if (byPath !== undefined && pathname !== "/api/changes/card-diff") return byPath;
 		for (var k in routes) {
 			if (k.indexOf(pathname + "?") === 0) {
-				var want = new URL("http://export.invalid" + k.slice(pathname.length));
+				var want = new URL(k, "http://export.invalid");
+				if (pathname === "/api/changes/card-diff" && want.searchParams.size !== query.size) continue;
 				var same = true;
 				want.searchParams.forEach(function (v, kk) { if (query.get(kk) !== v) same = false; });
 				if (same) return routes[k];
 			}
 		}
+		if (byPath !== undefined) return byPath;
 		missing.push(path);
 		return routes["*"];
 	}

@@ -878,8 +878,12 @@ function MarkdownDiff({ patch }) {
 }
 
 const cardDiffReads = createReadCache(24);
-const cardDiffKey = (slot, card, file) => JSON.stringify([slot, card.id, card.runId, file.path]);
-const readCardDiff = (slot, card, file) => cardDiffReads.load(cardDiffKey(slot, card, file), () => api(`/api/changes/card-diff?id=${encodeURIComponent(card.id)}&runId=${card.runId}&path=${encodeURIComponent(file.path)}`, { slot }));
+const cardDiffKey = (slot, card, file) => JSON.stringify([slot, card.id, card.runId, file.path, card.commitRun]);
+const readCardDiff = (slot, card, file) => cardDiffReads.load(cardDiffKey(slot, card, file), () => {
+	const query = new URLSearchParams({ id: card.id, runId: card.runId, path: file.path });
+	if (card.commitRun !== undefined) query.set("commitRun", card.commitRun);
+	return api(`/api/changes/card-diff?${query}`, { slot });
+});
 
 /** The diff of one file of a change card, prefetched on pointer/focus intent and scoped to its Chat. */
 function ChangeDiff({ card, file }) {
@@ -895,7 +899,7 @@ function ChangeDiff({ card, file }) {
 		return () => {
 			cancelled = true;
 		};
-	}, [slot, card.id, card.runId, file.path]);
+	}, [slot, card.id, card.runId, file.path, card.commitRun]);
 	const data = entry?.data;
 	if (entry?.error) return html`<div class="change-note c-danger">${entry.error}</div>`;
 	if (!data) return html`<div class="change-note"><${Spinner} /></div>`;
@@ -938,7 +942,7 @@ const CHANGE_FILES_SHOWN = 5;
  * file can also be read as formatted text. Beyond five files the rest fold behind "Show the other N files" (and fold
  * back with the same row). The card never opens the Changes panel. A task from before cards were saved has none.
  */
-function ChangeCard({ card }) {
+function ChangeGroup({ card }) {
 	const [more, setMore] = useState(false);
 	const files = card.files;
 	if (!files?.length) return null;
@@ -947,7 +951,7 @@ function ChangeCard({ card }) {
 	const row = (file) => html`<${ChangeFile} key=${file.path} card=${card} file=${file} />`;
 	return html`<div class="change-card fade-in">
 		<div class="change-head">
-			<span class="grow truncate">${t("Edited {files}", { files: plural(files.length, "file") })}</span>
+			<span class="grow truncate">${t(card.commitRun === undefined ? "Edited {files}" : "Committed {files}", { files: plural(files.length, "file") })}</span>
 			${counted ? html`<${Counts} additions=${files.reduce((n, f) => n + f.additions, 0)} deletions=${files.reduce((n, f) => n + f.deletions, 0)} />` : null}
 		</div>
 		${files.slice(0, CHANGE_FILES_SHOWN).map(row)}
@@ -958,6 +962,16 @@ function ChangeCard({ card }) {
 		</button>` : null}
 		${card.elsewhere?.length ? html`<${ChangedElsewhere} files=${card.elsewhere} total=${card.elsewhereTotal} />` : null}
 	</div>`;
+}
+
+function ChangeCard({ card }) {
+	return html`
+		<${ChangeGroup} card=${card.files?.length ? card : { ...card, elsewhere: undefined }} />
+		${card.commits?.map((group, index) => html`<${ChangeGroup} key=${group.runId} card=${{
+			id: card.id, runId: card.runId, commitRun: group.runId, files: group.files,
+			...(!card.files?.length && index === card.commits.length - 1 ? { elsewhere: card.elsewhere, elsewhereTotal: card.elsewhereTotal } : {}),
+		}} />`)}
+	`;
 }
 
 const ELSEWHERE_BY = { chat: N_("Another conversation"), outside: N_("Another program") };
@@ -1109,7 +1123,9 @@ const TurnView = memo(function TurnView({ turn, isLast, live, waiting, run, cwd,
 	// Stopped by a message sent with "interrupt": no "cancelled" banner, the answer to that message follows.
 	const outcome = ended === "cancelled" && interrupted ? "redirected" : ended;
 	// The run's card of changes is saved, so a reopened chat counts the same files as the run record did.
-	const changeCount = run ? run.changeCount : turn.changes?.files?.length ?? turn.stats.files;
+	const changeCount = run ? run.changeCount : turn.changes ? new Set([
+		...(turn.changes.files || []), ...(turn.changes.commits || []).flatMap((group) => group.files),
+	].map((file) => file.path)).size : turn.stats.files;
 	const duration = turnDuration(turn, run);
 	const working = live || waiting;
 	const expanded = processDefault === "expanded";

@@ -440,15 +440,19 @@ function useWaitingDots(idle, immediate) {
 }
 
 // ---- A turn ------------------------------------------------------------------------------------
-function ChangesCard({ item }) {
-	const files = item.files || [];
+function ChangesGroup({ files, committed }) {
+	if (!files?.length) return null;
 	const additions = files.reduce((sum, file) => sum + (file.additions || 0), 0);
 	const deletions = files.reduce((sum, file) => sum + (file.deletions || 0), 0);
 	return html`<div class="card">
-		<div class="ctitle"><${Icon} name="fileDiff" size=${16} />${t("Changed {files}", { files: count(files.length, "file") })}<span class="counts"><span class="add">+${additions}</span><span class="del">−${deletions}</span></span></div>
+		<div class="ctitle"><${Icon} name="fileDiff" size=${16} />${t(committed ? "Committed {files}" : "Changed {files}", { files: count(files.length, "file") })}<span class="counts"><span class="add">+${additions}</span><span class="del">−${deletions}</span></span></div>
 		${files.slice(0, 8).map((file) => html`<div class="cline" key=${file.path}><span class="cpath">${file.path}</span><span class="counts"><span class="add">+${file.additions}</span><span class="del">−${file.deletions}</span></span></div>`)}
 		${files.length > 8 && html`<div class="cline dim">${t("and {n} more", { n: files.length - 8 })}</div>`}
 	</div>`;
+}
+
+function ChangesCard({ item }) {
+	return html`<${ChangesGroup} files=${item.files} />${item.commits?.map((group) => html`<${ChangesGroup} key=${group.runId} files=${group.files} committed=${true} />`)}`;
 }
 
 const OUTCOME_NOTE = { cancelled: "Stopped", redirected: "Switched to your new message", unanswered: "No response" };

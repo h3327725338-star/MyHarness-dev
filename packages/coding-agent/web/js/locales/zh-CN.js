@@ -1410,6 +1410,8 @@ export const zhCN = {
 	"Ran {commands}": "已运行{commands}",
 	"Editing {files}": "正在编辑{files}",
 	"Edited {files}": "已编辑 {files}",
+	"Committed {files}": "已提交 {files}",
+	"The committed content could not be read from Git.": "无法从 Git 读取已提交的内容。",
 	"Show the other {files}": "显示其余 {files}",
 	"Hide the other {files}": "收起其余 {files}",
 	"{files} changed elsewhere meanwhile, not counted": "另有 {files}在这期间被别处改动，未计入",

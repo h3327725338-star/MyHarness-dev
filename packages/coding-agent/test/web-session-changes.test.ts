@@ -41,6 +41,27 @@ describe("conversation change review", () => {
 			restored.files,
 		);
 	});
+	it("includes commit-only paths and counts overlapping edits once", () => {
+		const files = [file("both.ts", "edit")];
+		const entry = {
+			...card("task", 2, files),
+			data: {
+				runId: 2,
+				files,
+				commits: [
+					{ runId: 1, files: [file("both.ts", "commit"), file("committed.ts", "earlier")] },
+					{ runId: 2, files: [file("committed.ts", "latest", 3)] },
+				],
+			},
+		};
+		const result = collectSessionChanges([entry]);
+		expect(result.files.map(({ path, additions }) => [path, additions])).toEqual([
+			["both.ts", 1],
+			["committed.ts", 3],
+		]);
+		expect(result.diffs.get("both.ts")).toMatchObject([{ patch: "edit" }]);
+		expect(result.diffs.get("committed.ts")).toMatchObject([{ runId: 2, patch: "latest" }]);
+	});
 	it("never draws the changes a new message held back for its task's card, and counts each file once", () => {
 		const held = (id: string, runId: number, files: unknown[]) => ({
 			...card(id, runId, files),

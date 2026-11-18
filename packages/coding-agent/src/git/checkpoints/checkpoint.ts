@@ -633,15 +633,18 @@ export async function observeGitCheckpointFinalState(
 }
 
 /** 异步版 collectGitCheckpointHeadChanges：同一语义，不阻塞事件循环。 */
-export async function collectGitCheckpointHeadChangesAsync(checkpoint: GitCheckpoint): Promise<{
+export async function collectGitCheckpointHeadChangesAsync(
+	checkpoint: GitCheckpoint,
+	finalCommit?: string,
+): Promise<{
 	changes?: GitCheckpointHeadChange[];
 	error?: string;
 }> {
-	const current = await getHeadStateAsync(checkpoint.repositoryRoot);
-	if (!checkpoint.headCommit || !current.commit || checkpoint.headCommit === current.commit) return { changes: [] };
+	const commit = finalCommit ?? (await getHeadStateAsync(checkpoint.repositoryRoot)).commit;
+	if (!checkpoint.headCommit || !commit || checkpoint.headCommit === commit) return { changes: [] };
 	const result = await runCheckpointGitAsync(
 		checkpoint.repositoryRoot,
-		["diff", "--name-status", "-z", "--no-renames", checkpoint.headCommit, current.commit, "--"],
+		["diff", "--name-status", "-z", "--no-renames", checkpoint.headCommit, commit, "--"],
 		true,
 	);
 	if (!result.ok) return { error: formatGitFailure(result) };

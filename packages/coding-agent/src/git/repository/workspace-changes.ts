@@ -449,9 +449,23 @@ export function toReviewChanges(cwd: string, mutations: readonly AutoReviewMutat
  * - indeterminate：检测不可靠（如工作区基线被截断），changes 只包含已知部分，
  *   调用方必须进入保守路径，不得把“无法判断”当作“没有变化”。
  */
-export type ChangeDetectionResult =
-	| { status: "known"; changes: ReviewChange[]; git?: GitTaskChangeSummary }
-	| { status: "indeterminate"; changes: ReviewChange[]; reason: string; git?: GitTaskChangeSummary };
+export interface TaskCommitDelta {
+	repositoryRoot: string;
+	before: string;
+	after: string;
+	changes: ReviewChange[];
+}
+
+type DetectedChanges = {
+	changes: ReviewChange[];
+	git?: GitTaskChangeSummary;
+	// Presentation keeps these comparisons separate; the merged list above still drives Git bookkeeping.
+	workingChanges?: ReviewChange[];
+	commitDelta?: TaskCommitDelta;
+};
+
+export type ChangeDetectionResult = DetectedChanges &
+	({ status: "known" } | { status: "indeterminate"; reason: string });
 
 export interface GitTaskChangeSummary {
 	hasTaskChanges: boolean;
@@ -518,10 +532,15 @@ export async function collectFinalWorkspaceChanges(
 		// These six only read the repository and do not depend on one another, so they run side by side: this is the
 		// wait between the end of a reply and the next message, and each Git process costs tens of milliseconds to start.
 		// The checks below still read their results in the order they used to run in.
+		const observed = observeGitCheckpointFinalState(checkpoint);
 		const [workingChanges, current, head, pending, currentIndexTree, localRefChanges] = await Promise.all([
 			collectCheckpointChanges({ cwd, checkpoint }),
-			observeGitCheckpointFinalState(checkpoint),
-			collectGitCheckpointHeadChangesAsync(checkpoint),
+			observed,
+			observed.then(({ observation }) =>
+				observation?.headCommit
+					? collectGitCheckpointHeadChangesAsync(checkpoint, observation.headCommit)
+					: collectGitCheckpointHeadChangesAsync(checkpoint),
+			),
 			// Final ChangeSet 决定提交/恢复语义：必须读最新状态，绕过短 TTL 缓存。
 			getGitCheckpointPendingTaskPathsAsync(checkpoint, undefined, { fresh: true }),
 			// checkpoint 保存的是任务开始时的 write-tree oid；当前 index 同样用
@@ -543,10 +562,12 @@ export async function collectFinalWorkspaceChanges(
 		// 另一个分支，整个工作区内容被替换），此时 workingChanges 是两个分支的内容差，
 		// 不是本轮编辑，不得归属。本轮自己提交的后代（headCommit 是其祖先）不受影响。
 		const finalHead = current.observation.headCommit;
+		let extendsCheckpoint = false;
 		if (finalHead && checkpoint.headCommit && finalHead !== checkpoint.headCommit) {
 			const lineage = await runGit(["merge-base", "--is-ancestor", checkpoint.headCommit, finalHead], {
 				cwd: checkpoint.repositoryRoot,
 			});
+			extendsCheckpoint = lineage.ok;
 			if (lineage.exitCode === 1) {
 				return {
 					status: "indeterminate",
@@ -582,10 +603,29 @@ export async function collectFinalWorkspaceChanges(
 			effectiveWorkingChanges = workingChanges.filter((change) => !foreignPaths.has(pathCompareKey(change.path)));
 		}
 		const changes = mergeReviewChanges(effectiveWorkingChanges, ownCommittedChanges);
+		const presentation = {
+			...(excludeExternalCommits === false &&
+			extendsCheckpoint &&
+			finalHead &&
+			checkpoint.headCommit &&
+			ownCommittedChanges.length > 0 &&
+			current.observation.headRef === checkpoint.headRef
+				? {
+						workingChanges: effectiveWorkingChanges,
+						commitDelta: {
+							repositoryRoot: checkpoint.repositoryRoot,
+							before: checkpoint.headCommit,
+							after: finalHead,
+							changes: ownCommittedChanges,
+						},
+					}
+				: {}),
+		};
 		if (!pending.paths) {
 			return {
 				status: "indeterminate",
 				changes,
+				...presentation,
 				reason: pending.error ?? "无法判断剩余未提交任务路径。",
 			};
 		}
@@ -597,6 +637,7 @@ export async function collectFinalWorkspaceChanges(
 			return {
 				status: "indeterminate",
 				changes,
+				...presentation,
 				reason: currentIndexTree.error ?? "无法读取当前 Git 暂存区状态。",
 			};
 		}
@@ -619,6 +660,7 @@ export async function collectFinalWorkspaceChanges(
 		return {
 			status: "known",
 			changes,
+			...presentation,
 			...(indexChanged ||
 			headChanged ||
 			headRefChanged ||

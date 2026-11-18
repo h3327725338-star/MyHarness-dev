@@ -210,6 +210,7 @@ export type WireItem =
 			ts: number;
 			runId: number;
 			files: WireChangeFile[];
+			commits?: Array<{ runId: number; files: WireChangeFile[] }>;
 			/** Files changed elsewhere while the task ran, listed under the card (not counted). */
 			elsewhere?: WireElsewhereFile[];
 			/** How many files were changed elsewhere when that is more than `elsewhere` lists. */
@@ -655,15 +656,29 @@ export function isDeferredRunChanges(data: unknown): boolean {
 	return (data as { deferred?: unknown } | null | undefined)?.deferred === true;
 }
 
-/** The change card kept in a RUN_CHANGES_ENTRY, without the diffs; undefined when the data is not a card with files. */
-export function runChangesToWire(id: string, ts: number, data: unknown): WireItem | undefined {
-	const card = data as
-		| { runId?: unknown; files?: unknown; elsewhere?: unknown; elsewhereTotal?: unknown }
-		| null
-		| undefined;
-	if (!card || !Array.isArray(card.files) || isDeferredRunChanges(card)) return undefined;
+type SavedChanges = {
+	runId?: unknown;
+	files?: unknown;
+	commits?: unknown;
+	elsewhere?: unknown;
+	elsewhereTotal?: unknown;
+};
+
+function cardGroups(value: unknown): SavedChanges[] {
+	return Array.isArray(value)
+		? value.filter(
+				(group): group is SavedChanges => !!group && typeof group === "object" && typeof group.runId === "number",
+			)
+		: [];
+}
+
+function cardFiles(value: unknown): Array<Record<string, unknown> & { path: string }> {
+	return Array.isArray(value) ? value.filter((file) => !!file && typeof file.path === "string") : [];
+}
+
+function changeFilesToWire(value: unknown): WireChangeFile[] {
 	const files: WireChangeFile[] = [];
-	for (const file of card.files as Array<Record<string, unknown> | null>) {
+	for (const file of cardFiles(value)) {
 		if (!file || typeof file.path !== "string") continue;
 		files.push({
 			path: file.path,
@@ -676,7 +691,18 @@ export function runChangesToWire(id: string, ts: number, data: unknown): WireIte
 			...(file.lineEndingsOnly === true ? { lineEndingsOnly: true } : {}),
 		});
 	}
-	if (files.length === 0) return undefined;
+	return files;
+}
+
+/** The change card kept in a RUN_CHANGES_ENTRY, without its patches. */
+export function runChangesToWire(id: string, ts: number, data: unknown): WireItem | undefined {
+	const card = data as SavedChanges | null | undefined;
+	if (!card || isDeferredRunChanges(card)) return undefined;
+	const files = changeFilesToWire(card.files);
+	const commits = cardGroups(card.commits)
+		.map((group) => ({ runId: Number(group.runId), files: changeFilesToWire(group.files) }))
+		.filter((group) => group.files.length > 0);
+	if (files.length === 0 && commits.length === 0) return undefined;
 	const elsewhere: WireElsewhereFile[] = [];
 	if (Array.isArray(card.elsewhere)) {
 		for (const file of card.elsewhere as Array<Record<string, unknown> | null>) {
@@ -695,6 +721,7 @@ export function runChangesToWire(id: string, ts: number, data: unknown): WireIte
 		ts,
 		runId: Number(card.runId) || 0,
 		files,
+		...(commits.length ? { commits } : {}),
 		...(elsewhere.length > 0 ? { elsewhere } : {}),
 		...(elsewhere.length > 0 && Number.isFinite(elsewhereTotal) && elsewhereTotal > elsewhere.length
 			? { elsewhereTotal }
@@ -730,13 +757,11 @@ export function entryProjectsToWire(entry: SessionEntry): boolean {
 			return PROJECTABLE_MESSAGE_ROLES.has((entry.message as { role?: unknown } | undefined)?.role as string);
 		case "custom":
 			if (entry.customType === RUN_CHANGES_ENTRY) {
-				const card = entry.data as { files?: unknown } | null | undefined;
+				const card = entry.data as SavedChanges | null | undefined;
 				return (
 					!isDeferredRunChanges(card) &&
-					Array.isArray(card?.files) &&
-					(card.files as Array<Record<string, unknown> | null>).some(
-						(file) => !!file && typeof file.path === "string",
-					)
+					(cardFiles(card?.files).length > 0 ||
+						cardGroups(card?.commits).some((group) => cardFiles(group.files).length > 0))
 				);
 			}
 			return true;

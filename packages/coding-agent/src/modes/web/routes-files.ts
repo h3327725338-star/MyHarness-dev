@@ -44,7 +44,7 @@ import {
 	migrateLegacyMemories,
 	restoreMemoryArchive,
 } from "../../session/memory/store.ts";
-import type { FileChangeSummary, RunChangeCardFile } from "./changes.ts";
+import type { FileChangeSummary, RunChangeCardFile, RunCommitCard } from "./changes.ts";
 import {
 	getCachedWorktreeChangesSync,
 	invalidateWorktreeCache,
@@ -1491,12 +1491,23 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 	server.route("GET", "/api/changes/card-diff", ({ url }) => {
 		const file = url.searchParams.get("path");
 		if (!file) throw new HttpError(400, "Missing path");
-		const entry = host.session.sessionManager.getEntry(url.searchParams.get("id") ?? "");
+		const id = url.searchParams.get("id") ?? "";
+		const entry = host.session.sessionManager.getEntry(id);
 		const card =
 			entry?.type === "custom" && entry.customType === RUN_CHANGES_ENTRY
-				? (entry.data as { runId?: number; chain?: boolean; files?: RunChangeCardFile[] } | undefined)
+				? (entry.data as
+						| { runId?: number; chain?: boolean; files?: RunChangeCardFile[]; commits?: RunCommitCard[] }
+						| undefined)
 				: undefined;
-		const kept = card?.files?.find((candidate) => candidate?.path === file);
+		const commitRun = url.searchParams.get("commitRun");
+		const files =
+			commitRun === null
+				? card?.files
+				: (entry
+						? card?.commits?.find((group) => String(group.runId) === commitRun)
+						: host.mirrorCommitCard(id, commitRun)
+					)?.files;
+		const kept = files?.find((candidate) => candidate?.path === file);
 		if (kept && !kept.patchOmitted) {
 			const { patch, patchOmitted: _omitted, ...summary } = kept;
 			return { summary, ...(patch ? { patch } : {}) };
@@ -1504,7 +1515,7 @@ export function registerFileRoutes(server: WebHttpServer, host: WebHost): void {
 		const runId = Number(card?.runId ?? url.searchParams.get("runId"));
 		// The card of a task cut into runs by new messages holds the task's net change: the record of one run is not it.
 		const live =
-			Number.isFinite(runId) && card?.chain !== true
+			commitRun === null && Number.isFinite(runId) && card?.chain !== true
 				? host.tracker.diffForRunFile(runId, file, host.session.getGitCheckpoint())
 				: undefined;
 		if (live) return live;

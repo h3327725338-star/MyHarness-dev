@@ -18,6 +18,7 @@ import {
 	type ChangeDetectionResult,
 	collectCheckpointChanges,
 	type GitTaskChangeSummary,
+	type TaskCommitDelta,
 } from "../../git/repository/workspace-changes.ts";
 import { pathIdentityKey } from "../../utils/paths.ts";
 import {
@@ -73,6 +74,11 @@ export interface RunChangeCardFile extends FileChangeSummary {
 	patchOmitted?: boolean;
 }
 
+export interface RunCommitCard {
+	runId: number;
+	files: RunChangeCardFile[];
+}
+
 export interface RunChangeRecord {
 	runId: number;
 	startedAt: number;
@@ -81,6 +87,7 @@ export interface RunChangeRecord {
 	reliability: "known" | "indeterminate" | "pending";
 	reason?: string;
 	changes: ReviewChange[];
+	commitDelta?: TaskCommitDelta;
 	git?: GitTaskChangeSummary;
 	checkpointId?: string;
 	checkpointStatus?: string;
@@ -307,6 +314,8 @@ export class ChangeTracker {
 	 * the card of the task's last run holds them all (deferRun, finishChain).
 	 */
 	private readonly chain = new Map<string, ChainFile>();
+	private readonly chainCommits: RunCommitCard[] = [];
+	private chainCommitChars = 0;
 	private readonly chainElsewhere = new Map<string, ChangedElsewhere>();
 	private chainBytes = 0;
 	/**
@@ -580,7 +589,8 @@ export class ChangeTracker {
 		record.endedAt = Date.now();
 		if (detection) {
 			record.reliability = detection.status;
-			record.changes = [...detection.changes];
+			record.changes = [...(detection.workingChanges ?? detection.changes)];
+			record.commitDelta = detection.commitDelta;
 			if (detection.status === "indeterminate") record.reason = detection.reason;
 			record.git = detection.git;
 			this.mergeToolChanges(runId, record);
@@ -860,6 +870,61 @@ export class ChangeTracker {
 		});
 	}
 
+	/** Compare immutable Git versions, not the run's dirty starting tree or its ending disk contents. */
+	async runCommitCard(runId: number): Promise<RunCommitCard | undefined> {
+		const delta = this.runs.get(runId)?.commitDelta;
+		if (!delta) return undefined;
+		const changes = delta.changes.slice(0, MAX_FILES_WITH_STATS);
+		const files: RunChangeCardFile[] = new Array(changes.length);
+		let next = 0;
+		let kept = 0;
+		const worker = async () => {
+			while (next < changes.length) {
+				const index = next++;
+				const change = changes[index];
+				const summary: FileChangeSummary = { ...change, additions: 0, deletions: 0, binary: false };
+				const repoPath = toRelative(delta.repositoryRoot, path.resolve(this.cwd, change.path));
+				if (!repoPath) {
+					files[index] = { ...summary, unavailable: "The committed content could not be read from Git." };
+					continue;
+				}
+				const read = async (
+					commit: string,
+					absent: boolean,
+				): Promise<{ text: string | null; binary: boolean; tooLarge?: boolean } | undefined> => {
+					if (absent) return { text: null, binary: false };
+					const spec = `${commit}:${repoPath}`;
+					const size = await runGit(["cat-file", "-s", spec], { cwd: delta.repositoryRoot });
+					if (!size.ok) return undefined;
+					if (Number(size.stdout.trim()) > MAX_TEXT_BYTES) return { text: null, binary: false, tooLarge: true };
+					const content = await gitShowAsync(delta.repositoryRoot, spec);
+					return content.text !== null || content.binary ? content : undefined;
+				};
+				const [before, after] = await Promise.all([
+					read(delta.before, change.status === "added"),
+					read(delta.after, change.status === "deleted"),
+				]);
+				if (!before || !after)
+					files[index] = { ...summary, unavailable: "The committed content could not be read from Git." };
+				else if (before.binary || after.binary) files[index] = { ...summary, binary: true };
+				else if (before.tooLarge || after.tooLarge)
+					files[index] = { ...summary, unavailable: "File is larger than 2 MB; content diff skipped." };
+				else {
+					const { patch } = textDiff(summary, before.text, after.text, change.path);
+					if (!patch) files[index] = summary;
+					else if (patch.length > MAX_CARD_PATCH_CHARS || kept + patch.length > MAX_CARD_PATCH_CHARS_PER_RUN) {
+						files[index] = { ...summary, patchOmitted: true };
+					} else {
+						kept += patch.length;
+						files[index] = { ...summary, patch };
+					}
+				}
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(BEFORE_READ_PARALLEL, changes.length) }, worker));
+		return { runId, files };
+	}
+
 	/**
 	 * The files a finished run left out because they were changed elsewhere, as its card keeps them: names and
 	 * statuses only (never counted, no diffs), at most MAX_CARD_ELSEWHERE_FILES by name plus the full count.
@@ -879,7 +944,21 @@ export class ChangeTracker {
 
 	/** Whether runs a new message cut short have changes that still wait for the card of the task's last run. */
 	hasDeferredRuns(): boolean {
-		return this.chain.size > 0;
+		return this.chain.size > 0 || this.chainCommits.length > 0;
+	}
+
+	deferCommit(card: RunCommitCard): void {
+		this.chainCommits.push({
+			runId: card.runId,
+			files: card.files.map((file) => {
+				const { patch, ...summary } = file;
+				if (!patch) return file;
+				if (this.chainCommitChars + patch.length > MAX_CARD_PATCH_CHARS_PER_RUN)
+					return { ...summary, patchOmitted: true };
+				this.chainCommitChars += patch.length;
+				return file;
+			}),
+		});
 	}
 
 	/**
@@ -939,7 +1018,12 @@ export class ChangeTracker {
 	finishChain(
 		runId: number | undefined,
 		checkpoint: GitCheckpoint | undefined,
-	): { files: RunChangeCardFile[]; elsewhere?: ChangedElsewhere[]; elsewhereTotal?: number } {
+	): {
+		files: RunChangeCardFile[];
+		commits?: RunCommitCard[];
+		elsewhere?: ChangedElsewhere[];
+		elsewhereTotal?: number;
+	} {
 		if (runId !== undefined) this.deferRun(runId, checkpoint);
 		const files: RunChangeCardFile[] = [];
 		let kept = 0;
@@ -973,9 +1057,11 @@ export class ChangeTracker {
 		}
 		const own = new Set(files.map((file) => file.path));
 		const elsewhere = [...this.chainElsewhere.values()].filter((file) => !own.has(file.path));
+		const commits = this.chainCommits.slice();
 		this.clearChain();
 		return {
 			files,
+			...(commits.length > 0 ? { commits } : {}),
 			...(elsewhere.length > 0 ? { elsewhere: elsewhere.slice(0, MAX_CARD_ELSEWHERE_FILES) } : {}),
 			...(elsewhere.length > MAX_CARD_ELSEWHERE_FILES ? { elsewhereTotal: elsewhere.length } : {}),
 		};
@@ -985,6 +1071,8 @@ export class ChangeTracker {
 		this.chain.clear();
 		this.chainElsewhere.clear();
 		this.chainBytes = 0;
+		this.chainCommits.length = 0;
+		this.chainCommitChars = 0;
 	}
 
 	// ---------------------------------------------------------------------

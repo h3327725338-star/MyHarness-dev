@@ -161,6 +161,7 @@ export const MOBILE_ZH = {
 	"Used the browser": "使用了浏览器",
 	"Browser step failed": "浏览器操作失败",
 	"Changed {files}": "改动了 {files}",
+	"Committed {files}": "已提交 {files}",
 	"Background work finished": "后台任务结束",
 	"Earlier messages were summarized": "更早的内容已压缩成摘要",
 	"Continued from another branch": "从另一条分支接着聊",

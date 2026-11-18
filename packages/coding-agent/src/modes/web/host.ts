@@ -52,7 +52,13 @@ import {
 	summarizeRunWork,
 } from "../../utils/popup-notification.ts";
 import type { ChangeClaimRegistry } from "./change-claims.ts";
-import { ChangeTracker, type RunChangeCardFile, type RunChangeRecord, toolCallMayWriteFiles } from "./changes.ts";
+import {
+	ChangeTracker,
+	type RunChangeCardFile,
+	type RunChangeRecord,
+	type RunCommitCard,
+	toolCallMayWriteFiles,
+} from "./changes.ts";
 import type { WebDialogBridge } from "./dialogs.ts";
 import { GenerationSpeedMeter } from "./generation-speed.ts";
 import type { WebHttpServer } from "./http-server.ts";
@@ -400,6 +406,7 @@ export class WebHost {
 	private completionPromise: Promise<void> | undefined;
 	private completionStatus: { phase: "changes" | "records" | "memory"; startedAt: number; runId?: number } | undefined;
 	private runFinished = new Map<number, RunFinishedPayload>();
+	private readonly mirrorCommitCards = new Map<string, RunCommitCard[]>();
 	/** Number of finished runs, and how many of them the browser has shown to the user (unread = the difference). */
 	private finishedRuns = 0;
 	private seenRuns = 0;
@@ -1760,9 +1767,13 @@ export class WebHost {
 				finalDetection ?? detection,
 				session.getGitCheckpoint() ?? checkpoint,
 			);
+			const commit = await this.tracker.runCommitCard(runId).catch((error) => {
+				this.reportCardError(error);
+				return undefined;
+			});
 			const payload = this.buildRunFinished(runId, record, uncommitted);
 			const cardCheckpoint = session.getGitCheckpoint() ?? checkpoint;
-			const hasChanges = !!record && record.changes.length > 0;
+			const hasChanges = !!record && (record.changes.length > 0 || !!commit);
 			if (hasChanges) {
 				// What the files held before the task is read from the checkpoint side by side, not one blocking Git
 				// process per file while the card is built.
@@ -1771,9 +1782,9 @@ export class WebHost {
 			if (payload.outcome === "redirected") {
 				// A new message cut this run short and the task goes on with it: no card yet. The changes are kept in the
 				// session (hidden) and held by the tracker for the card of the task's last run.
-				if (hasChanges) this.deferRunChanges(runId, cardCheckpoint);
+				if (hasChanges) this.deferRunChanges(runId, cardCheckpoint, commit);
 			} else if (hasChanges || this.tracker.hasDeferredRuns()) {
-				this.recordRunChanges(runId, cardCheckpoint);
+				this.recordRunChanges(runId, cardCheckpoint, commit);
 			}
 			this.runFinished.set(runId, payload);
 			this.finishedRuns += 1;
@@ -1792,22 +1803,45 @@ export class WebHost {
 	 * of all those runs, each once, as the task changed them from its start to its end. A mirrored session is written by
 	 * the process that owns it, so here its card is only shown, not saved.
 	 */
-	private recordRunChanges(runId: number | undefined, checkpoint: GitCheckpoint | undefined): void {
+	private recordRunChanges(
+		runId: number | undefined,
+		checkpoint: GitCheckpoint | undefined,
+		commit?: RunCommitCard,
+	): void {
 		try {
 			// Files another chat or another program changed while the task went on are listed with the card, never counted.
 			const chained = this.tracker.hasDeferredRuns();
-			const data = this.cardData(runId, checkpoint, chained);
+			if (chained && commit) this.tracker.deferCommit(commit);
+			const data = {
+				...this.cardData(runId, checkpoint, chained),
+				...(!chained && commit ? { commits: [commit] } : {}),
+			};
 			// A task that was cut into runs always closes in the session, even when nothing is left to list: the held-back
 			// entries of its earlier runs then no longer count (see lastClosingRunChanges).
-			if (data.files.length === 0 && !chained) return;
+			if (data.files.length === 0 && !commit && !chained) return;
 			const id = this.session.isMirror
 				? `run-changes-${runId ?? `chain-${data.runId}`}`
 				: this.session.sessionManager.appendCustomEntry(RUN_CHANGES_ENTRY, data);
 			const item = runChangesToWire(id, Date.now(), data);
-			if (item) this.broadcast("entry_appended", { id, item });
+			if (item) {
+				if (this.session.isMirror && data.commits?.length) {
+					this.mirrorCommitCards.set(id, data.commits);
+					for (const oldest of this.mirrorCommitCards.keys()) {
+						if (this.mirrorCommitCards.size <= 12) break;
+						this.mirrorCommitCards.delete(oldest);
+					}
+				}
+				this.broadcast("entry_appended", { id, item });
+			}
 		} catch (error) {
 			this.reportCardError(error);
 		}
+	}
+
+	/** Saved patches of a recent card broadcast by this mirror without a session entry. */
+	mirrorCommitCard(id: string, commitRun: string): RunCommitCard | undefined {
+		if (!this.session.isMirror) return undefined;
+		return this.mirrorCommitCards.get(id)?.find((group) => String(group.runId) === commitRun);
 	}
 
 	/** The data of a task's card: one run's own changes, or the union of the runs a new message cut the task into. */
@@ -1834,11 +1868,12 @@ export class WebHost {
 	 * the Changes panel and the conversation's file ownership see them at once, and a restart that comes before the task
 	 * ends loses nothing (recoverDeferredRunChanges); the tracker holds them for the one card of the task's last run.
 	 */
-	private deferRunChanges(runId: number, checkpoint: GitCheckpoint | undefined): void {
+	private deferRunChanges(runId: number, checkpoint: GitCheckpoint | undefined, commit?: RunCommitCard): void {
 		try {
 			const data = {
 				runId,
 				deferred: true,
+				...(commit ? { commits: [commit] } : {}),
 				files: this.tracker.runChangeCard(runId, checkpoint),
 				...this.tracker.runChangeCardElsewhere(runId),
 			};
@@ -1847,6 +1882,7 @@ export class WebHost {
 			this.reportCardError(error);
 		}
 		this.tracker.deferRun(runId, checkpoint);
+		if (commit) this.tracker.deferCommit(commit);
 		this.deferredRunId = runId;
 	}
 
@@ -1915,7 +1951,9 @@ export class WebHost {
 		uncommitted: boolean,
 	): RunFinishedPayload {
 		const state = this.lastTerminalRunState ?? this.session.getRunStateSnapshot();
-		const changeCount = record?.changes.length ?? 0;
+		const changeCount = new Set(
+			[...(record?.changes ?? []), ...(record?.commitDelta?.changes ?? [])].map((file) => file.path),
+		).size;
 		let outcome: RunOutcome;
 		switch (state.state) {
 			case "completed":

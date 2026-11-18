@@ -334,6 +334,21 @@ describe.runIf(shouldRun)("web-export-replay-completeness-browser", () => {
 					binary: false,
 				},
 			],
+			commits: [
+				{
+					runId: 101,
+					files: [
+						{
+							path: "packages/coding-agent/src/export.ts",
+							status: "modified",
+							patch: diffPatch.replace("completeness = true", "committed = true"),
+							additions: 2,
+							deletions: 1,
+							binary: false,
+						},
+					],
+				},
+			],
 		});
 
 		// 保存并获取真实磁盘 JSONL
@@ -365,7 +380,7 @@ describe.runIf(shouldRun)("web-export-replay-completeness-browser", () => {
 			settleMs: 3000,
 		});
 		if (!opened.ready) {
-			throw new Error("页面首屏加载超时或未渲染内容");
+			throw new Error(`页面首屏加载超时或未渲染内容: ${JSON.stringify(browser.pageErrors)}`);
 		}
 	}, 120_000);
 
@@ -534,11 +549,7 @@ describe.runIf(shouldRun)("web-export-replay-completeness-browser", () => {
 			clicks.push({ action: 'markerHead', count: markerCount });
 
 			// 点击展开变更文件 -> 展现 .dl / .hunk
-			var changeFile = document.querySelector('.change-file');
-			if (changeFile) {
-				changeFile.click();
-				clicks.push({ action: 'changeFile', clicked: true });
-			}
+			document.querySelectorAll('.change-card .change-file').forEach(function(file) { file.click(); });
 
 			return clicks;
 		})()`);
@@ -553,6 +564,10 @@ describe.runIf(shouldRun)("web-export-replay-completeness-browser", () => {
 				raw: document.querySelectorAll('.raw').length,
 				dl: document.querySelectorAll('.dl').length,
 				hunk: document.querySelectorAll('.hunk').length,
+				groups: Array.from(document.querySelectorAll('.change-card'), card => ({
+					title: card.querySelector('.change-head').textContent,
+					diff: card.querySelector('.change-diff')?.textContent,
+				})),
 				earlierLeft: document.querySelectorAll('.earlier').length,
 				rawTextSnippet: document.querySelector('.raw')?.textContent || '',
 				markerBodySnippet: document.querySelector('.marker-body')?.textContent || '',
@@ -568,6 +583,12 @@ describe.runIf(shouldRun)("web-export-replay-completeness-browser", () => {
 		expect(afterInteract.rawTextSnippet).toContain("SUCCESS");
 		expect(afterInteract.rawTextSnippet).toContain("deep-search");
 		expect(afterInteract.dl).toBeGreaterThanOrEqual(1);
+		expect(afterInteract.groups.find((group: { title: string }) => group.title.includes("已编辑"))?.diff).toContain(
+			"completeness = true",
+		);
+		expect(afterInteract.groups.find((group: { title: string }) => group.title.includes("已提交"))?.diff).toContain(
+			"committed = true",
+		);
 	});
 
 	it("只读收口：命令面板/快捷键/划词引用/本地链接/设置入口在只读页失效，保留项不受影响", async () => {
