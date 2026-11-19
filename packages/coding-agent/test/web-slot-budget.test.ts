@@ -4,7 +4,8 @@
  * stub hosts so no real runtimes are needed.
  */
 
-import { describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import type { WebHost } from "../src/modes/web/host.ts";
 import { WebHttpServer } from "../src/modes/web/http-server.ts";
 import { WebHostHub } from "../src/modes/web/hub.ts";
@@ -105,7 +106,11 @@ function stubHost(slotId: string, spec: StubSpec, disposed: string[]): WebHost {
 		// Aged slots by default: the hub's startup grace only protects freshly created ones.
 		startedAt: spec.startedAt ?? 0,
 		touchedAt: spec.touchedAt,
-		session: { isIdle: !spec.busy },
+		session: {
+			isIdle: !spec.busy,
+			modelRuntime: { getModelsConfigPath: () => join(process.cwd(), "stub-models.json") },
+		},
+		runtimeHost: { services: { settingsManager: { flush: async () => {} } } },
 		completionActive: false,
 		dialogs: { requests: [] },
 		gitTask: null,
@@ -126,10 +131,12 @@ async function tick(): Promise<void> {
 }
 
 describe("WebHostHub.pruneIdle wiring", () => {
+	let hub: WebHostHub;
+	afterEach(async () => hub?.dispose());
 	it("applies the higher fallback cap without closing busy slots", async () => {
 		const disposed: string[] = [];
 		const server = new WebHttpServer();
-		const hub = new WebHostHub({ server, version: "test", onShutdown: () => {} });
+		hub = new WebHostHub({ server, version: "test", onShutdown: () => {} });
 		const internals = hub as unknown as { slots: Map<string, WebHost>; primary: WebHost | undefined };
 		const primary = stubHost("s-primary", { touchedAt: 0 }, disposed);
 		internals.slots.set(primary.slotId, primary);
@@ -165,7 +172,7 @@ describe("WebHostHub.pruneIdle wiring", () => {
 			["s-mid", 10],
 			["s-old", 10],
 		]);
-		const hub = new WebHostHub({
+		hub = new WebHostHub({
 			server,
 			version: "test",
 			onShutdown: () => {},
@@ -196,7 +203,7 @@ describe("WebHostHub.pruneIdle wiring", () => {
 	it("keeps an idle chat whose background command still runs or has not reported yet", async () => {
 		const disposed: string[] = [];
 		const server = new WebHttpServer();
-		const hub = new WebHostHub({
+		hub = new WebHostHub({
 			server,
 			version: "test",
 			onShutdown: () => {},

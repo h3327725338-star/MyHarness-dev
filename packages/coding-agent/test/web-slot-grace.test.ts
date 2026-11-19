@@ -3,7 +3,8 @@
  * 全部用 stub host，不起真实 runtime。
  */
 
-import { describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import type { WebHost } from "../src/modes/web/host.ts";
 import { WebHttpServer } from "../src/modes/web/http-server.ts";
 import { SLOT_STARTUP_GRACE_MS, WebHostHub } from "../src/modes/web/hub.ts";
@@ -19,7 +20,12 @@ function stubHost(slotId: string, spec: StubSpec, disposed: string[]): WebHost {
 		slotId,
 		startedAt: spec.startedAt ?? 0,
 		touchedAt: spec.touchedAt,
-		session: { isIdle: !spec.busy, sessionManager: { getEntryCount: () => 0 } },
+		session: {
+			isIdle: !spec.busy,
+			sessionManager: { getEntryCount: () => 0 },
+			modelRuntime: { getModelsConfigPath: () => join(process.cwd(), "stub-models.json") },
+		},
+		runtimeHost: { services: { settingsManager: { flush: async () => {} } } },
 		completionActive: false,
 		dialogs: { requests: [] },
 		gitTask: null,
@@ -44,11 +50,15 @@ interface HubInternals {
 	opening: Map<string, Promise<WebHost>>;
 }
 
+let activeHub: WebHostHub;
+afterEach(async () => activeHub?.dispose());
+
 function setupHub(
 	disposed: string[],
 	options: ConstructorParameters<typeof WebHostHub>[0] & { server: WebHttpServer },
 ): { hub: WebHostHub; internals: HubInternals; keep: WebHost } {
 	const hub = new WebHostHub(options);
+	activeHub = hub;
 	const internals = hub as unknown as HubInternals;
 	const primary = stubHost("s-primary", { touchedAt: 0 }, disposed);
 	internals.slots.set(primary.slotId, primary);
