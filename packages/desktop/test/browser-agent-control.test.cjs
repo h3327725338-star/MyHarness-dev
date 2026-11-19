@@ -24,6 +24,8 @@ function loadHost() {
       url: '',
       handlers: {},
       on(name, handler) { this.handlers[name] = handler; return this; },
+      listeners(name) { const handler = this.handlers[name]; return handler ? [handler] : []; },
+      removeAllListeners(name) { delete this.handlers[name]; return this; },
       setWindowOpenHandler() {},
       async loadURL(url) { this.url = url; },
       executeJavaScript: async (code) => {
@@ -40,7 +42,7 @@ function loadHost() {
         // Where the input-scale probe landed: set by a test, undefined (no measurement) otherwise.
         return scripts[0].code === 'window.__myharnessProbe.x' ? webContents.probeX : undefined;
       },
-      capturePage: async () => ({ isEmpty: () => false, toPNG: () => Buffer.from('visible'), toJPEG: () => Buffer.from('jpg') }),
+      capturePage: async () => ({ isEmpty: () => !!webContents.emptyCapture, toPNG: () => Buffer.from('visible'), toJPEG: () => Buffer.from('jpg') }),
       navigationHistory: { canGoBack: () => false, canGoForward: () => false },
       isDestroyed: () => false,
       isLoading: () => false,
@@ -160,8 +162,12 @@ test('a background tab has a real viewport and is captured through the page comp
     assert.equal(view.getVisible(), false);
     assert.deepEqual(view.bounds, { x: 0, y: 0, width: 1280, height: 800 }, 'a hidden tab is never laid out smaller than the Agent desktop size');
     const shot = await browser.command({ action: 'snapshot', tabId: hidden.tabId });
-    assert.equal(Buffer.from(shot.snapshot.split(',')[1], 'base64').toString(), 'cdp-png');
+    assert.equal(Buffer.from(shot.snapshot.split(',')[1], 'base64').toString(), 'visible');
     assert.equal(shot.width, 800);
+    assert.ok(!cdp.some((entry) => entry.method === 'Page.captureScreenshot'));
+    view.webContents.emptyCapture = true;
+    const fallback = await browser.command({ action: 'snapshot', tabId: hidden.tabId });
+    assert.equal(Buffer.from(fallback.snapshot.split(',')[1], 'base64').toString(), 'cdp-png');
     assert.ok(cdp.some((entry) => entry.method === 'Page.captureScreenshot'));
     assert.notEqual(shown.tabId, hidden.tabId);
   } finally {

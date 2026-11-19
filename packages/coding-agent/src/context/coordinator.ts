@@ -414,6 +414,7 @@ export class AgentSessionContextCoordinator {
 			autoCompactEnabled: this.host.settingsManager.getCompactionEnabled(),
 			configuredViaCli: this.host.contextWindowOverride !== undefined,
 			managesOwnContext: this.managesOwnContext,
+			providerCompactionThreshold: model?.providerCompactionThreshold,
 		});
 	}
 }

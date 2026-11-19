@@ -17,6 +17,8 @@
 
 当前 library 层没有 Provider catalog，Provider 只来自 `models.json`、Settings 和 Extension registration。Coding Agent 产品层也不内置任何现成预设：Provider 由用户在设置 → Providers 里手动添加（任何兼容 OpenAI、Anthropic、Gemini 或 Mistral 的服务都按普通自定义 Provider 处理）。曾经内置过的 Nebius Token Factory 一键预设已经移除；旧版本写进 `models.json` 的 `nebius` 条目、保存的 Key 和指向它的设置原样保留，按普通 Provider 读取，不再自动升级条目里的 thinking 档位和缓存价格。曾内置的 OpenAI ChatGPT（Codex App Server）和 Command Code Provider 已从 MyHarness 移出，MyHarness 不再加载它们。
 
+桌面和 Web 服务运行时会自动加载直接保存到 `models.json` 和 `auth.json` 的修改，包括 Agent 代改的模型列表、接口地址和 API Key。已打开的模型列表会自动刷新。进行中的任务继续使用原配置，空闲后加载新配置。若外部编辑移除了当前模型，下次发送会提示重新选择。文件无法读取或配置格式有误时，会提示检查文件并保留上一份有效配置。修改系统环境变量或扩展代码不属于这项热重载。
+
 <a id="api-keys"></a>
 ## API Keys
 

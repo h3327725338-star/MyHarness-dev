@@ -98,6 +98,34 @@ describe("AgentSession compaction characterization", () => {
 		}
 	});
 
+	it("writes a provider-requested checkpoint before sending the pending prompt once", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prompt_compact", (event) => event.requestSummary());
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.agent.state.model = { ...harness.getModel(), managesOwnContext: true };
+		seedCompactableSession(harness);
+		const calls = useSummaryStreamFn(harness, "portable checkpoint");
+		await harness.session.prompt("pending original message");
+		const entries = harness.sessionManager.getBranch();
+		const checkpoint = entries.findIndex((entry) => entry.type === "compaction");
+		const pending = entries.flatMap((entry, index) =>
+			entry.type === "message" &&
+			entry.message.role === "user" &&
+			JSON.stringify(entry.message.content).includes("pending original message")
+				? [index]
+				: [],
+		);
+		expect(checkpoint).toBeGreaterThan(-1);
+		expect(pending).toHaveLength(1);
+		expect(pending[0]).toBeGreaterThan(checkpoint);
+		expect(calls()).toBe(2);
+	});
+
 	it("persists provider usage and the full replacement checkpoint", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

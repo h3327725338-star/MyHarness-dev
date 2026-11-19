@@ -41,6 +41,7 @@ import type { RuntimeCredentials } from "../credentials/runtime.ts";
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
+	clearApiKeyCache,
 	composeModelProvider,
 	configuredRequestAuthStatus,
 	type ProviderConfigInput,
@@ -1194,6 +1195,29 @@ export class ModelRuntime implements Models {
 		this.config = config;
 		this.rebuildProviders();
 		await this.refresh({ allowNetwork: this.modelNetworkEnabled });
+	}
+
+	/** Reload each valid file independently, without remote model discovery. */
+	async reloadProviderFiles(canApply: () => boolean): Promise<readonly string[] | undefined> {
+		const config = await ModelConfig.load(this.modelsPath);
+		if (!canApply()) return undefined;
+		const errors: string[] = [];
+		try {
+			if (config.getError()) throw new Error("Invalid models.json");
+			for (const id of new Set([...config.getProviderIds(), ...this.config.getProviderIds()])) {
+				const base = this.nativeExtensionProviders.get(id);
+				const extension = this.extensionProviders.get(id);
+				if (config.getProvider(id) || extension) composeModelProvider(id, base, config, extension);
+			}
+			this.config = config;
+		} catch {
+			errors.push("models.json");
+		}
+		if (!this.credentials.reload()) errors.push("auth.json");
+		clearApiKeyCache();
+		this.rebuildProviders();
+		await this.refresh({ allowNetwork: false });
+		return errors;
 	}
 
 	/**

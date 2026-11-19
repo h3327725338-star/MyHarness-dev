@@ -385,25 +385,44 @@ export class AuthStorage implements ApiKeyCollectionStore {
 	}
 
 	private parseStorageData(content: string | undefined): AuthStorageData {
-		if (!content) {
-			return {};
+		if (content === undefined) return {};
+		let value: unknown;
+		try {
+			value = JSON.parse(content);
+		} catch {
+			throw new Error("Invalid auth.json JSON");
 		}
-		return JSON.parse(content) as AuthStorageData;
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid auth.json object");
+		for (const entry of Object.values(value)) {
+			if (
+				!entry ||
+				(entry.type === "api_key"
+					? (entry.key !== undefined && typeof entry.key !== "string") ||
+						(entry.env !== undefined &&
+							(!entry.env ||
+								typeof entry.env !== "object" ||
+								Array.isArray(entry.env) ||
+								Object.values(entry.env).some((item) => typeof item !== "string")))
+					: entry.type !== "oauth" ||
+						typeof entry.access !== "string" ||
+						typeof entry.refresh !== "string" ||
+						typeof entry.expires !== "number")
+			)
+				throw new Error("Invalid auth.json credential");
+		}
+		return value as AuthStorageData;
 	}
 
 	/**
 	 * Reload credentials from storage.
 	 */
-	reload(): void {
-		let content: string | undefined;
+	reload(): boolean {
 		try {
-			this.storage.withLock((current) => {
-				content = current;
-				return { result: undefined };
-			});
-			this.data = this.parseStorageData(content);
+			this.data = this.storage.withLock((current) => ({ result: this.parseStorageData(current) }));
+			return true;
 		} catch {
-			// Preserve the last valid in-memory snapshot.
+			// Preserve the last valid in-memory snapshot. Parsing errors can contain credential values.
+			return false;
 		}
 	}
 

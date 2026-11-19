@@ -24,6 +24,8 @@ function loadBrowser(options = {}) {
       url: '',
       on(event, handler) { handlers.set(event, handler); return this; },
       once(event, handler) { handlers.set(event, handler); return this; },
+      listeners(event) { const handler = handlers.get(event); return handler ? [handler] : []; },
+      removeAllListeners(event) { handlers.delete(event); return this; },
       setWindowOpenHandler(handler) { this.openHandler = handler; },
       async loadURL(url) { this.url = url; webContents.loaded.push(url); },
       downloadURL(url) { webContents.downloaded.push(url); },

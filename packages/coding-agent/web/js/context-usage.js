@@ -119,6 +119,7 @@ export function ContextDetails({ onDone, capacityOnly = false, controls }) {
 			<div class=${`cu-pct ${level}`}>${percentText}</div>
 		</div>
 		<div class="cu-bar" role="img" aria-label=${`${percentText} ${t("used")}`} ><i class=${`cu-fill ${level}`} style=${{ width: `${knownWindow ? Math.min(100, pct(data.used ?? 0, window_)) : 0}%` }} /></div>
+		${snap?.context?.budget?.providerCompactionThreshold > 0 ? html`<div class="dim cu-sub">${t("Auto-compaction threshold")}: ${fmtK(snap.context.budget.providerCompactionThreshold)}</div>` : null}
 		<div class=${capacityOnly ? "cu-capacity-row" : "cu-stats"}>
 			<div class="cu-stat" title=${tokensText(remaining)}><span class="dim">${t("Remaining")}</span><strong>${tokensText(remaining)}</strong></div>
 			${controls ? html`<div class="cu-controls">${controls}</div>` : null}

@@ -11,8 +11,8 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, statSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { existsSync, statSync, unwatchFile, watchFile } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 import type { AgentSessionRuntime } from "../../agent/runtime/session-runtime.ts";
 import type { WorkspaceStore } from "../../application/workspace-store.ts";
 import { WorkspaceStore as WorkspaceStoreImpl } from "../../application/workspace-store.ts";
@@ -116,6 +116,11 @@ export class WebHostHub implements WebHostHubLink {
 	private disposed = false;
 	/** Slots whose model list changed while they were busy; they are reconciled as soon as they are idle. */
 	private readonly deferredModelsReconcile = new Set<string>();
+	private readonly providerFileWatches = new Map<string, () => void>();
+	private readonly pendingProviderReloads = new Set<WebHost>();
+	private providerReload: Promise<void> | undefined;
+	private readonly providerReloadErrors = new Map<string, readonly string[]>();
+	private readonly providerFileStamps = new Map<string, string>();
 	/** Route code sees this as a normal WebHost; every access is forwarded to the slot the request addresses. */
 	readonly host: WebHost;
 
@@ -168,6 +173,7 @@ export class WebHostHub implements WebHostHubLink {
 		});
 		this.slots.set(host.slotId, host);
 		await host.start();
+		this.updateProviderFileWatches();
 		this.scheduleStatus();
 		return host;
 	}
@@ -210,8 +216,136 @@ export class WebHostHub implements WebHostHubLink {
 			}
 		}
 		// A slot that missed a model update while it was busy catches up once its work has settled.
-		if (this.deferredModelsReconcile.has(host.slotId) && host.session.isIdle)
+		if (event === "session_replaced") this.updateProviderFileWatches();
+		if (
+			this.deferredModelsReconcile.has(host.slotId) &&
+			host.session.isIdle &&
+			!this.pendingProviderReloads.has(host)
+		)
 			this.reconcileSlot(host, "models_changed");
+		if (this.pendingProviderReloads.size && host.session.isIdle) void this.flushProviderFiles();
+	}
+
+	private providerFiles(host: WebHost): string[] {
+		const models = host.session.modelRuntime.getModelsConfigPath();
+		const auth = join(models ? dirname(models) : host.runtimeHost.services.agentDir, "auth.json");
+		return models ? [models, auth] : [auth];
+	}
+
+	private updateProviderFileWatches(): void {
+		if (this.disposed) return;
+		const paths = new Set(this.all().flatMap((host) => this.providerFiles(host)));
+		for (const [path, stop] of this.providerFileWatches) {
+			if (paths.has(path)) continue;
+			stop();
+			this.providerFileWatches.delete(path);
+			this.providerFileStamps.delete(path);
+			this.providerReloadErrors.delete(path);
+		}
+		for (const path of paths) {
+			if (this.providerFileWatches.has(path)) continue;
+			this.providerFileStamps.set(path, this.providerFileStamp(path));
+			const listener = () => {
+				this.detectProviderFileChange(path);
+				void this.flushProviderFiles();
+			};
+			// Watching the path by stat also sees creation and atomic replacement on Windows.
+			watchFile(path, { interval: 400, persistent: false }, listener);
+			this.providerFileWatches.set(path, () => unwatchFile(path, listener));
+		}
+	}
+
+	private providerFileStamp(path: string): string {
+		try {
+			const info = statSync(path, { bigint: true });
+			return `${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code ?? "unreadable";
+		}
+	}
+
+	private detectProviderFileChange(path: string): void {
+		const stamp = this.providerFileStamp(path);
+		if (this.providerFileStamps.get(path) === stamp) return;
+		this.providerFileStamps.set(path, stamp);
+		for (const host of this.slots.values()) {
+			if (this.providerFiles(host).includes(path)) this.pendingProviderReloads.add(host);
+		}
+	}
+
+	async refreshProviderFilesBeforePrompt(host: WebHost): Promise<void> {
+		for (const path of this.providerFiles(host)) this.detectProviderFileChange(path);
+		while (this.providerReload || this.pendingProviderReloads.has(host)) {
+			const reload = this.flushProviderFiles();
+			// If a sibling is busy, let the prompt proceed on the current shared configuration.
+			if (!reload) break;
+			await reload;
+		}
+	}
+
+	/** Applied as a group because chats in the same directory can share a ModelRuntime. */
+	private flushProviderFiles(): Promise<void> | undefined {
+		if (this.providerReload) return this.providerReload;
+		if (this.disposed || !this.pendingProviderReloads.size) return;
+		const groups = new Map<AgentSessionRuntime["session"]["modelRuntime"], WebHost[]>();
+		for (const host of this.slots.values()) {
+			const runtime = host.session.modelRuntime;
+			const group = groups.get(runtime);
+			if (group) group.push(host);
+			else groups.set(runtime, [host]);
+		}
+		const ready = [...groups].filter(
+			([, hosts]) =>
+				hosts.some((host) => this.pendingProviderReloads.has(host)) && hosts.every((host) => host.session.isIdle),
+		);
+		if (!ready.length) return;
+		const reload = Promise.resolve()
+			.then(async () => {
+				for (const [runtime, hosts] of ready) {
+					if (this.disposed || hosts.some((host) => !host.session.isIdle)) continue;
+					const sessions = hosts.map((host) => ({ host, session: host.session }));
+					for (const host of hosts) this.pendingProviderReloads.delete(host);
+					const stillOpen = () =>
+						sessions.filter(({ host, session }) => this.slots.has(host.slotId) && host.session === session);
+					const errors = await runtime
+						.reloadProviderFiles(
+							() =>
+								!this.disposed &&
+								this.all().every((host) => host.session.modelRuntime !== runtime || host.session.isIdle),
+						)
+						.catch(() => ["Provider configuration"]);
+					if (this.disposed) return;
+					if (!errors) {
+						for (const { host } of stillOpen()) this.pendingProviderReloads.add(host);
+						continue;
+					}
+					const path = this.providerFiles(hosts[0])[0];
+					const previous = this.providerReloadErrors.get(path) ?? [];
+					if (errors.length) this.providerReloadErrors.set(path, errors);
+					else this.providerReloadErrors.delete(path);
+					for (const file of errors) {
+						if (!previous.includes(file))
+							this.options.server.broadcast("notice", {
+								message: `${file} 重载失败，请检查配置文件。`,
+								type: "error",
+							});
+					}
+					for (const { host, session } of stillOpen()) {
+						if (!session.isIdle) {
+							this.pendingProviderReloads.add(host);
+							continue;
+						}
+						if (!session.isMirror) session.reconcileExternalProviderChange();
+						this.options.server.broadcast("models_changed", { slot: host.slotId });
+					}
+				}
+			})
+			.finally(() => {
+				this.providerReload = undefined;
+				void this.flushProviderFiles();
+			});
+		this.providerReload = reload;
+		return reload;
 	}
 
 	/**
@@ -610,6 +744,9 @@ export class WebHostHub implements WebHostHubLink {
 	async closeSlot(host: WebHost): Promise<void> {
 		if (!this.slots.delete(host.slotId)) return;
 		this.deferredModelsReconcile.delete(host.slotId);
+		this.pendingProviderReloads.delete(host);
+		this.updateProviderFileWatches();
+		void this.flushProviderFiles();
 		if (this.primary === host) this.primary = this.all()[0];
 		await host.dispose();
 		this.options.server.broadcast("slot_closed", { slot: host.slotId });
@@ -668,6 +805,10 @@ export class WebHostHub implements WebHostHubLink {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		for (const stop of this.providerFileWatches.values()) stop();
+		this.providerFileWatches.clear();
+		this.pendingProviderReloads.clear();
+		await this.providerReload;
 		if (this.statusTimer) clearTimeout(this.statusTimer);
 		const hosts = this.all();
 		this.slots.clear();

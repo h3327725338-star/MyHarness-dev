@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -977,6 +977,7 @@ describe("Web host (real runtime with a faux provider)", () => {
 		// An undecided thinking-effort test is tried again; the tests do not wait between the attempts.
 		registerProviderRoutes(server, host, hub);
 		await hub.addPrimary(runtimeHost, dialogs);
+		cleanups.push(() => hub.dispose());
 		const address = await server.listen(0);
 		cleanups.push(() => server.close());
 
@@ -4014,7 +4015,8 @@ describe("Web host (real runtime with a faux provider)", () => {
 			models: [{ id: "deepseek-v4.1-flash" }],
 		};
 		await fx.post("/api/providers/custom/save", { id: "opencode-rename", config }, first.slot);
-		const other = await fx.post("/api/sessions/new", {}, first.slot);
+		const other = await fx.post("/api/sessions/new", { rootPath: tempDir("myharness-rename-sibling") }, first.slot);
+		expect(other.slot).not.toBe(first.slot);
 		await fx.post("/api/model", { provider: "opencode-rename", id: "deepseek-v4.1-flash" }, other.slot);
 		// The first chat runs a task (on the faux model) while the other chat renames the model.
 		let release: () => void = () => {};
@@ -4028,8 +4030,10 @@ describe("Web host (real runtime with a faux provider)", () => {
 			},
 		]);
 		const owner = fx.hub.get(first.slot)!;
+		const fauxModel = fx.faux.getModel();
+		await fx.post("/api/model", { provider: fauxModel.provider, id: fauxModel.id }, first.slot);
 		cleanups.push(() => release());
-		const running = owner.submit("work");
+		await fx.post("/api/prompt", { text: "busy chat" }, first.slot);
 		await vi.waitFor(() => expect(owner.session.isIdle).toBe(false));
 		await fx.post(
 			"/api/providers/custom/save",
@@ -4042,7 +4046,6 @@ describe("Web host (real runtime with a faux provider)", () => {
 		);
 		expect((await fx.get("/api/state", other.slot)).model?.name).toBe("oc-ds");
 		release();
-		await running;
 		await owner.session.waitForIdle();
 		// Nothing else happens in the first chat: its catalog must still catch up once its run is over.
 		await vi.waitFor(async () => {
@@ -4072,6 +4075,99 @@ describe("Web host (real runtime with a faux provider)", () => {
 		if (!address || typeof address === "string") throw new Error("endpoint has no port");
 		return { baseUrl: `http://127.0.0.1:${address.port}/v1`, requests };
 	}
+
+	it("hot reloads externally saved model and credential files and keeps the selected model on removal", async () => {
+		const fx = await start({ authFile: true });
+		const { slot } = await fx.get("/api/state");
+		const dir = process.env.MYHARNESS_CODING_AGENT_DIR!;
+		const models = join(dir, "models.json");
+		const auth = join(dir, "auth.json");
+		const reply = (_req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
+			res.setHeader("content-type", "text/event-stream");
+			res.end(
+				`data: ${JSON.stringify({ id: "1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "hello" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+			);
+		};
+		const firstEndpoint = await startEndpoint(reply);
+		const secondEndpoint = await startEndpoint(reply);
+		const config = {
+			api: "openai-completions",
+			baseUrl: firstEndpoint.baseUrl,
+			models: [{ id: "first" }, { id: "second" }],
+		};
+		const save = (path: string, data: unknown) => {
+			writeFileSync(`${path}.tmp`, JSON.stringify(data));
+			renameSync(`${path}.tmp`, path);
+		};
+		const runtime = fx.hub.get(slot)!.session.modelRuntime;
+		const originalAuth = JSON.parse(readFileSync(auth, "utf8"));
+		save(auth, { ...originalAuth, external: { type: "api_key", key: "old-key" } });
+		save(models, { providers: { external: config } });
+		await fx.waitFor("models_changed", (data) => data.slot === slot);
+		expect((await fx.get("/api/models", slot)).providers).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: "external" })]),
+		);
+		await fx.post("/api/model", { provider: "external", id: "first" }, slot);
+
+		writeFileSync(models, '{"providers":');
+		await fx.waitFor("notice", (data) => data.message?.startsWith("models.json 重载失败"));
+		expect(runtime.getModel("external", "first")?.baseUrl).toBe(config.baseUrl);
+
+		save(auth, { external: { type: "api_key", key: 123 } });
+		await fx.waitFor("notice", (data) => data.message?.startsWith("auth.json 重载失败"));
+		expect((await runtime.getAuth("external"))?.auth.apiKey).toBe("old-key");
+		save(models, { providers: { external: { ...config, baseUrl: secondEndpoint.baseUrl } } });
+		const owner = fx.hub.get(slot)!;
+		await vi.waitFor(() => expect(owner.session.model?.baseUrl).toBe(secondEndpoint.baseUrl), { timeout: 2500 });
+		save(auth, { ...originalAuth, external: { type: "api_key", key: "new-key" } });
+		await fx.post("/api/prompt", { text: "use the new address and credentials" }, slot);
+		await fx.waitFor("agent_settled", (data) => data.slot === slot);
+		expect(firstEndpoint.requests).toEqual([]);
+		expect(secondEndpoint.requests).toEqual([{ url: "/v1/chat/completions", authorization: "Bearer new-key" }]);
+
+		save(models, { providers: { external: { ...config, models: [{ id: "second" }] } } });
+		await vi.waitFor(() => expect(runtime.getModel("external", "first")).toBeUndefined(), { timeout: 2500 });
+		expect((await fx.get("/api/models", slot)).currentAvailable).toBe(false);
+		expect((await fx.get("/api/state", slot)).model?.id).toBe("first");
+		await expect(fx.post("/api/prompt", { text: "hello" }, slot)).rejects.toThrow("请从模型菜单重新选择");
+	});
+
+	it("hot reloads a shared runtime after its busy chat settles", async () => {
+		const fx = await start();
+		const { slot } = await fx.get("/api/state");
+		const other = await fx.post("/api/sessions/new", { rootPath: tempDir("myharness-reload-sibling") }, slot);
+		expect(other.slot).not.toBe(slot);
+		const owner = fx.hub.get(slot)!;
+		const sibling = fx.hub.get(other.slot)!;
+		expect(owner.session.modelRuntime).toBe(sibling.session.modelRuntime);
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		cleanups.push(() => release());
+		fx.faux.setResponses([
+			async () => {
+				await gate;
+				return fauxAssistantMessage([fauxText("finished")]);
+			},
+		]);
+		await fx.post("/api/prompt", { text: "busy chat" }, slot);
+		await vi.waitFor(() => expect(owner.session.isIdle).toBe(false));
+		const model = owner.session.model!;
+		writeFileSync(
+			join(process.env.MYHARNESS_CODING_AGENT_DIR!, "models.json"),
+			JSON.stringify({
+				providers: { [model.provider]: { modelOverrides: { [model.id]: { name: "Updated while busy" } } } },
+			}),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 550));
+		expect(owner.session.model).toBe(model);
+		expect(sibling.session.model?.name).not.toBe("Updated while busy");
+		release();
+		await fx.waitFor("models_changed", (data) => data.slot === other.slot);
+		expect(owner.session.model?.name).toBe("Updated while busy");
+		expect(sibling.session.model?.name).toBe("Updated while busy");
+	});
 
 	it("detects models with the unsaved form state and reports why a detection failed", async () => {
 		const fx = await start();

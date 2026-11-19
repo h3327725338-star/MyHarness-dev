@@ -38,14 +38,14 @@
  * same check is made here, hidden (NO_AUTO_UPDATE_ENV, keepUpdated).
  *
  * The conversation and its context belong to `agy` (managesOwnContext): MyHarness shows how full the window is, as `agy`
- * reports it, and does not gate on it or compact automatically. Manual compaction creates a portable MyHarness
+ * reports it without applying the normal MyHarness budget gate. Manual compaction creates a portable MyHarness
  * checkpoint in a separate request and rebuilds the agy conversation from it. Which conversation a chat continues is remembered, and it is
  * resumed after `agy` was restarted when `agy` supports that; otherwise the chat's earlier messages go along as text,
  * within what `agy` takes in one message (MAX_PROMPT_BYTES): the newest are kept and the oldest left out, and a message
  * `agy` still cut short is reported to the user (cutFromInput).
  * `agy` compacts by itself near the end of its own window. A shorter length can be set per model on the provider's
  * card (Settings → Provider → agy): a conversation that has reached it is compacted by `agy`'s own /compact before the
- * next message, and the chat's meter is measured against that length.
+ * next message when possible, otherwise MyHarness writes a portable checkpoint. The meter uses agy's own window.
  *
  * Models: the ones `agy` lists for the signed-in account, each with the thinking levels `agy` offers for it. They come
  * from `agy models` before any conversation has run, and from every conversation's own list after that; the reasoning
@@ -81,7 +81,7 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { createAssistantMessageEventStream, createProvider } from "@myharness/ai";
+import { calculateContextTokens, createAssistantMessageEventStream, createProvider } from "@myharness/ai";
 import type { ExtensionAPI } from "@myharness/coding-agent";
 import { Type } from "typebox";
 
@@ -775,11 +775,8 @@ export function contextLimit(modelId: string): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= MIN_CONTEXT_LIMIT ? value : undefined;
 }
 
-/** The window a model's chats are measured against: the user's length while it is within what `agy` has for the model. */
 function windowFor(model: KnownModel): number {
-	const own = model.window && model.window > 0 ? model.window : DEFAULT_CONTEXT_WINDOW;
-	const limit = contextLimit(model.id);
-	return limit ? Math.min(limit, own) : own;
+	return model.window && model.window > 0 ? model.window : DEFAULT_CONTEXT_WINDOW;
 }
 
 function modelEntry(model: KnownModel): any {
@@ -793,6 +790,7 @@ function modelEntry(model: KnownModel): any {
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: windowFor(model),
+		providerCompactionThreshold: contextLimit(model.id),
 		// The conversation and its compaction are `agy`'s.
 		managesOwnContext: true,
 		// Its own tools act inside `agy`: the task's checkpoint is taken when the task starts (see Model.runsOwnTools).
@@ -826,7 +824,12 @@ function saveModels(next: KnownModel[]): void {
 	for (const model of next) {
 		const entry = held.find((candidate) => candidate.id === model.id);
 		if (entry)
-			Object.assign(entry, { name: `agy · ${model.name}`, ...reasoningOf(model), contextWindow: windowFor(model) });
+			Object.assign(entry, {
+				name: `agy · ${model.name}`,
+				...reasoningOf(model),
+				contextWindow: windowFor(model),
+				providerCompactionThreshold: contextLimit(model.id),
+			});
 		else held.push(modelEntry(model));
 	}
 	for (let at = held.length - 1; at >= 0; at--) {
@@ -1913,6 +1916,7 @@ class AcpSession {
 			if (this.turnOpen) this.push({ type: "__exit", problem });
 		};
 		this.connection = connection;
+		this.commands = [];
 		// Stop, or a close, can come while `agy` is still starting: that `agy` is ended here, not left running unused.
 		const stillWanted = () => {
 			if (this.connection !== connection) throw new Error("已中断");
@@ -1995,6 +1999,7 @@ class AcpSession {
 			}
 		}
 		if (!resumed) {
+			this.usage = undefined;
 			answer = await connection.request("session/new", setup, OPEN_TIMEOUT_MS);
 			this.acpSessionId = String(answer?.sessionId ?? "");
 			if (!this.acpSessionId) throw new Error("agy 没有给出会话 id");
@@ -2585,22 +2590,23 @@ class AcpSession {
 	}
 
 	/**
-	 * `agy`'s own /compact, for "Compact now". Only an `agy` that is running, idle and offers the command is asked; the
-	 * conversation is `agy`'s, so nothing else here can shorten it.
+	 * A successful command must provide a fresh, lower reading in addition to finishing its turn.
 	 */
-	async compact(signal: AbortSignal | undefined): Promise<{ tokensBefore: number } | undefined> {
-		if (!this.connection?.child || this.turnOpen || this.turnActive || !this.commands.includes("compact"))
-			return undefined;
-		const tokensBefore = this.usage?.used ?? 0;
-		// The command is `agy`'s own and is answered inside `agy`; whatever it records for it is no request of a turn.
-		this.takeRequests();
+	async compact(tokensBefore: number, signal: AbortSignal): Promise<boolean> {
 		const connection = this.connection;
-		const onAbort = () => connection.notify("session/cancel", { sessionId: this.acpSessionId });
-		signal?.addEventListener("abort", onAbort, { once: true });
+		if (!connection?.child || this.turnOpen || this.turnActive || this.draining || !this.commands.includes("compact"))
+			return false;
+		const before = this.usage;
+		const usageDropped = () => !!this.usage && this.usage !== before && this.usage.used < tokensBefore;
+		this.takeRequests();
+		const onAbort = () => this.interrupt();
+		signal.addEventListener("abort", onAbort, { once: true });
+		this.compactingNow = true;
+		showStatus(this.sessionId);
 		this.silent = true;
 		this.turnActive = true;
 		try {
-			if (signal?.aborted) return undefined;
+			if (signal.aborted) return false;
 			const answer = await connection.request(
 				"session/prompt",
 				{
@@ -2609,36 +2615,26 @@ class AcpSession {
 				},
 				TURN_IDLE_MS,
 			);
-			return answer?.stopReason === "end_turn" ? { tokensBefore } : undefined;
+			if (answer?.stopReason !== "end_turn") return false;
+			for (
+				let waited = 0;
+				!usageDropped() && this.running && !signal.aborted && waited < USAGE_SETTLE_MS;
+				waited += 50
+			) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			return !signal.aborted && this.running && usageDropped();
 		} catch {
 			this.close();
-			return undefined;
+			return false;
 		} finally {
 			this.silent = false;
 			this.turnActive = false;
+			this.compactingNow = false;
 			this.touchActivity();
 			this.settleDraining();
 			this.takeRequests();
-			signal?.removeEventListener("abort", onAbort);
-		}
-	}
-
-	/**
-	 * The user set how long this model's conversation may grow (Settings → Provider → agy). `agy` itself only compacts
-	 * near the end of its own window, so a conversation that has reached that length is compacted here, by `agy`'s own
-	 * /compact, before the next message goes to it. Nothing happens while `agy` offers no such command.
-	 */
-	async compactAtLimit(modelId: string, signal: AbortSignal | undefined): Promise<void> {
-		const limit = contextLimit(modelId);
-		if (!limit || this.ephemeral || !this.usage || this.usage.used < limit) return;
-		// Commands are advertised asynchronously after session/new, sometimes after its first short answer.
-		if (!this.commands.length) await new Promise((resolve) => setTimeout(resolve, 100));
-		this.compactingNow = true;
-		showStatus(this.sessionId);
-		try {
-			await this.compact(signal);
-		} finally {
-			this.compactingNow = false;
+			signal.removeEventListener("abort", onAbort);
 			showStatus(this.sessionId);
 		}
 	}
@@ -2844,9 +2840,6 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 				await session.applyModel(model, effort);
 				session.setInstructions(context.systemPrompt);
 			}
-			// A conversation that has reached the length the user set for this model is compacted before it grows on.
-			await session.compactAtLimit(model.id, signal);
-			if (!session.running) throw new Error("agy 在压缩上下文时退出或超时，请重试。");
 			return { type: "ready" as const };
 		})();
 		let outcome: { type: "ready" | "__abort" };
@@ -2939,7 +2932,7 @@ async function runTurn(stream: any, session: AcpSession, model: any, context: an
 	};
 	/**
 	 * What this round used. How full the context is comes from `agy` itself, and MyHarness measures it against the
-	 * window `agy` names (or the shorter length the user set). What the round's model requests read, read from the
+	 * window `agy` names. What the round's model requests read, read from the
 	 * cache and wrote comes from `agy`'s record of the conversation: a round is every request since the last one read,
 	 * usually one, and none when `agy` only went on to the next tool of a request already counted.
 	 */
@@ -3573,22 +3566,17 @@ export function setContextLimit(modelId: string, text: string): void {
 		limits[modelId] = tokens;
 	}
 	writeJson(settingsFile(), { ...settings, contextLimits: limits });
-	// Every open chat on the model measures against the new length at once.
 	saveModels(known);
 }
 
-/**
- * One setting per model, for the provider's card: how long that model's conversation may grow. `agy` compacts only
- * near the end of its own window, so a conversation that has reached the user's length is compacted by `agy`'s own
- * /compact before the next message (compactAtLimit).
- */
+/** One optional automatic compaction threshold per model, independent of its window. */
 function contextSettings(): any[] {
 	return readKnownModels().map((model) => ({
 		id: `context-length:${model.id}`,
 		model: model.id,
-		label: "上下文长度",
+		label: "自动压缩阈值",
 		description:
-			"对话到这个长度后，发下一条消息前先让 agy 压缩一次。留空就用 agy 自己的上限，它快满时自己压缩。可填 50K 到该模型的上限，例如 300k，下一轮生效。",
+			"达到阈值后，下条消息前优先用 agy 原生压缩；不可用、失败或用量没有下降时，用 MyHarness 摘要压缩。留空仅使用 agy 自身的压缩机制。可填 50K 到模型窗口，例如 300k。",
 		placeholder: formatTokens(model.window && model.window > 0 ? model.window : DEFAULT_CONTEXT_WINDOW),
 		get: () => {
 			const limit = contextLimit(model.id);
@@ -3788,6 +3776,70 @@ export default function (pi: ExtensionAPI) {
 		shared.sessions.set(sessionId, session);
 		session.warm(model, effortFor(model, pi.getThinkingLevel()), event.systemPrompt, tools);
 		return undefined;
+	});
+
+	pi.on("session_before_prompt_compact", async ({ signal, requestSummary }, ctx) => {
+		const model = ctx.model;
+		if (!model || !usingAgy(model)) return;
+		const limit = contextLimit(model.id);
+		if (!limit || signal.aborted) return;
+		const id = sessionIdOf(ctx);
+		const existing = shared.sessions.get(id);
+		// ACP can resume without sending a usage event. Use the most recent persisted agy reading on the active
+		// branch in that case, never a reading older than a MyHarness checkpoint or from another model.
+		let recorded: number | undefined;
+		for (const entry of ctx.sessionManager.getBranch().reverse()) {
+			if (entry.type === "compaction") break;
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const message = entry.message;
+			if (message.provider !== PROVIDER_ID || message.model !== model.id) break;
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			recorded = calculateContextTokens(message.usage) || undefined;
+			if (recorded !== undefined) break;
+		}
+		const used = existing?.usage?.used ?? recorded;
+		if (used === undefined || used < limit) return;
+
+		const session = existing ?? new AcpSession(id);
+		shared.sessions.set(id, session);
+		let opening = false;
+		const onAbort = () => {
+			if (opening) session.close();
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		let native = false;
+		try {
+			await session.warming;
+			signal.throwIfAborted();
+			session.hold();
+			if (!session.running && !session.startOver && readLinks()[id]) {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				signal.throwIfAborted();
+				if (auth.ok) {
+					const apiKey = savedKey(auth);
+					const active = new Set(pi.getActiveTools());
+					session.tools = pi.getAllTools().filter((tool) => active.has(tool.name));
+					session.signature = launchSignature(session.activeNames(), apiKey);
+					opening = true;
+					await session.start(model, effortFor(model, pi.getThinkingLevel()), ctx.getSystemPrompt(), apiKey);
+					opening = false;
+				}
+			}
+			if (session.running && !session.needsHistory && !session.startOver && !signal.aborted) {
+				// On an actual resume an ACP reading can arrive before the prompt; prefer it over the saved one.
+				const current = session.usage?.used ?? used;
+				if (current < limit) return;
+				if (!session.commands.length) await new Promise((resolve) => setTimeout(resolve, 100));
+				native = await session.compact(current, signal);
+			}
+		} catch {
+			// The portable checkpoint path also covers a failed native reconnect.
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+		if (signal.aborted) return;
+		if (native) ctx.ui.notify("已使用 agy 原生压缩上下文。", "info");
+		else requestSummary();
 	});
 
 	pi.on("turn_end", async (event: any) => {

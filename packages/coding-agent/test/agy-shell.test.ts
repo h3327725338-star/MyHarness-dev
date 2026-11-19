@@ -1496,9 +1496,21 @@ describe("agy-shell with a stand-in agy", () => {
 		expect(final.message.usage).toMatchObject({ input: 50, cacheRead: 900, output: 5 });
 	});
 
-	it("lets the user set a model's context length, and has agy compact a conversation that reached it", async () => {
+	function promptCompactionHook() {
+		const handlers = new Map<string, any>();
+		agyShell({
+			registerProvider() {},
+			registerTool() {},
+			registerCommand() {},
+			on: (name: string, handler: any) => handlers.set(name, handler),
+		} as any);
+		return handlers.get("session_before_prompt_compact");
+	}
+
+	it("keeps the agy window separate and verifies native compaction before sending the next prompt", async () => {
 		setEnv("MOCK_ACP_COMMANDS", "compact");
 		setEnv("MOCK_ACP_COMPACT_TO", "20000");
+		setEnv("MOCK_ACP_COMPACT_MODE", "late");
 		internals.shared.models = [];
 		const chatModel = { ...model(), id: "gemini-3.8-flash" };
 		const chat = openChat(CODING_TOOLS, { model: chatModel });
@@ -1509,8 +1521,8 @@ describe("agy-shell with a stand-in agy", () => {
 		// One setting per model on the provider's card.
 		const settings = internals.contextSettings();
 		expect(settings.map((entry) => [entry.id, entry.model, entry.label])).toEqual([
-			["context-length:gemini-3.8-flash", "gemini-3.8-flash", "上下文长度"],
-			["context-length:gemini-3.8-pro", "gemini-3.8-pro", "上下文长度"],
+			["context-length:gemini-3.8-flash", "gemini-3.8-flash", "自动压缩阈值"],
+			["context-length:gemini-3.8-pro", "gemini-3.8-pro", "自动压缩阈值"],
 		]);
 		const setting = settings[0];
 		expect(setting.get()).toBe("");
@@ -1522,16 +1534,30 @@ describe("agy-shell with a stand-in agy", () => {
 		setting.set("100k");
 		expect(setting.get()).toBe("100K");
 		expect(contextLimit("gemini-3.8-flash")).toBe(100_000);
-		// Chats on the model are measured against the new length at once; the other model keeps its own.
-		expect(internals.shared.models!.map((entry) => entry.contextWindow)).toEqual([100_000, 1_000_000]);
+		expect(internals.shared.models!.map((entry) => entry.contextWindow)).toEqual([1_000_000, 1_000_000]);
+		expect(internals.shared.models![0].providerCompactionThreshold).toBe(100_000);
 
-		// The conversation stands at 120K: agy compacts it before the next message goes in.
+		const hook = promptCompactionHook();
+		const notify = vi.fn();
+		const requestSummary = vi.fn();
+		const check = () =>
+			hook(
+				{ signal: new AbortController().signal, requestSummary },
+				{
+					model: chatModel,
+					ui: { notify },
+					sessionManager: { getSessionId: () => chat.session.sessionId, getBranch: () => [] },
+				},
+			);
+		await check();
+		expect(notify).toHaveBeenCalledWith(expect.stringContaining("agy 原生"), "info");
+		expect(requestSummary).not.toHaveBeenCalled();
 		const final = await chat.send("say two");
 		expect(textOf(final)).toBe("two");
 		expect(compactions()).toBe(1);
 		expect(final.message.usage.totalTokens).toBe(20_000);
-		expect(chatModel.contextWindow).toBe(100_000);
-		// Under the length again: nothing is compacted.
+		expect(chatModel.contextWindow).toBe(1_000_000);
+		await check();
 		await chat.send("say three");
 		expect(compactions()).toBe(1);
 
@@ -1539,7 +1565,47 @@ describe("agy-shell with a stand-in agy", () => {
 		setting.set("");
 		expect(contextLimit("gemini-3.8-flash")).toBeUndefined();
 		expect(internals.shared.models![0].contextWindow).toBe(1_000_000);
+		expect(internals.shared.models![0].providerCompactionThreshold).toBeUndefined();
 	});
+
+	it.each(["unavailable", "unchanged", "failed", "no-update", "cancelled"])(
+		"handles native compression %s without sending the pending prompt",
+		async (scenario) => {
+			if (scenario !== "unavailable") setEnv("MOCK_ACP_COMMANDS", "compact");
+			if (scenario === "unchanged") setEnv("MOCK_ACP_COMPACT_TO", "120000");
+			if (scenario === "failed" || scenario === "no-update" || scenario === "cancelled")
+				setEnv("MOCK_ACP_COMPACT_MODE", scenario);
+			const chatModel = { ...model(), id: "gemini-3.8-flash" };
+			const chat = openChat(CODING_TOOLS, { model: chatModel });
+			const final = await chat.send("usage 120000 1000000 ;; say one");
+			const hook = promptCompactionHook();
+			internals.contextSettings()[0].set("100k");
+			const notify = vi.fn();
+			const requestSummary = vi.fn();
+			const ac = new AbortController();
+			// Simulate a resumed session for which ACP has not sent an initial reading.
+			chat.session.usage = undefined;
+			const check = hook(
+				{ signal: ac.signal, requestSummary },
+				{
+					model: chatModel,
+					ui: { notify },
+					sessionManager: {
+						getSessionId: () => chat.session.sessionId,
+						getBranch: () => [{ type: "message", message: final.message }],
+					},
+				},
+			);
+			if (scenario === "cancelled") {
+				await vi.waitFor(() => expect(requests().some((entry) => entry.compact)).toBe(true));
+				ac.abort();
+			}
+			await check;
+			if (scenario === "cancelled") expect(chat.session.running).toBe(true);
+			expect(requestSummary).toHaveBeenCalledTimes(scenario === "cancelled" ? 0 : 1);
+			expect(notify).not.toHaveBeenCalled();
+		},
+	);
 
 	it("asks agy what is left of the plan without a model request, and shows it in the chats that are on agy", async () => {
 		setEnv(

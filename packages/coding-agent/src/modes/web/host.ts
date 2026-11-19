@@ -287,6 +287,7 @@ const ACTIVITY_EVENTS = new Set(["agent_start", "run_finished", "bash_start", "b
 /** The parts of the hub that a single WebHost reports back to. */
 export interface WebHostHubLink {
 	hostBroadcast(host: WebHost, event: string): void;
+	refreshProviderFilesBeforePrompt(host: WebHost): Promise<void>;
 	/** The process that owned this host's session ended: take the session over in place. */
 	reclaimMirror(host: WebHost): void;
 	requestShutdown(): void;
@@ -2294,7 +2295,10 @@ export class WebHost {
 		const running = session.isStreaming || session.isCompacting;
 		if (!running && this.completionPromise) await this.completionPromise;
 		// run_finished can reach the page while the settled run still holds prompt admission (its trace is finishing).
-		if (!running) await session.waitForSettlingRun();
+		if (!running) {
+			await session.waitForSettlingRun();
+			await this.hub?.refreshProviderFilesBeforePrompt(this);
+		}
 		const streamingBehavior: "followUp" | "steer" | undefined =
 			running && !interrupt ? (mode === "followUp" ? "followUp" : "steer") : undefined;
 		await new Promise<void>((resolve, reject) => {

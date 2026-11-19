@@ -203,6 +203,18 @@ export class SessionModelController {
 		}
 	}
 
+	/** Reload the selected model's definition without changing the user's selection. */
+	reconcileExternalProviderChange(): void {
+		const current = this._model;
+		if (!current) return;
+		const model = this._host.modelRuntime.getModel(current.provider, current.id);
+		if (model) {
+			this._host.agent.state.model = model;
+			this._host.setThinkingLevel(this._host.agent.state.thinkingLevel);
+		}
+		this._host.notifyModelChanged();
+	}
+
 	/** Swap the live model instance for the registry's current one after providers were (re)registered. */
 	refreshCurrentFromRegistry(): void {
 		const currentModel = this._model;

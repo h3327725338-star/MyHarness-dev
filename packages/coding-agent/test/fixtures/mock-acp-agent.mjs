@@ -370,9 +370,22 @@ async function prompt(session, params) {
 	const promptText = (params.prompt ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("\n");
 	if (env.MOCK_ACP_SEARCH && promptText.includes("search relay")) return searchRelay(session, promptText);
 	// agy's own command: the conversation is summarized inside agy, which then says how full the context is.
-	if (promptText.trim() === "/compact" && env.MOCK_ACP_COMPACT_TO) {
+	if (promptText.trim() === "/compact" && (env.MOCK_ACP_COMPACT_TO || env.MOCK_ACP_COMPACT_MODE)) {
 		log({ compact: session.id });
-		update(session, { sessionUpdate: "usage_update", used: Number(env.MOCK_ACP_COMPACT_TO), size: session.size ?? 1_000_000 });
+		if (env.MOCK_ACP_COMPACT_MODE === "failed") throw new Error("native compression failed");
+		if (env.MOCK_ACP_COMPACT_MODE === "cancelled") {
+			session.cancelled = false;
+			for (let i = 0; !session.cancelled && i < 200; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+			if (session.cancelled) return { stopReason: "cancelled" };
+		}
+		if (env.MOCK_ACP_COMPACT_TO) {
+			const size = session.size ?? 1_000_000;
+			const done = () => update(session, { sessionUpdate: "usage_update", used: Number(env.MOCK_ACP_COMPACT_TO), size });
+			if (env.MOCK_ACP_COMPACT_MODE === "late") {
+				update(session, { sessionUpdate: "usage_update", used: 121000, size });
+				setTimeout(done, 100);
+			} else done();
+		}
 		return { stopReason: "end_turn" };
 	}
 	// The steps are the last line that starts with one of the verbs, so whatever a client puts around it (instructions

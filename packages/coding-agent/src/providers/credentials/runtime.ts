@@ -29,9 +29,9 @@ export class RuntimeCredentials implements ApiKeyCollectionStore {
 	 * Reload persisted credentials (e.g. auth.json) from the underlying store.
 	 * Stores without reload support (memory-only stores) are left untouched.
 	 */
-	reload(): void {
-		const store = this.store as { reload?: () => void };
-		store.reload?.();
+	reload(): boolean {
+		const store = this.store as { reload?: () => boolean | undefined };
+		return store.reload?.() !== false;
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string): void {

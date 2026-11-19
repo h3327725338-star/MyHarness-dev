@@ -8,6 +8,7 @@ export type ExtensionEventName =
 	| "session_info_changed"
 	| "session_before_switch"
 	| "session_before_fork"
+	| "session_before_prompt_compact"
 	| "session_before_compact"
 	| "session_compact"
 	| "session_shutdown"

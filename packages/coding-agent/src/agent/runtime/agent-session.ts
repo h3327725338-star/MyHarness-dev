@@ -32,6 +32,7 @@ import {
 	cleanupSessionResources,
 	isContextOverflow,
 	isRetryableAssistantError,
+	modelsAreEqual,
 	type ProviderErrorCategory,
 	streamSimple,
 } from "@myharness/ai/compat";
@@ -2128,6 +2129,34 @@ export class AgentSession {
 		return this._contextCoordinator.ensure(additionalMessages, context, resumeAfterCompaction);
 	}
 
+	/** Provider-owned conversations can request a portable checkpoint before any new input is sent. */
+	private async _compactProviderConversationBeforePrompt(): Promise<void> {
+		if (!this.model?.managesOwnContext || !this._extensionRunner.hasHandlers("session_before_prompt_compact")) return;
+		if (this._abortRequested) return;
+		const preparation = new AbortController();
+		this._runPreparation = preparation;
+		let summaryRequested = false;
+		try {
+			await this._extensionRunner.emit({
+				type: "session_before_prompt_compact",
+				signal: preparation.signal,
+				requestSummary: () => {
+					summaryRequested = true;
+				},
+			});
+		} finally {
+			this._runPreparation = undefined;
+		}
+		preparation.signal.throwIfAborted();
+		if (!summaryRequested || this._abortRequested) return;
+		const leaf = this.sessionManager.getLeafId();
+		await this._runAutoCompaction("threshold", false, true);
+		if (this._abortRequested) throw new DOMException("Aborted", "AbortError");
+		const ui = this._extensionRunner.getUIContext();
+		if (this.sessionManager.getLeafId() !== leaf) ui.notify("已使用 MyHarness 摘要压缩上下文。", "info");
+		else ui.notify("MyHarness 摘要压缩未完成。", "warning");
+	}
+
 	/** Assign the provider-facing system prompt only when it actually changed. */
 	private _setAgentSystemPrompt(next: string): void {
 		if (this.agent.state.systemPrompt !== next) this.agent.state.systemPrompt = next;
@@ -2281,15 +2310,17 @@ export class AgentSession {
 				}
 			}
 			try {
+				await this._compactProviderConversationBeforePrompt();
 				await this._ensureContextBudget(inputMessages);
 			} catch (error) {
 				const blocked = error instanceof ContextBudgetBlockedError;
-				this._runStateTracker.terminal = {
-					state: blocked ? "blocked" : "failed",
-					activity: blocked ? "上下文超出安全预算，任务未发送" : "任务启动失败",
-					error: error instanceof Error ? error.message : String(error),
-					reason: blocked ? terminalReasonForContextBlock(error.reason) : "precheck-failed",
-				};
+				if (!this._abortRequested)
+					this._runStateTracker.terminal = {
+						state: blocked ? "blocked" : "failed",
+						activity: blocked ? "上下文超出安全预算，任务未发送" : "任务启动失败",
+						error: error instanceof Error ? error.message : String(error),
+						reason: blocked ? terminalReasonForContextBlock(error.reason) : "precheck-failed",
+					};
 				for (const message of inputMessages) {
 					if (
 						message.role !== "compactionSummary" &&
@@ -2666,6 +2697,13 @@ export class AgentSession {
 			// Validate model
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
+			}
+
+			if (
+				this._unavailableExternalModel === this.model &&
+				!this._modelRuntime.getAvailableSnapshot().some((model) => modelsAreEqual(model, this.model))
+			) {
+				throw new Error("当前模型已不可用，请从模型菜单重新选择。");
 			}
 
 			const hasConfiguredAuth =
@@ -3340,6 +3378,17 @@ export class AgentSession {
 			throw new Error("Compaction failed before switching to a smaller context window");
 	}
 
+	private _unavailableExternalModel: Model<any> | undefined;
+
+	reconcileExternalProviderChange(): void {
+		this._models.reconcileExternalProviderChange();
+		const current = this.model;
+		this._unavailableExternalModel =
+			current && !this._modelRuntime.getAvailableSnapshot().some((model) => modelsAreEqual(model, current))
+				? current
+				: undefined;
+	}
+
 	/** Reconcile the live model after a persisted Provider/Model/Key mutation. */
 	async reconcileModelAfterConfigChange(): Promise<void> {
 		await this._models.reconcileAfterConfigChange();
@@ -3564,7 +3613,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		beforePrompt = false,
+	): Promise<boolean> {
 		if (this._autoCompactionAbortController || this._compactionAbortController || this._manualCompactionStarting) {
 			this._contextCoordinator.setAutoCompactionFailure({ reason: "in-progress" });
 			return false;
@@ -3690,7 +3743,9 @@ export class AgentSession {
 			// wiped out by an older run's cleanup.
 			if (this._autoCompactionAbortController === abortController) this._autoCompactionAbortController = undefined;
 			try {
-				if (!willRetry || this._contextCoordinator.hasAutoCompactionFailure) {
+				if (beforePrompt) {
+					this._setRunState("starting", "任务启动中");
+				} else if (!willRetry || this._contextCoordinator.hasAutoCompactionFailure) {
 					const terminal = this._terminalRunStateFromLastMessage();
 					this._setRunState(terminal.state, terminal.activity, { error: terminal.error });
 				}

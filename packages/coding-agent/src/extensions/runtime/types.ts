@@ -412,6 +412,14 @@ export interface SessionBeforeForkEvent {
 	position: "before" | "at";
 }
 
+/** Before a new prompt for a provider-owned conversation, while its new input is still outside the history. */
+export interface SessionBeforePromptCompactEvent {
+	type: "session_before_prompt_compact";
+	signal: AbortSignal;
+	/** Ask the host to run its existing summary compaction before sending the prompt. */
+	requestSummary(): void;
+}
+
 /** Fired before context compaction (can be cancelled or customized) */
 export interface SessionBeforeCompactEvent {
 	type: "session_before_compact";
@@ -480,6 +488,7 @@ export type SessionEvent =
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
+	| SessionBeforePromptCompactEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionShutdownEvent
@@ -1023,6 +1032,7 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
 	): void;
 	on(event: "session_before_fork", handler: ExtensionHandler<SessionBeforeForkEvent, SessionBeforeForkResult>): void;
+	on(event: "session_before_prompt_compact", handler: ExtensionHandler<SessionBeforePromptCompactEvent>): void;
 	on(
 		event: "session_before_compact",
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,

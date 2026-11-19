@@ -842,6 +842,8 @@ export interface Model<TApi extends Api> {
 	 * so an interface can show how full it is, but a host must not gate requests on it or compact on the model's behalf.
 	 */
 	managesOwnContext?: boolean;
+	/** Optional per-model auto-compaction threshold for a provider that manages its own context. Not a window size. */
+	providerCompactionThreshold?: number;
 	/**
 	 * The provider's own program runs tools by itself while it answers (it reads, writes and runs commands in the working
 	 * folder), and the host learns of a call only as it happens. A host that keeps a snapshot of the folder from before a

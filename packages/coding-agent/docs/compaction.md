@@ -65,6 +65,8 @@ rather than an unknown value.
 > compact and also does **not** send the request — it reports a blocked state
 > (`ContextBudgetBlockedError`) instead of relying on the provider to reject the request.
 
+For agy, the context meter uses the model window. The optional per-model auto-compaction threshold is shown separately. Before sending the next message after reaching that threshold, the extension tries agy's `/compact`. If the command is unavailable, fails, or produces no verified drop in usage, MyHarness tries its summary compaction and rebuilds the agy conversation from the checkpoint. The new message stays outside the summary. The interface reports which compression succeeded, or warns if the summary could not be completed. Leaving the threshold blank uses agy's built-in policy.
+
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
 ### How It Works

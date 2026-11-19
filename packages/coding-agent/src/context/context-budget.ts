@@ -67,6 +67,7 @@ export interface ContextRuntimePolicy {
 	windowSource: ContextWindowSource;
 	/** The model's own program compacts: the window is only reported, never a reason to block or compact. */
 	managesOwnContext: boolean;
+	providerCompactionThreshold?: number;
 }
 
 /** The single runtime context state consumed by UI, gates and lifecycle checks. */
@@ -78,6 +79,8 @@ export interface ContextBudgetSnapshot {
 	reserveTokens: number;
 	/** Raw effective-window threshold for normal auto compaction. */
 	autoCompactThresholdTokens: number;
+	/** Separate threshold used by a provider-owned conversation, when configured. */
+	providerCompactionThreshold?: number;
 	/** Provider hard gate; it is separate from the normal threshold decision. */
 	budgetLimit: number;
 	activeTokens: number;
@@ -255,6 +258,7 @@ export function resolveContextRuntimePolicy(options: {
 	autoCompactEnabled: boolean;
 	configuredViaCli: boolean;
 	managesOwnContext?: boolean;
+	providerCompactionThreshold?: number;
 }): ContextRuntimePolicy {
 	const configuredValid =
 		options.configuredContextWindow !== undefined &&
@@ -297,6 +301,7 @@ export function resolveContextRuntimePolicy(options: {
 		autoCompactEnabled: options.autoCompactEnabled,
 		windowSource,
 		managesOwnContext: options.managesOwnContext === true,
+		providerCompactionThreshold: options.providerCompactionThreshold,
 	};
 }
 
@@ -316,6 +321,9 @@ export function computeContextBudgetSnapshot(
 		effectiveWindow: policy.effectiveWindow,
 		reserveTokens: policy.reserveTokens,
 		autoCompactThresholdTokens: policy.autoCompactThresholdTokens,
+		...(policy.providerCompactionThreshold !== undefined && {
+			providerCompactionThreshold: policy.providerCompactionThreshold,
+		}),
 		budgetLimit: policy.budgetLimit,
 		activeTokens: estimate.tokens,
 		percent,

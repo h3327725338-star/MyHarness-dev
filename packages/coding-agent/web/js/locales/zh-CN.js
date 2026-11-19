@@ -821,6 +821,7 @@ export const zhCN = {
 	Remaining: "剩余",
 	"Context window": "上下文窗口",
 	"Auto-compact": "自动压缩",
+	"Auto-compaction threshold": "自动压缩阈值",
 	"Compact now": "立即压缩",
 	Context: "上下文",
 	Skills: "技能",
